@@ -15,6 +15,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,9 +26,11 @@ import (
 )
 
 const (
-	productionBaseURL = "https://api.polar.sh"
-	sandboxBaseURL    = "https://sandbox-api.polar.sh"
-	maxErrorBody      = 64 << 10
+	productionBaseURL  = "https://api.polar.sh"
+	sandboxBaseURL     = "https://sandbox-api.polar.sh"
+	maxErrorBody       = 64 << 10
+	maxRequestAttempts = 3
+	retryBaseDelay     = 100 * time.Millisecond
 )
 
 // usageDedupe is the existing hourly push table exposed by state.Store. The
@@ -478,49 +481,96 @@ func (p *Provider) doJSON(ctx context.Context, method, path string, in, out any,
 	if strings.TrimSpace(p.apiKey) == "" {
 		return ErrNoAPIKey
 	}
-	var body io.Reader
+	var encoded []byte
 	if in != nil {
-		encoded, err := json.Marshal(in)
+		var err error
+		encoded, err = json.Marshal(in)
 		if err != nil {
 			return fmt.Errorf("polar: encode %s %s: %w", method, path, err)
 		}
-		body = bytes.NewReader(encoded)
 	}
 	base := strings.TrimRight(p.baseURL, "/")
-	req, err := http.NewRequestWithContext(ctx, method, base+path, body)
-	if err != nil {
-		return fmt.Errorf("polar: build %s %s: %w", method, path, err)
-	}
-	req.Header.Set("Authorization", "Bearer "+p.apiKey)
-	req.Header.Set("Accept", "application/json")
-	if in != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	if idem != "" {
-		req.Header.Set("Idempotency-Key", idem)
-	}
 	client := p.client
 	if client == nil {
 		client = http.DefaultClient
 	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer func() {
+	// Only replay writes that carry an idempotency key. Customer-session
+	// creation intentionally has no key in Polar's API and must not be
+	// duplicated by a transport retry; GET/HEAD are safe without one.
+	retryable := idem != "" || method == http.MethodGet || method == http.MethodHead
+	for attempt := 1; attempt <= maxRequestAttempts; attempt++ {
+		var body io.Reader
+		if encoded != nil {
+			body = bytes.NewReader(encoded)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, base+path, body)
+		if err != nil {
+			return fmt.Errorf("polar: build %s %s: %w", method, path, err)
+		}
+		req.Header.Set("Authorization", "Bearer "+p.apiKey)
+		req.Header.Set("Accept", "application/json")
+		if in != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		if idem != "" {
+			req.Header.Set("Idempotency-Key", idem)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			if !retryable || attempt == maxRequestAttempts || ctx.Err() != nil {
+				return err
+			}
+			if err := waitPolarRetry(ctx, retryBaseDelayFor(attempt, "")); err != nil {
+				return err
+			}
+			continue
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			errorBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
+			_ = resp.Body.Close()
+			apiErr := &APIError{Status: resp.StatusCode, Body: string(errorBody)}
+			if !retryable || !retryablePolarStatus(resp.StatusCode) || attempt == maxRequestAttempts {
+				return apiErr
+			}
+			if err := waitPolarRetry(ctx, retryBaseDelayFor(attempt, resp.Header.Get("Retry-After"))); err != nil {
+				return err
+			}
+			continue
+		}
+		if out == nil || resp.StatusCode == http.StatusNoContent {
+			_ = resp.Body.Close()
+			return nil
+		}
+		err = json.NewDecoder(resp.Body).Decode(out)
 		_ = resp.Body.Close()
-	}()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		errorBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
-		return &APIError{Status: resp.StatusCode, Body: string(errorBody)}
-	}
-	if out == nil || resp.StatusCode == http.StatusNoContent {
+		if err != nil {
+			return fmt.Errorf("polar: decode %s %s: %w", method, path, err)
+		}
 		return nil
 	}
-	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
-		return fmt.Errorf("polar: decode %s %s: %w", method, path, err)
+	return errors.New("polar: request attempts exhausted")
+}
+
+func retryablePolarStatus(status int) bool {
+	return status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= 500
+}
+
+func retryBaseDelayFor(attempt int, retryAfter string) time.Duration {
+	if seconds, err := strconv.Atoi(strings.TrimSpace(retryAfter)); err == nil && seconds >= 0 {
+		return time.Duration(seconds) * time.Second
 	}
-	return nil
+	return retryBaseDelay * time.Duration(1<<(attempt-1))
+}
+
+func waitPolarRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func hasStatus(err error, status int) bool {

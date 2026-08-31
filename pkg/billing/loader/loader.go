@@ -420,17 +420,13 @@ func LoadProviderForAPID(ctx context.Context, cfg *RootBillingConfig, env func(s
 		// planOverage). The call is bounded by the SDK's HTTP timeout
 		// and the supplied ctx so a daemon shutdown can cancel it.
 		//
-		// Best-effort: a failed hydration is warn-logged, not fatal.
-		// The upgrade 402 will degrade to a 500 "monthly price missing"
-		// until the next EnsurePlanProducts run (e2e harness +
-		// transient Paddle outage at boot both need this). The webhook
-		// ingress is independent of the catalog — the dunning state
-		// machine reads acct.Plan, not price handles, so the boot
-		// failure mode is the upgrade 402 path only.
 		bootCtx, cancel := context.WithTimeout(ctx, providerBootHydrationTimeout)
 		err = bp.EnsurePlanProducts(bootCtx)
 		cancel()
 		if err != nil {
+			if m.Name == providerPolar {
+				return nil, m.Name, fmt.Errorf("billing: Polar catalog preflight failed: %w", err)
+			}
 			log.Warn("billing: EnsurePlanProducts failed at boot — upgrade 402 will degrade to 500 until next run",
 				"provider", m.Name, "err", err)
 		}
@@ -489,6 +485,15 @@ func LoadProviderForMeterd(cfg *RootBillingConfig, env func(string) string, stor
 		bp, ok := p.(billing.Provider)
 		if !ok {
 			return nil, m.Name, fmt.Errorf("billing: provider %s BuildMeterd returned %T, does not satisfy billing.Provider", m.Name, p)
+		}
+		if m.Name == providerPolar {
+			// Polar's product and usage-event IDs are deployment-owned config,
+			// not lazily discovered data. Refuse to start meterd when the
+			// catalog cannot satisfy the billing contract; otherwise the box
+			// would sample usage forever while every checkout/push is unusable.
+			if err := bp.EnsurePlanProducts(context.Background()); err != nil {
+				return nil, m.Name, fmt.Errorf("billing: Polar catalog preflight failed for meterd: %w", err)
+			}
 		}
 		return bp, m.Name, nil
 	}

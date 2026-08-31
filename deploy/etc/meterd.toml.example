@@ -19,14 +19,15 @@
 # metrics_addr = "127.0.0.1:9106"
 
 # meter block — timer cadences + the per-tick behavior knobs. Default
-# cadences: sample 60s, quota 60s, stripe 60m. Override via env:
+# cadences: sample 60s, quota 60s, billing usage push 60m. Override via env:
 # FAAS_SAMPLE_INTERVAL, FAAS_QUOTA_INTERVAL, FAAS_STRIPE_INTERVAL.
-# Sample and quota intervals must be ≤ 60s on busy days; the stripe
-# interval can be longer (the §14 sample is monthly).
+# Sample and quota intervals must be ≤ 60s on busy days. Billing pushes
+# recheck a durable 30-day lookback and must stay hourly or faster.
 [meter]
 # sample_interval = "60s"
 # quota_interval = "60s"
 # stripe_interval = "60m"
+# billing_lookback = "720h"
 
 # [billing] block — provider config (PR-P2 + ADR-032 v2). meterd
 # doesn't read webhook_secret (no ingress) but the surface is kept

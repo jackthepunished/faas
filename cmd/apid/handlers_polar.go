@@ -47,6 +47,36 @@ func (s *server) polarWebhook(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
+	// Persist the invoice projection before claiming the delivery. A failed
+	// database write must leave the delivery retryable; the natural-key upsert
+	// makes this safe when Polar redelivers after the later business-state
+	// processing succeeds.
+	if ev.Invoice != nil {
+		currency := ev.Invoice.Currency
+		if currency == "" {
+			currency = "eur"
+		}
+		inv := state.Invoice{
+			AccountID:         acct.ID,
+			Provider:          string(webhookdedupe.ProviderPolar),
+			ProviderInvoiceID: ev.Invoice.ProviderInvoiceID,
+			Number:            ev.Invoice.Number,
+			Status:            ev.Invoice.Status,
+			PeriodStart:       ev.Invoice.PeriodStart,
+			PeriodEnd:         ev.Invoice.PeriodEnd,
+			SubtotalCents:     ev.Invoice.SubtotalCents,
+			TaxCents:          ev.Invoice.TaxCents,
+			TotalCents:        ev.Invoice.TotalCents,
+			AmountPaidCents:   ev.Invoice.AmountPaidCents,
+			Currency:          currency,
+			PDFAvailable:      ev.Invoice.PDFAvailable,
+		}
+		if err := s.store.UpsertInvoice(r.Context(), inv); err != nil {
+			s.log.Error("polar webhook invoice persistence failed", "event_id", logsanitize.Field(ev.EventID), "err", err)
+			api.WriteProblem(w, api.ErrCapacity("billing webhook temporarily unavailable"))
+			return
+		}
+	}
 	if ev.EventID != "" {
 		now := time.Now().UTC()
 		claimed, err := s.store.ClaimWebhookDelivery(

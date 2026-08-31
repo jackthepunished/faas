@@ -68,6 +68,81 @@ func TestEnsurePlanProductsRequiresConfiguredIDs(t *testing.T) {
 	}
 }
 
+func TestVerifyWebhookAcceptsRawPolarSecret(t *testing.T) {
+	cfg := testConfig("http://example.test")
+	cfg.WebhookSecret = "polar_whs_test_secret"
+	p, err := NewProvider(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	when := time.Now().UTC()
+	body := []byte(`{"type":"order.paid","data":{"id":"order-raw","customer_id":"customer-1","total_amount":100,"currency":"eur"}}`)
+	headers := map[string]string{
+		"webhook-id":        "raw-1",
+		"webhook-timestamp": strconv.FormatInt(when.Unix(), 10),
+		"webhook-signature": SignForTest(body, cfg.WebhookSecret, "raw-1", when),
+	}
+	ev, err := p.VerifyWebhook(body, headers, 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev.Invoice == nil || ev.Invoice.ProviderInvoiceID != "order-raw" || ev.Invoice.Status != "paid" {
+		t.Fatalf("invoice projection = %+v, want paid order", ev.Invoice)
+	}
+}
+
+func TestVerifyWebhookProjectsPolarOrderInvoice(t *testing.T) {
+	p, err := NewProvider(testConfig("http://example.test"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	when := time.Now().UTC()
+	body := []byte(`{"type":"order.created","data":{"id":"order-1","customer_id":"customer-1","invoice_number":"INV-1","status":"pending","subtotal_amount":900,"tax_amount":100,"total_amount":1000,"currency":"eur","current_period_start":"2026-08-01T00:00:00Z","current_period_end":"2026-09-01T00:00:00Z","invoice_pdf":"https://polar.test/invoice.pdf"}}`)
+	headers := map[string]string{
+		"webhook-id":        "invoice-1",
+		"webhook-timestamp": strconv.FormatInt(when.Unix(), 10),
+		"webhook-signature": SignForTest(body, "webhook-secret", "invoice-1", when),
+	}
+	ev, err := p.VerifyWebhook(body, headers, 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev.Type != billing.EventUnknown {
+		t.Fatalf("order.created type = %v, want unknown state transition", ev.Type)
+	}
+	inv := ev.Invoice
+	if inv == nil || inv.ProviderInvoiceID != "order-1" || inv.Number != "INV-1" || inv.Status != "open" || inv.SubtotalCents != 900 || inv.TaxCents != 100 || inv.TotalCents != 1000 || !inv.PDFAvailable {
+		t.Fatalf("invoice projection = %+v", inv)
+	}
+	if !inv.PeriodStart.Equal(time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)) || !inv.PeriodEnd.Equal(time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("invoice period = %v..%v", inv.PeriodStart, inv.PeriodEnd)
+	}
+}
+
+func TestDoJSONRetriesTransientResponses(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls < 3 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer server.Close()
+	p, err := NewProvider(testConfig(server.URL), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out map[string]bool
+	if err := p.doJSON(context.Background(), http.MethodPost, "/v1/retry", map[string]string{"x": "y"}, &out, "retry-key"); err != nil {
+		t.Fatalf("doJSON: %v", err)
+	}
+	if calls != 3 || !out["ok"] {
+		t.Fatalf("calls=%d out=%v, want three attempts and ok response", calls, out)
+	}
+}
+
 func TestCreateCustomerAndCheckout(t *testing.T) {
 	var mu sync.Mutex
 	var methods []string

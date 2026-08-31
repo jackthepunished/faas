@@ -3697,6 +3697,15 @@ type Usage struct {
 	ColdBootCount int64
 }
 
+// UsageWindow is the account-level billable usage aggregate for one
+// completed UTC hour. It is intentionally provider-neutral: every metered
+// provider uses the same durable source rows and its own idempotency key.
+type UsageWindow struct {
+	AccountID string
+	Hour      time.Time
+	MBSeconds int64
+}
+
 // DailyUsage is the per-(account, app, day) row read by
 // Store.UsageDaily (ADR-048 §5). Mirrors the columns declared
 // in migrations/00067_extend_metering_telemetry.sql::usage_daily.
@@ -3753,7 +3762,7 @@ type StorageUsage struct {
 type Invoice struct {
 	ID                string
 	AccountID         string
-	Provider          string // "stripe" | "paddle"
+	Provider          string // "stripe" | "paddle" | "polar"
 	ProviderInvoiceID string
 	Number            string
 	Status            string // "draft" | "open" | "paid" | "uncollectible" | "void"

@@ -189,6 +189,20 @@ func TestLoadProviderForMeterd_Polar_BuildsProvider(t *testing.T) {
 	}
 }
 
+func TestLoadProviderForMeterd_PolarFailsMissingCatalogID(t *testing.T) {
+	t.Parallel()
+	env := mapEnv(map[string]string{
+		"FAAS_BILLING_PROVIDER":       "polar",
+		"FAAS_POLAR_ACCESS_TOKEN":     "polar_test_token",
+		"FAAS_POLAR_HOBBY_PRODUCT_ID": "hobby-product",
+		"FAAS_POLAR_PRO_PRODUCT_ID":   "pro-product",
+	})
+	cfg := resolveCfg(t, env)
+	if _, _, err := LoadProviderForMeterd(cfg, env, state.NewMemStore(), discardLog()); err == nil || !strings.Contains(err.Error(), "Scale") && !strings.Contains(err.Error(), "scale") {
+		t.Fatalf("LoadProviderForMeterd error = %v, want missing scale product preflight", err)
+	}
+}
+
 // TestLoadProviderForAPID_Unknown fails the boot loudly on a typo.
 // "braintree" is the canonical bad-value example (real product, not a
 // supported provider) — the loader must return an error rather than

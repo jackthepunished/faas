@@ -26,12 +26,10 @@ import (
 // call so a retry is safe; meterd's own loop is at-least-once too — a
 // redelivered window is just a duplicate that the provider collapses.
 //
-// The production cadence is one push per day (cfg.StripeInterval =
-// 24h). The pusher reads usage_minutes across the past 24h window and
-// hands the integer sum to the SDK; the SDK converts to wire units
-// with one deterministic integer division. The historical per-hour
-// float path was retired in M7 §14 — see docs/STATUS.md and the
-// acceptance test in pkg/billing/stripe/sandbox_test.go.
+// The production cadence is hourly. Each pass reads a bounded history of
+// completed UTC-hour windows from Postgres and replays every positive window
+// whose provider dedupe key has not completed. This makes a restart, missed
+// ticker, or temporary provider outage recoverable without double billing.
 type Pusher struct {
 	store  state.Store
 	pusher billing.Provider
@@ -77,13 +75,10 @@ func HourWindow(at time.Time) (start, end time.Time) {
 // overage). Returns the number of accounts it pushed for so the loop
 // can log a line; errors push loop backoff decisions up to the caller.
 //
-// TODO(M7-followup): rename to PushWindow (or similar) once
-// pkg/meter/loop.go is updated to a daily cadence. The function name
-// is kept as PushHour for historical / interface consistency with the
-// loop driver; the underlying billing window is HourWindow(now), which
-// spans the past 24h under the production cadence
-// (cfg.StripeInterval = 24h). The integer mb_seconds sum is handed to
-// the SDK which converts to wire units in pure int64 arithmetic.
+// PushHour remains the single-window compatibility/test seam. Production
+// uses PushPending below so a missed hourly tick is recovered from the
+// durable lookback. The integer mb_seconds sum is handed to the SDK, which
+// converts to wire units in pure int64 arithmetic.
 //
 // Each non-skip SDK call is observed under the "stripe" op with a code
 // label from stripe.ClassifyPushError — "ok" on success, a stable
@@ -167,6 +162,62 @@ func (p *Pusher) PushHour(ctx context.Context) (int, error) {
 		pushed++
 	}
 	return pushed, nil
+}
+
+// PushPending replays all positive completed usage windows in lookback. The
+// source rows are durable usage_minutes aggregates; provider implementations
+// claim/record their own (account, hour) idempotency key, so an hourly pass is
+// an at-least-once delivery mechanism rather than a best-effort "latest hour"
+// cursor. Per-window failures do not stop the rest of the sweep, but the first
+// error is returned so the meterd health surface and next tick can see it.
+func (p *Pusher) PushPending(ctx context.Context, lookback time.Duration) (int, error) {
+	if p.pusher == nil {
+		return 0, errors.New("meter: billing pusher not configured")
+	}
+	if lookback <= 0 {
+		lookback = 30 * 24 * time.Hour
+	}
+	end := p.now().UTC().Truncate(time.Hour)
+	start := end.Add(-lookback).Truncate(time.Hour)
+	windows, err := p.store.UsageWindows(ctx, start, end)
+	if err != nil {
+		return 0, err
+	}
+	accounts, err := p.store.ListAllAccounts(ctx)
+	if err != nil {
+		return 0, err
+	}
+	byID := make(map[string]state.Account, len(accounts))
+	for _, acct := range accounts {
+		byID[acct.ID] = acct
+	}
+	ops := providerOpsFor(p.pusher)
+	pushed := 0
+	var firstErr error
+	for _, window := range windows {
+		acct, ok := byID[window.AccountID]
+		if !ok || acct.Plan == "free" || acct.Status == state.AccountSuspended || acct.Status == state.AccountDeletedPending {
+			continue
+		}
+		pushStart := time.Now()
+		perr := p.pusher.PushUsageRecord(ctx, acct, window.Hour, window.MBSeconds)
+		code := ops.classify(perr)
+		dur := time.Since(pushStart)
+		p.ops.ObserveCode(ops.opLabel, code, dur)
+		ops.observe(p.ops, code, dur)
+		if perr != nil {
+			if firstErr == nil {
+				firstErr = perr
+			}
+			p.log.Warn("meter: push usage", "account", acct.ID, "hour", window.Hour,
+				"replay", true, "code", code, "mb_seconds", window.MBSeconds, "err", perr)
+			continue
+		}
+		pushed++
+		p.log.Info("meter: push usage", "account", acct.ID, "hour", window.Hour,
+			"replay", true, "code", code, "mb_seconds", window.MBSeconds)
+	}
+	return pushed, firstErr
 }
 
 // providerOps is the per-provider seam — one struct, three closures,

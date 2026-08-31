@@ -4482,6 +4482,10 @@ type Store interface {
 	// list method alone cannot fetch an unknown invoice without
 	// knowing its account_id up-front.
 	GetInvoiceByID(ctx context.Context, id string) (Invoice, error)
+	// UpsertInvoice persists one provider invoice projection. The natural key
+	// (account_id, provider, provider_invoice_id) makes webhook redelivery and
+	// order status updates idempotent.
+	UpsertInvoice(ctx context.Context, inv Invoice) error
 
 	// Account credits (issue #279). The handler is the only writer to
 	// account_credits + credit_ledger; meterd reads overage_cap_cents
@@ -4557,6 +4561,11 @@ type Store interface {
 	// GB-RAM-hours for the past hour (spec §4.7, ADR-010). MemStore scans
 	// in memory; PgStore runs a SELECT … WHERE minute >= $2 AND minute < $3.
 	UsageByHour(ctx context.Context, accountID string, start, end time.Time) ([]Usage, error)
+	// UsageWindows returns positive account-level usage aggregates for the
+	// completed UTC-hour windows in [start, end). The query is the durable
+	// backfill source for meterd: a restart or provider outage can safely
+	// replay these rows because every provider records its own idempotency key.
+	UsageWindows(ctx context.Context, start, end time.Time) ([]UsageWindow, error)
 
 	// StripePushDedup is the dedupe table for hourly usage pushes. The
 	// PushDedupe interface in pkg/billing/stripe is satisfied by both stores.

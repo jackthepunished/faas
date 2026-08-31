@@ -82,7 +82,7 @@ Configure a Polar webhook endpoint at
 `https://<your-api-host>/v1/webhooks/polar` and subscribe at least to
 `subscription.created`, `subscription.updated`, `subscription.active`,
 `subscription.canceled`, `subscription.revoked`, `subscription.past_due`,
-`order.paid`, and `order.refunded`. Polar signs deliveries with Standard
+`order.created`, `order.paid`, and `order.refunded`. Polar signs deliveries with Standard
 Webhooks headers (`webhook-id`, `webhook-timestamp`, and
 `webhook-signature`); the provider verifies the body before parsing it.
 
@@ -100,9 +100,25 @@ update their payment method and recover the subscription from that portal.
 
 Polar usage events are attributed to billing periods by receipt time, not the
 event's supplied timestamp. meterd therefore pushes each completed hour and
-rejects a Polar configuration whose billing push interval is longer than one
-hour; this prevents silent under-reporting after a default/configuration
-mistake.
+rechecks a durable 30-day history on every pass. A Polar configuration whose
+push interval is longer than one hour is rejected, so a restart or temporary
+Polar outage cannot silently under-report usage.
+
+### Production release gates
+
+Before enabling Polar in production, verify that the three paid-plan product
+IDs point to recurring EUR products containing the configured metered price.
+Both `apid` and `meterd` fail startup when a required product ID is missing.
+The deployment must use the hourly `meterd` pass and include migration `00588`.
+
+Polar's raw `polar_whs_...` webhook secret is accepted alongside the existing
+base64/`whsec_` form. Invoice projections are persisted idempotently from
+`order.created` and updated by `order.paid`; a persistence failure returns
+non-2xx so Polar retries. Run the host smoke test after rendering config:
+
+```sh
+sudo deploy/scripts/verify-secrets.sh
+```
 
 Official references: [Polar checkout sessions](https://polar.sh/docs/api-reference/checkouts/create-session),
 [customer portal sessions](https://polar.sh/docs/api-reference/customer-portal/sessions/create),
@@ -164,6 +180,9 @@ the legacy `stripe.Client`.
 | `transaction.paid` 200 but no state flip                   | Unknown customer (event's `data.customer_id` doesn't match `accounts.provider_customer_id`). 200 stops Paddle from retrying. | `journalctl -u faas-apid` shows `paddle_webhook.unknown_customer customer_id=…`. Check the mapping. |
 | `changePlan` 402 carries `paddle_checkout_url` but URL 404 | Paddle sandbox product/price IDs not yet created. Run `EnsurePlanProducts` manually (it's idempotent — re-running on an existing catalog is a no-op). | `faas billing price-catalog list` shows the catalog snapshot.                                       |
 | Duplicate Paddle events arriving within seconds            | Paddle redelivery (network blip). Deduped by `pkg/webhookdedupe` (5-min TTL). | `paddle_webhook_replay_suppressed_total` increments; audit row `webhook.replay_rejected` is emitted. |
+| Polar usage is missing after a restart/outage              | Stale meterd config or unapplied migrations.                                | Confirm `stripe_interval <= 1h`, migration `00588`, and `failed` entries from meterd `/healthz`. |
+| Polar webhook returns 503                                   | Invoice/replay persistence is unavailable.                                  | Fix Postgres or migrations; Polar retries the non-2xx delivery. |
+| Polar invoice history is empty                              | `order.created` is not subscribed or the customer/product IDs do not map.   | Check Polar webhook subscriptions and `polar_webhook.unknown_customer` logs. |
 
 ## Webhook hardening knobs
 
