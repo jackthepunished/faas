@@ -217,11 +217,11 @@ func makeGoHandlerLayer(layers []io.ReadCloser) (io.ReadCloser, func(), error) {
 	info, err := os.Stat(source)
 	if err != nil {
 		cleanupStaging()
-		return nil, func() {}, fmt.Errorf("Go build artifact missing /app/server: %w", err)
+		return nil, func() {}, fmt.Errorf("go build artifact missing /app/server: %w", err)
 	}
 	if !info.Mode().IsRegular() || info.Mode()&0o111 == 0 {
 		cleanupStaging()
-		return nil, func() {}, errors.New("Go build artifact /app/server is not an executable regular file")
+		return nil, func() {}, errors.New("go build artifact /app/server is not an executable regular file")
 	}
 
 	archive, err := os.CreateTemp("", "faas-go-handler-*.tar.gz")
@@ -241,6 +241,7 @@ func makeGoHandlerLayer(layers []io.ReadCloser) (io.ReadCloser, func(), error) {
 		removeArchive()
 		return nil, func() {}, fmt.Errorf("write Go handler layer header: %w", err)
 	}
+	//nolint:forbidigo // source is the file we just validated under a private temporary staging directory.
 	src, err := os.Open(source)
 	if err != nil {
 		removeArchive()

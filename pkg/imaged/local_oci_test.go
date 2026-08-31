@@ -609,6 +609,7 @@ func TestMakeGoHandlerLayerExtractsExecutableServer(t *testing.T) {
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
+	//nolint:forbidigo // path is a test-created local OCI fixture.
 	file, err = os.Open(path)
 	if err != nil {
 		t.Fatal(err)
