@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -96,6 +97,13 @@ type Engine interface {
 	EnsureWake(ctx context.Context, appID, trigger string) (WakeOutcome, error)
 }
 
+// BurstEngine is the optional fast path for engines that can admit a bounded
+// batch of instances. Keeping it separate from Engine preserves the small
+// fake/test seam and lets older adapters fall back to one admission at a time.
+type BurstEngine interface {
+	AdmitInstances(ctx context.Context, appID, scope, trigger string, count int) ([]AdmitResult, error)
+}
+
 // PromScraper is the per-app RPS signal source. Production impl
 // scrapes gatewayd-internal's /metrics for `gateway_requests_total`. Returns
 // the per-app request count for the most recent reading; the trigger
@@ -170,6 +178,11 @@ type Decision struct {
 	// ObservedRPS is the per-instance RPS at decision time. Used to
 	// feed the scale_up_admit_rps histogram on the admit branch.
 	ObservedRPS float64
+	// Desired is the estimated resident-instance count, capped at
+	// MaxConcurrency. Admissions is the number of new instances this
+	// decision should request, before the per-tick burst bound.
+	Desired    int
+	Admissions int
 }
 
 // decide is the pure decision function. Extracted so tests can drive
@@ -203,11 +216,36 @@ func decide(s AppStats) Decision {
 	if headroom <= 0 {
 		return Decision{Outcome: OutcomeRejectAtCap, Headroom: 0}
 	}
+	desired := s.Concurrency + 1
+	if rpsHot && s.Concurrency > 0 {
+		// The ring stores total app RPS while the decision compares
+		// per-instance RPS. Reconstruct total demand and ceil so a
+		// fractional remainder gets capacity.
+		desired = int(math.Ceil((s.PerInstanceRPS * float64(s.Concurrency)) / float64(s.TargetRPS)))
+	}
+	// CPU is a saturation signal rather than a capacity measurement,
+	// so it safely contributes one additional instance when no
+	// stronger RPS estimate is available. When both signals are hot,
+	// retain the larger estimate.
+	if cpuHot && desired < s.Concurrency+1 {
+		desired = s.Concurrency + 1
+	}
+	if desired > s.MaxConcurrency {
+		desired = s.MaxConcurrency
+	}
+	if desired <= s.Concurrency {
+		desired = s.Concurrency + 1
+		if desired > s.MaxConcurrency {
+			desired = s.MaxConcurrency
+		}
+	}
 	return Decision{
 		ShouldAdmit: true,
 		Outcome:     OutcomeAdmit,
 		Headroom:    headroom,
 		ObservedRPS: s.PerInstanceRPS,
+		Desired:     desired,
+		Admissions:  desired - s.Concurrency,
 	}
 }
 
@@ -305,6 +343,29 @@ func (t *Trigger) WithOwnerNodeID(nodeID string) {
 	t.ownerNodeID = nodeID
 }
 
+// admit requests a bounded batch. Production's sched.Engine implements the
+// BurstEngine fast path; small adapters and existing tests intentionally fall
+// back to the original one-at-a-time call. The engine remains the authority on
+// capacity, so a race can still return AtCapacity for the final attempt.
+func (t *Trigger) admit(ctx context.Context, appID string, count int) ([]AdmitResult, error) {
+	if count <= 0 {
+		return nil, nil
+	}
+	if count > api.ScaleUpMaxBurstPerTick {
+		count = api.ScaleUpMaxBurstPerTick
+	}
+	if burst, ok := t.engine.(BurstEngine); ok {
+		return burst.AdmitInstances(ctx, appID, "", wakeBootTriggerScaleup, count)
+	}
+	// An older adapter has no safe way to carry the burst continuation
+	// marker, so preserve its original one-admission behavior.
+	result, err := t.engine.AdmitInstance(ctx, appID, "", wakeBootTriggerScaleup)
+	if err != nil {
+		return nil, err
+	}
+	return []AdmitResult{result}, nil
+}
+
 // Tick runs one sweep. It is the single public entry point the schedd
 // loop calls. Returns nil on success; errors are logged inside the
 // loop (the trigger never aborts the loop on a transient store
@@ -396,12 +457,10 @@ func (t *Trigger) Tick(ctx context.Context) error {
 		if !dec.ShouldAdmit {
 			continue
 		}
-		// Admit path: call Engine.AdmitInstance. The engine
-		// enforces the cap via NodeLedger.Admit; if the cap
-		// is hit between the decide() check and the call
-		// (the ledger is concurrent), AdmitInstance returns
-		// WakeResult{AtCapacity: true} which we observe as
-		// reject_at_cap.
+		// Admit path: request the desired number of instances, bounded
+		// by ScaleUpMaxBurstPerTick. The engine enforces the cap via
+		// NodeLedger.Admit; if it is hit between the decide() check and
+		// a batch attempt, the corresponding result is AtCapacity.
 		if t.engine == nil {
 			continue
 		}
@@ -411,7 +470,7 @@ func (t *Trigger) Tick(ctx context.Context) error {
 		// one running VM stay at one VM forever, even when decide() found
 		// headroom. AdmitInstance skips that fast path and reserves a new
 		// capacity slot through the shared ledger.
-		result, err := t.engine.AdmitInstance(ctx, app.ID, "", wakeBootTriggerScaleup)
+		results, err := t.admit(ctx, app.ID, dec.Admissions)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				return err
@@ -420,20 +479,20 @@ func (t *Trigger) Tick(ctx context.Context) error {
 			// error to the loop (the next tick can
 			// retry). Log + skip.
 			t.log.Warn("scaleup: admit failed", "app", app.ID, "err", err)
-			continue
 		}
-		if result.AtCapacity {
-			// The ledger can reach the cap between decide() and
-			// AdmitInstance. Preserve the decision metric and record the
-			// effective rejection so operators can distinguish pressure
-			// from a successful scale-out.
-			t.metrics.ObserveScaleUp(app.ID, string(OutcomeRejectAtCap))
-			continue
+		for _, result := range results {
+			if result.AtCapacity {
+				// The ledger can reach the cap between decide() and
+				// an individual batch attempt. Preserve the decision
+				// metric and record the effective rejection.
+				t.metrics.ObserveScaleUp(app.ID, string(OutcomeRejectAtCap))
+				continue
+			}
+			// Successful admit: observe the per-instance RPS at
+			// decision time so the dashboard can p95/p99 the
+			// trigger's aggressiveness.
+			t.metrics.ObserveScaleUpAdmitRPS(dec.ObservedRPS)
 		}
-		// Successful admit: observe the per-instance RPS at
-		// decision time so the §12 dashboard can p95/p99 the
-		// "aggressiveness" of the trigger.
-		t.metrics.ObserveScaleUpAdmitRPS(dec.ObservedRPS)
 	}
 	return nil
 }

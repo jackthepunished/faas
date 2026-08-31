@@ -1965,6 +1965,18 @@ func (s schedScaleUpEngine) AdmitInstance(ctx context.Context, appID, scope, tri
 	return scaleup.AdmitResult{InstanceID: r.InstanceID, AtCapacity: r.AtCapacity}, nil
 }
 
+// AdmitInstances implements scaleup.BurstEngine and preserves only the
+// result fields the trigger consumes. The wrapped scheduler still owns every
+// admission check and returns partial results with the first error.
+func (s schedScaleUpEngine) AdmitInstances(ctx context.Context, appID, scope, trigger string, count int) ([]scaleup.AdmitResult, error) {
+	results, err := s.engine.AdmitInstances(ctx, appID, scope, trigger, count)
+	out := make([]scaleup.AdmitResult, 0, len(results))
+	for _, r := range results {
+		out = append(out, scaleup.AdmitResult{InstanceID: r.InstanceID, AtCapacity: r.AtCapacity})
+	}
+	return out, err
+}
+
 // EnsureWake (ADR-098) implements scaleup.Engine: delegates to the
 // wrapped engine's single-flight wake entry and lifts the relevant
 // fields into the thinned scaleup.WakeOutcome. AtCapacity is dropped
@@ -2012,6 +2024,18 @@ func (s schedTargetsEngine) AdmitInstance(ctx context.Context, appID, scope, tri
 		return targets.AdmitResult{}, err
 	}
 	return targets.AdmitResult{InstanceID: r.InstanceID, AtCapacity: r.AtCapacity}, nil
+}
+
+// AdmitInstances implements targets.BurstEngine and preserves only the
+// result fields the trigger consumes. The wrapped scheduler still owns every
+// admission check and returns partial results with the first error.
+func (s schedTargetsEngine) AdmitInstances(ctx context.Context, appID, scope, trigger string, count int) ([]targets.AdmitResult, error) {
+	results, err := s.engine.AdmitInstances(ctx, appID, scope, trigger, count)
+	out := make([]targets.AdmitResult, 0, len(results))
+	for _, r := range results {
+		out = append(out, targets.AdmitResult{InstanceID: r.InstanceID, AtCapacity: r.AtCapacity})
+	}
+	return out, err
 }
 
 // EnsureWake (ADR-098) implements targets.Engine: delegates to the

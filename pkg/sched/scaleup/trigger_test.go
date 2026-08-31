@@ -3,6 +3,7 @@ package scaleup
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -57,6 +58,23 @@ type fakeEngine struct {
 	ensureWakeCalls []string // appIDs in EnsureWake call order
 	results         map[string]AdmitResult
 	errs            map[string]error
+}
+
+type burstFakeEngine struct {
+	*fakeEngine
+	mu          sync.Mutex
+	burstCounts []int
+}
+
+func (e *burstFakeEngine) AdmitInstances(_ context.Context, appID, _, _ string, count int) ([]AdmitResult, error) {
+	e.mu.Lock()
+	e.burstCounts = append(e.burstCounts, count)
+	e.mu.Unlock()
+	results := make([]AdmitResult, count)
+	for i := range results {
+		results[i] = AdmitResult{InstanceID: fmt.Sprintf("ins-%s-%d", appID, i)}
+	}
+	return results, nil
 }
 
 func (e *fakeEngine) AdmitInstance(_ context.Context, appID, _, _ string) (AdmitResult, error) {
@@ -154,6 +172,24 @@ func TestTrigger_AdmitOnRPSTargetHit(t *testing.T) {
 	}
 	if len(engine.ensureWakeCalls) != 0 {
 		t.Errorf("engine.ensureWakeCalls = %v, want []: scale-out must bypass EnsureWake", engine.ensureWakeCalls)
+	}
+}
+
+func TestTrigger_UsesBoundedDesiredCapacityBurst(t *testing.T) {
+	store := &fakeStore{apps: []state.App{
+		{ID: "app1", AutoscaleTargetRPS: 50, MaxConcurrency: 8},
+	}}
+	ledger := &fakeLedger{conc: map[string]int{"app1": 1}}
+	engine := &burstFakeEngine{fakeEngine: &fakeEngine{}}
+	tr := New(store, nil, &fakeScraper{byApp: map[string]int64{"app1": 500}}, engine, ledger, Options{})
+	tr.ring.Touch(t0(), map[string]int64{"app1": 0})
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	// 500 RPS / 50 target = 10 desired, but the app has one
+	// instance and the trigger's per-tick burst bound is four.
+	if len(engine.burstCounts) != 1 || engine.burstCounts[0] != 4 {
+		t.Fatalf("burst counts = %v, want [4]", engine.burstCounts)
 	}
 }
 

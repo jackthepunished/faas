@@ -1446,6 +1446,77 @@ func (e *Engine) AdmitInstance(ctx context.Context, appID, deploymentID, scope, 
 	return e.admitAndDispatchForDeployment(ctx, appID, deploymentID, string(state.InstanceModeNormal), true)
 }
 
+// scaleOutBurstContinuationKey marks the additional members of a single
+// signal-driven burst. It is intentionally private: customer-facing wakes can
+// never bypass the normal scale-out cooldown. Only AdmitInstances creates this
+// marker after its first admission has passed every ordinary gate.
+type scaleOutBurstContinuationKey struct{}
+
+func withScaleOutBurstContinuation(ctx context.Context) context.Context {
+	return context.WithValue(ctx, scaleOutBurstContinuationKey{}, true)
+}
+
+func isScaleOutBurstContinuation(ctx context.Context) bool {
+	value, _ := ctx.Value(scaleOutBurstContinuationKey{}).(bool)
+	return value
+}
+
+// AdmitInstances admits a bounded desired-capacity burst for one app. The
+// first admission uses the ordinary wake gates, including the customer's
+// scale-out cooldown. Remaining admissions are marked as continuations of the
+// same already-approved burst, so they do not serialize behind that cooldown.
+// Every instance still passes through the normal per-node placement, ledger,
+// rate-limit, attestation, and vmmd paths; the method only batches the trigger
+// intent and never grants capacity beyond the ledger.
+//
+// The first admission is performed synchronously to establish the policy
+// decision. Continuations run in parallel, bounded by
+// api.ScaleUpMaxBurstPerTick, so a four-instance cold burst does not multiply
+// its vmmd latency unnecessarily. An individual failure does not cancel its
+// siblings; successful results are returned along with the first error so the
+// trigger can retry the remaining desired capacity on its next tick.
+func (e *Engine) AdmitInstances(ctx context.Context, appID, scope, trigger string, count int) ([]WakeResult, error) {
+	if count <= 0 {
+		return nil, nil
+	}
+	if count > api.ScaleUpMaxBurstPerTick {
+		count = api.ScaleUpMaxBurstPerTick
+	}
+	first, err := e.AdmitInstance(ctx, appID, "", scope, trigger)
+	if err != nil {
+		return nil, err
+	}
+	results := []WakeResult{first}
+	if first.AtCapacity || count == 1 {
+		return results, nil
+	}
+
+	var (
+		mu       sync.Mutex
+		wg       sync.WaitGroup
+		firstErr error
+		burstCtx = withScaleOutBurstContinuation(ctx)
+	)
+	for i := 1; i < count; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			result, admitErr := e.AdmitInstance(burstCtx, appID, "", scope, trigger)
+			mu.Lock()
+			defer mu.Unlock()
+			if admitErr != nil {
+				if firstErr == nil {
+					firstErr = admitErr
+				}
+				return
+			}
+			results = append(results, result)
+		}()
+	}
+	wg.Wait()
+	return results, firstErr
+}
+
 // AdmitMirrorInstance (issue #72 / ADR-133 / ADR-125 PR-A3) is
 // the mirror-admission entry point the gateway's per-request
 // dispatch goroutine calls after the source deployment's
@@ -6755,7 +6826,7 @@ func (e *Engine) admitGate(ctx context.Context, app *state.App, limits api.Limit
 		}
 		return wakeRejectAtCap, 0, 0, concurrency, false
 	}
-	if e.isOnScaleOutCooldown(app, concurrency) {
+	if !isScaleOutBurstContinuation(ctx) && e.isOnScaleOutCooldown(app, concurrency) {
 		if e.ops != nil {
 			e.ops.ObserveScaleUp(app.ID, "cooldown_held")
 		}
