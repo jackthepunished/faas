@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/apislogs"
@@ -3308,8 +3309,16 @@ func (s *server) stripeWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	acct, err := s.lookupAccountByStripeID(r.Context(), ev.Data.Object.Customer)
 	if err != nil {
-		// Unknown customer: 200 so Stripe stops retrying. New customers
-		// land via CreateCustomer; we don't auto-provision on a webhook.
+		// Unknown customer: keep known billing events retryable. A 200 here
+		// would permanently discard a payment/subscription transition when
+		// the local customer binding is temporarily missing. Unknown no-op
+		// events remain ACKed so an unsupported provider event cannot create
+		// an endless retry loop.
+		if mapStripeTypeToEventType(ev.Type) != billing.EventUnknown {
+			s.log.Warn("stripe_webhook.unknown_customer", "customer_id", ev.Data.Object.Customer, "event_type", ev.Type)
+			api.WriteProblem(w, api.ErrCapacity("billing webhook customer binding unavailable"))
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -3352,7 +3361,12 @@ func (s *server) stripeWebhook(w http.ResponseWriter, r *http.Request) {
 		PlanID:     ev.Data.Object.Plan,
 		Raw:        body,
 	}
-	s.handleBillingEvent(r.Context(), normalized, acct)
+	if err := s.handleBillingEvent(r.Context(), normalized, acct); err != nil {
+		s.log.Error("stripe webhook state application failed", "event_id", logsanitize.Field(ev.ID), "err", err)
+		webhookdedupe.ReleaseReplay(r.Context(), webhookdedupe.ProviderStripe, ev.ID)
+		api.WriteProblem(w, api.ErrCapacity("billing webhook temporarily unavailable"))
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -3425,55 +3439,70 @@ func (s *server) paddleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	acct, err := s.lookupAccountByPaddleID(r.Context(), ev.CustomerID)
 	if err != nil {
-		// Unknown customer: 200 so Paddle stops retrying. New
-		// customers land via CreateCustomer; we don't auto-provision
-		// on a webhook.
-		//
-		// PR-P4 — surface the unknown-customer path to operators.
-		// The customer ID is a `ctm_…` identifier, NOT a secret, so
-		// no sanitiser is needed. The existing failure-mode table in
-		// docs/ops/billing-provider-switch.md tells operators to go
-		// grep for this exact line when a `transaction.paid` 200s
-		// without a state flip — pre-PR-P4 that grep returned
-		// nothing.
-		s.log.Info("paddle_webhook.unknown_customer",
+		// Keep known billing events retryable rather than silently dropping
+		// an entitlement or invoice transition. Unknown no-op events are
+		// acknowledged because there is no local side effect to recover.
+		if ev.Type != billing.EventUnknown || ev.Invoice != nil {
+			s.log.Warn("paddle_webhook.unknown_customer",
+				"customer_id", ev.CustomerID,
+				"event_type", ev.Type.Name(),
+			)
+			api.WriteProblem(w, api.ErrCapacity("billing webhook customer binding unavailable"))
+			return
+		}
+		s.log.Info("paddle_webhook.unknown_customer_noop",
 			"customer_id", ev.CustomerID,
-			"event_type", int(ev.Type),
+			"event_type", ev.Type.Name(),
 		)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-	// Issue #294: webhook replay dedupe. ev.EventID is the Paddle
-	// `event_id` (the delivery UUID). Mirrors stripeWebhook's
-	// replay check (handlers_ext.go:1148); a redelivery within the
-	// 5-minute TTL is rejected with 200 + a webhook.replay_rejected
-	// audit row. Empty ev.EventID (older Paddle payloads) skips the
-	// check — pre-#294 behaviour. Fail-open on dedupe transport
-	// errors (mirrors gatewayd-internal).
+	if err := s.persistBillingInvoice(r.Context(), string(webhookdedupe.ProviderPaddle), acct, ev.Invoice); err != nil {
+		s.log.Error("paddle webhook invoice persistence failed", "event_id", logsanitize.Field(ev.EventID), "err", err)
+		api.WriteProblem(w, api.ErrCapacity("billing webhook temporarily unavailable"))
+		return
+	}
+	// Issue #294: durable webhook replay claim. ev.EventID is the Paddle
+	// `event_id` (the delivery UUID). Use the state-store claim rather than
+	// the process-local helper so two apid instances cannot apply the same
+	// delivery concurrently. Empty ev.EventID (older Paddle payloads) skips
+	// the check — pre-#294 behaviour. Claim failures are retryable because
+	// acknowledging without replay protection could duplicate money-related
+	// audit/state side effects.
 	if ev.EventID != "" {
-		if err := webhookdedupe.CheckReplay(r.Context(), webhookdedupe.ProviderPaddle, ev.EventID); err != nil {
-			if webhookdedupe.IsReplay(err) {
-				acctID := acct.ID
-				s.audit.Emit(r.Context(), "webhook.replay_rejected", &acctID, map[string]any{
-					"provider":    webhookdedupe.ProviderPaddle,
-					"delivery_id": logsanitize.Field(ev.EventID),
-				})
-				// PR-P4 — counter for the replay-suppressed branch.
-				// Unlabelled (closed-vocabulary event_type is implied
-				// by the audit row). Mirrors alertEvalFiredTotal
-				// (pkg/wire/metrics.go:293). Helps operators
-				// distinguish "Paddle is redelivering" from "Paddle
-				// is sending brand-new events".
-				if s.ops != nil {
-					s.ops.IncPaddleWebhookReplaySuppressed()
-				}
-				w.WriteHeader(http.StatusOK)
-				return
+		now := time.Now().UTC()
+		claimed, err := s.store.ClaimWebhookDelivery(
+			r.Context(), webhookdedupe.ProviderPaddle, ev.EventID,
+			now.Add(-webhookdedupe.TTL), now.Add(webhookdedupe.TTL),
+		)
+		if err != nil {
+			s.log.Error("paddle webhook replay protection unavailable", "event_id", logsanitize.Field(ev.EventID), "err", err)
+			api.WriteProblem(w, api.ErrCapacity("billing webhook temporarily unavailable"))
+			return
+		}
+		if !claimed {
+			acctID := acct.ID
+			s.audit.Emit(r.Context(), "webhook.replay_rejected", &acctID, map[string]any{
+				"provider":    webhookdedupe.ProviderPaddle,
+				"delivery_id": logsanitize.Field(ev.EventID),
+			})
+			if s.ops != nil {
+				s.ops.IncPaddleWebhookReplaySuppressed()
 			}
-			s.log.Warn("paddle replay-check infra error; forwarding", "event_id", logsanitize.Field(ev.EventID), "err", err)
+			w.WriteHeader(http.StatusOK)
+			return
 		}
 	}
-	s.handleBillingEvent(r.Context(), ev, acct)
+	if err := s.handleBillingEvent(r.Context(), ev, acct); err != nil {
+		s.log.Error("paddle webhook state application failed", "event_id", logsanitize.Field(ev.EventID), "err", err)
+		if releaser, ok := s.store.(state.WebhookDeliveryReleaser); ok {
+			if releaseErr := releaser.ReleaseWebhookDelivery(r.Context(), webhookdedupe.ProviderPaddle, ev.EventID); releaseErr != nil {
+				s.log.Error("paddle webhook replay claim rollback failed", "event_id", logsanitize.Field(ev.EventID), "err", releaseErr)
+			}
+		}
+		api.WriteProblem(w, api.ErrCapacity("billing webhook temporarily unavailable"))
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -3488,22 +3517,56 @@ func (s *server) paddleWebhook(w http.ResponseWriter, r *http.Request) {
 // strings ("invoice.payment_failed" etc.) are mapped to the normalized
 // enum by the stripeWebhook handler before the call; Paddle's
 // VerifyWebhook returns the normalized enum directly.
-func (s *server) handleBillingEvent(ctx context.Context, ev billing.Event, acct state.Account) {
+// persistBillingInvoice stores the provider-neutral invoice projection before
+// a webhook delivery is claimed. Upserts make replay safe, while returning an
+// error keeps provider delivery retryable when Postgres is unavailable.
+func (s *server) persistBillingInvoice(ctx context.Context, provider string, acct state.Account, data *billing.InvoiceData) error {
+	if data == nil || data.ProviderInvoiceID == "" {
+		return nil
+	}
+	currency := data.Currency
+	if currency == "" {
+		currency = "eur"
+	}
+	return s.store.UpsertInvoice(ctx, state.Invoice{
+		AccountID:         acct.ID,
+		Provider:          provider,
+		ProviderInvoiceID: data.ProviderInvoiceID,
+		Number:            data.Number,
+		Status:            data.Status,
+		PeriodStart:       data.PeriodStart,
+		PeriodEnd:         data.PeriodEnd,
+		SubtotalCents:     data.SubtotalCents,
+		TaxCents:          data.TaxCents,
+		TotalCents:        data.TotalCents,
+		AmountPaidCents:   data.AmountPaidCents,
+		Currency:          currency,
+		PDFAvailable:      data.PDFAvailable,
+	})
+}
+
+func (s *server) handleBillingEvent(ctx context.Context, ev billing.Event, acct state.Account) error {
 	switch ev.Type {
 	case billing.EventSubscriptionCreated:
 		// The shared column retains its historical Stripe name, but for
 		// Polar it stores the subscription UUID that cancel-at-period-end
 		// and future provider operations use.
 		if ev.SubscriptionID != "" {
-			_ = s.store.UpdateAccountStripeSubscriptionItem(ctx, acct.ID, ev.SubscriptionID)
+			if err := s.store.UpdateAccountStripeSubscriptionItem(ctx, acct.ID, ev.SubscriptionID); err != nil {
+				return fmt.Errorf("store subscription id: %w", err)
+			}
 		}
-		if ev.PlanID != "" {
-			_ = s.store.UpdateAccountPlan(ctx, acct.ID, api.Plan(ev.PlanID))
+		if plan := billingPlanFromProviderID(ev.PlanID); plan != "" {
+			if err := s.store.UpdateAccountPlan(ctx, acct.ID, plan); err != nil {
+				return fmt.Errorf("store plan: %w", err)
+			}
 		}
 		// MFA is explicitly opt-in. Billing events must never change
 		// an account's MFA policy or force an enrolled-session prompt.
 	case billing.EventSubscriptionCanceled:
-		_ = s.store.UpdateAccountStatus(ctx, acct.ID, state.AccountSuspended)
+		if err := s.store.UpdateAccountStatus(ctx, acct.ID, state.AccountSuspended); err != nil {
+			return fmt.Errorf("store canceled status: %w", err)
+		}
 	case billing.EventPaymentFailed:
 		// Apps keep serving; deploys blocked at the auth gate (handlers
 		// reading acct.Active() refuse writes). 7-day dunning timer
@@ -3524,6 +3587,7 @@ func (s *server) handleBillingEvent(ctx context.Context, ev billing.Event, acct 
 					"account", acct.ID, "from_status", acct.Status)
 			} else {
 				s.log.Warn("apid: payment_failed MarkDunningStep", "account", acct.ID, "err", err)
+				return fmt.Errorf("mark payment failed: %w", err)
 			}
 		} else {
 			// First delivery — the CAS flip succeeded and past_due_at
@@ -3565,14 +3629,19 @@ func (s *server) handleBillingEvent(ctx context.Context, ev billing.Event, acct 
 			} else {
 				s.log.Warn("apid: subscription_past_due MarkDunningStep",
 					"account", acct.ID, "err", err)
+				return fmt.Errorf("mark subscription past due: %w", err)
 			}
 		}
 	case billing.EventPaymentSucceeded:
 		if ev.SubscriptionID != "" {
-			_ = s.store.UpdateAccountStripeSubscriptionItem(ctx, acct.ID, ev.SubscriptionID)
+			if err := s.store.UpdateAccountStripeSubscriptionItem(ctx, acct.ID, ev.SubscriptionID); err != nil {
+				return fmt.Errorf("store payment subscription id: %w", err)
+			}
 		}
-		if ev.PlanID != "" {
-			_ = s.store.UpdateAccountPlan(ctx, acct.ID, api.Plan(ev.PlanID))
+		if plan := billingPlanFromProviderID(ev.PlanID); plan != "" {
+			if err := s.store.UpdateAccountPlan(ctx, acct.ID, plan); err != nil {
+				return fmt.Errorf("store payment plan: %w", err)
+			}
 		}
 		// Restore the account if it was past_due. meterd will refresh
 		// quota state on its next tick. We also clear the dedupe stamp
@@ -3584,6 +3653,7 @@ func (s *server) handleBillingEvent(ctx context.Context, ev billing.Event, acct 
 			if err := s.store.UpdateAccountStatus(ctx, acct.ID, state.AccountActive); err != nil {
 				s.log.Warn("apid: payment_succeeded restore",
 					"account", acct.ID, "err", err)
+				return fmt.Errorf("restore account: %w", err)
 			} else {
 				// Status just flipped back to active. Send the
 				// recovery email (spec §171 "All transitions emailed").
@@ -3605,13 +3675,19 @@ func (s *server) handleBillingEvent(ctx context.Context, ev billing.Event, acct 
 		// confirmation shouldn't wait until the next UTC midnight to
 		// hear about a quota they crossed during the trial, and the
 		// cost of an extra pg_notify on a no-op event is nil.
-		_ = s.store.ClearQuotaWarning(ctx, acct.ID)
+		if err := s.store.ClearQuotaWarning(ctx, acct.ID); err != nil {
+			return fmt.Errorf("clear quota warning: %w", err)
+		}
 	case billing.EventSubscriptionUpdated:
 		if ev.SubscriptionID != "" {
-			_ = s.store.UpdateAccountStripeSubscriptionItem(ctx, acct.ID, ev.SubscriptionID)
+			if err := s.store.UpdateAccountStripeSubscriptionItem(ctx, acct.ID, ev.SubscriptionID); err != nil {
+				return fmt.Errorf("store updated subscription id: %w", err)
+			}
 		}
-		if ev.PlanID != "" {
-			_ = s.store.UpdateAccountPlan(ctx, acct.ID, api.Plan(ev.PlanID))
+		if plan := billingPlanFromProviderID(ev.PlanID); plan != "" {
+			if err := s.store.UpdateAccountPlan(ctx, acct.ID, plan); err != nil {
+				return fmt.Errorf("store updated plan: %w", err)
+			}
 		}
 	case billing.EventRefundProcessed:
 		// Issue #279: a refund was issued against one of the account's
@@ -3636,6 +3712,31 @@ func (s *server) handleBillingEvent(ctx context.Context, ev billing.Event, acct 
 			"currency":           ev.Currency,
 		})
 	}
+	return nil
+}
+
+// billingPlanFromProviderID accepts canonical plan values from providers
+// such as Polar and provider-shaped price handles emitted by legacy
+// Stripe/Paddle events. Unknown handles are ignored rather than written into
+// state.account.plan as an invalid plan.
+func billingPlanFromProviderID(id string) api.Plan {
+	value := strings.ToLower(strings.TrimSpace(id))
+	if value == "" {
+		return ""
+	}
+	if plan := api.Plan(value); plan.Valid() {
+		return plan
+	}
+	for _, token := range strings.FieldsFunc(value, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	}) {
+		for _, plan := range []api.Plan{api.PlanHobby, api.PlanPro, api.PlanScale} {
+			if token == string(plan) {
+				return plan
+			}
+		}
+	}
+	return ""
 }
 
 // mapStripeTypeToEventType translates Stripe's `type` strings into the

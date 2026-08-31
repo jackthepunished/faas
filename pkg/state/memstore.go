@@ -11335,6 +11335,17 @@ func (m *MemStore) ClaimWebhookDelivery(_ context.Context, provider, deliveryID 
 	return true, nil
 }
 
+// ReleaseWebhookDelivery mirrors PgStore's rollback path for a failed
+// webhook side-effect application.
+func (m *MemStore) ReleaseWebhookDelivery(_ context.Context, provider, deliveryID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.webhookDeliveries != nil {
+		delete(m.webhookDeliveries, webhookDeliveryKey{provider: provider, deliveryID: deliveryID})
+	}
+	return nil
+}
+
 func (m *MemStore) CheckWebhookReplay(_ context.Context, provider, deliveryID string, cutoff time.Time) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

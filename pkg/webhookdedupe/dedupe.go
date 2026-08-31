@@ -29,8 +29,8 @@
 // of this package is still the authenticity gate, and (b) each
 // provider's own redelivery cadence concentrates retries in
 // seconds, not minutes, so the rest of the dedupe window is
-// rarely meaningful. Polar's ingress uses the durable
-// `webhook_deliveries` claim in state.Store so its replay safety survives
+// rarely meaningful. Paddle and Polar's apid ingresses use the durable
+// `webhook_deliveries` claim in state.Store so their replay safety survives
 // daemon restarts and multiple apid instances.
 package webhookdedupe
 
@@ -157,4 +157,15 @@ func CheckReplay(_ context.Context, provider, deliveryID string) error {
 //	if webhookdedupe.IsReplay(err) { w.WriteHeader(200); return }
 func IsReplay(err error) bool {
 	return errors.Is(err, ErrReplay)
+}
+
+// ReleaseReplay removes a previously claimed in-process delivery. Ingress
+// handlers use this when durable business-state application fails after the
+// initial claim, so an upstream retry can actually re-run the event instead
+// of receiving a false replay acknowledgement.
+func ReleaseReplay(_ context.Context, provider, deliveryID string) {
+	if provider == "" || deliveryID == "" {
+		return
+	}
+	store.Delete(dedupeKey{provider: provider, deliveryID: deliveryID})
 }

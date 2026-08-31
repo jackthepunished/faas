@@ -131,7 +131,9 @@ type Provider interface {
 	// start, end) summed. Paddle: Paddle Billing does not yet
 	// expose a usage-summary endpoint, so the Paddle
 	// implementation returns ErrNotImplemented until the upstream
-	// adds one.
+	// adds one. Polar: the configured meter quantities endpoint is
+	// summed when FAAS_POLAR_METER_ID is set; without a meter ID it
+	// returns ErrNotImplemented.
 	ReconcileUsage(ctx context.Context, acct state.Account, start, end time.Time) (pushedMBSeconds int64, err error)
 
 	// Refund issues an operator-initiated refund against a charge
@@ -140,11 +142,10 @@ type Provider interface {
 	// responsible for:
 	//
 	//   1. Translating cents → the provider's native unit (Stripe:
-	//      millicents; Paddle: not implemented → returns
-	//      ErrNotImplemented).
+	//      millicents; Paddle: adjustment line-item cents).
 	//   2. Forwarding a ctx-derived Idempotency-Key so a network-blip
 	//      retry does not create a duplicate refund. Stripe: read
-	//      via idempotencyKeyFromCtx; Paddle: not implemented.
+	//      via idempotencyKeyFromCtx; Paddle: ContextWithTransitID).
 	//   3. Mapping provider errors (Stripe: amount_too_large,
 	//      charge_already_refunded, etc.) onto errors the apid
 	//      handler can dispatch on. Today the handler returns
@@ -189,12 +190,9 @@ type Provider interface {
 	//   - Stripe: Subscriptions.Update(cancel_at_period_end=true).
 	//     The flag lives on Stripe-side; no local mirror. Returns
 	//     sub.CurrentPeriodEnd as the effective timestamp.
-	//   - Paddle: Paddle has no separate "scheduled cancellation"
-	//     primitive; the cancel intent lives on the Paddle
-	//     Customer object's scheduled_change field. apid's Paddle
-	//     impl stamps that field via Customer.Update. Returns
-	//     the next month-rollover instant as the effective
-	//     timestamp.
+	//   - Paddle: Subscriptions.Cancel with
+	//     EffectiveFromNextBillingPeriod. Returns the effective date
+	//     from Paddle's scheduled-change/current-period response.
 	//
 	// Sentinel errors:
 	//   - ErrAlreadyCancelled — no active subscription (Free / post-
@@ -229,6 +227,13 @@ type Provider interface {
 // BillingPortalURL fallback.
 type CustomerPortalProvider interface {
 	CreateCustomerPortalSession(ctx context.Context, acct state.Account, returnURL string) (portalURL string, err error)
+}
+
+// InvoicePDFRequester is an optional provider surface for requesting an
+// invoice PDF after a paid order. Providers whose invoices are generated
+// automatically need not implement it.
+type InvoicePDFRequester interface {
+	RequestInvoicePDF(ctx context.Context, providerInvoiceID string) error
 }
 
 // EventType is the provider-neutral "what happened" classifier apid
@@ -386,7 +391,7 @@ type Event struct {
 	ChargeID string
 
 	// Invoice is populated by providers that deliver an invoice/order
-	// projection (currently Polar). It is persisted independently of the
+	// projection (currently Paddle and Polar). It is persisted independently of the
 	// event type so order.created can populate invoice history before payment.
 	Invoice *InvoiceData
 }
@@ -400,6 +405,9 @@ type RefundResult struct {
 	ChargeID         string
 	AmountCents      int64
 	Currency         string
+	// Status is the provider's current refund state. Providers may return a
+	// pending state when a refund requires asynchronous approval.
+	Status string
 }
 
 // ErrBadSignature is the unified error returned by VerifyWebhook when
@@ -409,8 +417,7 @@ type RefundResult struct {
 var ErrBadSignature = errors.New("billing: bad webhook signature")
 
 // ErrNotImplemented is the unified error a Provider returns when the
-// selected billing backend does not support a method (issue #279:
-// Paddle's Refund). Callers should map this to a 501 Problem with
+// selected billing backend does not support a method. Callers should map this to a 501 Problem with
 // docs_url pointing at the spec — the operator picks a backend that
 // supports the surface they need.
 var ErrNotImplemented = errors.New("billing: provider does not implement this method")
@@ -499,9 +506,8 @@ const (
 	CapHostedCheckout Capability = 1 << iota
 
 	// CapRefund means Provider.Refund is implemented. apid's
-	// admin/refund route maps to a 502 when absent. Paddle: no
-	// (issue #279 — Paddle's refund ceremony is out of scope).
-	// Stripe: yes.
+	// admin/refund route maps to a 502 when absent. Paddle and
+	// Stripe both expose this surface.
 	CapRefund
 
 	// CapUsageReconcile means Provider.ReconcileUsage is implemented
@@ -509,6 +515,7 @@ const (
 	// (pkg/billing/reconciler) skips accounts whose active provider
 	// lacks this capability, before any SDK call fires. Paddle: no
 	// (Paddle Billing has no usage-summary endpoint). Stripe: yes.
+	// Polar: yes when a meter ID is configured.
 	CapUsageReconcile
 
 	// CapSandbox means the provider supports a sandbox / test

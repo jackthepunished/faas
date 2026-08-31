@@ -68,6 +68,30 @@ func TestEnsurePlanProductsRequiresConfiguredIDs(t *testing.T) {
 	}
 }
 
+func TestEnsurePlanProductsValidatesConfiguredCatalog(t *testing.T) {
+	var productRequests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, "/v1/products/") {
+			http.NotFound(w, r)
+			return
+		}
+		productRequests++
+		id := strings.TrimPrefix(r.URL.Path, "/v1/products/")
+		_, _ = io.WriteString(w, `{"id":"`+id+`"}`)
+	}))
+	defer server.Close()
+	p, err := NewProvider(testConfig(server.URL), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.EnsurePlanProducts(context.Background()); err != nil {
+		t.Fatalf("EnsurePlanProducts: %v", err)
+	}
+	if productRequests != 3 {
+		t.Fatalf("catalog product requests = %d, want 3", productRequests)
+	}
+}
+
 func TestVerifyWebhookAcceptsRawPolarSecret(t *testing.T) {
 	cfg := testConfig("http://example.test")
 	cfg.WebhookSecret = "polar_whs_test_secret"
@@ -97,7 +121,7 @@ func TestVerifyWebhookProjectsPolarOrderInvoice(t *testing.T) {
 		t.Fatal(err)
 	}
 	when := time.Now().UTC()
-	body := []byte(`{"type":"order.created","data":{"id":"order-1","customer_id":"customer-1","invoice_number":"INV-1","status":"pending","subtotal_amount":900,"tax_amount":100,"total_amount":1000,"currency":"eur","current_period_start":"2026-08-01T00:00:00Z","current_period_end":"2026-09-01T00:00:00Z","invoice_pdf":"https://polar.test/invoice.pdf"}}`)
+	body := []byte(`{"type":"order.created","data":{"id":"order-1","customer_id":"customer-1","invoice_number":"INV-1","status":"pending","paid":false,"subtotal_amount":900,"tax_amount":100,"total_amount":1000,"currency":"eur","current_period_start":"2026-08-01T00:00:00Z","current_period_end":"2026-09-01T00:00:00Z","is_invoice_generated":false}}`)
 	headers := map[string]string{
 		"webhook-id":        "invoice-1",
 		"webhook-timestamp": strconv.FormatInt(when.Unix(), 10),
@@ -111,7 +135,7 @@ func TestVerifyWebhookProjectsPolarOrderInvoice(t *testing.T) {
 		t.Fatalf("order.created type = %v, want unknown state transition", ev.Type)
 	}
 	inv := ev.Invoice
-	if inv == nil || inv.ProviderInvoiceID != "order-1" || inv.Number != "INV-1" || inv.Status != "open" || inv.SubtotalCents != 900 || inv.TaxCents != 100 || inv.TotalCents != 1000 || !inv.PDFAvailable {
+	if inv == nil || inv.ProviderInvoiceID != "order-1" || inv.Number != "INV-1" || inv.Status != "open" || inv.SubtotalCents != 900 || inv.TaxCents != 100 || inv.TotalCents != 1000 || inv.AmountPaidCents != 0 || inv.PDFAvailable {
 		t.Fatalf("invoice projection = %+v", inv)
 	}
 	if !inv.PeriodStart.Equal(time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)) || !inv.PeriodEnd.Equal(time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)) {
@@ -330,6 +354,28 @@ func TestPushUsageRecordUsesGBRamHoursAndDedupe(t *testing.T) {
 	if got := received.Metadata["mb_seconds"].(float64); got != float64(mbSeconds) {
 		t.Errorf("mb_seconds = %v, want %d", got, mbSeconds)
 	}
+	if received.ExternalID != "faas-usage-acct-1-2026-08-31T07:00:00Z" {
+		t.Errorf("external_id = %q, want stable hourly id", received.ExternalID)
+	}
+}
+
+func TestRequestInvoicePDF(t *testing.T) {
+	var gotPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.Method + " " + r.URL.Path
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+	p, err := NewProvider(testConfig(server.URL), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.RequestInvoicePDF(context.Background(), "order-1"); err != nil {
+		t.Fatalf("RequestInvoicePDF: %v", err)
+	}
+	if gotPath != "POST /v1/orders/order-1/invoice" {
+		t.Fatalf("request path = %q", gotPath)
+	}
 }
 
 func TestVerifyWebhookNormalizesSubscriptionAndScheduledCancel(t *testing.T) {
@@ -432,6 +478,7 @@ func TestVerifyWebhookRejectsTampering(t *testing.T) {
 
 func TestCancelAndRefund(t *testing.T) {
 	var paths []string
+	var refundIdempotencyKey string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		paths = append(paths, r.Method+" "+r.URL.Path)
 		if r.URL.Path == "/v1/subscriptions/sub-1" {
@@ -439,6 +486,7 @@ func TestCancelAndRefund(t *testing.T) {
 			return
 		}
 		if r.URL.Path == "/v1/refunds" {
+			refundIdempotencyKey = r.Header.Get("Idempotency-Key")
 			_, _ = io.WriteString(w, `{"id":"refund-1","amount":500,"currency":"eur"}`)
 			return
 		}
@@ -456,6 +504,9 @@ func TestCancelAndRefund(t *testing.T) {
 	refund, err := p.Refund(context.Background(), "order-1", 500)
 	if err != nil || refund.ProviderRefundID != "refund-1" || refund.ChargeID != "order-1" {
 		t.Fatalf("Refund = %+v, %v", refund, err)
+	}
+	if refundIdempotencyKey != "faas-refund-order-1-500" {
+		t.Fatalf("refund idempotency key = %q", refundIdempotencyKey)
 	}
 	if len(paths) != 2 {
 		t.Fatalf("API paths = %v", paths)

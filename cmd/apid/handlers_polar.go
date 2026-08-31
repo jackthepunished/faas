@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/billing"
 	"github.com/onebox-faas/faas/pkg/logsanitize"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/webhookdedupe"
@@ -41,9 +42,16 @@ func (s *server) polarWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	acct, err := s.lookupAccountByPolarID(r.Context(), ev.CustomerID)
 	if err != nil {
-		// Unknown customers are acknowledged so Polar does not retry a
-		// delivery that cannot be joined to a local account.
-		s.log.Info("polar_webhook.unknown_customer", "customer_id", ev.CustomerID, "event_type", ev.Type.Name())
+		// Keep known billing events and invoice projections retryable rather
+		// than silently discarding an entitlement transition. Unknown no-op
+		// events are safe to acknowledge because there is no local side
+		// effect to recover.
+		if ev.Type != billing.EventUnknown || ev.Invoice != nil {
+			s.log.Warn("polar_webhook.unknown_customer", "customer_id", ev.CustomerID, "event_type", ev.Type.Name())
+			api.WriteProblem(w, api.ErrCapacity("billing webhook customer binding unavailable"))
+			return
+		}
+		s.log.Info("polar_webhook.unknown_customer_noop", "customer_id", ev.CustomerID, "event_type", ev.Type.Name())
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -51,30 +59,18 @@ func (s *server) polarWebhook(w http.ResponseWriter, r *http.Request) {
 	// database write must leave the delivery retryable; the natural-key upsert
 	// makes this safe when Polar redelivers after the later business-state
 	// processing succeeds.
-	if ev.Invoice != nil {
-		currency := ev.Invoice.Currency
-		if currency == "" {
-			currency = "eur"
-		}
-		inv := state.Invoice{
-			AccountID:         acct.ID,
-			Provider:          string(webhookdedupe.ProviderPolar),
-			ProviderInvoiceID: ev.Invoice.ProviderInvoiceID,
-			Number:            ev.Invoice.Number,
-			Status:            ev.Invoice.Status,
-			PeriodStart:       ev.Invoice.PeriodStart,
-			PeriodEnd:         ev.Invoice.PeriodEnd,
-			SubtotalCents:     ev.Invoice.SubtotalCents,
-			TaxCents:          ev.Invoice.TaxCents,
-			TotalCents:        ev.Invoice.TotalCents,
-			AmountPaidCents:   ev.Invoice.AmountPaidCents,
-			Currency:          currency,
-			PDFAvailable:      ev.Invoice.PDFAvailable,
-		}
-		if err := s.store.UpsertInvoice(r.Context(), inv); err != nil {
-			s.log.Error("polar webhook invoice persistence failed", "event_id", logsanitize.Field(ev.EventID), "err", err)
-			api.WriteProblem(w, api.ErrCapacity("billing webhook temporarily unavailable"))
-			return
+	if err := s.persistBillingInvoice(r.Context(), string(webhookdedupe.ProviderPolar), acct, ev.Invoice); err != nil {
+		s.log.Error("polar webhook invoice persistence failed", "event_id", logsanitize.Field(ev.EventID), "err", err)
+		api.WriteProblem(w, api.ErrCapacity("billing webhook temporarily unavailable"))
+		return
+	}
+	if ev.Type == billing.EventPaymentSucceeded && ev.Invoice != nil && !ev.Invoice.PDFAvailable {
+		if requester, ok := s.billingProvider.(billing.InvoicePDFRequester); ok {
+			if err := requester.RequestInvoicePDF(r.Context(), ev.Invoice.ProviderInvoiceID); err != nil {
+				s.log.Error("polar webhook invoice PDF request failed", "event_id", logsanitize.Field(ev.EventID), "err", err)
+				api.WriteProblem(w, api.ErrCapacity("billing webhook temporarily unavailable"))
+				return
+			}
 		}
 	}
 	if ev.EventID != "" {
@@ -102,7 +98,16 @@ func (s *server) polarWebhook(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	s.handleBillingEvent(r.Context(), ev, acct)
+	if err := s.handleBillingEvent(r.Context(), ev, acct); err != nil {
+		s.log.Error("polar webhook state application failed", "event_id", logsanitize.Field(ev.EventID), "err", err)
+		if releaser, ok := s.store.(state.WebhookDeliveryReleaser); ok {
+			if releaseErr := releaser.ReleaseWebhookDelivery(r.Context(), string(webhookdedupe.ProviderPolar), ev.EventID); releaseErr != nil {
+				s.log.Error("polar webhook replay claim rollback failed", "event_id", logsanitize.Field(ev.EventID), "err", releaseErr)
+			}
+		}
+		api.WriteProblem(w, api.ErrCapacity("billing webhook temporarily unavailable"))
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 }
 

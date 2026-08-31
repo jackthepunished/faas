@@ -43,6 +43,7 @@
 //	FAAS_POLAR_WEBHOOK_SECRET required when Polar is active (apid only)
 //	FAAS_POLAR_SANDBOX      "1" / "true" to use sandbox-api.polar.sh (apid + meterd)
 //	FAAS_POLAR_METER_ID    optional; enables usage reconciliation
+//	FAAS_POLAR_BASE_URL    optional; private API proxy / contract-test endpoint
 //
 // TOML config precedence: env > TOML > Defaults. The daemon's
 // LoadConfig reads the [billing] block from its TOML file via
@@ -330,7 +331,7 @@ func Providers() []ProviderMeta {
 				"FAAS_POLAR_ACCESS_TOKEN", "FAAS_POLAR_WEBHOOK_SECRET",
 				"FAAS_POLAR_SANDBOX", "FAAS_POLAR_HOBBY_PRODUCT_ID",
 				"FAAS_POLAR_PRO_PRODUCT_ID", "FAAS_POLAR_SCALE_PRODUCT_ID",
-				"FAAS_POLAR_METER_ID",
+				"FAAS_POLAR_METER_ID", "FAAS_POLAR_BASE_URL",
 			},
 			BuildAPID: func(cfg *RootBillingConfig, env func(string) string, log *slog.Logger) (any, error) {
 				p, err := polar.NewProvider(resolvedPolarConfig(cfg, env), log)
@@ -370,6 +371,11 @@ func Providers() []ProviderMeta {
 //     Paddle outage at boot must not take down apid (the webhook
 //     ingress is independent of the catalog). Returns the provider +
 //     the literal "paddle".
+//
+//   - cfg.Provider "polar" → constructs a *polar.Provider and
+//     requires its configured products (and optional meter) to pass
+//     the live catalog preflight before apid starts accepting billing
+//     traffic.
 //
 //   - Any other value → error so a typo fails the boot loudly.
 //
@@ -450,6 +456,9 @@ func LoadProviderForAPID(ctx context.Context, cfg *RootBillingConfig, env func(s
 //     overage dedupe. meterd doesn't need the webhook secret (no
 //     ingress) so the second arg is empty.
 //
+//   - cfg.Provider "polar" → constructs a *polar.Provider and refuses
+//     to start meterd when the configured product catalog preflight fails.
+//
 //   - Any other value → error so a typo fails the boot loudly.
 //
 // cfg is the env-overlaid TOML config. env is the env-var reader the
@@ -491,7 +500,10 @@ func LoadProviderForMeterd(cfg *RootBillingConfig, env func(string) string, stor
 			// not lazily discovered data. Refuse to start meterd when the
 			// catalog cannot satisfy the billing contract; otherwise the box
 			// would sample usage forever while every checkout/push is unusable.
-			if err := bp.EnsurePlanProducts(context.Background()); err != nil {
+			preflightCtx, cancel := context.WithTimeout(context.Background(), providerBootHydrationTimeout)
+			err := bp.EnsurePlanProducts(preflightCtx)
+			cancel()
+			if err != nil {
 				return nil, m.Name, fmt.Errorf("billing: Polar catalog preflight failed for meterd: %w", err)
 			}
 		}

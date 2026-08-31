@@ -14550,6 +14550,15 @@ func (s *PgStore) ClaimWebhookDelivery(ctx context.Context, provider, deliveryID
 	return tag.RowsAffected() == 1, nil
 }
 
+// ReleaseWebhookDelivery removes a claim after business-state application
+// fails. The next provider retry can then claim and process the delivery.
+func (s *PgStore) ReleaseWebhookDelivery(ctx context.Context, provider, deliveryID string) error {
+	_, err := s.pool.Exec(ctx,
+		`delete from webhook_deliveries where provider = $1 and delivery_id = $2`,
+		provider, deliveryID)
+	return err
+}
+
 func (s *PgStore) CheckWebhookReplay(ctx context.Context, provider, deliveryID string, cutoff time.Time) (bool, error) {
 	var exists bool
 	err := s.pool.QueryRow(ctx,
