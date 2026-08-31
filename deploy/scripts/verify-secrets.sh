@@ -147,8 +147,15 @@ if [[ -f /etc/faas/sealed.env ]]; then
       grep -q "^FAAS_POLAR_ACCESS_TOKEN=." /etc/faas/sealed.env
     '
     check "sealed.env has FAAS_POLAR_WEBHOOK_SECRET" bash -c '
-      grep -q "^FAAS_POLAR_WEBHOOK_SECRET=whsec_" /etc/faas/sealed.env
+      grep -qE "^FAAS_POLAR_WEBHOOK_SECRET=(whsec_[A-Za-z0-9+/=_-]+|polar_whs_[A-Za-z0-9_-]+|[A-Za-z0-9+/=_-]+)$" /etc/faas/sealed.env
     '
+    for polar_product in hobby pro scale; do
+      polar_product_env=${polar_product^^}
+      check "Polar ${polar_product} product id is configured" bash -c "
+        grep -q \"^FAAS_POLAR_${polar_product_env}_PRODUCT_ID=.\" /etc/faas/sealed.env \\
+          || grep -qsE \"^[[:space:]]*${polar_product}_product_id[[:space:]]*=[[:space:]]+\\\"[^\\\"]+\\\"\" /etc/faas/apid.toml /etc/faas/meterd.toml 2>/dev/null
+      "
+    done
   else
     check "sealed.env has FAAS_PADDLE_API_KEY" bash -c '
       grep -q "^FAAS_PADDLE_API_KEY=pdl_" /etc/faas/sealed.env

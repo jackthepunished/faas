@@ -49,7 +49,13 @@ from .app_errors_summary_response import AppErrorsSummaryResponse
 from .app_manifest import AppManifest
 from .app_manifest_env import AppManifestEnv
 from .app_manifest_env_secrets import AppManifestEnvSecrets
+from .app_manifest_execution_mode_type_1 import AppManifestExecutionModeType1
+from .app_manifest_execution_mode_type_2_type_1 import AppManifestExecutionModeType2Type1
+from .app_manifest_execution_mode_type_3_type_1 import AppManifestExecutionModeType3Type1
 from .app_manifest_healthcheck import AppManifestHealthcheck
+from .app_manifest_restart_policy_type_1 import AppManifestRestartPolicyType1
+from .app_manifest_restart_policy_type_2_type_1 import AppManifestRestartPolicyType2Type1
+from .app_manifest_restart_policy_type_3_type_1 import AppManifestRestartPolicyType3Type1
 from .app_metrics_response import AppMetricsResponse
 from .app_metrics_response_range import AppMetricsResponseRange
 from .app_open_api_import_dry_run_response import AppOpenAPIImportDryRunResponse
@@ -347,6 +353,12 @@ from .import_app_open_api_body_paths import ImportAppOpenAPIBodyPaths
 from .install_bind_request import InstallBindRequest
 from .install_bind_response import InstallBindResponse
 from .instance_response import InstanceResponse
+from .instance_response_execution_mode_type_1 import InstanceResponseExecutionModeType1
+from .instance_response_execution_mode_type_2_type_1 import InstanceResponseExecutionModeType2Type1
+from .instance_response_execution_mode_type_3_type_1 import InstanceResponseExecutionModeType3Type1
+from .instance_response_lifecycle_failure_reason_type_1 import InstanceResponseLifecycleFailureReasonType1
+from .instance_response_lifecycle_failure_reason_type_2_type_1 import InstanceResponseLifecycleFailureReasonType2Type1
+from .instance_response_lifecycle_failure_reason_type_3_type_1 import InstanceResponseLifecycleFailureReasonType3Type1
 from .invitation_list_response import InvitationListResponse
 from .invitation_with_token_response import InvitationWithTokenResponse
 from .invite_member_request import InviteMemberRequest
@@ -557,6 +569,7 @@ from .seat_usage_response_plan import SeatUsageResponsePlan
 from .secret_finding import SecretFinding
 from .secret_finding_severity import SecretFindingSeverity
 from .secret_scan_result import SecretScanResult
+from .service_replicas import ServiceReplicas
 from .session_info import SessionInfo
 from .session_list_response import SessionListResponse
 from .sessions_revoke_all_response import SessionsRevokeAllResponse
@@ -716,7 +729,13 @@ __all__ = (
     "AppManifest",
     "AppManifestEnv",
     "AppManifestEnvSecrets",
+    "AppManifestExecutionModeType1",
+    "AppManifestExecutionModeType2Type1",
+    "AppManifestExecutionModeType3Type1",
     "AppManifestHealthcheck",
+    "AppManifestRestartPolicyType1",
+    "AppManifestRestartPolicyType2Type1",
+    "AppManifestRestartPolicyType3Type1",
     "AppMetricsResponse",
     "AppMetricsResponseRange",
     "AppOpenAPIImportDryRunResponse",
@@ -1003,6 +1022,12 @@ __all__ = (
     "InstallBindRequest",
     "InstallBindResponse",
     "InstanceResponse",
+    "InstanceResponseExecutionModeType1",
+    "InstanceResponseExecutionModeType2Type1",
+    "InstanceResponseExecutionModeType3Type1",
+    "InstanceResponseLifecycleFailureReasonType1",
+    "InstanceResponseLifecycleFailureReasonType2Type1",
+    "InstanceResponseLifecycleFailureReasonType3Type1",
     "InvitationListResponse",
     "InvitationWithTokenResponse",
     "InviteMemberRequest",
@@ -1209,6 +1234,7 @@ __all__ = (
     "SecretFinding",
     "SecretFindingSeverity",
     "SecretScanResult",
+    "ServiceReplicas",
     "SessionInfo",
     "SessionListResponse",
     "SessionsRevokeAllResponse",

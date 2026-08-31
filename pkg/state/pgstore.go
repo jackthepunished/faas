@@ -13479,6 +13479,49 @@ func (s *PgStore) GetInvoiceByID(ctx context.Context, id string) (Invoice, error
 	return inv, nil
 }
 
+// UpsertInvoice stores the provider projection used by invoice history. A
+// Polar order can arrive as pending and later as paid, so updates replace the
+// mutable invoice fields while preserving the original created_at timestamp.
+func (s *PgStore) UpsertInvoice(ctx context.Context, inv Invoice) error {
+	if inv.Provider == "" || inv.ProviderInvoiceID == "" || inv.AccountID == "" {
+		return errors.New("state: invoice account, provider, and provider_invoice_id are required")
+	}
+	if inv.PeriodStart.IsZero() {
+		inv.PeriodStart = time.Now().UTC()
+	}
+	if inv.PeriodEnd.IsZero() {
+		inv.PeriodEnd = inv.PeriodStart
+	}
+	if inv.Currency == "" {
+		inv.Currency = "eur"
+	}
+	if inv.Status == "" {
+		inv.Status = "open"
+	}
+	_, err := s.pool.Exec(ctx,
+		`insert into invoices (
+			account_id, provider, provider_invoice_id, number, status,
+			period_start, period_end, subtotal_cents, tax_cents, total_cents,
+			amount_paid_cents, currency, pdf_available, updated_at
+		) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now())
+		on conflict (account_id, provider, provider_invoice_id) do update set
+			number = excluded.number,
+			status = excluded.status,
+			period_start = excluded.period_start,
+			period_end = excluded.period_end,
+			subtotal_cents = excluded.subtotal_cents,
+			tax_cents = excluded.tax_cents,
+			total_cents = excluded.total_cents,
+			amount_paid_cents = excluded.amount_paid_cents,
+			currency = excluded.currency,
+			pdf_available = excluded.pdf_available,
+			updated_at = now()`,
+		inv.AccountID, inv.Provider, inv.ProviderInvoiceID, inv.Number, inv.Status,
+		inv.PeriodStart.UTC(), inv.PeriodEnd.UTC(), inv.SubtotalCents, inv.TaxCents,
+		inv.TotalCents, inv.AmountPaidCents, strings.ToLower(inv.Currency), inv.PDFAvailable)
+	return err
+}
+
 // --- account credits (issue #279) -------------------------------------------
 
 // CreateAccountCredit inserts a new operator-issued credit. The DB
@@ -14099,6 +14142,37 @@ func (s *PgStore) UsageByHour(ctx context.Context, accountID string, start, end 
 		}
 		u.Month = hour
 		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
+// UsageWindows returns the account-level, per-UTC-hour billable aggregates
+// used by meterd's retry/backfill pass. Keeping the aggregation in Postgres
+// means a meterd restart does not lose an hour merely because its tick was
+// missed; the provider-side dedupe tables make replays safe.
+func (s *PgStore) UsageWindows(ctx context.Context, start, end time.Time) ([]UsageWindow, error) {
+	rows, err := s.pool.Query(ctx,
+		`select account_id,
+		        date_trunc('hour', minute AT TIME ZONE 'UTC') as hour,
+		        sum(mb_seconds)::bigint as mb_seconds
+		   from usage_minutes
+		  where minute >= $1 and minute < $2
+		  group by account_id, hour
+		 having sum(mb_seconds) > 0
+		  order by hour, account_id`,
+		start.UTC(), end.UTC())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []UsageWindow
+	for rows.Next() {
+		var w UsageWindow
+		if err := rows.Scan(&w.AccountID, &w.Hour, &w.MBSeconds); err != nil {
+			return nil, err
+		}
+		w.Hour = w.Hour.UTC()
+		out = append(out, w)
 	}
 	return out, rows.Err()
 }

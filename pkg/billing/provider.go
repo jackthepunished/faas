@@ -304,6 +304,23 @@ func (t EventType) Name() string {
 	}
 }
 
+// InvoiceData is the provider-neutral invoice projection carried by webhook
+// events. It is deliberately small and contains only fields the customer
+// invoice history API can persist.
+type InvoiceData struct {
+	ProviderInvoiceID string
+	Number            string
+	Status            string
+	PeriodStart       time.Time
+	PeriodEnd         time.Time
+	SubtotalCents     int64
+	TaxCents          int64
+	TotalCents        int64
+	AmountPaidCents   int64
+	Currency          string
+	PDFAvailable      bool
+}
+
 // Event is the normalized envelope apid's dunning state machine
 // dispatches on. Provider-shaped JSON stays inside each
 // implementation; Raw carries the original body for debugging.
@@ -367,6 +384,11 @@ type Event struct {
 	// operator can correlate the audit row with the provider
 	// dashboard.
 	ChargeID string
+
+	// Invoice is populated by providers that deliver an invoice/order
+	// projection (currently Polar). It is persisted independently of the
+	// event type so order.created can populate invoice history before payment.
+	Invoice *InvoiceData
 }
 
 // RefundResult is what Provider.Refund returns on a successful refund.

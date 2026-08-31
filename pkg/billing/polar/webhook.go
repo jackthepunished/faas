@@ -83,10 +83,17 @@ func verifyStandardWebhookSignature(payload []byte, id, timestamp, signature, se
 }
 
 func decodeSecret(secret string) ([]byte, error) {
-	secret = strings.TrimSpace(strings.TrimPrefix(secret, "whsec_"))
+	secret = strings.TrimSpace(secret)
 	if secret == "" {
 		return nil, errors.New("empty secret")
 	}
+	// Polar's dashboard exposes the raw `polar_whs_...` secret. Standard
+	// Webhooks libraries ask for base64 of the entire raw secret; our verifier
+	// works on the decoded HMAC key, so raw Polar input is already the key.
+	if strings.HasPrefix(secret, "polar_whs_") {
+		return []byte(secret), nil
+	}
+	secret = strings.TrimPrefix(secret, "whsec_")
 	return decodeBase64(secret)
 }
 
@@ -128,7 +135,9 @@ func parsePolarEvent(payload []byte, eventID string, p *Provider) (billing.Event
 	var data map[string]any
 	decoder := json.NewDecoder(strings.NewReader(string(raw.Data)))
 	decoder.UseNumber()
-	_ = decoder.Decode(&data)
+	if err := decoder.Decode(&data); err != nil {
+		return billing.Event{}, fmt.Errorf("polar: parse webhook data: %w", err)
+	}
 
 	subscriptionID := stringValue(data["subscription_id"])
 	if subscriptionID == "" && strings.HasPrefix(raw.Type, "subscription.") {
@@ -142,6 +151,7 @@ func parsePolarEvent(payload []byte, eventID string, p *Provider) (billing.Event
 		PlanID:         p.planForProduct(firstString(data, "product_id", nestedString(data, "product", "id"))),
 		Raw:            clone(payload),
 		Currency:       strings.ToUpper(firstString(data, "currency", "price_currency")),
+		Invoice:        polarInvoice(raw.Type, data),
 	}
 	if event.Type == billing.EventRefundProcessed {
 		event.ProviderRefundID = stringValue(data["id"])
@@ -262,6 +272,85 @@ func firstNumber(data map[string]any, keys ...string) int64 {
 		}
 	}
 	return 0
+}
+
+func polarInvoice(eventType string, data map[string]any) *billing.InvoiceData {
+	if !strings.HasPrefix(eventType, "order.") {
+		return nil
+	}
+	id := firstString(data, "id", "order_id")
+	if id == "" {
+		return nil
+	}
+	status := invoiceStatus(eventType, firstString(data, "status"))
+	total := firstNumber(data, "total_amount", "amount", "net_amount")
+	periodStart := firstTime(data, "period_start", "billing_period_start", "current_period_start")
+	periodEnd := firstTime(data, "period_end", "billing_period_end", "current_period_end")
+	if periodStart.IsZero() {
+		periodStart = firstTime(data, "created_at")
+	}
+	if periodStart.IsZero() {
+		periodStart = time.Now().UTC()
+	}
+	if periodEnd.IsZero() {
+		periodEnd = periodStart
+	}
+	return &billing.InvoiceData{
+		ProviderInvoiceID: id,
+		Number:            firstString(data, "invoice_number", "number"),
+		Status:            status,
+		PeriodStart:       periodStart,
+		PeriodEnd:         periodEnd,
+		SubtotalCents:     firstNumber(data, "subtotal_amount", "subtotal"),
+		TaxCents:          firstNumber(data, "tax_amount", "tax"),
+		TotalCents:        total,
+		AmountPaidCents:   firstNumber(data, "amount_paid", "paid_amount", "total_amount"),
+		Currency:          strings.ToLower(firstString(data, "currency", "price_currency")),
+		PDFAvailable:      firstString(data, "invoice_pdf", "invoice_url", "pdf_url") != "",
+	}
+}
+
+func invoiceStatus(eventType, providerStatus string) string {
+	if eventType == "order.paid" {
+		return "paid"
+	}
+	switch strings.ToLower(providerStatus) {
+	case "paid":
+		return "paid"
+	case "void", "cancelled", "canceled":
+		return "void"
+	case "uncollectible", "failed":
+		return "uncollectible"
+	case "draft":
+		return "draft"
+	default:
+		return "open"
+	}
+}
+
+func firstTime(data map[string]any, keys ...string) time.Time {
+	for _, key := range keys {
+		if value := timeValue(data[key]); !value.IsZero() {
+			return value
+		}
+	}
+	return time.Time{}
+}
+
+func timeValue(value any) time.Time {
+	switch value := value.(type) {
+	case string:
+		if parsed, err := time.Parse(time.RFC3339, value); err == nil {
+			return parsed.UTC()
+		}
+	case json.Number:
+		if unix, err := value.Int64(); err == nil {
+			return time.Unix(unix, 0).UTC()
+		}
+	case float64:
+		return time.Unix(int64(value), 0).UTC()
+	}
+	return time.Time{}
 }
 
 func clone(payload []byte) []byte {

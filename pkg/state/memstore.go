@@ -382,10 +382,7 @@ type MemStore struct {
 	// AccountByProviderCustomerID; keyed by Stripe `cus_…` ID.
 	stripeByCustomer map[string]string
 	// invoices is the in-memory mirror of the `invoices` table
-	// (migration 00050, issue #259). PR A reads via
-	// ListInvoicesForAccount; PR B adds the writer
-	// (UpsertInvoice via webhook ingestion). Seeded by tests for
-	// parity-with-pgstore checks.
+	// (migration 00050, issue #259).
 	invoices map[string]Invoice
 	// accountCredits is the in-memory mirror of the `account_credits`
 	// table (migration 00049, issue #279). Keyed by credit id. The
@@ -10605,6 +10602,52 @@ func (m *MemStore) GetInvoiceByID(_ context.Context, id string) (Invoice, error)
 	return Invoice{}, ErrNotFound
 }
 
+// UpsertInvoice mirrors the production natural-key upsert used by webhook
+// ingestion. MemStore keeps the existing row id and created_at on updates so
+// list ordering and idempotency match Postgres.
+func (m *MemStore) UpsertInvoice(_ context.Context, inv Invoice) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if inv.AccountID == "" || inv.Provider == "" || inv.ProviderInvoiceID == "" {
+		return errors.New("state: invoice account, provider, and provider_invoice_id are required")
+	}
+	if inv.PeriodStart.IsZero() {
+		inv.PeriodStart = time.Now().UTC()
+	}
+	if inv.PeriodEnd.IsZero() {
+		inv.PeriodEnd = inv.PeriodStart
+	}
+	if inv.Currency == "" {
+		inv.Currency = "eur"
+	}
+	if inv.Status == "" {
+		inv.Status = "open"
+	}
+	for id, existing := range m.invoices {
+		if existing.AccountID == inv.AccountID && existing.Provider == inv.Provider && existing.ProviderInvoiceID == inv.ProviderInvoiceID {
+			inv.ID = existing.ID
+			inv.CreatedAt = existing.CreatedAt
+			if inv.CreatedAt.IsZero() {
+				inv.CreatedAt = time.Now().UTC()
+			}
+			inv.UpdatedAt = time.Now().UTC()
+			m.invoices[id] = inv
+			return nil
+		}
+	}
+	if inv.ID == "" {
+		inv.ID = uuid.NewString()
+	}
+	if inv.CreatedAt.IsZero() {
+		inv.CreatedAt = time.Now().UTC()
+	}
+	if inv.UpdatedAt.IsZero() {
+		inv.UpdatedAt = inv.CreatedAt
+	}
+	m.invoices[inv.ID] = inv
+	return nil
+}
+
 // SeedInvoiceForTest is the test-only seam PR A's listInvoices
 // handler tests use to plant invoice rows directly. PR B wires
 // UpsertInvoice via the webhook path; until then, no production
@@ -11101,6 +11144,42 @@ func (m *MemStore) UsageByHour(_ context.Context, accountID string, start, end t
 			CPUUsec: a.CPUUsec, TXBytes: a.TXBytes, NetTxBytes: a.NetTxBytes,
 		})
 	}
+	return out, nil
+}
+
+// UsageWindows mirrors PgStore.UsageWindows and gives tests the same
+// durable backfill shape as production without requiring Postgres.
+func (m *MemStore) UsageWindows(_ context.Context, start, end time.Time) ([]UsageWindow, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	start = start.UTC()
+	end = end.UTC()
+	type key struct {
+		account string
+		hour    time.Time
+	}
+	agg := make(map[key]int64)
+	for _, u := range m.usage {
+		if u.Minute.Before(start) || !u.Minute.Before(end) {
+			continue
+		}
+		hour := u.Minute.UTC().Truncate(time.Hour)
+		k := key{account: u.AccountID, hour: hour}
+		agg[k] += u.MBSeconds
+	}
+	out := make([]UsageWindow, 0, len(agg))
+	for k, mbSeconds := range agg {
+		if mbSeconds <= 0 {
+			continue
+		}
+		out = append(out, UsageWindow{AccountID: k.account, Hour: k.hour, MBSeconds: mbSeconds})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].Hour.Equal(out[j].Hour) {
+			return out[i].Hour.Before(out[j].Hour)
+		}
+		return out[i].AccountID < out[j].AccountID
+	})
 	return out, nil
 }
 
