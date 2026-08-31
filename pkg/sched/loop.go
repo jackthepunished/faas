@@ -92,6 +92,8 @@ type Loop struct {
 	deadNodeReconciler   *DeadNodeReconciler    // dead-node billing-leak self-healer; nil opts out (no ticker arm)
 	instStats            InstanceStatsPoller    // issue #170 / PR-A per-{app,node} metrics poller; nil opts out
 	scaleup              *scaleup.Trigger       // issue #169 / #172 reactive scale-up trigger; nil opts out
+	scaleupMu            sync.Mutex             // serializes asynchronous scale-up ticks
+	scaleupRunning       bool                   // true while one scale-up tick is in flight
 	targets              *targets.Trigger       // issue #462 (PR-C) concurrent_requests target trigger; nil opts out
 	floor                *floor.Trigger         // issue #557 / ADR-071 proactive min-instances floor reconciler; nil opts out
 	recentLoad           *recentload.RecentLoad // issue #171 aggressive-reaper signal mirror; nil opts out
@@ -1269,15 +1271,33 @@ func (l *Loop) runDeadNodeReconcile(ctx context.Context) {
 }
 
 // runScaleUp dispatches one tick of the per-app reactive scale-up
-// trigger (issue #169 / #172). Same shape as runHeartbeat —
-// exported as a method so tests drive a single tick without
-// spinning up Run. Tick errors are logged inside the trigger; Run
-// never returns them so a transient store / scraper blip can't
-// tear down the loop.
+// trigger (issue #169 / #172). The tick runs asynchronously because
+// its optional Prometheus scrape can otherwise hold the scheduler loop
+// for the HTTP client's timeout. At most one tick is in flight; a slow
+// scrape therefore causes the next cadence to be skipped rather than
+// creating concurrent ring-buffer writers or piling up goroutines.
 func (l *Loop) runScaleUp(ctx context.Context) {
-	if err := l.scaleup.Tick(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		l.log.Warn("scaleup tick error", "err", err)
+	if l == nil || l.scaleup == nil {
+		return
 	}
+	l.scaleupMu.Lock()
+	if l.scaleupRunning {
+		l.scaleupMu.Unlock()
+		return
+	}
+	l.scaleupRunning = true
+	trigger := l.scaleup
+	l.scaleupMu.Unlock()
+	go func() {
+		defer func() {
+			l.scaleupMu.Lock()
+			l.scaleupRunning = false
+			l.scaleupMu.Unlock()
+		}()
+		if err := trigger.Tick(ctx); err != nil && !errors.Is(err, context.Canceled) && l.log != nil {
+			l.log.Warn("scaleup tick error", "err", err)
+		}
+	}()
 }
 
 // runTargets (PR-C, issue #462) dispatches one tick of the

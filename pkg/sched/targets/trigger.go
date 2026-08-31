@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -238,6 +239,12 @@ type Trigger struct {
 	// from instats on each Tick; the window keeps the most recent
 	// reading so the trigger can debounce single-tick spikes.
 	ring *RingBuffer
+
+	// admissionMu serializes the in-memory retry state. The loop normally
+	// runs one Tick at a time, but keeping this state protected also makes
+	// direct test/integration callers safe.
+	admissionMu      sync.Mutex
+	admissionBackoff map[string]admissionBackoffState
 }
 
 // Options is the functional-options bag for New(). All fields are
@@ -268,14 +275,15 @@ func New(appStore AppStore, instats InstatsReader, engine Engine, ledger Ledger,
 		opts.Interval = api.ScaleUpDecisionIntervalSeconds * time.Second
 	}
 	return &Trigger{
-		appStore: appStore,
-		instats:  instats,
-		engine:   engine,
-		ledger:   ledger,
-		metrics:  opts.Metrics,
-		log:      opts.Logger,
-		interval: opts.Interval,
-		ring:     NewRingBuffer(5, time.Second, opts.Interval),
+		appStore:         appStore,
+		instats:          instats,
+		engine:           engine,
+		ledger:           ledger,
+		metrics:          opts.Metrics,
+		log:              opts.Logger,
+		interval:         opts.Interval,
+		ring:             NewRingBuffer(5, time.Second, opts.Interval),
+		admissionBackoff: make(map[string]admissionBackoffState),
 	}
 }
 
@@ -396,6 +404,9 @@ func (t *Trigger) Tick(ctx context.Context) error {
 		if t.engine == nil {
 			continue
 		}
+		if t.admissionBackoffActive(app.ID, now) {
+			continue
+		}
 		// Scale-out must use AdmitInstance, not EnsureWake. EnsureWake is
 		// deliberately idempotent: its Phase-1 fast path returns an
 		// existing RUNNING instance. Using it here prevents a hot app
@@ -404,7 +415,10 @@ func (t *Trigger) Tick(ctx context.Context) error {
 		// new capacity slot through the shared ledger.
 		results, err := t.admit(ctx, app.ID, dec.Admissions)
 		if err != nil {
+			t.recordAdmissionFailure(app.ID, now)
 			t.log.Warn("targets: admit failed", "app_id", app.ID, "err", err)
+		} else {
+			t.clearAdmissionBackoff(app.ID)
 		}
 		for _, result := range results {
 			if result.AtCapacity {

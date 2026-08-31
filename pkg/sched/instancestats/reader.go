@@ -9,9 +9,9 @@ import (
 // Validity tags the freshness of a single signal on an InstanceStat
 // row. The poller stamps Unknown on the first sample (CPUPct has no
 // prior baseline) and on transient cgroup reads; Stale is reserved
-// for a future "freshness budget" — when a row's SampledAt is older
-// than the budget, future readers should treat its values as
-// advisory. Today only Valid and Unknown are emitted.
+// for the freshness budget — when a row's SampledAt is older than
+// DefaultFreshness, signal readers treat its values as absent. The
+// poller may still retain the row for diagnostic/snapshot consumers.
 type Validity uint8
 
 const (
@@ -27,8 +27,8 @@ const (
 	// rows.
 	Unknown Validity = 1
 	// Stale means the value is older than the freshness budget.
-	// Reserved for a future gate; today the poller never stamps
-	// Stale (no budget is enforced).
+	// Reserved as an explicit producer tag. Reader signal accessors
+	// independently enforce the SampledAt freshness budget.
 	Stale Validity = 2
 )
 
@@ -82,9 +82,9 @@ type InstanceStat struct {
 	// ActivityTracker; PR-A leaves it zero and the poller
 	// falls back to state.Instance.LastRequestAt.
 	LastRequestAt time.Time
-	// SampledAt is the wall-clock time the poller stamped this
-	// row. Future freshness gating (Reader.PruneOlderThan) reads
-	// this; today's poller always stamps it.
+	// SampledAt is the wall-clock time the underlying vmmd sample was
+	// taken. Signal readers reject rows older than DefaultFreshness;
+	// snapshot consumers can still inspect the row for diagnostics.
 	SampledAt time.Time
 	// CPU is the validity of CPUPct. PR-A semantics: Unknown
 	// when the wire reports nil (vmmd-side `usage_usec` is
@@ -93,8 +93,9 @@ type InstanceStat struct {
 	// recreation forces a baseline reset" branch lives in PR-B
 	// — PR-A treats nil-on-the-wire as Unknown and lets the
 	// rollup drop the row, without keeping a previous-sample
-	// baseline. The Stale value is reserved for #172's
-	// StatsFreshness budget; today the poller never stamps it.
+	// baseline. Reader signal accessors independently enforce the
+	// SampledAt freshness budget; the poller does not need to rewrite
+	// the validity tag when a row ages out.
 	CPU Validity
 	// RSS is the validity of RSSMB. Unknown on a transient
 	// cgroup miss; Valid otherwise.
@@ -283,10 +284,11 @@ func (r *Reader) MaxInflightForApp(appID string) (int64, bool) {
 	if cur == nil {
 		return 0, false
 	}
+	now := time.Now()
 	var max int64
 	var found bool
 	for _, row := range *cur {
-		if row.AppID != appID {
+		if row.AppID != appID || !freshSample(row.SampledAt, now) {
 			continue
 		}
 		if !found || row.InflightRequests > max {
@@ -325,10 +327,11 @@ func (r *Reader) MaxCPU(appID string) (float64, bool) {
 	if cur == nil {
 		return 0, false
 	}
+	now := time.Now()
 	var max float64
 	var seen bool
 	for _, row := range *cur {
-		if row.AppID != appID {
+		if row.AppID != appID || !freshSample(row.SampledAt, now) {
 			continue
 		}
 		// Any row for the app counts as "the app is live" —
@@ -346,4 +349,15 @@ func (r *Reader) MaxCPU(appID string) (float64, bool) {
 		return 0, false
 	}
 	return max, true
+}
+
+// freshSample is deliberately fail-closed. A zero timestamp means the
+// producer did not identify when the measurement was taken, and a future
+// timestamp is not trusted as fresh because it indicates a clock problem.
+func freshSample(sampledAt, now time.Time) bool {
+	if sampledAt.IsZero() {
+		return false
+	}
+	age := now.Sub(sampledAt)
+	return age >= 0 && age <= DefaultFreshness
 }

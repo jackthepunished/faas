@@ -322,6 +322,26 @@ func TestTrigger_EngineErrorContinues(t *testing.T) {
 	}
 }
 
+func TestTrigger_AdmissionErrorBackoff(t *testing.T) {
+	store := &fakeStore{apps: []state.App{
+		{ID: "app1", MaxConcurrency: 5, ScalingPolicy: scaleUpPolicy(1.0, 60)},
+	}}
+	ledger := &fakeLedger{conc: map[string]int{"app1": 1}}
+	instats := &fakeInstats{byApp: map[string]int64{"app1": 5}}
+	engine := &fakeEngine{errs: map[string]error{"app1": errors.New("vmmd unavailable")}}
+	tr := New(store, instats, engine, ledger, Options{})
+
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Fatalf("first Tick: %v", err)
+	}
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Fatalf("second Tick: %v", err)
+	}
+	if len(engine.admitCalls) != 1 {
+		t.Fatalf("engine.admitCalls = %d, want 1 while retry backoff is active", len(engine.admitCalls))
+	}
+}
+
 // TestTrigger_FiltersNonConcurrentRequestsApps verifies the
 // target.metric filter: apps whose Target.Metric !=
 // "concurrent_requests" are NOT processed by the targets trigger
