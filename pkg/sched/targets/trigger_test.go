@@ -39,19 +39,22 @@ func (l *fakeLedger) Concurrency(appID string) int {
 	return l.conc[appID]
 }
 
-// fakeEngine is a minimal Engine. Records every AdmitInstance call
-// and ships back a canned AdmitResult.
+// fakeEngine is a minimal Engine. It records the two wake surfaces
+// separately because EnsureWake is idempotent while AdmitInstance is
+// the scale-out primitive. A test that only checks a combined call
+// count would miss accidentally wiring the wrong method.
 type fakeEngine struct {
-	mu      sync.Mutex
-	calls   []string
-	results map[string]AdmitResult
-	errs    map[string]error
+	mu              sync.Mutex
+	admitCalls      []string
+	ensureWakeCalls []string
+	results         map[string]AdmitResult
+	errs            map[string]error
 }
 
 func (e *fakeEngine) AdmitInstance(_ context.Context, appID, _, _ string) (AdmitResult, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.calls = append(e.calls, appID)
+	e.admitCalls = append(e.admitCalls, appID)
 	if err, ok := e.errs[appID]; ok {
 		return AdmitResult{}, err
 	}
@@ -61,13 +64,12 @@ func (e *fakeEngine) AdmitInstance(_ context.Context, appID, _, _ string) (Admit
 	return AdmitResult{InstanceID: "ins-" + appID}, nil
 }
 
-// EnsureWake (ADR-098): targets' trigger-local WakeOutcome mirrors
-// the canned AdmitResult. The fake records a parallel call so tests
-// that need to count EnsureWake vs AdmitInstance calls can do so.
+// EnsureWake (ADR-098) remains on the compatibility interface for
+// other wake producers, but reactive scale-up must never call it.
 func (e *fakeEngine) EnsureWake(_ context.Context, appID, _ string) (WakeOutcome, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.calls = append(e.calls, appID)
+	e.ensureWakeCalls = append(e.ensureWakeCalls, appID)
 	if err, ok := e.errs[appID]; ok {
 		return WakeOutcome{}, err
 	}
@@ -122,8 +124,11 @@ func TestTrigger_AdmitOnInflightTargetHit(t *testing.T) {
 	if err := tr.Tick(context.Background()); err != nil {
 		t.Fatalf("Tick: %v", err)
 	}
-	if len(engine.calls) != 1 || engine.calls[0] != "app1" {
-		t.Errorf("engine.calls = %v, want [app1]", engine.calls)
+	if len(engine.admitCalls) != 1 || engine.admitCalls[0] != "app1" {
+		t.Errorf("engine.admitCalls = %v, want [app1]", engine.admitCalls)
+	}
+	if len(engine.ensureWakeCalls) != 0 {
+		t.Errorf("engine.ensureWakeCalls = %v, want []: scale-out must bypass EnsureWake", engine.ensureWakeCalls)
 	}
 }
 
@@ -143,8 +148,8 @@ func TestTrigger_NoSignalOnInflightBelowTarget(t *testing.T) {
 	if err := tr.Tick(context.Background()); err != nil {
 		t.Fatalf("Tick: %v", err)
 	}
-	if len(engine.calls) != 0 {
-		t.Errorf("engine.calls = %v, want [] (below target)", engine.calls)
+	if len(engine.admitCalls) != 0 || len(engine.ensureWakeCalls) != 0 {
+		t.Errorf("engine calls = admit:%v ensure:%v, want no calls (below target)", engine.admitCalls, engine.ensureWakeCalls)
 	}
 }
 
@@ -163,8 +168,8 @@ func TestTrigger_NoSignalWithoutInflightReader(t *testing.T) {
 	if err := tr.Tick(context.Background()); err != nil {
 		t.Fatalf("Tick: %v", err)
 	}
-	if len(engine.calls) != 0 {
-		t.Errorf("engine.calls = %v, want [] (nil instats)", engine.calls)
+	if len(engine.admitCalls) != 0 || len(engine.ensureWakeCalls) != 0 {
+		t.Errorf("engine calls = admit:%v ensure:%v, want no calls (nil instats)", engine.admitCalls, engine.ensureWakeCalls)
 	}
 }
 
@@ -187,8 +192,8 @@ func TestTrigger_CooldownHeld(t *testing.T) {
 	if err := tr.Tick(context.Background()); err != nil {
 		t.Fatalf("Tick: %v", err)
 	}
-	if len(engine.calls) != 0 {
-		t.Errorf("engine.calls = %v, want [] (cooldown held)", engine.calls)
+	if len(engine.admitCalls) != 0 || len(engine.ensureWakeCalls) != 0 {
+		t.Errorf("engine calls = admit:%v ensure:%v, want no calls (cooldown held)", engine.admitCalls, engine.ensureWakeCalls)
 	}
 }
 
@@ -211,8 +216,11 @@ func TestTrigger_AtCapacityReAdmitReObserved(t *testing.T) {
 	}
 	// The trigger called AdmitInstance (decide said admit) but
 	// the engine refused — call count is still 1.
-	if len(engine.calls) != 1 {
-		t.Errorf("engine.calls = %d, want 1 (decide said admit, engine refused)", len(engine.calls))
+	if len(engine.admitCalls) != 1 {
+		t.Errorf("engine.admitCalls = %d, want 1 (decide said admit, engine refused)", len(engine.admitCalls))
+	}
+	if len(engine.ensureWakeCalls) != 0 {
+		t.Errorf("engine.ensureWakeCalls = %v, want []: scale-out must bypass EnsureWake", engine.ensureWakeCalls)
 	}
 }
 
@@ -233,8 +241,8 @@ func TestTrigger_EngineErrorContinues(t *testing.T) {
 	}
 	// app1 errored (logged + skipped), app2 admitted — total 1
 	// successful call.
-	if len(engine.calls) != 2 {
-		t.Errorf("engine.calls = %v, want [app1, app2] (engine error continues)", engine.calls)
+	if len(engine.admitCalls) != 2 {
+		t.Errorf("engine.admitCalls = %v, want [app1, app2] (engine error continues)", engine.admitCalls)
 	}
 }
 
@@ -256,8 +264,8 @@ func TestTrigger_FiltersNonConcurrentRequestsApps(t *testing.T) {
 	if err := tr.Tick(context.Background()); err != nil {
 		t.Fatalf("Tick: %v", err)
 	}
-	if len(engine.calls) != 1 || engine.calls[0] != "app1" {
-		t.Errorf("engine.calls = %v, want [app1] (app2 filtered by metric)", engine.calls)
+	if len(engine.admitCalls) != 1 || engine.admitCalls[0] != "app1" {
+		t.Errorf("engine.admitCalls = %v, want [app1] (app2 filtered by metric)", engine.admitCalls)
 	}
 }
 

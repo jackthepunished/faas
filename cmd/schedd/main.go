@@ -1425,6 +1425,26 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		engine.ReconcileDeadNodeInstances,
 		time.Duration(dnrInterval)*time.Second,
 		log))
+	// The concurrent_requests trigger consumes the instance-stats reader
+	// directly and must not depend on the optional Prometheus scrape URL.
+	// Keep this wiring independent so disabling GatewayMetricsURL only
+	// disables the RPS/recent-load path, not in-flight based scale-out.
+	if reader != nil {
+		targetsTrigger := targets.New(
+			store, reader,
+			schedTargetsEngine{engine: engine},
+			schedTargetsLedger{ledger: engine.Ledger()},
+			targets.Options{
+				Logger:   log,
+				Metrics:  ops,
+				Interval: cfg.ScaleUpInterval,
+			},
+		)
+		loop.WithTargets(targetsTrigger)
+		log.Info("concurrent_requests target trigger enabled",
+			"interval", cfg.ScaleUpInterval,
+			"prometheus_metrics_url_configured", cfg.GatewayMetricsURL != "")
+	}
 	if cfg.GatewayMetricsURL != "" {
 		// Issue #171: share a single HTTPPromScraper between the
 		// scale-up trigger and the aggressive-reaper signal mirror.
@@ -1453,29 +1473,6 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			},
 		)
 		loop.WithScaleUp(trigger)
-		// PR-C (issue #462): concurrent_requests target scale-up
-		// trigger. Reads InstatsReader.MaxInflightForApp and
-		// compares against ScalingPolicy.Target.Value per app.
-		// Distinct from the RPS/CPU scale-up trigger (above) which
-		// is unchanged. The instats reader is the same one already
-		// constructed for the scaleup trigger; both triggers share
-		// the reader (it's read-only). nil reader ⇒ targets
-		// construction is skipped (test wiring without Instats).
-		if reader != nil {
-			targetsTrigger := targets.New(
-				store, reader,
-				schedTargetsEngine{engine: engine},
-				schedTargetsLedger{ledger: engine.Ledger()},
-				targets.Options{
-					Logger:   log,
-					Metrics:  ops,
-					Interval: cfg.ScaleUpInterval,
-				},
-			)
-			loop.WithTargets(targetsTrigger)
-			log.Info("concurrent_requests target trigger enabled",
-				"interval", cfg.ScaleUpInterval)
-		}
 		// Issue #557 / ADR-071: proactive min-instances floor
 		// reconciler. Walks every app the schedd owns each tick and
 		// admits instances up to the effective floor (max of legacy

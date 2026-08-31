@@ -89,11 +89,10 @@ type Engine interface {
 	// scope (`pr-{N}`) forwarded to the underlying sched.Engine.
 	// Empty = prod (legacy).
 	AdmitInstance(ctx context.Context, appID, scope, trigger string) (AdmitResult, error)
-	// EnsureWake (ADR-098): the single-flight wake entry. Routes
-	// through this so a scaleup tick racing the gateway, cron, floor,
-	// or targets triggers on the same parked app coalesces into one
-	// virtual boot. trigger (ADR-127) is stamped on the emitted
-	// wake.boot_started / wake.boot_completed events.
+	// EnsureWake (ADR-098) is retained on the shared engine surface for
+	// compatibility with other wake producers. The reactive scale-up
+	// path deliberately does not call it: its idempotent Phase-1
+	// shortcut cannot create a second VM for a hot app.
 	EnsureWake(ctx context.Context, appID, trigger string) (WakeOutcome, error)
 }
 
@@ -406,12 +405,13 @@ func (t *Trigger) Tick(ctx context.Context) error {
 		if t.engine == nil {
 			continue
 		}
-		// ADR-098: route through EnsureWake so a scaleup tick racing the
-		// gateway, cron, floor, or targets triggers on the same parked
-		// app coalesces into one virtual boot. The detached leader ctx
-		// means a cancelled triggering tick doesn't kill an in-flight
-		// boot other callers still need.
-		result, err := t.engine.EnsureWake(ctx, app.ID, wakeBootTriggerScaleup)
+		// Scale-out must use AdmitInstance, not EnsureWake. EnsureWake is
+		// deliberately idempotent: its Phase-1 fast path returns an
+		// existing RUNNING instance. Using it here makes a hot app with
+		// one running VM stay at one VM forever, even when decide() found
+		// headroom. AdmitInstance skips that fast path and reserves a new
+		// capacity slot through the shared ledger.
+		result, err := t.engine.AdmitInstance(ctx, app.ID, "", wakeBootTriggerScaleup)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				return err
@@ -422,16 +422,17 @@ func (t *Trigger) Tick(ctx context.Context) error {
 			t.log.Warn("scaleup: admit failed", "app", app.ID, "err", err)
 			continue
 		}
-		// EnsureWake's leader runs Engine.Wake which honours the
-		// per-app max_concurrency ledger; a follower that arrives
-		// after the leader fills the last slot still sees a
-		// successful boot pointing at that slot. The leader's
-		// ledger closes the at-cap loop — we no longer need a
-		// reject_at_cap branch here.
+		if result.AtCapacity {
+			// The ledger can reach the cap between decide() and
+			// AdmitInstance. Preserve the decision metric and record the
+			// effective rejection so operators can distinguish pressure
+			// from a successful scale-out.
+			t.metrics.ObserveScaleUp(app.ID, string(OutcomeRejectAtCap))
+			continue
+		}
 		// Successful admit: observe the per-instance RPS at
 		// decision time so the §12 dashboard can p95/p99 the
 		// "aggressiveness" of the trigger.
-		_ = result
 		t.metrics.ObserveScaleUpAdmitRPS(dec.ObservedRPS)
 	}
 	return nil
