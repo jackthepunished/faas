@@ -1807,32 +1807,24 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 
 	// ADR-127 production debugger — request_telemetry data plane.
 	// Wires the recorder into Handler.observe + launches the
-	// publisher goroutine. The ShipFn is a sampled log stub in
-	// PR-A: rows drain from the recorder on FlushInterval and
-	// are sampled at 1/N to slog.Debug so operators can see the
-	// data plane is running without flooding the log. PR-B
-	// replaces the log stub with a real IncrementRequestTelemetry
-	// streaming RPC against apid's unix socket — the recorder +
-	// publisher plumbing stays unchanged.
+	// publisher goroutine. Single-box deployments use the dedicated
+	// Unix socket; split-box deployments reuse the private mTLS AppErrors
+	// endpoint, which is served by the same apid gRPC server.
 	requestTelemetryEnabled := osGetenv("FAAS_REQUEST_TELEMETRY_ENABLED") != "false"
 	if requestTelemetryEnabled {
 		recorder := gateway.NewRequestTelemetryRecorder(gateway.RequestTelemetryConfig{
 			Enabled:  true,
 			RingSize: 4096,
 		}, log)
-		// PR-B (ADR-127 §PR-B): dial apid's RequestTelemetry
-		// service over the unix socket and stream the collapsed
-		// buckets through IncrementRequestTelemetry. PR-A's
-		// log-only stub at this site is replaced — every batch
-		// now produces real INSERTs in apid's request_telemetry
-		// table. The dial is lazy: a transient apid outage
-		// doesn't block gateway boot, and the publisher's
-		// retry-with-backoff handles a cold apid start.
-		apidRTSock := osGetenv("FAAS_APID_REQUEST_TELEMETRY_SOCKET")
-		if apidRTSock == "" {
-			apidRTSock = "/run/faas/request_telemetry.sock"
+		// The split-box target falls back to FAAS_APID_APP_ERRORS_TARGET / the
+		// TOML AppErrors target. Load the same client certificate so the
+		// private endpoint cannot silently downgrade to plaintext.
+		apidRTTarget := cfg.GetRequestTelemetryTarget(osGetenv)
+		rtTLS, rtTLSErr := cfg.LoadAppErrorsTLS()
+		if rtTLSErr != nil {
+			return fmt.Errorf("gatewayd: load request telemetry TLS: %w", rtTLSErr)
 		}
-		rtCli, dialErr := apidgrpc.DialRequestTelemetry(ctx, apidRTSock, nil)
+		rtCli, dialErr := apidgrpc.DialRequestTelemetry(ctx, apidRTTarget, rtTLS)
 		var rtShippedTotal int64
 		publisher := gateway.NewRequestTelemetryPublisher(gateway.RequestTelemetryPublisherConfig{
 			Enabled:        true,
@@ -1935,7 +1927,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		log.Info("request_telemetry recorder enabled",
 			"ring_size", 4096,
 			"flush_interval", 5*time.Second,
-			"note", "PR-A: log-only ship stub; PR-B adds apid gRPC receiver")
+			"apid_target", apidRTTarget)
 	} else {
 		log.Info("request_telemetry recorder disabled (FAAS_REQUEST_TELEMETRY_ENABLED == \"false\")")
 	}
@@ -2386,6 +2378,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// #910).
 		unifiedMux.Handle("POST /v1/invocations:dispatch_batch", deps.synth.Mux())
 		unifiedMux.Handle("/healthz", deps.synth.Mux())
+		// The compute data-plane listener is private: the generated nftables
+		// policy admits port 8080 only from the control plane. Expose the
+		// control metrics there so the control-plane Prometheus can scrape
+		// every compute node without a provider-specific IP, second Prometheus
+		// installation, or an unauthenticated 0.0.0.0:9090 control bind.
+		// Do not install this route on the single-box/public role.
+		installComputeMetricsRoute(unifiedMux, cfg.Role, controlMux)
 		// Wrap with h2c so the in-process unix-socket hop negotiates
 		// H2C prior knowledge (no TLS). The customer publicHandler
 		// speaks HTTP/1.1 downstream, but the gatewayd-public ← →
@@ -2675,6 +2674,18 @@ func assertLoopbackBind(addr string) error {
 		return nil
 	}
 	return fmt.Errorf("control listener %q is not loopback; bind 127.0.0.1:9090 (or ::1) only", addr)
+}
+
+// installComputeMetricsRoute exposes only /metrics on a compute node's
+// private data-plane listener. The listener is admitted from the control
+// plane by the generated firewall; the single-box/public role never gets
+// this route, so an accidentally public application listener cannot expose
+// daemon metrics.
+func installComputeMetricsRoute(mux *http.ServeMux, boxRole role.Role, control http.Handler) {
+	if mux == nil || control == nil || boxRole != role.RoleComputeOnly {
+		return
+	}
+	mux.Handle("/metrics", control)
 }
 
 // weightsStoreAdapter (issue #556 / PR-B) adapts pkg/state.PgStore to

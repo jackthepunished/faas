@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/role"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -155,6 +156,18 @@ func TestRunAppErrorsServer_RejectsPlaintextRemoteTarget(t *testing.T) {
 	}
 	if !contains(err.Error(), "mTLS is required") {
 		t.Fatalf("error = %q, want mTLS requirement", err)
+	}
+}
+
+func TestResolvePrometheusURL(t *testing.T) {
+	if got := resolvePrometheusURL(func(string) string { return "" }, role.RoleControlPlane); got != prometheusURLDefault {
+		t.Fatalf("control-plane default = %q, want %q", got, prometheusURLDefault)
+	}
+	if got := resolvePrometheusURL(func(string) string { return "" }, role.RoleSingleBox); got != "" {
+		t.Fatalf("single-box default = %q, want empty", got)
+	}
+	if got := resolvePrometheusURL(func(string) string { return "http://prometheus.example:9095" }, role.RoleControlPlane); got != "http://prometheus.example:9095" {
+		t.Fatalf("explicit URL = %q", got)
 	}
 }
 

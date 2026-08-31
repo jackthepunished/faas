@@ -53,3 +53,19 @@ scrape_configs:
     metrics_path: "{{ tgt.metrics_path }}"
 {% endif %}
 {% endfor %}
+{% if (faas_box_role | default('')) == 'control-plane' %}
+  # Compute gateway metrics are served on the compute data-plane listener
+  # only for this private scrape path. The generated nftables policy permits
+  # port 8080 from control-plane addresses; no provider-specific IP is
+  # embedded here. faas_node_name is the stable /etc/hosts alias emitted by
+  # the manifest resolver and works unchanged on GCP, Hetzner, and OVH.
+{% for compute_host in groups['compute_nodes'] | default([]) %}
+  - job_name: "gatewayd-internal-{{ compute_host }}"
+    static_configs:
+      - targets: ["{{ hostvars[compute_host].faas_node_name | default(compute_host) }}:8080"]
+        labels:
+          job: "gatewayd-internal"
+          node: "{{ hostvars[compute_host].faas_node_name | default(compute_host) }}"
+    metrics_path: "/metrics"
+{% endfor %}
+{% endif %}
