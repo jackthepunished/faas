@@ -2,12 +2,15 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 // WarmHintFunc is the sticky-warm affinity source for the picker
@@ -317,6 +320,11 @@ type PGBackend struct {
 	// original Admit notification. The narrow hook keeps gateway independent
 	// of pkg/state.
 	liveTargetLoader func(ctx context.Context, appID string) ([]Target, error)
+	// liveTargetHydration coalesces cache-reconciliation reads for the same
+	// app. A gateway restart can receive a burst before the first request has
+	// populated the process-local picker; those requests must share one
+	// authoritative database read rather than stampeding Postgres.
+	liveTargetHydration singleflight.Group
 
 	// publicAuthCache is the unsealed basic-auth credential
 	// cache (issue #477 / ADR-079). nil = no caching; the
@@ -444,14 +452,95 @@ func (b *PGBackend) WithClientForApp(fn ClientForAppFunc) *PGBackend {
 	return b
 }
 
-// WithLiveTargetLoader installs the restart-reconciliation hook used when a
-// schedd admission is rejected at the app cap. A running instance may already
-// exist in Postgres even though this gateway's process-local picker is empty.
+// WithLiveTargetLoader installs the restart-reconciliation hook used when this
+// gateway's process-local picker is empty. A running instance may already
+// exist in Postgres even though this process missed its admission or running
+// notification; production filters the loader to current live deployments.
 func (b *PGBackend) WithLiveTargetLoader(fn func(context.Context, string) ([]Target, error)) *PGBackend {
 	if b != nil {
 		b.liveTargetLoader = fn
 	}
 	return b
+}
+
+// ReconcileLiveTargets hydrates the process-local picker from the authoritative
+// instance state when this gateway has no routable target for appID.
+//
+// The picker is intentionally a hot-path cache, but an empty cache is not
+// proof that an app is cold: an instance may have been admitted by another
+// gateway process, by cron/floor, or before this process restarted. The old
+// implementation only attempted this hydration after schedd returned
+// at-capacity, which was too late because the empty-cache path had already
+// started another VM.
+//
+// The replacement is conditional on the cache still being empty after the
+// database read. That preserves a target admitted concurrently while the read
+// was in flight and makes the reconciliation safe with the normal Admit path.
+func (b *PGBackend) ReconcileLiveTargets(ctx context.Context, appID string) error {
+	if b == nil || appID == "" || b.liveTargetLoader == nil {
+		return nil
+	}
+	if b.HealthyCount(appID) > 0 {
+		return nil
+	}
+	_, err, _ := b.liveTargetHydration.Do(appID, func() (any, error) {
+		if b.HealthyCount(appID) > 0 {
+			return nil, nil
+		}
+		targets, err := b.liveTargetLoader(ctx, appID)
+		if err != nil {
+			return nil, fmt.Errorf("gateway: reconcile live targets for app %s: %w", appID, err)
+		}
+		if len(targets) == 0 {
+			return nil, nil
+		}
+
+		b.tgtMu.Lock()
+		defer b.tgtMu.Unlock()
+		// An Admit or RecordTarget may have completed while the loader was
+		// querying Postgres. Do not overwrite that newer local observation.
+		if b.targetCountLocked(appID) > 0 {
+			return nil, nil
+		}
+		for _, target := range targets {
+			b.recordTargetLocked(appID, target)
+		}
+		return nil, nil
+	})
+	return err
+}
+
+// EnsureWarm ensures one running instance for an actually cold production
+// app. It uses schedd's Engine.EnsureWake coordinator, which is shared by all
+// wake producers and runs the leader lifecycle on a detached bounded context.
+// Deployment-scoped preview wakes continue through Admit because the legacy
+// EnsureWake RPC does not yet carry a scope/deployment selector.
+//
+// This method is deliberately an additive optional backend capability so the
+// existing Backend interface and its test doubles remain stable.
+func (b *PGBackend) EnsureWarm(ctx context.Context, appID, scope, trigger string) (string, WakeMethod, bool, error) {
+	if b == nil || scope != "" {
+		return "", WakeMethodUnspecified, false, errors.New("gateway: EnsureWarm requires production scope")
+	}
+	sched, err := b.resolveSched(ctx, appID)
+	if err != nil {
+		return "", WakeMethodUnspecified, false, err
+	}
+	instanceID, nodeID, deploymentID, wakeID, rawMethod, port, err := sched.EnsureWake(ctx, appID, trigger)
+	if err != nil {
+		return "", WakeMethodUnspecified, false, err
+	}
+	if instanceID == "" || nodeID == "" {
+		return "", WakeMethodUnspecified, true, nil
+	}
+	b.RecordTarget(appID, Target{
+		NodeID:       nodeID,
+		InstanceID:   instanceID,
+		WakeID:       wakeID,
+		Port:         port,
+		DeploymentID: deploymentID,
+	})
+	return wakeID, scheddWakeMethodToGateway(rawMethod), false, nil
 }
 
 // WithWarmHint attaches the sticky-warm affinity source for the picker.
@@ -751,16 +840,20 @@ func (b *PGBackend) Pick(appID string) PickResult {
 // does NOT double-bill the cap (issue #556 acceptance #3, §6.2-2).
 func (b *PGBackend) HealthyCount(appID string) int {
 	b.tgtMu.RLock()
+	n := b.targetCountLocked(appID)
+	b.tgtMu.RUnlock()
+	return n
+}
+
+func (b *PGBackend) targetCountLocked(appID string) int {
 	picker := b.appsPicker[appID]
 	if picker == nil {
-		b.tgtMu.RUnlock()
 		return 0
 	}
 	n := 0
 	for _, set := range picker.sets {
 		n += len(set.entries)
 	}
-	b.tgtMu.RUnlock()
 	return n
 }
 
@@ -778,7 +871,10 @@ func (b *PGBackend) RecordTarget(appID string, target Target) {
 	}
 	b.tgtMu.Lock()
 	defer b.tgtMu.Unlock()
+	b.recordTargetLocked(appID, target)
+}
 
+func (b *PGBackend) recordTargetLocked(appID string, target Target) {
 	picker := b.appsPicker[appID]
 	if picker == nil {
 		picker = &appPicker{sets: map[string]*targetSet{}}
@@ -838,7 +934,39 @@ func (b *PGBackend) RecordTarget(appID string, target Target) {
 // wake.boot_started / wake.boot_completed events. The gateway
 // always passes "gateway"; future callers (synth handler, replay
 // worker) can pass a distinct closed-enum value.
+const admissionLifecycleTimeout = 40 * time.Second
+
+type admitResult struct {
+	wakeID     string
+	method     WakeMethod
+	atCapacity bool
+	err        error
+}
+
+// Admit keeps the request-facing wait cancellable while the underlying
+// scheduler admission continues on a bounded lifecycle context. A client
+// timeout must not cancel a VM restore after schedd has reserved it; the
+// synchronous worker still publishes the target for the next request.
 func (b *PGBackend) Admit(ctx context.Context, appID, deploymentID, scope, trigger string, maxConcurrency int) (string, WakeMethod, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return "", WakeMethodUnspecified, false, err
+	}
+	lifecycleCtx, lifecycleCancel := context.WithTimeout(context.WithoutCancel(ctx), admissionLifecycleTimeout)
+	resultCh := make(chan admitResult, 1)
+	go func() {
+		defer lifecycleCancel()
+		wakeID, method, atCapacity, err := b.admitSynchronous(lifecycleCtx, appID, deploymentID, scope, trigger, maxConcurrency)
+		resultCh <- admitResult{wakeID: wakeID, method: method, atCapacity: atCapacity, err: err}
+	}()
+	select {
+	case result := <-resultCh:
+		return result.wakeID, result.method, result.atCapacity, result.err
+	case <-ctx.Done():
+		return "", WakeMethodUnspecified, false, ctx.Err()
+	}
+}
+
+func (b *PGBackend) admitSynchronous(ctx context.Context, appID, deploymentID, scope, trigger string, maxConcurrency int) (string, WakeMethod, bool, error) {
 	// Test seam (issue #272 / ADR-095 PR-B): the per-call scope arg
 	// is recorded on the backend so the unit test (TestPGBackend_AdmitScope)
 	// can assert which scope each admit carried. Production code

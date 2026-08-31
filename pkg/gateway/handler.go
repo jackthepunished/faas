@@ -520,6 +520,22 @@ type Backend interface {
 	ScheduleMirror(ctx context.Context, appID, mirrorDeploymentID, mirrorRuleID string) (instanceID, wakeID string, err error)
 }
 
+// liveTargetReconciler is an optional capability implemented by the
+// PostgreSQL-backed production backend. It lets the handler repair an empty
+// process-local target cache before deciding that an app is cold. Keeping it
+// optional preserves the small Backend test seam and legacy backends.
+type liveTargetReconciler interface {
+	ReconcileLiveTargets(ctx context.Context, appID string) error
+}
+
+// warmEnsurer is the optional production cold-start capability. Its scheduler
+// implementation is cross-producer single-flight; preview/deployment-scoped
+// paths fall back to Backend.Admit because the legacy EnsureWake RPC has no
+// scope selector yet.
+type warmEnsurer interface {
+	EnsureWarm(ctx context.Context, appID, scope, trigger string) (wakeID string, method WakeMethod, atCapacity bool, err error)
+}
+
 // Handler is gatewayd-internal's HTTP entrypoint: route → rate-limit → (wake-block if
 // parked) → proxy (spec §4.1, §2). It is the only public listener on the box.
 type Handler struct {
@@ -6401,29 +6417,20 @@ func (s *statusRecorder) finalFlush() {
 	s.doFlush()
 }
 
-// ensureCapacity (issue #168) is the per-app fan-out admission primitive.
+// ensureCapacity (issue #168) is the request-side wake primitive.
 //
-// Three paths:
+// A request wakes an app only when there is no routable target. The plan's
+// max_concurrency is a ceiling, not a request-per-instance target: admitting a
+// new VM merely because HealthyCount < max_concurrency makes every sequential
+// request cold until the ceiling is reached. Reactive scale-up belongs to the
+// scheduler's signal-driven targets/scaleup workers, which have real inflight
+// and RPS/CPU evidence before calling Backend.Admit.
 //
-//  1. Cold start (HealthyCount == 0): go through the WakeGate so a
-//     burst of N concurrent cold requests to a fully-parked app
-//     coalesces to ONE cold boot per "generation". The leader runs
-//     ensure(); followers wait on its result, then EACH re-enters the
-//     cold-start loop and admits its own instance IF HealthyCount is
-//     still < max_concurrency. This is the per-generation fan-out: a
-//     burst of N requests against a parked app admits up to
-//     max_concurrency distinct instances, where 1 <= admitted <= N.
-//     The loop is bounded by max_concurrency so a single request
-//     cannot drive past the cap by itself (the cap is enforced per
-//     request, not per generation).
-//
-//  2. Fan-out (HealthyCount > 0, < max_concurrency): skip the gate and
-//     call Admit directly. Sequential requests after the cold-start
-//     burst go through this path; schedd's own ledger enforces the cap
-//     atomically.
-//
-//  3. Saturated (HealthyCount >= max_concurrency): no-op. Pick returns
-//     one of the cached targets.
+// The cold path goes through the WakeGate, and the production backend's
+// EnsureWarm capability delegates to schedd's cross-producer EnsureWake. This
+// gives both the local gateway and other wake producers one authoritative
+// single-flight operation while preserving the existing optional Backend test
+// seam.
 //
 // Returns (cold, wakeID, method, err):
 //   - cold=true on a fresh admit (one or more new instances reached RUNNING);
@@ -6444,44 +6451,25 @@ func (s *statusRecorder) finalFlush() {
 // coldStart and coldStart in turn calls Admit, scope is plumbed
 // through both paths.
 func (h *Handler) ensureCapacity(ctx context.Context, appID, accountID, scope string, maxConcurrency int) (cold bool, wakeID string, method WakeMethod, err error) {
-	// Loop bound: a single request can drive at most max_concurrency
-	// iterations (cold-start with follow-up fan-out). The cap is
-	// enforced atomically by Backend.Admit (HealthyCount + add as one
-	// serialized op), so this loop is bounded by observation, not by
-	// speculation about concurrency.
-	for attempt := 0; attempt < maxConcurrency; attempt++ {
-		healthy := h.backend.HealthyCount(appID)
-		if healthy == 0 {
-			c, w, m, e := h.coldStart(ctx, appID, accountID, scope, maxConcurrency)
-			if e != nil {
-				return false, "", WakeMethodUnspecified, e
+	// HealthyCount is intentionally process-local for the hot path, but an
+	// empty process-local cache is not authoritative in a multi-node fleet.
+	// Reconcile before entering the cold path so a VM admitted by another
+	// gateway, cron/floor worker, or before a gateway restart is reused.
+	if h.backend.HealthyCount(appID) == 0 {
+		if reconciler, ok := h.backend.(liveTargetReconciler); ok {
+			if reconcileErr := reconciler.ReconcileLiveTargets(ctx, appID); reconcileErr != nil && h.log != nil {
+				h.log.Warn("gateway: live target reconciliation failed", "app_id", appID, "err", reconcileErr)
 			}
-			if c {
-				return true, w, m, nil
-			}
-			// Cold-start saw no need to admit (a peer's wake
-			// already populated the cache). Re-check HealthyCount
-			// and fall through to fan-out / saturation on the next
-			// iteration.
-			continue
 		}
-		if healthy >= maxConcurrency {
-			return false, "", WakeMethodUnspecified, nil
-		}
-		// Fan-out path: admit directly, no gate. Backend.Admit
-		// atomically checks HealthyCount < maxConcurrency under its
-		// own lock, so concurrent callers cannot collectively
-		// exceed the cap.
-		wakeID, method, atCapacity, e := h.backend.Admit(ctx, appID, "", scope, sched.TriggerGateway, maxConcurrency)
-		if e != nil {
-			return false, "", WakeMethodUnspecified, e
-		}
-		if atCapacity {
-			return false, "", WakeMethodUnspecified, nil
-		}
-		return true, wakeID, method, nil
 	}
-	return false, "", WakeMethodUnspecified, nil
+	if h.backend.HealthyCount(appID) > 0 {
+		return false, "", WakeMethodUnspecified, nil
+	}
+	cold, wakeID, method, err = h.coldStart(ctx, appID, accountID, scope, maxConcurrency)
+	if err != nil {
+		return false, "", WakeMethodUnspecified, err
+	}
+	return cold, wakeID, method, nil
 }
 
 // coldStart is path 1 of ensureCapacity: HealthyCount == 0, so we go
@@ -6496,9 +6484,25 @@ func (h *Handler) coldStart(ctx context.Context, appID, accountID, scope string,
 	)
 	werr := h.gate.Wait(ctx, appID, accountID,
 		func() bool {
-			return h.backend.HealthyCount(appID) < maxConcurrency
+			// max_concurrency is a ceiling for scheduler-driven scale-up,
+			// not a reason for the request path to create another VM. Once
+			// any healthy target exists, this wake generation is satisfied.
+			return h.backend.HealthyCount(appID) == 0
 		},
 		func(ctx context.Context) error {
+			if ensurer, ok := h.backend.(warmEnsurer); ok && scope == "" {
+				id, m, atCapacity, e := ensurer.EnsureWarm(ctx, appID, scope, sched.TriggerGateway)
+				if e != nil {
+					return e
+				}
+				if atCapacity {
+					return nil
+				}
+				admittedWakeID = id
+				method = m
+				cold = true
+				return nil
+			}
 			id, m, atCapacity, e := h.backend.Admit(ctx, appID, "", scope, sched.TriggerGateway, maxConcurrency)
 			if e != nil {
 				return e

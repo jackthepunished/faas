@@ -673,15 +673,11 @@ func TestHandlerStampsXFaasInstanceHeader(t *testing.T) {
 	}
 }
 
-// TestFanOutAdmitsUpToCapThenReuses (issue #168) — for plans with
-// max_concurrency > 1, a burst of concurrent cold requests admits up
-// to max_concurrency distinct instances; subsequent requests reuse
-// the cached targets without firing new admits.
-//
-// Hobby plan caps at 2, so 4 concurrent cold requests admit 2 distinct
-// instances (the leader's admit + 1 follower's fan-out admit), and the
-// remaining 2 followers hit the cache. A sequential 5th request also
-// reuses the cache.
+// TestFanOutAdmitsUpToCapThenReuses (issue #168) — max_concurrency is a
+// ceiling, not a request-per-instance target. A burst to a cold app
+// performs one wake and all followers reuse that target. Reactive scale-up
+// is driven by the scheduler's measured load signals, not by every request
+// racing through the gateway.
 func TestFanOutAdmitsUpToCapThenReuses(t *testing.T) {
 	h, b, _ := newTestHandler(t)
 	b.app.Plan = api.PlanHobby // max_concurrency = 2
@@ -704,14 +700,8 @@ func TestFanOutAdmitsUpToCapThenReuses(t *testing.T) {
 	}
 	wg.Wait()
 
-	// The cache must hold exactly max_concurrency targets after the
-	// burst — the cap is enforced, not "approximately". Note: the
-	// gateway may call Admit MORE than max_concurrency times when
-	// multiple followers race past the HealthyCount<cap check; schedd's
-	// ledger rejects the excess via atCapacity=true and those rejects
-	// don't add a Target. The cache size is the load-bearing invariant.
-	if got := b.HealthyCount("app-1"); got != 2 {
-		t.Errorf("HealthyCount after %d concurrent cold requests on Hobby cap = %d, want 2", fans, got)
+	if got := b.HealthyCount("app-1"); got != 1 {
+		t.Errorf("HealthyCount after %d concurrent cold requests = %d, want 1", fans, got)
 	}
 
 	// 5th request hits the cache — no new admit.
@@ -722,8 +712,8 @@ func TestFanOutAdmitsUpToCapThenReuses(t *testing.T) {
 	if post := atomic.LoadInt32(b.Admits()); post > preAdmit {
 		t.Errorf("5th request must reuse cached target, got %d new admits", post-preAdmit)
 	}
-	if got := b.HealthyCount("app-1"); got != 2 {
-		t.Errorf("HealthyCount after 5th request = %d, want 2", got)
+	if got := b.HealthyCount("app-1"); got != 1 {
+		t.Errorf("HealthyCount after 5th request = %d, want 1", got)
 	}
 }
 
@@ -1255,15 +1245,8 @@ func TestHandlerObserveWakeLocality(t *testing.T) {
 }
 
 // TestHandlerObserveWakeLocalityExactlyOncePerColdAdmit pins the
-// dual-increment contract: when the after-proxy chokepoint fires
-// twice (two distinct cold admits on the same app), the counter
-// increments exactly twice. Catches a future contributor who wraps
-// the increment in a loop, double-increments on a particular path,
-// or otherwise drifts from the "one increment per admission" rule.
-// Same canonical pattern as TestHandlerObserveWakeLocality: the
-// app is PlanPro (cap=5) so a second request still hits the cold
-// fan-out path (HealthyCount=1 < 5), admitting a second instance.
-// Both admits must enumerate.
+// one-increment-per-admission contract. A second sequential request is warm
+// even when the plan has spare max_concurrency capacity.
 func TestHandlerObserveWakeLocalityExactlyOncePerColdAdmit(t *testing.T) {
 	h, _, _ := newTestHandler(t)
 
@@ -1277,8 +1260,8 @@ func TestHandlerObserveWakeLocalityExactlyOncePerColdAdmit(t *testing.T) {
 	}
 
 	gotCB := counterValueFromBody(t, h.metrics, `gateway_wake_locality_total{outcome="local_coldboot"}`)
-	if gotCB != 2 {
-		t.Errorf("local_coldboot count after 2 cold admits = %d, want 2 (exactly once per admit)", gotCB)
+	if gotCB != 1 {
+		t.Errorf("local_coldboot count after cold then warm request = %d, want 1", gotCB)
 	}
 	gotSnap := counterValueFromBody(t, h.metrics, `gateway_wake_locality_total{outcome="local_snapshot"}`)
 	if gotSnap != 0 {
