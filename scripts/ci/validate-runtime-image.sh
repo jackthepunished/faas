@@ -28,18 +28,27 @@ esac
 
 container_id=$(docker create --entrypoint /bin/sh "${image_ref}" -c true)
 rootfs_tar=""
+rootfs_listing=""
 cleanup() {
   docker rm -f "${container_id}" >/dev/null 2>&1 || true
   if [[ -n "${rootfs_tar}" ]]; then
     rm -f "${rootfs_tar}"
+  fi
+  if [[ -n "${rootfs_listing}" ]]; then
+    rm -f "${rootfs_listing}"
   fi
 }
 trap cleanup EXIT
 
 rootfs_tar=$(mktemp)
 docker export "${container_id}" -o "${rootfs_tar}"
+rootfs_listing=$(mktemp)
+# Materialise the listing before matching. Piping tar into grep -q under
+# pipefail makes tar receive SIGPIPE as soon as grep finds a match, which
+# falsely turns a present path into a missing-path failure.
+tar -tf "${rootfs_tar}" >"${rootfs_listing}"
 for path in "${required[@]}"; do
-  if ! tar -tf "${rootfs_tar}" | grep -Eq "^(\./)?${path}(/|$)"; then
+  if ! grep -Eq "^(\./)?${path}(/|$)" "${rootfs_listing}"; then
     echo "::error::${image_ref} is missing /${path}" >&2
     exit 1
   fi
