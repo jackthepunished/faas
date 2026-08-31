@@ -300,6 +300,11 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false
+
       - name: Login to ghcr.io
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: docker/login-action@v3
@@ -341,3 +346,6 @@ jobs:
             ref="${IMAGE_NAME}:pr-${GITHUB_SHA::12}"
           fi
           bash scripts/ci/validate-runtime-image.sh "${ref}" "${{ matrix.image }}"
+          if [[ "${{ matrix.image }}" != "base-debian-parent" && "${{ matrix.image }}" != "base-minimal" ]]; then
+            bash scripts/ci/smoke-runtime-image.sh "${ref}" "${{ matrix.image }}"
+          fi
