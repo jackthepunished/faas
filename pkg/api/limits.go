@@ -3458,6 +3458,12 @@ const (
 	// is already over by the time the trigger fires.
 	ScaleUpDecisionIntervalSeconds = 1
 	ScaleUpWindowSeconds           = 5
+	// ScaleUpMaxBurstPerTick bounds the number of additional instances a
+	// signal-driven scale-up decision may request in one scheduler tick. The
+	// desired-capacity calculation can ask for more when a large burst arrives,
+	// but admissions are deliberately paced across ticks so one bad metric
+	// sample cannot turn into an unbounded cold-boot fan-out.
+	ScaleUpMaxBurstPerTick = 4
 
 	// Scaling policy cooldowns (issue #462 / ADR-058). The
 	// customer-facing knobs are `scale_out_cooldown_s` /

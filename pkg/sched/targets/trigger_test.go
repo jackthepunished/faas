@@ -3,6 +3,7 @@ package targets
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -49,6 +50,23 @@ type fakeEngine struct {
 	ensureWakeCalls []string
 	results         map[string]AdmitResult
 	errs            map[string]error
+}
+
+type burstFakeEngine struct {
+	*fakeEngine
+	mu          sync.Mutex
+	burstCounts []int
+}
+
+func (e *burstFakeEngine) AdmitInstances(_ context.Context, appID, _, _ string, count int) ([]AdmitResult, error) {
+	e.mu.Lock()
+	e.burstCounts = append(e.burstCounts, count)
+	e.mu.Unlock()
+	results := make([]AdmitResult, count)
+	for i := range results {
+		results[i] = AdmitResult{InstanceID: fmt.Sprintf("ins-%s-%d", appID, i)}
+	}
+	return results, nil
 }
 
 func (e *fakeEngine) AdmitInstance(_ context.Context, appID, _, _ string) (AdmitResult, error) {
@@ -129,6 +147,26 @@ func TestTrigger_AdmitOnInflightTargetHit(t *testing.T) {
 	}
 	if len(engine.ensureWakeCalls) != 0 {
 		t.Errorf("engine.ensureWakeCalls = %v, want []: scale-out must bypass EnsureWake", engine.ensureWakeCalls)
+	}
+}
+
+func TestTrigger_UsesBoundedDesiredCapacityBurst(t *testing.T) {
+	store := &fakeStore{apps: []state.App{{
+		ID:             "app1",
+		MaxConcurrency: 8,
+		ScalingPolicy:  scaleUpPolicy(10, 0),
+	}}}
+	ledger := &fakeLedger{conc: map[string]int{"app1": 2}}
+	instats := &fakeInstats{byApp: map[string]int64{"app1": 35}}
+	engine := &burstFakeEngine{fakeEngine: &fakeEngine{}}
+	tr := New(store, instats, engine, ledger, Options{})
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	// 2 instances × 35 inflight / 10 target = 7 desired, so
+	// five admissions are needed; the trigger caps this tick at four.
+	if len(engine.burstCounts) != 1 || engine.burstCounts[0] != 4 {
+		t.Fatalf("burst counts = %v, want [4]", engine.burstCounts)
 	}
 }
 
