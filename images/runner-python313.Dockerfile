@@ -2,10 +2,10 @@
 # deploys (spec §4.6, §4.9). Pairs with guest/runners/python313/main.go.
 # Content-addressed, staged to /srv/fc/base/runner-python313.ext4.
 #
-# Tier 1 PR 2 (ADR-052): this base is now AUTO-STAGED by imaged at
-# startup via pkg/imaged/base_stage.go::EnsureBases, mirroring the
-# builder-base path. The operator recipe below remains valid for
-# boxes that haven't upgraded imaged yet (fallback staging).
+# Tier 1 PR 2 (ADR-052): this base is auto-staged by imaged through
+# pkg/imaged/base_stage.go::EnsureRuntimeBase. Production nodes receive
+# a digest-pinned ref from the deployment pipeline; no manual ext4 copy is
+# part of the supported workflow.
 #
 # The two-drive scheme amortizes this base across every python313 app
 # on the box — per-app cost is just the customer's site-packages +

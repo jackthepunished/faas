@@ -3,6 +3,14 @@ set -euo pipefail
 
 image_ref=${1:?image reference is required}
 runtime_image=${2:?runtime image name is required}
+expected_platform=${3:-linux/amd64}
+
+expected_os=${expected_platform%%/*}
+expected_arch=${expected_platform##*/}
+if [[ "${expected_os}" == "${expected_platform}" || -z "${expected_os}" || -z "${expected_arch}" ]]; then
+  echo "expected platform must be OS/ARCH, got ${expected_platform}" >&2
+  exit 2
+fi
 
 case "${runtime_image}" in
   base-debian-parent)
@@ -27,6 +35,12 @@ case "${runtime_image}" in
     exit 2
     ;;
 esac
+
+actual_platform=$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "${image_ref}")
+if [[ "${actual_platform}" != "${expected_platform}" ]]; then
+  echo "::error::${image_ref} has platform ${actual_platform}, want ${expected_platform}" >&2
+  exit 1
+fi
 
 container_id=$(docker create --entrypoint /bin/sh "${image_ref}" -c true)
 rootfs_tar=""
@@ -55,4 +69,11 @@ for path in "${required[@]}"; do
     exit 1
   fi
 done
+
+# The OCI image is also booted as a container here. Runtime bases deliberately
+# receive the Firecracker PID 1 binary during imaged's ext4 staging, so this
+# checks the shell contract at the OCI boundary and the staged /sbin/init
+# contract is checked by the runtime smoke script below.
+docker run --rm --platform "${expected_platform}" --entrypoint /bin/sh "${image_ref}" \
+  -ceu 'test -x /bin/sh && test -r /etc/passwd'
 echo "OK: ${image_ref} contains the ${runtime_image} rootfs contract"
