@@ -29,6 +29,7 @@
 package fcvm
 
 import (
+	"bufio"
 	"os/exec"
 	"syscall"
 	"testing"
@@ -45,6 +46,46 @@ func spawnPy3(t *testing.T, script string) *exec.Cmd {
 	cmd := exec.Command("python3", "-c", script)
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start python3: %v", err)
+	}
+	return cmd
+}
+
+// spawnPy3Ready starts a child that prints "ready" after installing its
+// signal handler and waits for that handshake before returning. A fixed sleep
+// is not sufficient under -race and a busy hosted runner: the child can still
+// be between exec and signal.signal() when the test sends SIGTERM, making a
+// handler test accidentally exercise the default-kill path.
+func spawnPy3Ready(t *testing.T, script string) *exec.Cmd {
+	t.Helper()
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skipf("python3 not available: %v", err)
+	}
+	cmd := exec.Command("python3", "-c", script)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("stdout pipe: %v", err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start python3: %v", err)
+	}
+	ready := make(chan string, 1)
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		if scanner.Scan() {
+			ready <- scanner.Text()
+			return
+		}
+		ready <- ""
+	}()
+	select {
+	case line := <-ready:
+		if line != "ready" {
+			_ = cmd.Process.Kill()
+			t.Fatalf("python3 readiness handshake = %q, want ready", line)
+		}
+	case <-time.After(5 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatal("timed out waiting for python3 readiness handshake")
 	}
 	return cmd
 }
@@ -82,14 +123,14 @@ const readyDelay = 100 * time.Millisecond
 // Python SystemExit path which can race with the in-progress
 // C-level sleep on some platforms).
 func TestSignalAndKillRace_CleanExit(t *testing.T) {
-	cmd := spawnPy3(t, `
+	cmd := spawnPy3Ready(t, `
 import signal, os, time
 def h(s, f): os._exit(0)
 signal.signal(signal.SIGTERM, h)
+print("ready", flush=True)
 time.sleep(60)`)
 	done := make(chan struct{})
 	watchChild(cmd, done)
-	time.Sleep(readyDelay) // let child set up signal handler
 
 	start := time.Now()
 	killed, code, err := signalAndKillRace(cmd, done, syscall.SIGTERM, 3*time.Second, 2*time.Second)
@@ -114,13 +155,13 @@ time.sleep(60)`)
 // signalAndKillRace escalates to SIGKILL. killSignalSent=true
 // regardless of exit code.
 func TestSignalAndKillRace_GraceExpiresEscalates(t *testing.T) {
-	cmd := spawnPy3(t, `
+	cmd := spawnPy3Ready(t, `
 import signal, time
 signal.signal(signal.SIGTERM, signal.SIG_IGN)
+print("ready", flush=True)
 time.sleep(60)`)
 	done := make(chan struct{})
 	watchChild(cmd, done)
-	time.Sleep(readyDelay) // let child set up signal handler
 
 	start := time.Now()
 	killed, _, err := signalAndKillRace(cmd, done, syscall.SIGTERM, 500*time.Millisecond, 2*time.Second)
