@@ -70,6 +70,7 @@ const (
 // up Postgres.
 type AppStore interface {
 	ListAllApps(ctx context.Context) ([]state.App, error)
+	ListAppsByNodeID(ctx context.Context, nodeID string) ([]state.App, error)
 }
 
 // Ledger is the read-only slice of NodeLedger the trigger needs.
@@ -229,6 +230,10 @@ type Trigger struct {
 	log      *slog.Logger
 	interval time.Duration
 
+	// ownerNodeID is the durable shard key this schedd scales. Empty
+	// preserves the central/legacy posture and reads all apps.
+	ownerNodeID string
+
 	// per-app sliding window of per-instance max-inflight. Reads
 	// from instats on each Tick; the window keeps the most recent
 	// reading so the trigger can debounce single-tick spikes.
@@ -283,6 +288,15 @@ func (t *Trigger) Interval() time.Duration {
 	return t.interval
 }
 
+// WithOwnerNodeID scopes the trigger to apps owned by this schedd's
+// compute node. Empty preserves the central one-box posture.
+func (t *Trigger) WithOwnerNodeID(nodeID string) {
+	if t == nil {
+		return
+	}
+	t.ownerNodeID = nodeID
+}
+
 // admit requests a bounded batch. Production's sched.Engine implements the
 // BurstEngine fast path; small adapters and existing tests intentionally fall
 // back to the original one-at-a-time call. The engine remains the authority on
@@ -319,7 +333,13 @@ func (t *Trigger) Tick(ctx context.Context) error {
 		return nil
 	}
 	now := time.Now()
-	apps, err := t.appStore.ListAllApps(ctx)
+	var apps []state.App
+	var err error
+	if t.ownerNodeID != "" {
+		apps, err = t.appStore.ListAppsByNodeID(ctx, t.ownerNodeID)
+	} else {
+		apps, err = t.appStore.ListAllApps(ctx)
+	}
 	if err != nil {
 		return fmt.Errorf("targets: list apps: %w", err)
 	}

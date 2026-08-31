@@ -1425,6 +1425,36 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		engine.ReconcileDeadNodeInstances,
 		time.Duration(dnrInterval)*time.Second,
 		log))
+	// Issue #171: share a single HTTPPromScraper between the RPS
+	// scale-up trigger and the aggressive-reaper signal mirror.
+	// The concurrent_requests and CPU triggers do not depend on the
+	// optional gateway metrics endpoint, so an empty metrics URL must
+	// not disable those workers.
+	var scraper scaleup.PromScraper
+	if cfg.GatewayMetricsURL != "" {
+		scraper = scaleup.NewHTTPPromScraper(cfg.GatewayMetricsURL)
+	}
+	trigger := scaleup.New(
+		// PR-C (issue #462): thread the *instancestats.Reader
+		// into the scale-up trigger so InstatsReader.MaxCPU
+		// is callable. The reader was nil before PR-B / PR-C;
+		// PR-B added the accessor; PR-C wires the dependency
+		// so the trigger can consult live CPU values alongside
+		// the RPS scrape. MaxInflightForApp is exposed by the
+		// same interface but the scaleup trigger itself does
+		// not read it (the concurrent_requests axis lives in
+		// pkg/sched/targets — see loop.WithTargets below).
+		store, reader, scraper,
+		schedScaleUpEngine{engine: engine},
+		engine.Ledger(),
+		scaleup.Options{
+			Logger:   log,
+			Metrics:  ops,
+			Interval: cfg.ScaleUpInterval,
+		},
+	)
+	trigger.WithOwnerNodeID(ownerNodeID)
+	loop.WithScaleUp(trigger)
 	// The concurrent_requests trigger consumes the instance-stats reader
 	// directly and must not depend on the optional Prometheus scrape URL.
 	// Keep this wiring independent so disabling GatewayMetricsURL only
@@ -1440,88 +1470,60 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 				Interval: cfg.ScaleUpInterval,
 			},
 		)
+		targetsTrigger.WithOwnerNodeID(ownerNodeID)
 		loop.WithTargets(targetsTrigger)
 		log.Info("concurrent_requests target trigger enabled",
 			"interval", cfg.ScaleUpInterval,
-			"prometheus_metrics_url_configured", cfg.GatewayMetricsURL != "")
-	}
-	if cfg.GatewayMetricsURL != "" {
-		// Issue #171: share a single HTTPPromScraper between the
-		// scale-up trigger and the aggressive-reaper signal mirror.
-		// The scraper surface is stateless (one Scrape call → one
-		// HTTP GET + parse); two callers are safe and a shared
-		// connection keeps gatewayd-internal's listener traffic to ~1
-		// req/sec instead of ~2.
-		var scraper scaleup.PromScraper = scaleup.NewHTTPPromScraper(cfg.GatewayMetricsURL)
-		trigger := scaleup.New(
-			// PR-C (issue #462): thread the *instancestats.Reader
-			// into the scale-up trigger so InstatsReader.MaxCPU
-			// is callable. The reader was nil before PR-B / PR-C;
-			// PR-B added the accessor; PR-C wires the dependency
-			// so the trigger can consult live CPU values alongside
-			// the RPS scrape. MaxInflightForApp is exposed by the
-			// same interface but the scaleup trigger itself does
-			// not read it (the concurrent_requests axis lives in
-			// pkg/sched/targets — see loop.WithTargets below).
-			store, reader, scraper,
-			schedScaleUpEngine{engine: engine},
-			engine.Ledger(),
-			scaleup.Options{
-				Logger:   log,
-				Metrics:  ops,
-				Interval: cfg.ScaleUpInterval,
-			},
-		)
-		loop.WithScaleUp(trigger)
-		// Issue #557 / ADR-071: proactive min-instances floor
-		// reconciler. Walks every app the schedd owns each tick and
-		// admits instances up to the effective floor (max of legacy
-		// column + ScalingPolicy jsonb). Distinct from the scale-up
-		// and targets triggers — those are reactive (RPS / CPU /
-		// inflight signal); the floor trigger is proactive, the
-		// customer's SLA is "min N resident at all times". Uses the
-		// same engine + ledger as the other triggers so the engine's
-		// wake-gate remains the single admission authority.
-		//
-		// FAAS_FLOOR_INTERVAL_SECONDS overrides the trigger cadence
-		// (operator can dampen during incidents without restarting).
-		// Default falls back to cfg.ScaleUpInterval so a single
-		// shared dial governs all three triggers when no env is set;
-		// api.FloorDecisionIntervalSeconds (1s) is the trigger's own
-		// last-resort default. A non-positive / unparseable env
-		// returns a typed error so a typo surfaces at boot rather
-		// than silently damping the floor reconciler off.
-		floorInterval := cfg.ScaleUpInterval
-		if v := os.Getenv("FAAS_FLOOR_INTERVAL_SECONDS"); v != "" {
-			n, parseErr := strconv.Atoi(v)
-			if parseErr != nil || n <= 0 {
-				return fmt.Errorf("FAAS_FLOOR_INTERVAL_SECONDS: %s", v)
-			}
-			floorInterval = time.Duration(n) * time.Second
-		}
-		floorTrigger := floor.New(
-			store,
-			store, // deploymentStore — issue #557 closure / ADR-074 (per-deployment walk)
-			schedFloorLedger{ledger: engine.Ledger()},
-			schedFloorEngine{engine: engine},
-			floor.Options{
-				Logger:       log,
-				Metrics:      ops,
-				Interval:     floorInterval,
-				Auditor:      schedulerAuditor,
-				PlanResolver: schedFloorPlanResolver{store: store},
-			},
-		)
-		floorTrigger.WithOwnerNodeID(ownerNodeID)
-		loop.WithFloor(floorTrigger)
-		log.Info("min-instances floor reconciler enabled",
-			"interval", floorInterval,
 			"owner_node_id", ownerNodeID)
-		// Issue #171: wire the recent-load mirror off the same
-		// scraper so the reaper sees per-app RPS without duplicating
-		// the scraping wiring. nil scraper ⇒ mirror is a no-op
-		// (recentload.New handles nil); the loop's WithRecentLoad
-		// nil-check keeps the ticker + runReaper block disabled.
+	}
+	// Issue #557 / ADR-071: proactive min-instances floor
+	// reconciler. Walks every app the schedd owns each tick and
+	// admits instances up to the effective floor (max of legacy
+	// column + ScalingPolicy jsonb). Distinct from the scale-up
+	// and targets triggers — those are reactive (RPS / CPU /
+	// inflight signal); the floor trigger is proactive, the
+	// customer's SLA is "min N resident at all times". Uses the
+	// same engine + ledger as the other triggers so the engine's
+	// wake-gate remains the single admission authority.
+	//
+	// FAAS_FLOOR_INTERVAL_SECONDS overrides the trigger cadence
+	// (operator can dampen during incidents without restarting).
+	// Default falls back to cfg.ScaleUpInterval so a single
+	// shared dial governs all three triggers when no env is set;
+	// api.FloorDecisionIntervalSeconds (1s) is the trigger's own
+	// last-resort default. A non-positive / unparseable env
+	// returns a typed error so a typo surfaces at boot rather
+	// than silently damping the floor reconciler off.
+	floorInterval := cfg.ScaleUpInterval
+	if v := os.Getenv("FAAS_FLOOR_INTERVAL_SECONDS"); v != "" {
+		n, parseErr := strconv.Atoi(v)
+		if parseErr != nil || n <= 0 {
+			return fmt.Errorf("FAAS_FLOOR_INTERVAL_SECONDS: %s", v)
+		}
+		floorInterval = time.Duration(n) * time.Second
+	}
+	floorTrigger := floor.New(
+		store,
+		store, // deploymentStore — issue #557 closure / ADR-074 (per-deployment walk)
+		schedFloorLedger{ledger: engine.Ledger()},
+		schedFloorEngine{engine: engine},
+		floor.Options{
+			Logger:       log,
+			Metrics:      ops,
+			Interval:     floorInterval,
+			Auditor:      schedulerAuditor,
+			PlanResolver: schedFloorPlanResolver{store: store},
+		},
+	)
+	floorTrigger.WithOwnerNodeID(ownerNodeID)
+	loop.WithFloor(floorTrigger)
+	log.Info("min-instances floor reconciler enabled",
+		"interval", floorInterval,
+		"owner_node_id", ownerNodeID)
+	// Issue #171: wire the recent-load mirror off the same scraper so the
+	// reaper sees per-app RPS without duplicating the scraping wiring.
+	// It has no signal source when the optional endpoint is not configured.
+	if scraper != nil {
 		mirror := recentload.New(scraper, api.ScaleUpWindowSeconds, time.Second)
 		loop.WithRecentLoad(mirror)
 		log.Info("autoscale signal mirror enabled",
