@@ -442,7 +442,9 @@ func (p *Provider) doJSON(ctx context.Context, method, path string, in, out any,
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		errorBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
 		return &APIError{Status: resp.StatusCode, Body: string(errorBody)}
