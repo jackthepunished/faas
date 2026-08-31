@@ -3015,17 +3015,12 @@ func (s *server) getUsage(w http.ResponseWriter, r *http.Request, acct state.Acc
 // into here with the network-trusted plan). M5 keeps this minimal —
 // the table is wired, full dunning flow lands with M7 + meterd.
 //
-// Issue #142: also gate every paid upgrade on the account having a
-// Stripe subscription item. Previously the handler accepted any valid
-// plan from any authenticated bearer token, which let a Free account
-// self-upgrade to Pro/Scale via API key alone — getting 1024 MB RAM,
-// 25 deployments, 5 concurrent instances, with no Stripe subscription
-// to invoice. meterd's quota tick skips customers with empty
-// StripeSubscriptionItem so the overage was silently absorbed. The
-// gate below 402s with a billing portal URL pointing at the Stripe
-// checkout path; the Stripe webhook remains the legitimate way to
-// land on a paid plan (it stamps StripeSubscriptionItem on the way
-// through).
+// Paid upgrades are provider-confirmed operations. Previously the handler
+// accepted a valid paid plan from any authenticated bearer token, and the
+// free → hobby exception also let a customer self-upgrade without payment.
+// The gate below returns a hosted checkout for a new subscription, or a
+// provider portal link for an existing subscription. The webhook remains the
+// only legitimate path to land on a paid plan locally.
 func (s *server) changePlan(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	var req struct {
 		Plan string `json:"plan"`
@@ -3040,11 +3035,12 @@ func (s *server) changePlan(w http.ResponseWriter, r *http.Request, acct state.A
 			"Bad plan", "plan must be free|hobby|pro|scale"))
 		return
 	}
-	// Issue #142 gate: any paid upgrade that does not have a Stripe
-	// subscription item on the account is blocked. Downgrades and
-	// same-tier moves always pass; the free → hobby M5 path is the
-	// only free → paid direct upgrade.
-	if acct.Plan.RequiresStripeUpgradeTo(plan) && acct.StripeSubscriptionItem == "" {
+	// Any paid tier increase must be confirmed by the billing provider. A
+	// customer with an existing subscription is sent to the provider portal
+	// so the provider can change the product without creating a duplicate
+	// subscription; a customer without one gets a hosted checkout when the
+	// active provider supports it.
+	if acct.Plan.RequiresBillingUpgradeTo(plan) {
 		// CodeQL go/log-injection (CWE-117): plan was enum-validated
 		// against the 4 Plan constants (free|hobby|pro|scale) by
 		// plan.Valid() in this handler, but CodeQL's taint engine
@@ -3059,29 +3055,24 @@ func (s *server) changePlan(w http.ResponseWriter, r *http.Request, acct state.A
 			Status: http.StatusPaymentRequired,
 			Code:   api.CodePayment,
 			Title:  "Billing subscription required",
-			// The "faas billing retry" hint matches the dunning
-			// email copy at pkg/mail/account.go:107,150 so a
-			// customer who lands here from a failed-charge path
-			// (vs a clean free→paid path) sees the same command
-			// the mailer told them to run. Issue #242.
-			Detail: "plan upgrades to " + string(plan) + " require an active subscription; run `faas billing retry` to recover from a failed charge, or complete checkout to upgrade",
+			Detail: "plan upgrades to " + string(plan) + " require billing confirmation; update the payment method in the billing portal or complete checkout to upgrade",
 		}
-		// Provider dispatch: if the active provider has a real upgrade
-		// path (Paddle), call CreateUpgradeTransaction and surface the
-		// hosted checkout URL + tx handle on the Problem. The Stripe
-		// stub returns ("", "", nil) — apid reads txID == "" to fall
-		// through to the precomputed FAAS_BILLING_PORTAL_URL template
-		// (which the operator controls per environment).
+		// Provider dispatch: if the active provider has a real checkout
+		// path (Paddle or Polar) and there is no existing subscription,
+		// call CreateUpgradeTransaction and surface the
+		// hosted checkout URL + tx handle on the Problem. A provider
+		// without checkout returns ("", "", nil) — apid reads txID == ""
+		// to fall through to a provider session or the precomputed
+		// FAAS_BILLING_PORTAL_URL template.
 		//
-		// No-provider box (FAAS_BILLING_PROVIDER unset) and Stripe both
-		// land here with the same template response, so the pre-PR-#3
-		// Stripe path is bit-for-bit unchanged.
+		// A provider without checkout and a no-provider box land here with
+		// the configured portal fallback.
 		//
 		// Capabilities() is the primary dispatch signal (added in
 		// PR-P1 of the pluggable-billing rollout). The txID == "" check
 		// stays as a defensive fallback for any provider wired before
 		// the capability introspection was introduced.
-		if s.billingProvider != nil && s.billingProvider.Capabilities().Has(billing.CapHostedCheckout) {
+		if acct.StripeSubscriptionItem == "" && s.billingProvider != nil && s.billingProvider.Capabilities().Has(billing.CapHostedCheckout) {
 			// PR-P3: Paddle's CreateUpgradeTransaction requires an
 			// existing Paddle customer (ctm_…) to attach the
 			// subscription to. Stripe's path does not need this
@@ -3145,13 +3136,19 @@ func (s *server) changePlan(w http.ResponseWriter, r *http.Request, acct state.A
 				return
 			}
 			if txID != "" {
-				prob.PaddleCheckoutURL = checkoutURL
+				prob.CheckoutURL = checkoutURL
+				if providerName(s.billingProvider) != "polar" {
+					// Keep the legacy field for existing hosted-checkout SDK
+					// compatibility. New clients should consume the
+					// provider-neutral checkout_url.
+					prob.PaddleCheckoutURL = checkoutURL
+				}
 				prob.TxID = txID
 				api.WriteProblem(w, prob)
 				return
 			}
 		}
-		prob.BillingPortalURL = s.billingPortalURLFor(acct)
+		prob.BillingPortalURL = s.billingPortalURLForProvider(r.Context(), acct)
 		api.WriteProblem(w, prob)
 		return
 	}
@@ -4426,10 +4423,10 @@ func (s *server) usageStorage(w http.ResponseWriter, r *http.Request, acct state
 }
 
 // getBillingPortal serves GET /v1/billing/portal — issue #253. It
-// returns the operator-configured Stripe billing portal URL for the
-// authenticated account. The URL itself does not mutate anything; the
-// customer-facing mutations (card update, cancel, plan change) live
-// inside the Stripe-hosted portal that the URL points to.
+// returns a provider-authenticated customer portal session when the active
+// provider supports it, otherwise the operator-configured fallback URL. The
+// URL itself does not mutate anything; customer-facing billing mutations
+// remain inside the provider-hosted portal.
 //
 // Auth: standard /v1/* Bearer-or-cookie chain (server.go:703 cluster).
 // We deliberately do NOT require MFA — viewing a portal link is a
@@ -4442,7 +4439,7 @@ func (s *server) usageStorage(w http.ResponseWriter, r *http.Request, acct state
 // payload, not the status. The CLI branches on the empty string to
 // print a friendly "portal not configured" hint.
 func (s *server) getBillingPortal(w http.ResponseWriter, r *http.Request, acct state.Account) {
-	writeJSON(w, http.StatusOK, api.BillingPortalResponse{URL: s.billingPortalURLFor(acct)})
+	writeJSON(w, http.StatusOK, api.BillingPortalResponse{URL: s.billingPortalURLForProvider(r.Context(), acct)})
 }
 
 // listInvoices serves GET /v1/invoices — issue #259 invoice history.

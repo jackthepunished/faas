@@ -242,6 +242,9 @@ func ApplyBillingEnvOverlay(cfg *RootBillingConfig, env func(string) string) *Ro
 	if v := env("FAAS_POLAR_USAGE_EVENT_NAME"); v != "" {
 		cfg.Polar.UsageEventName = v
 	}
+	if v := env("FAAS_POLAR_METER_ID"); v != "" {
+		cfg.Polar.MeterID = v
+	}
 	if v := env("FAAS_POLAR_SUCCESS_URL"); v != "" {
 		cfg.Polar.SuccessURL = v
 	}

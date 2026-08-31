@@ -30,6 +30,10 @@ type Config struct {
 
 	// UsageEventName must match the name used by the Polar meter filter.
 	UsageEventName string `toml:"usage_event_name"`
+	// MeterID is the Polar meter UUID used by the optional usage
+	// reconciliation read path. The meter itself is configured in the
+	// Polar dashboard and must aggregate metadata.gb_ram_hours.
+	MeterID string `toml:"meter_id"`
 	// SuccessURL and ReturnURL are optional hosted-checkout redirects.
 	SuccessURL string `toml:"success_url"`
 	ReturnURL  string `toml:"return_url"`

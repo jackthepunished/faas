@@ -127,6 +127,94 @@ func TestCreateCustomerAndCheckout(t *testing.T) {
 	}
 }
 
+func TestCreateCustomerPortalSession(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/customer-sessions" {
+			http.NotFound(w, r)
+			return
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer polar_test_token" {
+			t.Errorf("authorization = %q, want bearer token", got)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body["external_customer_id"] != "acct-1" {
+			t.Errorf("external_customer_id = %v, want acct-1", body["external_customer_id"])
+		}
+		if body["return_url"] != "https://app.example.com/billing" {
+			t.Errorf("return_url = %v, want app URL", body["return_url"])
+		}
+		_, _ = io.WriteString(w, `{"customer_portal_url":"https://polar.test/portal/session-1"}`)
+	}))
+	defer server.Close()
+
+	p, err := NewProvider(testConfig(server.URL), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := p.CreateCustomerPortalSession(context.Background(), state.Account{ID: "acct-1"}, "https://app.example.com/billing")
+	if err != nil {
+		t.Fatalf("CreateCustomerPortalSession: %v", err)
+	}
+	if got != "https://polar.test/portal/session-1" {
+		t.Fatalf("portal URL = %q, want Polar session URL", got)
+	}
+}
+
+func TestReconcileUsageReadsMeterTotal(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/meters/meter-1/quantities" {
+			http.NotFound(w, r)
+			return
+		}
+		query := r.URL.Query()
+		if query.Get("external_customer_id") != "acct-1" || query.Get("interval") != "hour" || query.Get("timezone") != "UTC" {
+			t.Errorf("query = %v", query)
+		}
+		if query.Get("start_timestamp") == "" || query.Get("end_timestamp") == "" {
+			t.Error("reconciliation time range is missing")
+		}
+		_, _ = io.WriteString(w, `{"quantities":[{"timestamp":"2026-08-31T10:00:00Z","quantity":1.5}],"total":1.5}`)
+	}))
+	defer server.Close()
+
+	cfg := testConfig(server.URL)
+	cfg.MeterID = "meter-1"
+	p, err := NewProvider(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Date(2026, 8, 31, 10, 0, 0, 0, time.UTC)
+	end := start.Add(time.Hour)
+	got, err := p.ReconcileUsage(context.Background(), state.Account{ID: "acct-1"}, start, end)
+	if err != nil {
+		t.Fatalf("ReconcileUsage: %v", err)
+	}
+	want := int64(1.5 * float64(billing.SecondsPerGBHour))
+	if got != want {
+		t.Errorf("ReconcileUsage = %d, want %d", got, want)
+	}
+	if !p.Capabilities().Has(billing.CapUsageReconcile) {
+		t.Fatal("configured meter should advertise CapUsageReconcile")
+	}
+}
+
+func TestReconcileUsageWithoutMeterIsUnsupported(t *testing.T) {
+	p, err := NewProvider(testConfig("http://example.test"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := p.ReconcileUsage(context.Background(), state.Account{ID: "acct-1"}, time.Now().Add(-time.Hour), time.Now())
+	if got != 0 || !errors.Is(err, billing.ErrNotImplemented) {
+		t.Fatalf("ReconcileUsage = %d, %v, want 0/ErrNotImplemented", got, err)
+	}
+	if p.Capabilities().Has(billing.CapUsageReconcile) {
+		t.Fatal("provider without meter should not advertise CapUsageReconcile")
+	}
+}
+
 func TestPushUsageRecordUsesGBRamHoursAndDedupe(t *testing.T) {
 	var calls int
 	var received usageEvent
@@ -202,6 +290,51 @@ func TestVerifyWebhookNormalizesSubscriptionAndScheduledCancel(t *testing.T) {
 	}
 	if cancelEvent.Type != billing.EventSubscriptionUpdated {
 		t.Fatalf("scheduled cancellation mapped to %v, want subscription_updated", cancelEvent.Type)
+	}
+}
+
+func TestVerifyWebhookDoesNotActivateIncompleteSubscription(t *testing.T) {
+	p, err := NewProvider(testConfig("http://example.test"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	when := time.Now().UTC()
+	body := []byte(`{"type":"subscription.created","data":{"id":"sub-pending","customer_id":"customer-1","product_id":"hobby-product","status":"incomplete"}}`)
+	headers := map[string]string{
+		"webhook-id":        "pending-1",
+		"webhook-timestamp": strconv.FormatInt(when.Unix(), 10),
+		"webhook-signature": SignForTest(body, "webhook-secret", "pending-1", when),
+	}
+	ev, err := p.VerifyWebhook(body, headers, 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev.Type != billing.EventUnknown {
+		t.Fatalf("incomplete subscription event = %v, want unknown", ev.Type)
+	}
+	if ev.PlanID != string(api.PlanHobby) || ev.SubscriptionID != "sub-pending" {
+		t.Fatalf("incomplete event lost provider identifiers: %+v", ev)
+	}
+}
+
+func TestVerifyWebhookActivatesActiveCreatedSubscription(t *testing.T) {
+	p, err := NewProvider(testConfig("http://example.test"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	when := time.Now().UTC()
+	body := []byte(`{"type":"subscription.created","data":{"id":"sub-active","customer_id":"customer-1","product_id":"hobby-product","status":"active"}}`)
+	headers := map[string]string{
+		"webhook-id":        "active-1",
+		"webhook-timestamp": strconv.FormatInt(when.Unix(), 10),
+		"webhook-signature": SignForTest(body, "webhook-secret", "active-1", when),
+	}
+	ev, err := p.VerifyWebhook(body, headers, 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev.Type != billing.EventPaymentSucceeded {
+		t.Fatalf("active subscription event = %v, want payment_succeeded", ev.Type)
 	}
 }
 

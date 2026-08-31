@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
@@ -43,6 +44,7 @@ type Provider struct {
 	webhookSecret string
 	baseURL       string
 	usageEvent    string
+	meterID       string
 	products      map[api.Plan]string
 	successURL    string
 	returnURL     string
@@ -99,6 +101,7 @@ func newProvider(cfg Config, log *slog.Logger, dedupe usageDedupe) (*Provider, e
 		webhookSecret: cfg.WebhookSecret,
 		baseURL:       base,
 		usageEvent:    cfg.UsageEventName,
+		meterID:       cfg.MeterID,
 		products: map[api.Plan]string{
 			api.PlanHobby: cfg.HobbyProductID,
 			api.PlanPro:   cfg.ProProductID,
@@ -135,7 +138,13 @@ func (p *Provider) SetWebhookTolerance(d time.Duration) {
 	p.webhookTol = d
 }
 
-func (p *Provider) Capabilities() billing.CapabilitySet { return PolarCapabilities() }
+func (p *Provider) Capabilities() billing.CapabilitySet {
+	caps := PolarCapabilities()
+	if p != nil && strings.TrimSpace(p.meterID) != "" {
+		caps |= billing.CapabilitySet(billing.CapUsageReconcile)
+	}
+	return caps
+}
 
 // ClassifyPushError satisfies billing.Classifier while keeping Polar's
 // provider-specific error taxonomy in errors.go.
@@ -320,12 +329,68 @@ func (p *Provider) CreateUpgradeTransaction(ctx context.Context, acct state.Acco
 	return checkout.ID, checkout.URL, nil
 }
 
-// ReconcileUsage is intentionally not advertised. Polar's quantities endpoint
-// requires a configured meter ID and reports a floating-point meter quantity;
-// the current billing.Provider contract needs an exact mb_seconds total. The
-// local hourly dedupe and audit metadata remain the authoritative write path.
-func (p *Provider) ReconcileUsage(context.Context, state.Account, time.Time, time.Time) (int64, error) {
-	return 0, billing.ErrNotImplemented
+type customerSessionResponse struct {
+	PortalURL string `json:"customer_portal_url"`
+}
+
+// CreateCustomerPortalSession returns a short-lived authenticated Polar
+// customer portal URL. Polar identifies the customer by the same external
+// account ID used by checkout and usage ingestion.
+func (p *Provider) CreateCustomerPortalSession(ctx context.Context, acct state.Account, returnURL string) (string, error) {
+	if acct.ID == "" {
+		return "", errors.New("polar: customer portal requires account ID")
+	}
+	body := map[string]any{"external_customer_id": acct.ID}
+	if returnURL != "" {
+		body["return_url"] = returnURL
+	}
+	var session customerSessionResponse
+	if err := p.doJSON(ctx, http.MethodPost, "/v1/customer-sessions", body, &session, ""); err != nil {
+		return "", fmt.Errorf("polar: create customer portal session account=%s: %w", acct.ID, err)
+	}
+	if session.PortalURL == "" {
+		return "", fmt.Errorf("polar: create customer portal session account=%s returned empty URL", acct.ID)
+	}
+	return session.PortalURL, nil
+}
+
+type quantitiesResponse struct {
+	Total float64 `json:"total"`
+}
+
+// ReconcileUsage reads the configured Polar meter's total for the account and
+// converts the gb_ram_hours meter quantity back to the exact local
+// mb_seconds unit used by the drift detector. Polar's API exposes quantities
+// as a number, so the conversion rounds only at the final integer boundary.
+func (p *Provider) ReconcileUsage(ctx context.Context, acct state.Account, start, end time.Time) (int64, error) {
+	if strings.TrimSpace(p.meterID) == "" {
+		return 0, billing.ErrNotImplemented
+	}
+	if acct.ID == "" {
+		return 0, errors.New("polar: usage reconciliation requires account ID")
+	}
+	if start.IsZero() || end.IsZero() || !start.Before(end) {
+		return 0, errors.New("polar: usage reconciliation requires start before end")
+	}
+	query := url.Values{}
+	query.Set("start_timestamp", start.UTC().Format(time.RFC3339Nano))
+	query.Set("end_timestamp", end.UTC().Format(time.RFC3339Nano))
+	query.Set("interval", "hour")
+	query.Set("timezone", "UTC")
+	query.Set("external_customer_id", acct.ID)
+	var quantities quantitiesResponse
+	path := "/v1/meters/" + url.PathEscape(p.meterID) + "/quantities?" + query.Encode()
+	if err := p.doJSON(ctx, http.MethodGet, path, nil, &quantities, ""); err != nil {
+		return 0, fmt.Errorf("polar: reconcile usage account=%s: %w", acct.ID, err)
+	}
+	if math.IsNaN(quantities.Total) || math.IsInf(quantities.Total, 0) || quantities.Total < 0 {
+		return 0, fmt.Errorf("polar: reconcile usage account=%s returned invalid total %v", acct.ID, quantities.Total)
+	}
+	mbSeconds := quantities.Total * float64(billing.SecondsPerGBHour)
+	if mbSeconds > float64(math.MaxInt64) {
+		return 0, fmt.Errorf("polar: reconcile usage account=%s total overflows int64", acct.ID)
+	}
+	return int64(math.Round(mbSeconds)), nil
 }
 
 type refundResponse struct {

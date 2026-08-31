@@ -11242,6 +11242,20 @@ func (m *MemStore) PaddleOverageDedupeSchema(_ context.Context) (PaddleOverageDe
 // in-memory map size bounded under long test runs. Returns false
 // on an absent row OR on an expired row (caller's `cutoff` is
 // computed as now()-TTL by pkg/webhookdedupe).
+func (m *MemStore) ClaimWebhookDelivery(_ context.Context, provider, deliveryID string, cutoff, expiresAt time.Time) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.webhookDeliveries == nil {
+		m.webhookDeliveries = map[webhookDeliveryKey]time.Time{}
+	}
+	key := webhookDeliveryKey{provider: provider, deliveryID: deliveryID}
+	if existing, ok := m.webhookDeliveries[key]; ok && existing.UTC().After(cutoff.UTC()) {
+		return false, nil
+	}
+	m.webhookDeliveries[key] = expiresAt.UTC()
+	return true, nil
+}
+
 func (m *MemStore) CheckWebhookReplay(_ context.Context, provider, deliveryID string, cutoff time.Time) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

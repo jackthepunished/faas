@@ -42,6 +42,7 @@
 //	FAAS_POLAR_ACCESS_TOKEN required when Polar is active (apid + meterd)
 //	FAAS_POLAR_WEBHOOK_SECRET required when Polar is active (apid only)
 //	FAAS_POLAR_SANDBOX      "1" / "true" to use sandbox-api.polar.sh (apid + meterd)
+//	FAAS_POLAR_METER_ID    optional; enables usage reconciliation
 //
 // TOML config precedence: env > TOML > Defaults. The daemon's
 // LoadConfig reads the [billing] block from its TOML file via
@@ -147,6 +148,9 @@ func resolvedPolarConfig(cfg *RootBillingConfig, env func(string) string) polar.
 	}
 	if v := env("FAAS_POLAR_USAGE_EVENT_NAME"); v != "" {
 		out.UsageEventName = v
+	}
+	if v := env("FAAS_POLAR_METER_ID"); v != "" {
+		out.MeterID = v
 	}
 	if v := env("FAAS_POLAR_SUCCESS_URL"); v != "" {
 		out.SuccessURL = v
@@ -326,6 +330,7 @@ func Providers() []ProviderMeta {
 				"FAAS_POLAR_ACCESS_TOKEN", "FAAS_POLAR_WEBHOOK_SECRET",
 				"FAAS_POLAR_SANDBOX", "FAAS_POLAR_HOBBY_PRODUCT_ID",
 				"FAAS_POLAR_PRO_PRODUCT_ID", "FAAS_POLAR_SCALE_PRODUCT_ID",
+				"FAAS_POLAR_METER_ID",
 			},
 			BuildAPID: func(cfg *RootBillingConfig, env func(string) string, log *slog.Logger) (any, error) {
 				p, err := polar.NewProvider(resolvedPolarConfig(cfg, env), log)

@@ -14460,7 +14460,22 @@ func (s *PgStore) PaddleOverageDedupeSchema(ctx context.Context) (PaddleOverageD
 // a dedupe row received on or after cutoff. The PgStore implementation
 // translates a found-row into ErrReplay so callers can branch on a
 // single errors.Is(err, state.ErrReplay) check at the ingress layer.
-// Backing schema: webhook_deliveries (migration 00059).
+// Backing schema: webhook_deliveries (migration 00149, with provider
+// extensions in migration 00587).
+func (s *PgStore) ClaimWebhookDelivery(ctx context.Context, provider, deliveryID string, cutoff, expiresAt time.Time) (bool, error) {
+	tag, err := s.pool.Exec(ctx,
+		`insert into webhook_deliveries (provider, delivery_id, expires_at)
+		 values ($1, $2, $3)
+		 on conflict (provider, delivery_id) do update
+		 set received_at = now(), expires_at = excluded.expires_at
+		 where webhook_deliveries.received_at < $4`,
+		provider, deliveryID, expiresAt.UTC(), cutoff.UTC())
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
 func (s *PgStore) CheckWebhookReplay(ctx context.Context, provider, deliveryID string, cutoff time.Time) (bool, error) {
 	var exists bool
 	err := s.pool.QueryRow(ctx,
@@ -14479,7 +14494,8 @@ func (s *PgStore) CheckWebhookReplay(ctx context.Context, provider, deliveryID s
 // redelivery arrives after the original expires_at but before the
 // sweep runs. The unique constraint is (provider, delivery_id);
 // the provider column is constrained by the
-// webhook_deliveries_provider_check CHECK (added in migration 00059).
+// webhook_deliveries_provider_check CHECK (initial providers in migration
+// 00149; Polar/Resend are added by migration 00587).
 func (s *PgStore) RecordWebhookDelivery(ctx context.Context, provider, deliveryID string, expiresAt time.Time) error {
 	_, err := s.pool.Exec(ctx,
 		`insert into webhook_deliveries (provider, delivery_id, expires_at)

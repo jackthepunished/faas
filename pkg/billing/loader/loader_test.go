@@ -16,6 +16,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/onebox-faas/faas/pkg/billing"
 	"github.com/onebox-faas/faas/pkg/billing/paddle"
 	"github.com/onebox-faas/faas/pkg/billing/polar"
 	"github.com/onebox-faas/faas/pkg/billing/stripe"
@@ -144,6 +145,7 @@ func TestLoadProviderForAPID_Polar_BuildsProvider(t *testing.T) {
 		"FAAS_POLAR_PRO_PRODUCT_ID":            "pro-product",
 		"FAAS_POLAR_SCALE_PRODUCT_ID":          "scale-product",
 		"FAAS_POLAR_USAGE_EVENT_NAME":          "ram_usage",
+		"FAAS_POLAR_METER_ID":                  "meter-1",
 		"FAAS_POLAR_SANDBOX":                   "true",
 		"FAAS_POLAR_WEBHOOK_TOLERANCE_SECONDS": "120",
 	})
@@ -157,6 +159,9 @@ func TestLoadProviderForAPID_Polar_BuildsProvider(t *testing.T) {
 	}
 	if _, ok := p.(*polar.Provider); !ok {
 		t.Fatalf("provider = %T, want *polar.Provider", p)
+	}
+	if !p.Capabilities().Has(billing.CapUsageReconcile) {
+		t.Fatal("configured Polar meter should enable CapUsageReconcile")
 	}
 }
 

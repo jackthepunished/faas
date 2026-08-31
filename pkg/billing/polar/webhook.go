@@ -160,8 +160,20 @@ func parsePolarEvent(payload []byte, eventID string, p *Provider) (billing.Event
 func mapPolarEventType(eventType string, data map[string]any) billing.EventType {
 	switch eventType {
 	case "subscription.created":
-		return billing.EventSubscriptionCreated
+		// Polar can create the subscription before the first payment has
+		// completed. Only an active subscription is allowed to grant the
+		// local paid entitlement; an incomplete event is intentionally a
+		// no-op until order.paid or subscription.active arrives.
+		if stringValue(data["status"]) == "active" {
+			return billing.EventPaymentSucceeded
+		}
+		return billing.EventUnknown
 	case "subscription.updated", "subscription.uncanceled":
+		// Do not let an incomplete subscription.updated event set a paid
+		// plan before the first successful payment either.
+		if stringValue(data["status"]) != "active" {
+			return billing.EventUnknown
+		}
 		return billing.EventSubscriptionUpdated
 	case "subscription.active":
 		return billing.EventPaymentSucceeded
@@ -173,7 +185,7 @@ func mapPolarEventType(eventType string, data map[string]any) billing.EventType 
 		// Polar sends this immediately for a scheduled cancellation while
 		// the subscription is still active. Do not suspend the account until
 		// the eventual revoked event.
-		if boolValue(data["cancel_at_period_end"]) || stringValue(data["status"]) == "active" {
+		if stringValue(data["status"]) == "active" && boolValue(data["cancel_at_period_end"]) {
 			return billing.EventSubscriptionUpdated
 		}
 		return billing.EventSubscriptionCanceled
