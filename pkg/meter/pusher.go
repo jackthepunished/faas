@@ -209,13 +209,13 @@ func (p *Pusher) PushPending(ctx context.Context, lookback time.Duration) (int, 
 			if firstErr == nil {
 				firstErr = perr
 			}
-			p.log.Warn("meter: replay usage", "account", acct.ID, "hour", window.Hour,
-				"code", code, "mb_seconds", window.MBSeconds, "err", perr)
+			p.log.Warn("meter: push usage", "account", acct.ID, "hour", window.Hour,
+				"replay", true, "code", code, "mb_seconds", window.MBSeconds, "err", perr)
 			continue
 		}
 		pushed++
-		p.log.Info("meter: replay usage", "account", acct.ID, "hour", window.Hour,
-			"code", code, "mb_seconds", window.MBSeconds)
+		p.log.Info("meter: push usage", "account", acct.ID, "hour", window.Hour,
+			"replay", true, "code", code, "mb_seconds", window.MBSeconds)
 	}
 	return pushed, firstErr
 }
