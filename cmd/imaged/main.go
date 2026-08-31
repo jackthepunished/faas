@@ -365,6 +365,7 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 		WithNodeName(os.Getenv("FAAS_NODE_NAME")).
 		WithStorage(storageBackend).
 		WithRuntimeBaseStaging().
+		WithBaseArtifactValidator(imaged.ValidateBaseArtifact).
 		WithArtifactReplicator(artifactReplicator).
 		WithOpsMetrics(ops).
 		// Issue #472 / ADR-054: per-app cosign signature-enforcement

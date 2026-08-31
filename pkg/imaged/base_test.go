@@ -241,3 +241,29 @@ func TestResolveDeployBaseRef_PerRuntimeEnvOverride(t *testing.T) {
 		}
 	})
 }
+
+func TestResolveDeployBaseRef_NamedNodeRequiresImmutableDefault(t *testing.T) {
+	envLookup := func(key string) string {
+		if key == "FAAS_NODE_NAME" {
+			return "fsn-2.faas"
+		}
+		return ""
+	}
+	if _, err := resolveDeployBaseRef(RuntimeNode24, envLookup); err == nil || !strings.Contains(err.Error(), "digest-pinned") {
+		t.Fatalf("named node default = %v, want digest-pin error", err)
+	}
+}
+
+func TestResolveDeployBaseRef_MinimalOverride(t *testing.T) {
+	const ref = "ghcr.io/poyrazk/base-minimal@sha256:81d93757457f988523814ae0009837ae893f38d3fe123f2c37896f118b4c7804"
+	envLookup := func(key string) string {
+		if key == "FAAS_DEPLOY_BASE_REF_MINIMAL" {
+			return ref
+		}
+		return ""
+	}
+	got, err := resolveDeployBaseRef("", envLookup)
+	if err != nil || got != ref {
+		t.Fatalf("minimal ref = (%q, %v), want (%q, nil)", got, err, ref)
+	}
+}

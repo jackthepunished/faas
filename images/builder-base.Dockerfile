@@ -123,8 +123,11 @@ ARG RUNC_VERSION
 ARG RUNC_SHA256_AMD64
 ARG RUNC_SHA256_ARM64
 
+# Railpack's mise/python-build path executes Bash scripts. Alpine's BusyBox
+# /bin/sh is not a substitute when invoked as "bash"; keep the real Bash
+# package in the runtime builder rootfs.
 RUN apk add --no-cache \
-      git ca-certificates curl xz shadow-subids fuse-overlayfs util-linux util-linux-misc
+      bash git ca-certificates curl xz shadow-subids fuse-overlayfs util-linux util-linux-misc
 
 # Replace Alpine's runc build with the upstream static release. Besides
 # removing the stale Go standard library embedded in Alpine's package, the

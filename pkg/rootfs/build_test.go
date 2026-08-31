@@ -629,6 +629,70 @@ async def handler(event, ctx):
 	}
 }
 
+func TestNormalizeFunctionHandlerFrom_NodeKeepsSourceAndWritesAdapter(t *testing.T) {
+	staging := t.TempDir()
+	appDir := filepath.Join(staging, "app")
+	if err := os.MkdirAll(appDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const source = "export async function handler(event, ctx) { return event; }"
+	if err := os.WriteFile(filepath.Join(appDir, "handler.js"), []byte(source), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := NormalizeFunctionHandlerFrom(staging, "/app/handler.js", "/app/node24.js"); err != nil {
+		t.Fatalf("NormalizeFunctionHandlerFrom: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(appDir, "node24.js"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(got, []byte("handler.js")) {
+		t.Fatalf("node adapter does not import handler.js: %q", got)
+	}
+	kept, err := os.ReadFile(filepath.Join(appDir, "handler.js"))
+	if err != nil || string(kept) != source {
+		t.Fatalf("source was not preserved: %q (%v)", kept, err)
+	}
+}
+
+func TestNormalizeFunctionHandlerFrom_PythonWrapsInPlace(t *testing.T) {
+	staging := t.TempDir()
+	appDir := filepath.Join(staging, "app")
+	if err := os.MkdirAll(appDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(appDir, "handler.py"), []byte("def handler(event, ctx):\n    return 'ok'\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := NormalizeFunctionHandlerFrom(staging, "/app/handler.py", "/app/handler.py"); err != nil {
+		t.Fatalf("NormalizeFunctionHandlerFrom: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(appDir, ".faas-handler.py")); err != nil {
+		t.Fatalf("implementation was not preserved: %v", err)
+	}
+}
+
+func TestNormalizeFunctionHandlerFrom_GoPreservesExecutableMode(t *testing.T) {
+	staging := t.TempDir()
+	appDir := filepath.Join(staging, "app")
+	if err := os.MkdirAll(appDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(appDir, "server"), []byte("binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := NormalizeFunctionHandlerFrom(staging, "/app/server", "/app/handler"); err != nil {
+		t.Fatalf("NormalizeFunctionHandlerFrom: %v", err)
+	}
+	info, err := os.Stat(filepath.Join(appDir, "handler"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o755 {
+		t.Errorf("handler mode = %o, want 755", info.Mode().Perm())
+	}
+}
+
 // TestApplyTarball_RespectsCap — issue #197 B3.7. A tarball whose
 // single entry's declared size exceeds capBytes must be rejected
 // with *ErrTarballExceedsCap before the file is written to disk.

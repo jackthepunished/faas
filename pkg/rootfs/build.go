@@ -120,6 +120,13 @@ type BuildInput struct {
 	// root; the builder creates the runtime-specific alias when needed.
 	// Empty preserves the plain tarball/image behavior.
 	FunctionHandlerPath string
+	// FunctionHandlerSourcePath, when set, names an already-materialized
+	// handler inside the applied OCI layers. It is copied to
+	// FunctionHandlerPath before the runtime-specific adapter is applied.
+	// This is the source-build path: builderd's OCI export already contains
+	// the dependency tree, so imaged must not unpack the original source
+	// tarball a second time and discard that build output.
+	FunctionHandlerSourcePath string
 	// FunctionRunnerPath, when set, is copied into the layer at
 	// /usr/local/bin/faas-runner so the guest can exec it. Wired from
 	// cmd/imaged's config; empty skips the runner injection.
@@ -220,6 +227,14 @@ func (b *Builder) Build(ctx context.Context, in BuildInput) (BuildResult, error)
 			if err := NormalizeFunctionHandler(staging, in.FunctionHandlerPath); err != nil {
 				return BuildResult{}, err
 			}
+		}
+	}
+	if in.FunctionHandlerSourcePath != "" {
+		if in.FunctionHandlerPath == "" {
+			return BuildResult{}, errors.New("rootfs: function handler source requires a target path")
+		}
+		if err := NormalizeFunctionHandlerFrom(staging, in.FunctionHandlerSourcePath, in.FunctionHandlerPath); err != nil {
+			return BuildResult{}, err
 		}
 	}
 	if in.FunctionRunnerPath != "" {
@@ -714,6 +729,88 @@ func NormalizeFunctionHandler(staging, handlerPath string) error {
 	}
 	if err := os.Rename(source, target); err != nil {
 		return fmt.Errorf("rootfs: alias function handler %s as %s: %w", source, target, err)
+	}
+	return nil
+}
+
+// NormalizeFunctionHandlerFrom makes an already-built handler agree with the
+// runtime runner's manifest path. Unlike NormalizeFunctionHandler, the source
+// and its dependencies have already been applied from an OCI build artifact;
+// only the handler entrypoint needs to be copied/aliased. Keeping this path
+// separate prevents a source tarball from overwriting the dependency-complete
+// Railpack output.
+func NormalizeFunctionHandlerFrom(staging, sourcePath, handlerPath string) error {
+	sourceClean, err := cleanFunctionPath(sourcePath, "source")
+	if err != nil {
+		return err
+	}
+	targetClean, err := cleanFunctionPath(handlerPath, "target")
+	if err != nil {
+		return err
+	}
+	source := filepath.Join(staging, filepath.FromSlash(strings.TrimPrefix(sourceClean, "/")))
+	target := filepath.Join(staging, filepath.FromSlash(strings.TrimPrefix(targetClean, "/")))
+	info, err := os.Stat(source)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("rootfs: function handler source %q not found", sourcePath)
+		}
+		return fmt.Errorf("rootfs: stat function handler source %q: %w", sourcePath, err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("rootfs: function handler source %q is a directory", sourcePath)
+	}
+	if source == target {
+		return normalizeExistingFunctionHandler(target, targetClean)
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return fmt.Errorf("rootfs: create function handler target directory: %w", err)
+	}
+	data, err := os.ReadFile(source)
+	if err != nil {
+		return fmt.Errorf("rootfs: read function handler source %q: %w", sourcePath, err)
+	}
+	if filepath.Ext(target) == ".js" && isNodeFunctionSource(string(data)) {
+		if err := os.WriteFile(target, []byte(nodeFunctionAdapter), 0o644); err != nil {
+			return fmt.Errorf("rootfs: write node function adapter %s: %w", target, err)
+		}
+		return nil
+	}
+	mode := info.Mode().Perm()
+	if err := os.WriteFile(target, data, mode); err != nil {
+		return fmt.Errorf("rootfs: write function handler target %q: %w", handlerPath, err)
+	}
+	if err := os.Chmod(target, mode); err != nil {
+		return fmt.Errorf("rootfs: preserve function handler mode %q: %w", handlerPath, err)
+	}
+	return normalizeExistingFunctionHandler(target, targetClean)
+}
+
+func cleanFunctionPath(path, label string) (string, error) {
+	clean := filepath.ToSlash(filepath.Clean(path))
+	if !strings.HasPrefix(clean, "/app/") || clean == "/app/" {
+		return "", fmt.Errorf("rootfs: invalid function handler %s path %q", label, path)
+	}
+	return clean, nil
+}
+
+func normalizeExistingFunctionHandler(target, handlerPath string) error {
+	info, err := os.Stat(target)
+	if err != nil {
+		return fmt.Errorf("rootfs: stat function handler %q: %w", handlerPath, err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("rootfs: function handler path %q is a directory", handlerPath)
+	}
+	if filepath.Ext(target) != ".py" {
+		return nil
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		return fmt.Errorf("rootfs: read python function source %q: %w", target, err)
+	}
+	if isPythonFunctionSource(string(data)) {
+		return wrapPythonFunctionHandler(target, data)
 	}
 	return nil
 }

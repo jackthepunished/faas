@@ -277,6 +277,9 @@ func resolveDeployBaseRef(runtime string, envLookup func(string) string) (string
 		}
 		v := strings.TrimSpace(envLookup(row.EnvOverride))
 		if v == "" {
+			if err := requireProductionBaseDigest(row.EnvOverride, row.Ref, envLookup); err != nil {
+				return "", err
+			}
 			return row.Ref, nil
 		}
 		parsed, perr := oci.ParseReference(v)
@@ -287,5 +290,28 @@ func resolveDeployBaseRef(runtime string, envLookup func(string) string) (string
 	}
 	// Runtime not in the table (e.g. customer-uploaded image with
 	// runtime="") — fall through to baseRefFor's default (BaseRefMinimal).
-	return baseRefFor(runtime), nil
+	minimalEnv := "FAAS_DEPLOY_BASE_REF_MINIMAL"
+	if v := strings.TrimSpace(envLookup(minimalEnv)); v != "" {
+		parsed, perr := oci.ParseReference(v)
+		if perr != nil || parsed.Digest == "" {
+			return "", fmt.Errorf("imaged: %s=%q must be a digest-pinned reference (e.g. registry.gregale.dev/img@sha256:...)", minimalEnv, v)
+		}
+		return v, nil
+	}
+	ref := baseRefFor(runtime)
+	if err := requireProductionBaseDigest(minimalEnv, ref, envLookup); err != nil {
+		return "", err
+	}
+	return ref, nil
+}
+
+func requireProductionBaseDigest(envKey, ref string, envLookup func(string) string) error {
+	if strings.TrimSpace(envLookup("FAAS_NODE_NAME")) == "" {
+		return nil
+	}
+	parsed, err := oci.ParseReference(ref)
+	if err != nil || parsed.Digest == "" {
+		return fmt.Errorf("imaged: %s must be a digest-pinned reference on named node %q (got %q)", envKey, envLookup("FAAS_NODE_NAME"), ref)
+	}
+	return nil
 }

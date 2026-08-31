@@ -18,13 +18,9 @@
 # on first wake against this base. CGO_ENABLED=0 (Railpack's default)
 # works on both bases and is the drop-in case.
 #
-# Operator staging: build the image in CI, publish to
-# ghcr.io/onebox-faas/runner-go124-alpine, then stage the produced ext4
-# to /srv/fc/base/runner-go124-alpine.ext4 on the EX44 using the same
-# `mkfs.ext4 -O '^has_journal' -d <staging>` recipe the bookworm
-# runner-go124 / runner-node22 / runner-python312 Dockerfiles use.
-# imaged does not auto-stage runtime bases (the established pattern —
-# only the builder base is staged on startup).
+# The image is built and published by CI. imaged resolves the immutable
+# per-runtime reference and auto-stages the matching ext4 on first use, so a
+# newly provisioned compute node does not need a hand-copied runtime image.
 FROM golang:1.24-alpine@sha256:757779acac4af1b349a20f357c7296097b4a0b89da4ad0e370b339060077282a
 # Issue #197 B3.6 (extension): mutable tag pinned via images/Dockerfile.lock.
 

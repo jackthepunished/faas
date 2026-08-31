@@ -532,18 +532,44 @@ func ensureRailpackMise() error {
 	return stageExecutable(railpackMiseSource, railpackMiseTarget)
 }
 
-// ensureBuilderShell ensures /bin/bash and /usr/bin/bash point to a valid shell
-// so python-build / mise scripts with #!/usr/bin/env bash can execute cleanly.
+// builderShellCandidates follows builderPATH's lookup order. A real bash
+// binary is required here: mise's python-build plugin invokes scripts with a
+// #!/usr/bin/env bash shebang, and BusyBox sh is not a compatible substitute.
+var builderShellCandidates = []string{
+	"/usr/local/bin/bash",
+	"/usr/sbin/bash",
+	"/usr/bin/bash",
+	"/sbin/bash",
+	"/bin/bash",
+}
+
+// ensureBuilderShell verifies that the builder image provides a functioning
+// bash executable. Do not synthesize /bin/bash -> /bin/sh: when /bin/sh is
+// BusyBox, invoking it through the name "bash" makes BusyBox look for a bash
+// applet and fail with the misleading "bash: applet not found" error.
 func ensureBuilderShell() error {
-	for _, target := range []string{"/bin/bash", "/usr/bin/bash"} {
-		if _, err := os.Stat(target); os.IsNotExist(err) {
-			_ = os.MkdirAll(filepath.Dir(target), 0o755)
-			if _, shErr := os.Stat("/bin/sh"); shErr == nil {
-				_ = os.Symlink("/bin/sh", target)
+	return validateBuilderShell(builderShellCandidates, builderEnv())
+}
+
+func validateBuilderShell(candidates, env []string) error {
+	for _, candidate := range candidates {
+		if _, err := os.Stat(candidate); err != nil {
+			if os.IsNotExist(err) {
+				continue
 			}
+			return fmt.Errorf("stat %s: %w", candidate, err)
 		}
+		// BASH_VERSION is a Bash-only variable. A BusyBox shell reached through
+		// a bash-named symlink may accept `-c` but is not a valid interpreter
+		// for mise's Bash scripts.
+		cmd := exec.Command(candidate, "-c", `test -n "${BASH_VERSION:-}"`)
+		cmd.Env = env
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("builder shell %s is not a functional bash: %w (%s)", candidate, err, strings.TrimSpace(string(output)))
+		}
+		return nil
 	}
-	return nil
+	return errors.New("builder image does not contain a functional bash executable; install the bash package")
 }
 
 func stageExecutable(source, target string) error {
