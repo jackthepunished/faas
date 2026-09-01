@@ -9,12 +9,13 @@ In order (each role is independent and verifies its own preconditions):
 
 | Role | Spec § | What it touches | Idempotent because |
 |---|---|---|---|
+| `compute_admission` | §4.4 / §11 | compute env, `/dev/kvm`, release manifest | fail-closed assertions before provisioning |
 | `cgroups_v2` | §11 | asserts kernel cmdline | verify-only |
 | `grub` | §11 | `/etc/default/grub`, sysctl | `creates:` sentinel, regex match |
 | `storage` | §8 | provider-neutral `/srv/fc` filesystem and directory contract | reuses valid mounts; initializes only eligible blank devices |
 | `lvm` | §8 | verify lv-system / lv-fc when the reference layout is selected | verify-only |
 | `xfs` | §8 | dedicated fast-root mount, XFS features, `/srv/fc/jail` tmpfs | explicit device contract + `/etc/fstab` |
-| `firecracker` | §4.4 | `/usr/local/bin/{firecracker,jailer}`, `/srv/fc/base/vmlinux-6.1` | `creates:` + SHA-256 pin |
+| `firecracker` | §4.4 | `/usr/local/bin/{firecracker,jailer}`, `/srv/fc/base/vmlinux-6.1` | content checksums + config-aware rebuild |
 | `systemd_slices` | §13 | three `.slice` unit drops | `creates:` on each |
 | `nftables` | §7 | `/etc/nftables.conf` | managed-marker backup + `nft -c` syntax check |
 | `postgres` | §1 (cp slice), §4 | distro PostgreSQL major, `faas` user | apt idempotent, `creates:` on home |
@@ -182,6 +183,37 @@ disk or two equally-sized blank non-root disks for a mirror. It still refuses
 mounted, signed, partitioned, or ambiguous devices. An explicitly declared
 blank device remains protected by the `--format-storage` /
 `faas_storage_format` consent gate; an existing XFS device is reused.
+
+### Compute artifact admission
+
+A production compute node is not allowed to use host-local copies of the
+artifacts that define a VM's execution environment. Its root-only
+`/etc/faas/compute-db.env` must contain:
+
+```text
+FAAS_STORAGE_BACKEND=oci
+FAAS_STORAGE_LOCAL_PREFIXES=none
+FAAS_REQUIRE_SHARED_ARTIFACTS=1
+FAAS_STORAGE_CACHE_SERVE_STALE=0
+FAAS_OCI_REGISTRY=https://<registry>/<organization>
+```
+
+The first three lines are enforced by the `compute_only_service` role and by
+the Go storage backend at daemon startup. `none` is deliberate: leaving the
+variable unset retains the legacy local `snap/`, `base/`, `kernel/`, and
+`layers/` routes and is unsafe when more than one compute node can restore a
+deployment. The role also requires a real deployment manifest before it
+accepts a compute host's Firecracker and kernel artifacts; their SHA-256
+values must match `release.firecracker_digest` and `release.kernel_digest`.
+This makes a mismatched host fail during join, while the node is still
+drained, instead of failing its first customer restore.
+Strict mode also requires an HTTPS registry and rejects stale-cache fallback;
+the cache may still accelerate successful remote reads, but it cannot serve a
+last-known-good blob after the registry reports an error.
+
+The storage example lives at
+`roles/compute_only_service/files/compute-db.env.example`. The registry
+credentials remain operator-supplied; do not commit them to inventory.
 
 For a split-box manifest, the generated control-plane variables also
 declare the database listener address and the compute `/32` allow-list.
