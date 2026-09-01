@@ -196,7 +196,7 @@ func TestReconciler_EmitsDriftOnMismatch(t *testing.T) {
 // TestReconciler_ProviderErrorFailsSoft asserts a provider error
 // for one account does not block the loop or fail RunOnce.
 func TestReconciler_ProviderErrorFailsSoft(t *testing.T) {
-	store, _ := seedMemStore(t, "acct_err", api.PlanHobby, 500)
+	store, id := seedMemStore(t, "acct_err", api.PlanHobby, 500)
 	// caps advertises CapUsageReconcile so the new short-circuit
 	// does NOT skip the SDK call — the fail-soft-on-provider-error
 	// path must still be exercised by this test.
@@ -207,6 +207,18 @@ func TestReconciler_ProviderErrorFailsSoft(t *testing.T) {
 	rec := New("stripe", store, prov, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 	if err := rec.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce should not fail-soft propagate: %v", err)
+	}
+	srv := httptest.NewServer(rec.Handler())
+	defer srv.Close()
+	resp, err := srv.Client().Get(srv.URL)
+	if err != nil {
+		t.Fatalf("scrape GET: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	want := `meterd_billing_drift_reconcile_failures_total{provider="stripe",reason="provider"} 1`
+	if !strings.Contains(string(body), want) {
+		t.Fatalf("missing provider failure metric %q for account %s:\n%s", want, id, body)
 	}
 }
 

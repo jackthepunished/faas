@@ -1227,14 +1227,11 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// deploy, and never interpolate untrusted input.
 	srv.WithBillingPortalURL(deps.getenv("FAAS_BILLING_PORTAL_URL"))
 
-	// Billing provider dispatch (ADR-025 / PR #3 / ADR-032 v2).
-	// FAAS_BILLING_PROVIDER defaults to "paddle" (the v2 production
-	// provider) when unset — the loader constructs a *paddle.Provider
-	// and runs EnsurePlanProducts so the catalog is populated before
-	// the first /v1/webhooks/paddle POST can land. When unset, the
-	// daemon fatals at boot if FAAS_PADDLE_API_KEY is missing
-	// (NewProvider returns ErrNoAPIKey on empty key — see PR #962
-	// CRIT-2 fix). The legacy "stripe" opt-in still returns
+	// Billing provider dispatch (ADR-025 / public-release billing).
+	// FAAS_BILLING_PROVIDER defaults to "polar" when unset — the loader
+	// constructs a *polar.Provider and requires the configured catalog
+	// and meter to pass preflight before the daemon accepts billing traffic.
+	// The legacy "stripe" opt-in still returns
 	// (nil, "stripe", nil) so the changePlan 402 path falls back to
 	// the FAAS_BILLING_PORTAL_URL template above (the pre-PR-#3
 	// behaviour stays bit-for-bit unchanged).

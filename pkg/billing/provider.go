@@ -9,11 +9,11 @@
 // implementations today:
 //
 //   - pkg/billing/stripe — extracted from the original pkg/stripex package.
-//     Default provider when FAAS_BILLING_PROVIDER is empty.
-//   - pkg/billing/paddle — Paddle Billing v2 (current API). Opt-in via
-//     FAAS_BILLING_PROVIDER=paddle.
+//     Legacy opt-in via FAAS_BILLING_PROVIDER=stripe.
+//   - pkg/billing/paddle — Paddle Billing v2 (current API). Explicit opt-in
+//     via FAAS_BILLING_PROVIDER=paddle.
 //   - pkg/billing/polar — Polar MoR REST API + event-based usage billing.
-//     Opt-in via FAAS_BILLING_PROVIDER=polar.
+//     Public-release default and explicit option via FAAS_BILLING_PROVIDER=polar.
 //
 // Provider-specific behaviour stays inside each implementation; the rest
 // of the codebase (apid, meterd, the dunning state machine, the email
@@ -253,11 +253,37 @@ type CustomerPortalProvider interface {
 	CreateCustomerPortalSession(ctx context.Context, acct state.Account, returnURL string) (portalURL string, err error)
 }
 
+// SubscriptionPlanChangeProvider is an optional provider surface for
+// scheduling a change to an existing subscription. The caller must not
+// change the local entitlement before the provider confirms the new product
+// through a webhook. Providers that do not expose subscription product
+// changes leave customers on the hosted billing portal path.
+//
+// targetPlan == api.PlanFree means cancel the subscription at period end;
+// paid-to-paid changes should use the provider's non-prorating or
+// next-period semantics unless the provider explicitly documents otherwise.
+type SubscriptionPlanChangeProvider interface {
+	ChangeSubscriptionPlan(ctx context.Context, acct state.Account, targetPlan api.Plan) (effectiveAt time.Time, err error)
+}
+
 // InvoicePDFRequester is an optional provider surface for requesting an
 // invoice PDF after a paid order. Providers whose invoices are generated
 // automatically need not implement it.
 type InvoicePDFRequester interface {
 	RequestInvoicePDF(ctx context.Context, providerInvoiceID string) error
+}
+
+// CatalogProvider is an optional operator surface for inspecting and
+// revalidating the active provider's configured product catalog. The API
+// endpoint retains its historical billing-paddle-catalog path for client
+// compatibility, but the response and this interface are provider-neutral.
+// Providers whose catalog is dashboard-owned may return ErrNotImplemented for
+// ResetBillingCatalog rather than pretending that a local reset deletes the
+// remote products.
+type CatalogProvider interface {
+	ListBillingCatalog(ctx context.Context) []api.BillingCatalogEntry
+	SyncBillingCatalog(ctx context.Context) ([]api.BillingCatalogEntry, error)
+	ResetBillingCatalog(ctx context.Context) error
 }
 
 // EventType is the provider-neutral "what happened" classifier apid

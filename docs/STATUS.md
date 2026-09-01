@@ -187,9 +187,9 @@ and an overage accumulator (`pkg/billing/paddle/usage.go`).
 through `billing.Provider` via
 `pkg/billing/loader/loader.go::LoadProviderForAPID` /
 `LoadProviderForMeterd`. Operator selects via
-`FAAS_BILLING_PROVIDER=paddle`; empty (or `stripe`) keeps the
-historical path bit-for-bit unchanged. apid also mounts
-`/v1/webhooks/paddle` with HMAC verification. ADR-032 records the
+`FAAS_BILLING_PROVIDER=polar`; empty selects the Polar public-release
+provider. Paddle and Stripe remain explicit compatibility paths. apid also mounts
+`/v1/webhooks/polar` with Standard Webhooks verification. ADR-032 records the
 decision; the operator runbook is
 `docs/ops/billing-provider-switch.md`.
 

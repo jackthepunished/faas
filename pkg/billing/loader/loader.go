@@ -33,7 +33,7 @@
 //
 // Env vars consumed (all optional except per the per-branch docs):
 //
-//	FAAS_BILLING_PROVIDER   "" | "stripe" | "paddle" | "polar"   default ""
+//	FAAS_BILLING_PROVIDER   "" | "stripe" | "paddle" | "polar"   default "polar"
 //	STRIPE_API_KEY          required when Stripe is the active provider (apid + meterd)
 //	STRIPE_WEBHOOK_SECRET   required when Stripe is the active provider (apid only)
 //	FAAS_PADDLE_API_KEY     required when Paddle is the active provider (apid + meterd)
@@ -356,7 +356,11 @@ func Providers() []ProviderMeta {
 // LoadProviderForAPID returns a billing.Provider for apid's webhook
 // ingress + changePlan handler.
 //
-//   - cfg.Provider empty or "stripe" → returns (nil, "stripe", nil).
+//   - cfg.Provider empty or "polar" → constructs a *polar.Provider.
+//     Polar is the public-release default and requires a configured
+//     access token, catalog products, and meter preflight.
+//
+//   - cfg.Provider "stripe" → returns (nil, "stripe", nil).
 //     The apid Stripe path stays inline; apid reads
 //     FAAS_BILLING_PORTAL_URL + STRIPE_WEBHOOK_SECRET directly because
 //     it doesn't need to construct a *stripe.Client (only the webhook
@@ -390,7 +394,7 @@ func LoadProviderForAPID(ctx context.Context, cfg *RootBillingConfig, env func(s
 	if cfg == nil {
 		cfg = &RootBillingConfig{}
 	}
-	// cfg.DefaultProvider() applies the implicit default (v2 = Paddle)
+	// cfg.DefaultProvider() applies the implicit default (public release = Polar)
 	// when Provider is empty. The legacy Stripe opt-in
 	// (FAAS_BILLING_PROVIDER=stripe) is unaffected — an explicit value
 	// still wins. The default lives in exactly one place; both loader
@@ -444,7 +448,7 @@ func LoadProviderForAPID(ctx context.Context, cfg *RootBillingConfig, env func(s
 // loop. Always non-nil on success — the meterd pusher requires a Provider
 // (the legacy *stripe.Client path is folded into the interface).
 //
-//   - cfg.Provider empty or "stripe" → the Stripe BuildMeterd closure
+//   - cfg.Provider "stripe" → the Stripe BuildMeterd closure
 //     constructs a *stripe.Client with the supplied state.Store as both
 //     the StateStore and the PushDedupe (the Stripe provider's
 //     NewClient takes both args; today every Store implementation

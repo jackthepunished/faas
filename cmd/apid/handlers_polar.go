@@ -18,8 +18,8 @@ import (
 // verifies the signature and translates Polar's subscription/order payloads
 // into billing.Event before this handler touches account state.
 func (s *server) polarWebhook(w http.ResponseWriter, r *http.Request) {
-	if s.billingProvider == nil {
-		s.log.Error("polar_webhook.no_provider", "err", "Polar billing provider is not configured")
+	if s.billingProvider == nil || providerName(s.billingProvider) != "polar" {
+		s.log.Error("polar_webhook.no_provider", "provider", providerName(s.billingProvider), "err", "Polar is not the active billing provider")
 		api.WriteProblem(w, api.NewProblem(http.StatusServiceUnavailable, api.CodeCapacity,
 			"polar webhook not configured", "Polar is not the active billing provider"))
 		return
@@ -64,15 +64,6 @@ func (s *server) polarWebhook(w http.ResponseWriter, r *http.Request) {
 		api.WriteProblem(w, api.ErrCapacity("billing webhook temporarily unavailable"))
 		return
 	}
-	if ev.Type == billing.EventPaymentSucceeded && ev.Invoice != nil && !ev.Invoice.PDFAvailable {
-		if requester, ok := s.billingProvider.(billing.InvoicePDFRequester); ok {
-			if err := requester.RequestInvoicePDF(r.Context(), ev.Invoice.ProviderInvoiceID); err != nil {
-				s.log.Error("polar webhook invoice PDF request failed", "event_id", logsanitize.Field(ev.EventID), "err", err)
-				api.WriteProblem(w, api.ErrCapacity("billing webhook temporarily unavailable"))
-				return
-			}
-		}
-	}
 	if ev.EventID != "" {
 		now := time.Now().UTC()
 		claimed, err := s.store.ClaimWebhookDelivery(
@@ -108,7 +99,50 @@ func (s *server) polarWebhook(w http.ResponseWriter, r *http.Request) {
 		api.WriteProblem(w, api.ErrCapacity("billing webhook temporarily unavailable"))
 		return
 	}
+	// Invoice generation is an asynchronous enrichment and must not sit on
+	// the webhook acknowledgement path. Polar recommends a fast response and
+	// retries deliveries when the handler is slow. The durable invoice
+	// projection and entitlement transition above are complete before this
+	// best-effort retry worker starts; Polar's later order.updated delivery
+	// fills in the PDF availability flag.
+	if ev.Type == billing.EventPaymentSucceeded && ev.Invoice != nil && !ev.Invoice.PDFAvailable {
+		if requester, ok := s.billingProvider.(billing.InvoicePDFRequester); ok {
+			s.requestPolarInvoicePDFAsync(requester, ev.Invoice.ProviderInvoiceID, ev.EventID)
+		}
+	}
 	w.WriteHeader(http.StatusOK)
+}
+
+func (s *server) requestPolarInvoicePDFAsync(requester billing.InvoicePDFRequester, orderID, eventID string) {
+	if requester == nil || orderID == "" {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), 30*time.Second)
+		defer cancel()
+		var lastErr error
+		for attempt := 1; attempt <= 3; attempt++ {
+			if err := requester.RequestInvoicePDF(ctx, orderID); err == nil {
+				return
+			} else {
+				lastErr = err
+			}
+			if attempt == 3 {
+				break
+			}
+			timer := time.NewTimer(time.Duration(attempt) * 500 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+		}
+		s.log.Error("polar webhook invoice PDF request failed after retries",
+			"event_id", logsanitize.Field(eventID),
+			"order_id", logsanitize.Field(orderID),
+			"err", lastErr)
+	}()
 }
 
 func (s *server) lookupAccountByPolarID(ctx context.Context, polarID string) (state.Account, error) {

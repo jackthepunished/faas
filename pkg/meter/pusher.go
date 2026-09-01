@@ -3,7 +3,9 @@ package meter
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"math"
 	"sort"
 	"time"
 
@@ -19,8 +21,8 @@ import (
 // Pusher is the meterd daemon's billing-pusher loop. It walks every paid
 // account with a customer id (Stripe cus_… or Paddle ctm_…), sums the past
 // billing window's mb_seconds, and pushes a single metered usage
-// record. The active provider (FAAS_BILLING_PROVIDER=paddle for Paddle, "" or
-// "stripe" for Stripe) is dispatched through billing.Provider — the local
+// record. The active provider (Polar by default, or the explicit
+// FAAS_BILLING_PROVIDER selection) is dispatched through billing.Provider — the local
 // StripePusher interface that predated PR #3 was collapsed into the Provider
 // interface so the same pusher loop runs on either provider.
 //
@@ -129,6 +131,17 @@ func (p *Pusher) PushHour(ctx context.Context) (int, error) {
 		if acct.Status == state.AccountSuspended || acct.Status == state.AccountDeletedPending {
 			continue
 		}
+		if acct.ProviderCustomerID == "" || acct.StripeSubscriptionItem == "" {
+			// Paid usage is not billable until both provider identities have
+			// been persisted by the subscription webhook. Calling a provider
+			// with an incomplete account can be a successful no-op (Polar and
+			// Stripe both use that shape), which would falsely advance the
+			// pusher's success count and leave usage unbilled.
+			p.log.Warn("meter: billing identity incomplete",
+				"account", acct.ID, "provider_customer_id_set", acct.ProviderCustomerID != "",
+				"subscription_id_set", acct.StripeSubscriptionItem != "")
+			continue
+		}
 		// The provider impl's PushUsageRecord is the source-of-truth skip
 		// when an account has no customer id (stripe.Client::PushUsageRecord
 		// returns nil silently on empty cus_… — see
@@ -203,6 +216,16 @@ func (p *Pusher) PushPending(ctx context.Context, lookback time.Duration) (int, 
 	}
 	ops := providerOpsFor(p.pusher)
 	mode := providerUsageMode(p.pusher)
+	var caps map[string]int64
+	if mode == billing.UsageModeOverage {
+		// A cap is a billing safety boundary, so a read failure must fail
+		// closed. The bulk read keeps replay at one database round-trip
+		// instead of turning every usage window into an account lookup.
+		caps, err = p.store.LoadAllOverageCapCents(ctx)
+		if err != nil {
+			return 0, fmt.Errorf("meter: load overage caps: %w", err)
+		}
+	}
 	ordered := append([]state.UsageWindow(nil), windows...)
 	if mode == billing.UsageModeOverage {
 		// Postgres already returns hour order; sorting the copy also makes the
@@ -224,9 +247,19 @@ func (p *Pusher) PushPending(ctx context.Context, lookback time.Duration) (int, 
 		if !ok || acct.Plan == "free" || acct.Status == state.AccountSuspended || acct.Status == state.AccountDeletedPending {
 			continue
 		}
+		if acct.ProviderCustomerID == "" || acct.StripeSubscriptionItem == "" {
+			// Keep the window in durable usage_minutes until the subscription
+			// webhook stamps both identities. This avoids reporting a successful
+			// provider push for a provider no-op and lets the normal lookback
+			// replay it after checkout completes.
+			p.log.Warn("meter: billing identity incomplete",
+				"account", acct.ID, "provider_customer_id_set", acct.ProviderCustomerID != "",
+				"subscription_id_set", acct.StripeSubscriptionItem != "", "replay", true)
+			continue
+		}
 		billableMBSeconds := window.MBSeconds
 		if mode == billing.UsageModeOverage {
-			billableMBSeconds, err = p.billablePendingUsage(ctx, acct, window, cursors)
+			billableMBSeconds, err = p.billablePendingUsage(ctx, acct, window, cursors, caps)
 			if err != nil {
 				if firstErr == nil {
 					firstErr = err
@@ -282,10 +315,19 @@ func (p *Pusher) billableUsage(ctx context.Context, acct state.Account, hour tim
 	if err != nil {
 		return 0, err
 	}
-	return api.BillableMBSeconds(acct.Plan, prior+raw) - api.BillableMBSeconds(acct.Plan, prior), nil
+	before := api.BillableMBSeconds(acct.Plan, prior)
+	after := api.BillableMBSeconds(acct.Plan, prior+raw)
+	capCents, capped, err := p.store.GetAccountOverageCapCents(ctx, acct.ID)
+	if err != nil {
+		return 0, fmt.Errorf("load overage cap: %w", err)
+	}
+	if capped && overageCapReached(capCents, before, after) {
+		return 0, nil
+	}
+	return after - before, nil
 }
 
-func (p *Pusher) billablePendingUsage(ctx context.Context, acct state.Account, window state.UsageWindow, cursors map[string]overageCursor) (int64, error) {
+func (p *Pusher) billablePendingUsage(ctx context.Context, acct state.Account, window state.UsageWindow, cursors map[string]overageCursor, caps map[string]int64) (int64, error) {
 	hour := window.Hour.UTC().Truncate(time.Hour)
 	monthStart := time.Date(hour.Year(), hour.Month(), 1, 0, 0, 0, 0, time.UTC)
 	key := acct.ID + "\x00" + monthStart.Format("2006-01")
@@ -301,7 +343,30 @@ func (p *Pusher) billablePendingUsage(ctx context.Context, acct state.Account, w
 	cursor.rawBefore += window.MBSeconds
 	after := api.BillableMBSeconds(acct.Plan, cursor.rawBefore)
 	cursors[key] = cursor
+	if capCents, capped := caps[acct.ID]; capped && overageCapReached(capCents, before, after) {
+		// Do not send a partial window. A partial push would be recorded as
+		// complete by the provider's hourly dedupe key and the remainder
+		// could never be replayed if the customer later raises the cap.
+		return 0, nil
+	}
 	return after - before, nil
+}
+
+// overageCapReached reports whether posting the entire candidate window would
+// cross the configured monthly cap. The public financial model prices one
+// cent per GB-hour, so cap cents map exactly to cap*SecondsPerGBHour
+// billable MB-seconds. Keeping the comparison in MB-seconds avoids rounding
+// a candidate down to an arbitrary provider quantity and guarantees that a
+// Polar event can never be emitted above the configured ceiling.
+func overageCapReached(capCents, billableBefore, billableAfter int64) bool {
+	if capCents < 0 {
+		return true
+	}
+	if capCents > math.MaxInt64/api.SecondsPerGBHour {
+		return false
+	}
+	limit := capCents * api.SecondsPerGBHour
+	return billableBefore >= limit || billableAfter > limit
 }
 
 func sumUsageRows(ctx context.Context, store state.Store, accountID string, start, end time.Time) (int64, error) {
