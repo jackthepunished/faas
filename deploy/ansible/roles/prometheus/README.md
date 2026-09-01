@@ -13,7 +13,13 @@ unit on loopback.
 - `schedd`    `:9103` (also exposes `/metrics/fcvm`)
 - `vmmd`      `:9104` (also exposes `/metrics/fallback`)
 - `imaged`    `:9102`
-- `builderd`  `:9105`
+- `builderd` `:9105` on single-box installs (the daemon's canonical default)
+
+On a split deployment, compute gateway metrics are discovered through apid's
+loopback HTTP service-discovery endpoint, backed by the active `compute_nodes`
+registry. Adding, draining, or replacing a compute node therefore does not
+require editing the Prometheus target list or restarting Prometheus. The
+public gateway explicitly rejects that internal endpoint.
 - `meterd`    `:9106`
 - `githubd`   `:8083`
 - `alertmanager` `:9094`
