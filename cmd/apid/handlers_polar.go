@@ -107,18 +107,21 @@ func (s *server) polarWebhook(w http.ResponseWriter, r *http.Request) {
 	// fills in the PDF availability flag.
 	if ev.Type == billing.EventPaymentSucceeded && ev.Invoice != nil && !ev.Invoice.PDFAvailable {
 		if requester, ok := s.billingProvider.(billing.InvoicePDFRequester); ok {
-			s.requestPolarInvoicePDFAsync(requester, ev.Invoice.ProviderInvoiceID, ev.EventID)
+			s.requestPolarInvoicePDFAsync(r.Context(), requester, ev.Invoice.ProviderInvoiceID, ev.EventID)
 		}
 	}
 	w.WriteHeader(http.StatusOK)
 }
 
-func (s *server) requestPolarInvoicePDFAsync(requester billing.InvoicePDFRequester, orderID, eventID string) {
+func (s *server) requestPolarInvoicePDFAsync(parentCtx context.Context, requester billing.InvoicePDFRequester, orderID, eventID string) {
 	if requester == nil || orderID == "" {
 		return
 	}
-	go func() {
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), 30*time.Second)
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+	go func(parentCtx context.Context) {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(parentCtx), 30*time.Second)
 		defer cancel()
 		var lastErr error
 		for attempt := 1; attempt <= 3; attempt++ {
@@ -142,7 +145,7 @@ func (s *server) requestPolarInvoicePDFAsync(requester billing.InvoicePDFRequest
 			"event_id", logsanitize.Field(eventID),
 			"order_id", logsanitize.Field(orderID),
 			"err", lastErr)
-	}()
+	}(parentCtx)
 }
 
 func (s *server) lookupAccountByPolarID(ctx context.Context, polarID string) (state.Account, error) {

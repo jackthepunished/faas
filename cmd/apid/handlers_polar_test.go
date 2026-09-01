@@ -77,7 +77,7 @@ func TestRequestPolarInvoicePDFAsyncDoesNotBlockCaller(t *testing.T) {
 	srv := &server{log: slog.New(slog.NewTextHandler(io.Discard, nil))}
 
 	started := time.Now()
-	srv.requestPolarInvoicePDFAsync(requester, "order-1", "event-1")
+	srv.requestPolarInvoicePDFAsync(context.Background(), requester, "order-1", "event-1")
 	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
 		t.Fatalf("async helper blocked caller for %s", elapsed)
 	}
