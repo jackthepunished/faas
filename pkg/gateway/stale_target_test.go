@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"net/http"
@@ -14,11 +15,20 @@ type staleTargetTestBackend struct {
 	*fakeBackend
 	evictedApp      string
 	evictedInstance string
+	recoveredApp    string
+	recoveredScope  string
+	recoveredCap    int
 }
 
 func (b *staleTargetTestBackend) EvictInstance(appID, instanceID string) {
 	b.evictedApp = appID
 	b.evictedInstance = instanceID
+}
+
+func (b *staleTargetTestBackend) RecoverStaleTarget(_ context.Context, appID, scope string, maxConcurrency int) {
+	b.recoveredApp = appID
+	b.recoveredScope = scope
+	b.recoveredCap = maxConcurrency
 }
 
 func TestHandlerEvictsOnlyForwarderMarkedStaleTarget(t *testing.T) {
@@ -46,6 +56,9 @@ func TestHandlerEvictsOnlyForwarderMarkedStaleTarget(t *testing.T) {
 	if b.evictedApp != "app-1" || b.evictedInstance != "i-fake" {
 		t.Fatalf("eviction = (%q, %q), want (app-1, i-fake)", b.evictedApp, b.evictedInstance)
 	}
+	if b.recoveredApp != "app-1" || b.recoveredCap <= 0 {
+		t.Fatalf("recovery = (%q, %q, %d), want app-1 with a positive cap", b.recoveredApp, b.recoveredScope, b.recoveredCap)
+	}
 }
 
 func TestHandlerDoesNotEvictOrdinaryGuestError(t *testing.T) {
@@ -71,5 +84,8 @@ func TestHandlerDoesNotEvictOrdinaryGuestError(t *testing.T) {
 	}
 	if b.evictedApp != "" || b.evictedInstance != "" {
 		t.Fatalf("ordinary guest error evicted target: (%q, %q)", b.evictedApp, b.evictedInstance)
+	}
+	if b.recoveredApp != "" {
+		t.Fatalf("ordinary guest error triggered recovery for %q", b.recoveredApp)
 	}
 }

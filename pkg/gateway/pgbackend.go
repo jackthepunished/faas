@@ -325,6 +325,10 @@ type PGBackend struct {
 	// populated the process-local picker; those requests must share one
 	// authoritative database read rather than stampeding Postgres.
 	liveTargetHydration singleflight.Group
+	// staleTargetRecovery coalesces replacement admissions after a stale
+	// target eviction. Without this guard, a burst that discovers the same
+	// dead instance could start one replacement per failed request.
+	staleTargetRecovery singleflight.Group
 
 	// publicAuthCache is the unsealed basic-auth credential
 	// cache (issue #477 / ADR-079). nil = no caching; the
@@ -1121,6 +1125,43 @@ func (b *PGBackend) EvictInstance(appID, instanceID string) {
 		delete(b.appsPicker, appID)
 	}
 	b.tgtMu.Unlock()
+}
+
+// RecoverStaleTarget asynchronously restores one serving slot after the
+// handler evicts a target that the forwarder proved stale. It is deliberately
+// detached from the request context: the failed request must not cancel the
+// replacement admission, and a bounded lifecycle context prevents a broken
+// schedd from leaving a goroutine behind indefinitely.
+func (b *PGBackend) RecoverStaleTarget(ctx context.Context, appID, scope string, maxConcurrency int) {
+	if b == nil || appID == "" || maxConcurrency <= 0 || b.HealthyCount(appID) > 0 {
+		return
+	}
+	go func() {
+		_, err, _ := b.staleTargetRecovery.Do(appID, func() (any, error) {
+			if b.HealthyCount(appID) > 0 {
+				return nil, nil
+			}
+			lifecycleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), admissionLifecycleTimeout)
+			defer cancel()
+			_, _, atCapacity, err := b.admitSynchronous(lifecycleCtx, appID, "", scope, "stale_target_recovery", maxConcurrency)
+			if err != nil {
+				return nil, err
+			}
+			if atCapacity {
+				// Another producer may have admitted the replacement while
+				// the local cache was empty. Reconcile so this process does
+				// not immediately send another request into a false cold
+				// path.
+				if reconcileErr := b.ReconcileLiveTargets(lifecycleCtx, appID); reconcileErr != nil {
+					return nil, reconcileErr
+				}
+			}
+			return nil, nil
+		})
+		if err != nil && b.log != nil {
+			b.log.Warn("gateway: stale target recovery failed", "app_id", appID, "err", err)
+		}
+	}()
 }
 
 // EvictTarget drops ALL cached targets for appID (legacy contract).

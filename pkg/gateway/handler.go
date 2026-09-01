@@ -528,6 +528,15 @@ type liveTargetReconciler interface {
 	ReconcileLiveTargets(ctx context.Context, appID string) error
 }
 
+// staleTargetRecovery is an optional production capability. When the
+// forwarder proves that the selected target is stale, the backend removes it
+// from the picker and asynchronously admits a replacement if that eviction
+// left the app with no routable capacity. Keeping this optional preserves the
+// small Backend test seam and avoids widening the hot-path interface.
+type staleTargetRecovery interface {
+	RecoverStaleTarget(ctx context.Context, appID, scope string, maxConcurrency int)
+}
+
 // warmEnsurer is the optional production cold-start capability. Its scheduler
 // implementation is cross-producer single-flight; preview/deployment-scoped
 // paths fall back to Backend.Admit because the legacy EnsureWake RPC has no
@@ -5537,6 +5546,13 @@ haveApp:
 			evictor.EvictInstance(app.ID, target.InstanceID)
 			h.log.Warn("gateway: evicted stale target", "app_id", app.ID,
 				"instance_id", target.InstanceID, "node_id", target.NodeID)
+		}
+		if recovery, ok := h.backend.(staleTargetRecovery); ok {
+			// The client request may already be canceled after a bridge
+			// failure. Recovery is lifecycle work for the fleet, not work
+			// owned by that client, so the production backend detaches it
+			// and bounds the admission internally.
+			recovery.RecoverStaleTarget(r.Context(), app.ID, app.Scope, limits.MaxConcurrency)
 		}
 	}
 	// Issue #471 / ADR-047 PR-A buffered-fallback AC. The
