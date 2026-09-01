@@ -25,7 +25,7 @@ case "${runtime_image}" in
   runner-go124|runner-go124-alpine)
     fixture_name=main.go
     fixture_body=$'package main\n\nimport "fmt"\n\nfunc main() { fmt.Println("runtime-smoke-ok") }'
-    runtime_command=(/usr/local/go/bin/go run "/tmp/gregale-runtime-smoke/${fixture_name}")
+    runtime_command=(/tmp/gregale-runtime-smoke/handler)
     ;;
   *)
     echo "unsupported runtime image ${runtime_image}" >&2
@@ -46,10 +46,15 @@ trap cleanup EXIT
 
 printf '%s\n' "${fixture_body}" >"${fixture_dir}/${fixture_name}"
 
+if [[ "${runtime_image}" == runner-go124 || "${runtime_image}" == runner-go124-alpine ]]; then
+  GO111MODULE=off GOOS=linux GOARCH="${expected_arch}" CGO_ENABLED=0 \
+    go build -trimpath -o "${fixture_dir}/handler" "${fixture_dir}/${fixture_name}"
+fi
+
 # This is a real runtime start, not just a tar listing: the image boots a
 # container and executes a minimal program through its production interpreter
-# or Go toolchain. Both Go images use the same test but are separate matrix
-# entries, so libc compatibility is exercised independently.
+# or compiled Go handler. Both Go images use the same static test binary but
+# are separate matrix entries, so libc compatibility is exercised independently.
 output=$(docker run --rm --platform "${expected_platform}" \
   --entrypoint "${runtime_command[0]}" \
   -e GO111MODULE=off -e GOCACHE=/tmp/gocache -e GOMODCACHE=/tmp/gomodcache \
