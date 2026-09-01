@@ -148,6 +148,7 @@ release:
   # /etc/faas/runtime-bases.env on compute nodes so builderd and imaged use
   # the same immutable runtime contract.
   runtime_base_refs:
+    minimal: __RUNTIME_BASE_REF_MINIMAL__
     node22: __RUNTIME_BASE_REF_NODE22__
     python312: __RUNTIME_BASE_REF_PYTHON312__
     go124: __RUNTIME_BASE_REF_GO124__

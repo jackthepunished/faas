@@ -30,7 +30,7 @@ ARG MISE_VERSION=2026.7.6
 # ---- buildkit (Dockerfile builds, spec §4.5 fallback path) ----------------
 # Rootless inside the VM — rootless-runc inside a VM is functionally root, and
 # the VM boundary is the actual security perimeter (ADR-003).
-ARG BUILDKIT_VERSION=0.31.2
+ARG BUILDKIT_VERSION=0.32.2
 
 # Alpine v3.22's packaged runc was built with Go 1.24.12. That leaves the
 # builder image exposed to GO-2026-4337 (CVE-2025-68121), which the runtime
@@ -52,12 +52,14 @@ ARG RUNC_SHA256_ARM64=ca70e7dbd6616ca782a59b5d3ac86909123fdaa9fa3f89dcf29051c70e
 # workflow) also lets the Lima local-build path stage a multi-arch rootfs
 # via buildx without per-arch file juggling.
 # Note: the version is intentionally baked into the FROM line (no ARG)
-# so images/Dockerfile.lock has a literal "golang:1.25.9" alias to
+# so images/Dockerfile.lock has a literal "golang:1.26.6" alias to
 # match against. Bumping the Go version is a two-step: change this
 # line, run `make images-lock-update` to refresh the lock and digest.
-# We use 1.25.9 (not 1.23.x) because BuildKit v0.31.2 requires
-# Go 1.25.9 and the repo's `tool` directive rejects older Go versions
-# with `unknown directive: tool` (verified during PR #940 review).
+# BuildKit v0.32.x requires Go 1.26.3 or newer. Use 1.26.6 so the
+# builder itself is not shipped with the Go standard-library advisories
+# fixed after 1.25.9; the repo's `tool` directive also rejects older
+# toolchains with `unknown directive: tool` (verified during PR #940
+# review).
 
 # ---- stage 1: build guest-init for the target arch -----------------------
 # Image registry digest pinned via images/Dockerfile.lock; make
@@ -68,7 +70,7 @@ ARG RUNC_SHA256_ARM64=ca70e7dbd6616ca782a59b5d3ac86909123fdaa9fa3f89dcf29051c70e
 # stable across re-pulls, but the manifest-list digest is).
 # $TARGETPLATFORM is implicit on multi-arch FROM; the explicit
 # `--platform=` would emit a RedundantTargetPlatform warning.
-FROM golang:1.25.9@sha256:8a7adc288b77e9b787cd2695029eb54d10ae80571b21d44fed68d067ad0a9c96 AS guest-init-build
+FROM golang:1.26.6@sha256:0d1d3a794be25f809dd2cb3160d8c73276c4056a9f8242a138e908ddeee7b6b6 AS guest-init-build
 WORKDIR /src
 # guest-init is a pure-Go binary; no submodule vendoring needed. The
 # repository is the build context, so COPY . picks up the whole tree.
@@ -86,7 +88,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # Build the tiny upstream client with the repository patch that opts into a
 # bounded, longer session interval; buildkitd itself remains the pinned
 # upstream release binary below.
-FROM golang:1.25.9@sha256:8a7adc288b77e9b787cd2695029eb54d10ae80571b21d44fed68d067ad0a9c96 AS buildkit-client-build
+FROM golang:1.26.6@sha256:0d1d3a794be25f809dd2cb3160d8c73276c4056a9f8242a138e908ddeee7b6b6 AS buildkit-client-build
 WORKDIR /src/buildkit
 ARG BUILDKIT_VERSION
 ARG TARGETOS
@@ -127,7 +129,8 @@ ARG RUNC_SHA256_ARM64
 # /bin/sh is not a substitute when invoked as "bash"; keep the real Bash
 # package in the runtime builder rootfs.
 RUN apk add --no-cache \
-      bash git ca-certificates curl xz shadow-subids fuse-overlayfs util-linux util-linux-misc
+      bash git ca-certificates curl xz shadow-subids fuse-overlayfs util-linux util-linux-misc && \
+    apk upgrade --no-cache
 
 # Replace Alpine's runc build with the upstream static release. Besides
 # removing the stale Go standard library embedded in Alpine's package, the

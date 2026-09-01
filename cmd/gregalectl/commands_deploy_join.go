@@ -1085,6 +1085,7 @@ func validateRuntimeBasesEnv(path string, expected map[string]string) error {
 		return err
 	}
 	required := map[string]string{
+		"FAAS_DEPLOY_BASE_REF_MINIMAL":      "minimal",
 		"FAAS_DEPLOY_BASE_REF_NODE22":       "node22",
 		"FAAS_DEPLOY_BASE_REF_PYTHON312":    "python312",
 		"FAAS_DEPLOY_BASE_REF_GO124":        "go124",
