@@ -2168,6 +2168,15 @@ type GatewaySynth interface {
 	Invoke(ctx context.Context, appID string, inv state.Invocation) (state.Invocation, error)
 }
 
+// prewokenGatewaySynth is the optional fast path for the invocation drain.
+// Schedd already owns admission and has the live target after engine.Wake;
+// implementations can carry that target to gatewayd-internal instead of
+// waking the same app a second time. Legacy GatewaySynth implementations
+// continue to use Invoke and retain their existing behaviour.
+type prewokenGatewaySynth interface {
+	InvokeWithWake(ctx context.Context, appID string, inv state.Invocation, wake WakeResult) (state.Invocation, error)
+}
+
 // httpGatewaySynth is the production GatewaySynth: an HTTP client
 // pointed at gatewayd-internal's internal listener. The transport is chosen
 // by the dial target:
@@ -2457,13 +2466,24 @@ func (h *httpGatewaySynth) SynthesizeRequest(ctx context.Context, appID, method,
 // state (dispatched/completed) so the drain can call Store.CompleteInvocation
 // with the result blob. Network errors bubble up so the drain can retry.
 func (h *httpGatewaySynth) Invoke(ctx context.Context, appID string, inv state.Invocation) (state.Invocation, error) {
+	return h.invoke(ctx, appID, inv, nil)
+}
+
+// InvokeWithWake is the pre-woken variant used by the unified invocation
+// drain. The target is the result of schedd's engine.Wake call, so the
+// gateway-internal side can forward directly to the selected instance.
+func (h *httpGatewaySynth) InvokeWithWake(ctx context.Context, appID string, inv state.Invocation, wake WakeResult) (state.Invocation, error) {
+	return h.invoke(ctx, appID, inv, &wake)
+}
+
+func (h *httpGatewaySynth) invoke(ctx context.Context, appID string, inv state.Invocation, wake *WakeResult) (state.Invocation, error) {
 	var headers map[string]string
 	if len(inv.Headers) > 0 {
 		if err := json.Unmarshal(inv.Headers, &headers); err != nil {
 			return inv, fmt.Errorf("sched: invocation headers: %w", err)
 		}
 	}
-	body, err := json.Marshal(map[string]any{
+	dispatch := map[string]any{
 		"invocation_id": inv.ID,
 		"app_id":        appID,
 		"source":        string(inv.Source),
@@ -2471,7 +2491,15 @@ func (h *httpGatewaySynth) Invoke(ctx context.Context, appID string, inv state.I
 		"path":          inv.Path,
 		"headers":       headers,
 		"body_b64":      base64.StdEncoding.EncodeToString(inv.Payload),
-	})
+	}
+	if wake != nil {
+		dispatch["instance_id"] = wake.InstanceID
+		dispatch["node_id"] = wake.NodeID
+		dispatch["deployment_id"] = wake.DeploymentID
+		dispatch["wake_id"] = wake.WakeID
+		dispatch["port"] = wake.Port
+	}
+	body, err := json.Marshal(dispatch)
 	if err != nil {
 		return inv, fmt.Errorf("sched: invocation marshal: %w", err)
 	}

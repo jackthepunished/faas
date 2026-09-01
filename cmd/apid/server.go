@@ -48,6 +48,10 @@ type server struct {
 	// response. The public edge at this origin forwards /cli-auth to apid.
 	cliAuthURLBase string
 	notif          Notifier
+	// invocationCompletion multiplexes the durable invocation_done
+	// notification stream for synchronous invoke waiters. Nil keeps the
+	// legacy per-request LISTEN path for tests and degraded boot.
+	invocationCompletion *invocationCompletionWaiter
 	// stripeWebhookSecret is the endpoint signing secret Stripe uses
 	// for the v1 HMAC. Empty disables signature verification (dev mode).
 	stripeWebhookSecret string
@@ -599,6 +603,15 @@ func (s *server) WithHostHashFunc(fn func(host string) (string, error)) *server 
 // this PR; same-box is the only supported posture today).
 func (s *server) WithGatewaydControlURL(url string) *server {
 	s.gatewaydControlURL = url
+	return s
+}
+
+// WithInvocationCompletionWaiter attaches the process-wide completion
+// fan-out used by synchronous invocation handlers. The setter preserves the
+// existing server construction seams while allowing production boot to make
+// the optimization optional and fail-safe.
+func (s *server) WithInvocationCompletionWaiter(w *invocationCompletionWaiter) *server {
+	s.invocationCompletion = w
 	return s
 }
 
