@@ -248,11 +248,11 @@ type StatsSnapshot struct {
 }
 
 // VMInstanceStat is the sched-side view of vmmdpb.InstanceStats —
-// one per live VM the queried vmmd owns. InflightRequests and
-// LastRequestAt are populated by PR-B (the vmmd ActivityTracker +
-// stats handler extraction); until that lands the wire carries
-// zero / zero-time and the reader falls back to
-// state.Instance.LastRequestAt for the durable timestamp.
+// one per live VM the queried vmmd owns. InflightRequests,
+// LastRequestAt, and RequestCountTotal are populated by the vmmd
+// ActivityTracker when available; older vmmds may still return the
+// zero / absent shape and the poller falls back to durable state for
+// the timestamp.
 type VMInstanceStat struct {
 	InstanceID    string
 	LeaseUID      int32
@@ -296,6 +296,10 @@ type VMInstanceStat struct {
 	NetRxBytes       *int64
 	InflightRequests int64
 	LastRequestAt    time.Time
+	// RequestCountTotal is vmmd's cumulative ForwardHTTP count for this
+	// instance. It is optional because older vmmds do not emit it and the
+	// counter resets when vmmd or the instance is recreated.
+	RequestCountTotal *int64
 }
 
 // AppSpec is the flat set of fields vmmd needs to boot an instance (ADR-014).
@@ -887,10 +891,10 @@ func (c *VMMClient) Stats(ctx context.Context) (*StatsSnapshot, error) {
 
 // vmInstanceStatFromProto decodes one vmmdpb.InstanceStats row into
 // the typed wrapper. Pointer fields are nil when the proto wrapper
-// is absent (the caller maps that to Unknown). InflightRequests and
-// LastRequestAt are populated by PR-B; today the wire carries
-// zero / zero-time, which the poller treats as "no signal yet"
-// and falls back to state.Instance.LastRequestAt.
+// is absent (the caller maps that to Unknown). InflightRequests,
+// LastRequestAt, and RequestCountTotal are optional activity signals;
+// the poller treats absent values as "no signal yet" and falls back
+// to state.Instance.LastRequestAt for the timestamp.
 func vmInstanceStatFromProto(in *vmmdpb.InstanceStats) VMInstanceStat {
 	row := VMInstanceStat{
 		InstanceID:       in.GetInstance(),
@@ -917,6 +921,10 @@ func vmInstanceStatFromProto(in *vmmdpb.InstanceStats) VMInstanceStat {
 	if v := in.GetNetTxBytes(); v != nil {
 		b := v.GetValue()
 		row.NetTxBytes = &b
+	}
+	if v := in.GetRequestCountTotal(); v != nil {
+		c := v.GetValue()
+		row.RequestCountTotal = &c
 	}
 	if t := in.GetLastRequestAt(); t != nil {
 		row.LastRequestAt = t.AsTime()

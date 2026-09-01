@@ -903,6 +903,13 @@ func buildInstanceStatsRow(
 		if lastAt, ok := activityCache.LastAt(instance); ok {
 			row.LastRequestAt = timestamppb.New(lastAt)
 		}
+		if total, ok := activityCache.Total(instance); ok {
+			// The activity tracker is the source of truth for the
+			// topology-independent scale signal. Keep it optional so
+			// older/non-production test constructors retain the
+			// pre-tracker wire shape.
+			row.RequestCountTotal = wrapperspb.Int64(int64(total))
+		}
 	}
 	return row
 }

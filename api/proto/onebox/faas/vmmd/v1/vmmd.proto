@@ -929,6 +929,12 @@ message InstanceStats {
   // table. Zero is a real idle value; the enclosing Stats response is
   // additive so older schedd peers can ignore this field.
   int64 open_conns = 11;
+  // Cumulative ForwardHTTP requests observed by vmmd for this instance.
+  // Wrapper semantics match the other optional counters: absent means the
+  // activity tracker has not seen the instance yet, while zero is a real
+  // value after the first observation. Schedd uses the deltas between Stats
+  // samples as a topology-independent RPS signal for reactive scale-up.
+  google.protobuf.Int64Value request_count_total = 12;
 }
 
 // PingRequest is intentionally empty. Ping is a liveness probe; the

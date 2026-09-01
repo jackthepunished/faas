@@ -1246,14 +1246,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		hb.Interval = deps.heartbeatInterval
 	}
 	// PR-A observability slice (issue #170): per-{app,node} instance
-	// stats poller. Builds a Reader (the canonical seam #171 reaper
-	// and #169 scale-up will read from), wires the Poller with the
+	// stats poller. Builds a Reader (the canonical seam for per-instance
+	// policy consumers; #169 scale-up reads from it), wires the Poller with the
 	// same deps.dialVMM the heartbeat uses (so dial churn is bounded
 	// by the dialer — same pattern PR #120 established), and
-	// attaches it via WithInstanceStats. The Reader is intentionally
-	// NOT threaded to the reaper or any policy consumer today —
-	// that's #171 / #169's job. PR-A keeps the reader as the only
-	// public surface.
+	// attaches it via WithInstanceStats. The same Reader is passed to
+	// the reactive scale-up trigger below; its cumulative activity
+	// counter is the provider-independent RPS fallback when the
+	// optional gateway metrics endpoint is unavailable.
 	reader := instancestats.NewReader()
 	statsPoller := instancestats.NewPoller(
 		store,
@@ -1290,9 +1290,10 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// cfg.ScaleUpInterval (default 1s); admits another instance
 	// when measured per-instance RPS or CPU exceeds the target
 	// and headroom is available. The trigger is nil-safe on every
-	// dep; an empty GatewayMetricsURL disables the RPS path (and
-	// the trigger still fires on CPU when PR #205's
-	// instancestats.Reader is wired). The engine adapter converts
+	// dep; an empty GatewayMetricsURL disables only the optional
+	// gateway scrape. The VMMD activity-counter signal from the
+	// instancestats.Reader remains available for split-box and
+	// bare-metal deployments. The engine adapter converts
 	// sched.WakeResult → scaleup.AdmitResult (a small subset —
 	// the trigger only inspects AtCapacity).
 	//
@@ -1425,8 +1426,9 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		engine.ReconcileDeadNodeInstances,
 		time.Duration(dnrInterval)*time.Second,
 		log))
-	// Issue #171: share a single HTTPPromScraper between the RPS
-	// scale-up trigger and the aggressive-reaper signal mirror.
+	// Issue #171: share a single HTTPPromScraper between the gateway
+	// scrape path for the RPS scale-up trigger and the aggressive-
+	// reaper signal mirror.
 	// The concurrent_requests and CPU triggers do not depend on the
 	// optional gateway metrics endpoint, so an empty metrics URL must
 	// not disable those workers.
