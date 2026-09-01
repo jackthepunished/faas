@@ -445,6 +445,26 @@ jobs:
             }
           done
 
+      - name: Require fleet runner disk headroom
+        run: |
+          set -euo pipefail
+          # The bootstrap CLI verifies a signed release in a private temp
+          # directory and the join artifact keeps a second copy. Fail early
+          # with an actionable diagnostic instead of allowing a mid-join
+          # "no space left on device" failure.
+          minimum_free_kb=$((5 * 1024 * 1024))
+          free_kb="$(df -Pk "$RUNNER_TEMP" | awk 'NR == 2 { print $4 }')"
+          [[ "$free_kb" =~ ^[0-9]+$ ]] || {
+            echo "::error::could not determine free space on fleet runner" >&2
+            exit 1
+          }
+          if (( free_kb < minimum_free_kb )); then
+            echo "::error::fleet runner has only ${free_kb} KiB free; at least ${minimum_free_kb} KiB is required" >&2
+            echo "::error::prune old /opt/faas/releases entries or repair runner retention before retrying" >&2
+            exit 1
+          fi
+          df -h "$RUNNER_TEMP"
+
       - name: Install pinned cosign verifier
         run: |
           set -euo pipefail
@@ -635,6 +655,11 @@ jobs:
           echo "ARTIFACT_DIR=$ARTIFACT_DIR" >> "$GITHUB_ENV"
 
       - name: Verify runner prerequisites and adopt the compute host
+        env:
+          # Keep Go/CLI temporary files inside the runner-owned scratch area
+          # so the final cleanup step can reclaim them after an interrupted
+          # join.
+          TMPDIR: ${{ runner.temp }}
         run: |
           set -euo pipefail
           # The supplied deployment key/user are the fleet operator identity,
@@ -702,3 +727,17 @@ jobs:
           set -euo pipefail
           echo "release=${RELEASE_ID:-unknown} node=$NODE ssh_host=$SSH_HOST"
           echo "The join command is the readiness/activation gate; inspect its JSON result above."
+
+      - name: Clean compute rollout scratch
+        if: always()
+        run: |
+          set +e
+          rm -rf -- \
+            "$RUNNER_TEMP/gregale-compute-release" \
+            "$RUNNER_TEMP/gregale-compute-join" \
+            "$RUNNER_TEMP/compute-pki.tar.gz" \
+            "$RUNNER_TEMP/compute-pki-extracted" \
+            "$RUNNER_TEMP/release-tools"
+          find "$RUNNER_TEMP" -maxdepth 1 -mindepth 1 -type d \
+            \( -name 'gregalectl-release-bootstrap-*' -o -name 'release-cosign-*' -o -name 'release-tarball-*' \) \
+            -mmin +10 -exec rm -rf -- {} +
