@@ -99,6 +99,15 @@
         mode: "0440"
       no_log: true
 
+    - name: Stage the release-bound runtime base contract
+      ansible.builtin.copy:
+        src: "{{ faas_join_runtime_bases_env_source }}"
+        dest: /etc/faas/runtime-bases.env
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+
     - name: Stage the compute trust bundle (the source never includes the CA private key)
       ansible.builtin.copy:
         src: "{{ faas_join_pki_source }}/"

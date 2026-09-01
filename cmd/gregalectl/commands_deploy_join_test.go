@@ -88,6 +88,64 @@ func TestHasComputeDatabaseEnvRequiresBothDaemonVariables(t *testing.T) {
 	}
 }
 
+func TestValidateRuntimeBasesEnvRequiresAllPinnedRefs(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "runtime-bases.env")
+	valid := strings.Join([]string{
+		"FAAS_DEPLOY_BASE_REF_NODE22=ghcr.io/example/runner-node22@sha256:" + strings.Repeat("a", 64),
+		"FAAS_DEPLOY_BASE_REF_PYTHON312=ghcr.io/example/runner-python312@sha256:" + strings.Repeat("b", 64),
+		"FAAS_DEPLOY_BASE_REF_GO124=ghcr.io/example/runner-go124@sha256:" + strings.Repeat("c", 64),
+		"FAAS_DEPLOY_BASE_REF_GO124_ALPINE=ghcr.io/example/runner-go124-alpine@sha256:" + strings.Repeat("d", 64),
+		"FAAS_DEPLOY_BASE_REF_NODE24=ghcr.io/example/runner-node24@sha256:" + strings.Repeat("e", 64),
+		"FAAS_DEPLOY_BASE_REF_PYTHON313=ghcr.io/example/runner-python313@sha256:" + strings.Repeat("f", 64),
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(valid), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateRuntimeBasesEnv(path, nil); err != nil {
+		t.Fatalf("valid runtime contract rejected: %v", err)
+	}
+
+	if err := os.WriteFile(path, []byte(strings.Replace(valid, "FAAS_DEPLOY_BASE_REF_NODE24=", "", 1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateRuntimeBasesEnv(path, nil); err == nil || !strings.Contains(err.Error(), "NODE24") {
+		t.Fatalf("missing runtime ref error = %v", err)
+	}
+}
+
+func TestValidateRuntimeBasesEnvMatchesSignedManifestRefs(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "runtime-bases.env")
+	ref := "ghcr.io/example/runner-node22@sha256:" + strings.Repeat("a", 64)
+	body := "FAAS_DEPLOY_BASE_REF_NODE22=" + ref + "\n"
+	for _, line := range []string{
+		"FAAS_DEPLOY_BASE_REF_PYTHON312=ghcr.io/example/runner-python312@sha256:" + strings.Repeat("b", 64),
+		"FAAS_DEPLOY_BASE_REF_GO124=ghcr.io/example/runner-go124@sha256:" + strings.Repeat("c", 64),
+		"FAAS_DEPLOY_BASE_REF_GO124_ALPINE=ghcr.io/example/runner-go124-alpine@sha256:" + strings.Repeat("d", 64),
+		"FAAS_DEPLOY_BASE_REF_NODE24=ghcr.io/example/runner-node24@sha256:" + strings.Repeat("e", 64),
+		"FAAS_DEPLOY_BASE_REF_PYTHON313=ghcr.io/example/runner-python313@sha256:" + strings.Repeat("f", 64),
+	} {
+		body += line + "\n"
+	}
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	expected := map[string]string{
+		"node22":       ref,
+		"python312":    "ghcr.io/example/runner-python312@sha256:" + strings.Repeat("b", 64),
+		"go124":        "ghcr.io/example/runner-go124@sha256:" + strings.Repeat("c", 64),
+		"go124_alpine": "ghcr.io/example/runner-go124-alpine@sha256:" + strings.Repeat("d", 64),
+		"node24":       "ghcr.io/example/runner-node24@sha256:" + strings.Repeat("e", 64),
+		"python313":    "ghcr.io/example/runner-python313@sha256:" + strings.Repeat("f", 64),
+	}
+	if err := validateRuntimeBasesEnv(path, expected); err != nil {
+		t.Fatalf("signed runtime contract rejected: %v", err)
+	}
+	expected["node22"] = strings.Replace(ref, "runner-node22", "runner-node24", 1)
+	if err := validateRuntimeBasesEnv(path, expected); err == nil || !strings.Contains(err.Error(), "NODE22") {
+		t.Fatalf("manifest mismatch error = %v", err)
+	}
+}
+
 func TestDeployJoinValidate_RejectsControlPlane(t *testing.T) {
 	manifestPath := splitboxJoinManifest(t)
 	_, err := deployJoinValidate(deployJoinOptions{
@@ -472,6 +530,11 @@ func TestDeployJoinApply_RendersProviderConnectionOverride(t *testing.T) {
 	if err := os.WriteFile(storageEnv, []byte("FAAS_STORAGE_BACKEND=oci\nFAAS_OCI_REGISTRY=https://registry.example\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	runtimeBasesEnv := filepath.Join(artifactDir, "runtime-bases.env")
+	if err := os.WriteFile(runtimeBasesEnv, []byte(
+		"FAAS_DEPLOY_BASE_REF_NODE22=ghcr.io/example/runner-node22@sha256:1111111111111111111111111111111111111111111111111111111111111111\n"+"FAAS_DEPLOY_BASE_REF_PYTHON312=ghcr.io/example/runner-python312@sha256:2222222222222222222222222222222222222222222222222222222222222222\n"+"FAAS_DEPLOY_BASE_REF_GO124=ghcr.io/example/runner-go124@sha256:3333333333333333333333333333333333333333333333333333333333333333\n"+"FAAS_DEPLOY_BASE_REF_GO124_ALPINE=ghcr.io/example/runner-go124-alpine@sha256:4444444444444444444444444444444444444444444444444444444444444444\n"+"FAAS_DEPLOY_BASE_REF_NODE24=ghcr.io/example/runner-node24@sha256:5555555555555555555555555555555555555555555555555555555555555555\n"+"FAAS_DEPLOY_BASE_REF_PYTHON313=ghcr.io/example/runner-python313@sha256:6666666666666666666666666666666666666666666666666666666666666666\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	signKey := filepath.Join(artifactDir, "sign.key")
 	verifyKey := filepath.Join(artifactDir, "sign-pub.pem")
 	for _, path := range []string{signKey, verifyKey} {
@@ -537,39 +600,41 @@ func TestDeployJoinApply_RendersProviderConnectionOverride(t *testing.T) {
 	}
 
 	report, err := deployJoinValidate(deployJoinOptions{
-		ManifestFile:       manifestPath,
-		Node:               "fsn-2",
-		SSHHost:            "203.0.113.27",
-		ReleaseTarball:     tarball,
-		BootstrapBinary:    bootstrap,
-		CosignBinary:       cosign,
-		PKISource:          pkiDir,
-		SignKeySource:      signKey,
-		VerifyKeySource:    verifyKey,
-		ComputeDBEnvSource: computeDBEnv,
-		StorageEnvSource:   storageEnv,
-		RepoRoot:           repo,
-		SkipFleetPreflight: true,
+		ManifestFile:          manifestPath,
+		Node:                  "fsn-2",
+		SSHHost:               "203.0.113.27",
+		ReleaseTarball:        tarball,
+		BootstrapBinary:       bootstrap,
+		CosignBinary:          cosign,
+		PKISource:             pkiDir,
+		SignKeySource:         signKey,
+		VerifyKeySource:       verifyKey,
+		ComputeDBEnvSource:    computeDBEnv,
+		StorageEnvSource:      storageEnv,
+		RuntimeBasesEnvSource: runtimeBasesEnv,
+		RepoRoot:              repo,
+		SkipFleetPreflight:    true,
 	})
 	if err != nil {
 		t.Fatalf("deployJoinValidate: %v", err)
 	}
 	if code, err := deployJoinApply(&deployJoinOptions{
-		ManifestFile:       manifestPath,
-		Node:               "fsn-2",
-		SSHHost:            "203.0.113.27",
-		SSHUser:            "root",
-		SSHPort:            22,
-		ReleaseTarball:     tarball,
-		BootstrapBinary:    bootstrap,
-		CosignBinary:       cosign,
-		PKISource:          pkiDir,
-		SignKeySource:      signKey,
-		VerifyKeySource:    verifyKey,
-		ComputeDBEnvSource: computeDBEnv,
-		StorageEnvSource:   storageEnv,
-		RepoRoot:           repo,
-		SkipFleetPreflight: true,
+		ManifestFile:          manifestPath,
+		Node:                  "fsn-2",
+		SSHHost:               "203.0.113.27",
+		SSHUser:               "root",
+		SSHPort:               22,
+		ReleaseTarball:        tarball,
+		BootstrapBinary:       bootstrap,
+		CosignBinary:          cosign,
+		PKISource:             pkiDir,
+		SignKeySource:         signKey,
+		VerifyKeySource:       verifyKey,
+		ComputeDBEnvSource:    computeDBEnv,
+		StorageEnvSource:      storageEnv,
+		RuntimeBasesEnvSource: runtimeBasesEnv,
+		RepoRoot:              repo,
+		SkipFleetPreflight:    true,
 	}, &report); err != nil || code != 0 {
 		t.Fatalf("deployJoinApply: code=%d err=%v", code, err)
 	}
