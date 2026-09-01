@@ -1120,6 +1120,11 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		impl.WithEvents(events.NewPlatform("vmmd", store, log, ops, nil))
 	}
 	impl.Register(gsrv)
+	defer func() {
+		if err := impl.Close(context.WithoutCancel(ctx)); err != nil {
+			log.Warn("vmmd: stream bridge cleanup during shutdown failed", "err", err)
+		}
+	}()
 
 	// Optional /metrics endpoint.
 	var httpSrv *http.Server

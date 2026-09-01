@@ -53,7 +53,7 @@
 //	argv[3] = guest TCP port
 //	argv[4] = session deadline (RFC3339 or duration like "24h")
 //
-// Env vars (HONORED BY THE HANDLER, set by vmmd from the
+// Env vars (legacy per-RPC fallback, set by vmmd from the
 // ForwardHTTPRequestInit frame):
 //
 //	FAAS_BRIDGE_METHOD  = HTTP method (e.g. GET, POST)
@@ -67,12 +67,16 @@
 //	                      HTTP/1.1 field-values. Content-Length is
 //	                      dropped (chunked is hard-coded).
 //
+// Persistent v2 requests carry method, URI, headers, protocol, port,
+// and host on the inbound H2C request using private X-Faas-Bridge-*
+// headers. Those headers are removed before the guest request is built;
+// the environment remains only as the explicit per-RPC rollback path.
+//
 // Wire protocol:
 //
 //   - server side: H2C (cleartext HTTP/2) per RFC 7540 / 9113
-//   - client side: HTTP/1.1 + Transfer-Encoding: chunked to the
-//     guest (the legacy v1 contract; matches the shell bridge so
-//     guest-side net/http sees the same envelope)
+//   - client side: HTTP/1.1 + Transfer-Encoding: chunked or prior-
+//     knowledge H2C to the guest, selected per request
 //   - bidi byte-copy with chunked framing on the request side and
 //     httputil.NewChunkedReader on the response side
 //
@@ -299,14 +303,14 @@ func buildServer(guestIP string, guestPort uint16, deadline time.Time) *http.Ser
 	}
 }
 
-// newHandler builds the H2C handler that proxies a single H2C
-// stream to the guest at <guestIP>:<port>. Each inbound request
-// opens a fresh dial against the guest, writes the H1 request
-// line + headers + chunked body, and reads back the chunked
-// response.
+// newHandler builds the H2C handler that proxies requests to the guest at
+// <guestIP>:<port>. Each inbound request opens a fresh guest dial, while the
+// bridge process, unix socket, and host-side H2C transport are reusable.
 //
-// The request parts are taken from env vars set by vmmd from the
-// ForwardHTTPRequestInit frame:
+// Legacy request parts are taken from env vars set by vmmd from the
+// ForwardHTTPRequestInit frame. Persistent requests use the inbound
+// request metadata instead so concurrent streams cannot overwrite one
+// another's environment.
 //
 //	FAAS_BRIDGE_METHOD  + FAAS_BRIDGE_URL form the request line
 //	FAAS_BRIDGE_HOST    is the Host header
@@ -333,12 +337,17 @@ func newHandler(guestIP string, guestPort uint16, deadline time.Time) http.Handl
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Read FAAS_BRIDGE_PROTOCOL once per request: currentBridgeFraming uses the same value for dispatch, and the slog line below logs the raw string verbatim (operator correlation with FAAS_BRIDGE_PROTOCOL env flips). One syscall beats two.
 		bridgeProtoEnv := os.Getenv("FAAS_BRIDGE_PROTOCOL")
+		if bridgeRequestUsesWireMetadata(r) {
+			wireProtocol := r.Header.Get(bridgeRequestProtocolHeader)
+			bridgeProtoEnv = wireProtocol
+		}
 		framing := currentBridgeFramingFrom(bridgeProtoEnv)
+		requestPort := bridgeRequestPort(r, guestPort)
 		// ADR-127 §D3 (Layer 7) — framing-selection slog line. Captured at DEBUG, not Info: at Scale plan (5000 rps/account × N accounts × many bridge processes), per-request Info emission generates tens of thousands of JSON lines/sec/box and buries operator queries under journald's rate limit. Debug is the right level — the operator opts in via FAAS_LOG_LEVEL=debug (the canonical env flag, parsed at pkg/wire/ParseLevel) when investigating a framing question. The counter vmmd_bridge_framing_total carries the same information as a queryable metric; the dashboard panel 1 (bridge-protection deploy/grafana/bridge-protection.json) is the operator's primary view.
 		slog.Debug("vmmd-stream-bridge: framing selected",
 			"framing", framing.String(),
 			"app_protocol_env", bridgeProtoEnv,
-			"guest", net.JoinHostPort(guestIP, strconv.FormatUint(uint64(guestPort), 10)),
+			"guest", net.JoinHostPort(guestIP, strconv.FormatUint(uint64(requestPort), 10)),
 			"method", r.Method,
 			"path", r.URL.Path,
 		)
@@ -358,9 +367,9 @@ func newHandler(guestIP string, guestPort uint16, deadline time.Time) http.Handl
 		w.Header().Set("X-Faas-Bridge-Framing", framing.String())
 		switch framing {
 		case framingH2C:
-			handleH2CStream(w, r, guestIP, guestPort, deadline)
+			handleH2CStream(w, r, guestIP, requestPort, deadline)
 		default:
-			handleH1Stream(w, r, guestIP, guestPort, deadline)
+			handleH1Stream(w, r, guestIP, requestPort, deadline)
 		}
 	})
 }
@@ -375,15 +384,22 @@ func handleH1Stream(w http.ResponseWriter, r *http.Request, guestIP string, gues
 	defer cancel()
 
 	method := os.Getenv("FAAS_BRIDGE_METHOD")
+	url := os.Getenv("FAAS_BRIDGE_URL")
+	host := os.Getenv("FAAS_BRIDGE_HOST")
+	extraHeaders := parseHeaders(os.Getenv("FAAS_BRIDGE_HEADERS"))
+	if bridgeRequestUsesWireMetadata(r) {
+		method = r.Method
+		url = r.URL.RequestURI()
+		host = bridgeRequestHost(r, "")
+		extraHeaders = bridgeRequestHeaders(r)
+		guestPort = bridgeRequestPort(r, guestPort)
+	}
 	if method == "" {
 		method = "GET"
 	}
-	url := os.Getenv("FAAS_BRIDGE_URL")
 	if url == "" {
 		url = "/"
 	}
-	host := os.Getenv("FAAS_BRIDGE_HOST")
-	extraHeaders := parseHeaders(os.Getenv("FAAS_BRIDGE_HEADERS"))
 
 	// Defense-in-depth CR/LF sanitization. vmmd already strips
 	// CR/LF in streamBridgeEnv (pkg/vmmdgrpc/forward.go), but
