@@ -11,9 +11,11 @@
 # spawn → runBuild → DestroyWithExport path works against a real artifact
 # producing engine rather than a busybox stub.
 #
-# Both railpack and buildkit are pulled as upstream release tarballs (neither is
-# packaged in Alpine). Versions are pinned via build-args so CI can
-# override them per release without churning this file.
+# Railpack is pulled as an upstream release tarball (it is not packaged in
+# Alpine). BuildKit is compiled from its checksum-pinned source below so the
+# daemon and client share the dependency and toolchain floor enforced by this
+# image. Versions are pinned via build-args so CI can override them per
+# release without churning this file.
 
 # ---- railpack (Node/Python builder, spec §4.5) ---------------------------
 # Upstream switched from flat `-linux-amd64` binaries to Rust-target-triple
@@ -36,8 +38,7 @@ ARG MISE_SHA256_ARM64=926914f938c55e86e48875f1c9253573ddf6d5efb5abb6e8721ea061fe
 # the VM boundary is the actual security perimeter (ADR-003).
 ARG BUILDKIT_VERSION=0.32.2
 ARG BUILDKIT_SOURCE_SHA256=b19deba3f8cf3eb05407aa85c246e22839770c437439a04d880ef3d645aed0aa
-ARG BUILDKIT_SHA256_AMD64=2975d0f651ad96ba8b80b9992ae1f9a964f4408569af5b6dc36544165c3926af
-ARG BUILDKIT_SHA256_ARM64=9e8f46bf309ec0ab262967be5538a4dbe06be756a82621f98253933bac5dcf92
+ARG GO_ARCHIVE_VERSION=0.3.0
 
 # Alpine v3.22's packaged runc was built with Go 1.24.12. That leaves the
 # builder image exposed to GO-2026-4337 (CVE-2025-68121), which the runtime
@@ -74,10 +75,10 @@ ARG RUNC_SHA256_ARM64=ca70e7dbd6616ca782a59b5d3ac86909123fdaa9fa3f89dcf29051c70e
 # this line and the lock entry. The base manifest-list digest pins
 # every per-arch child manifest so buildx's per-arch resolution
 # stays race-free under multi-arch build (per-arch digests are not
-# stable across re-pulls, but the manifest-list digest is).
-# $TARGETPLATFORM is implicit on multi-arch FROM; the explicit
-# `--platform=` would emit a RedundantTargetPlatform warning.
-FROM golang:1.26.6@sha256:0d1d3a794be25f809dd2cb3160d8c73276c4056a9f8242a138e908ddeee7b6b6 AS guest-init-build
+# stable across re-pulls, but the manifest-list digest is). Use the native
+# build platform for the toolchain and cross-compile the target artifact; this
+# avoids emulating the Go compiler for arm64 multi-arch builds.
+FROM --platform=$BUILDPLATFORM golang:1.26.6@sha256:0d1d3a794be25f809dd2cb3160d8c73276c4056a9f8242a138e908ddeee7b6b6 AS guest-init-build
 WORKDIR /src
 # guest-init is a pure-Go binary; no submodule vendoring needed. The
 # repository is the build context, so COPY . picks up the whole tree.
@@ -92,16 +93,21 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # BuildKit's server has a deliberately strict session liveness check. The
 # stock buildctl release has no flag for its per-session timeout header, while
 # slow bare-metal builders can spend several minutes importing a remote layer.
-# Build the tiny upstream client with the repository patch that opts into a
-# bounded, longer session interval; buildkitd itself remains the pinned
-# upstream release binary below.
-FROM golang:1.26.6@sha256:0d1d3a794be25f809dd2cb3160d8c73276c4056a9f8242a138e908ddeee7b6b6 AS buildkit-client-build
+# Build both upstream binaries from the same source tree so the repository
+# patch and the dependency floors apply consistently to buildctl and buildkitd.
+FROM --platform=$BUILDPLATFORM golang:1.26.6@sha256:0d1d3a794be25f809dd2cb3160d8c73276c4056a9f8242a138e908ddeee7b6b6 AS buildkit-client-build
 WORKDIR /src/buildkit
 ARG BUILDKIT_VERSION
 ARG TARGETOS
 ARG TARGETARCH
 ARG BUILDKIT_SOURCE_SHA256
+ARG GO_ARCHIVE_VERSION
 COPY images/buildkit-session-health.patch /tmp/buildkit-session-health.patch
+# BuildKit 0.32.2 still selects the vulnerable go-archive v0.2.0. Keep the
+# source release's vendored dependency graph for a fast, reproducible build,
+# but replace that one module with the fixed release before compiling. x/net
+# and grpc are already fixed in this source release; pin them explicitly so a
+# future source change cannot lower the builder's dependency floor unnoticed.
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git && \
       rm -rf /var/lib/apt/lists/* && \
       curl -fsSL -o /tmp/buildkit-source.tgz \
@@ -110,8 +116,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
       tar -xzf /tmp/buildkit-source.tgz --strip-components=1 -C /src/buildkit && \
       rm /tmp/buildkit-source.tgz && \
       git apply /tmp/buildkit-session-health.patch && \
+      go mod edit -require=github.com/moby/go-archive@v${GO_ARCHIVE_VERSION} && \
+      go mod edit -require=golang.org/x/net@v0.57.0 && \
+      go mod edit -require=google.golang.org/grpc@v1.82.1 && \
+      go mod download github.com/moby/go-archive@v${GO_ARCHIVE_VERSION} && \
+      archive_module="$(go env GOMODCACHE)/github.com/moby/go-archive@v${GO_ARCHIVE_VERSION}" && \
+      rm -rf vendor/github.com/moby/go-archive && \
+      cp -a "${archive_module}" vendor/github.com/moby/go-archive && \
+      sed -i "s#github.com/moby/go-archive v0.2.0#github.com/moby/go-archive v${GO_ARCHIVE_VERSION}#" vendor/modules.txt && \
       CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-        go build -trimpath -o /out/buildctl ./cmd/buildctl
+        go build -mod=vendor -trimpath -o /out/buildkitd ./cmd/buildkitd && \
+      CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+        go build -mod=vendor -trimpath -o /out/buildctl ./cmd/buildctl
 
 # ---- stage 2: assemble the runtime rootfs -------------------------------
 # See the stage 1 FROM above re: $TARGETPLATFORM handling.
@@ -130,8 +146,6 @@ FROM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc
 # line. CI runs `make images-lock-check` to fail any PR that drifts.
 ARG RAILPACK_VERSION
 ARG BUILDKIT_VERSION
-ARG BUILDKIT_SHA256_AMD64
-ARG BUILDKIT_SHA256_ARM64
 ARG MISE_VERSION
 ARG MISE_SHA256_AMD64
 ARG MISE_SHA256_ARM64
@@ -183,24 +197,12 @@ RUN test -x /usr/local/bin/runc && \
 RUN printf 'root:100000:65536\n' > /etc/subuid && \
     printf 'root:100000:65536\n' > /etc/subgid
 
-# BuildKit rootless. Two files: buildkitd (daemon) + buildctl (client). The
-# upstream tarball unpacks both into ./bin/.
-RUN mkdir -p /opt/buildkit && \
-      curl -fsSL -o /tmp/buildkit.tgz \
-      "https://github.com/moby/buildkit/releases/download/v${BUILDKIT_VERSION}/buildkit-v${BUILDKIT_VERSION}.linux-${TARGETARCH}.tar.gz" && \
-      case "${TARGETARCH}" in \
-        amd64) BUILDKIT_SHA256="${BUILDKIT_SHA256_AMD64}" ;; \
-        arm64) BUILDKIT_SHA256="${BUILDKIT_SHA256_ARM64}" ;; \
-        *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
-      esac && \
-      echo "${BUILDKIT_SHA256}  /tmp/buildkit.tgz" | sha256sum -c - && \
-      tar -C /opt/buildkit -xzf /tmp/buildkit.tgz && \
-      rm /tmp/buildkit.tgz && \
-      install -m 0755 /opt/buildkit/bin/buildkitd /usr/local/bin/buildkitd && \
-      rm -rf /opt/buildkit
-
+# BuildKit rootless. Both binaries come from the source build above; using the
+# upstream release tarball here would reintroduce its older Go modules and
+# standard library into the final image.
+COPY --from=buildkit-client-build /out/buildkitd /usr/local/bin/buildkitd
 COPY --from=buildkit-client-build /out/buildctl /usr/local/bin/buildctl
-RUN chmod 0755 /usr/local/bin/buildctl
+RUN chmod 0755 /usr/local/bin/buildkitd /usr/local/bin/buildctl
 
 # Railpack. The current naming convention is `<ver>-<arch>-unknown-linux-musl.tar.gz`
 # where <arch> is `x86_64` or `arm64`. We resolve the right arch from TARGETARCH.
