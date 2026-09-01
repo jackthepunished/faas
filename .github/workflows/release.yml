@@ -439,6 +439,22 @@ jobs:
           echo "RUNTIME_SOURCE_SHA=$RUNTIME_SOURCE_SHA" >> "$GITHUB_ENV"
           echo "materialized release runtime-base contract from source $RUNTIME_SOURCE_SHA"
 
+      - name: Build release-pinned Firecracker kernel
+        env:
+          KERNEL_FILE: ${{ runner.temp }}/gregale-release/vmlinux
+        run: |
+          set -euo pipefail
+          # The kernel is part of the signed release, so production compute
+          # hosts never rebuild it with provider-specific compiler, hostname,
+          # or timestamp metadata during node adoption.
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            bc bison build-essential cpio flex file kmod libelf-dev libssl-dev xz-utils
+          scripts/build-firecracker-kernel.sh --output "$KERNEL_FILE"
+          KERNEL_DIGEST="$(sha256sum "$KERNEL_FILE" | awk '{print $1}')"
+          echo "KERNEL_DIGEST=$KERNEL_DIGEST" >> "$GITHUB_ENV"
+          echo "release kernel digest=$KERNEL_DIGEST"
+
       - name: Build canonical daemon tarball and SPDX SBOM
         env:
           GIT_SHA: ${{ github.sha }}
@@ -449,6 +465,7 @@ jobs:
           # tag commit and the signed bundle always share one identity.
           OUT_DIR: ${{ runner.temp }}/gregale-release
           SYFT_BIN: syft
+          KERNEL_FILE: ${{ runner.temp }}/gregale-release/vmlinux
         run: |
           set -euo pipefail
           MANIFEST_FILE="$OUT_DIR/production-manifest.yaml"
@@ -456,12 +473,14 @@ jobs:
             --template deploy/manifest/production/gcp-live.template.yaml \
             --git-sha "$GIT_SHA" \
             --builder-base-digest "$BUILDER_BASE_DIGEST" \
+            --kernel-digest "$KERNEL_DIGEST" \
             --runtime-bases-env "$OUT_DIR/runtime-bases.env" \
             --output "$MANIFEST_FILE"
           go run ./cmd/gregalectl manifest validate --file "$MANIFEST_FILE"
           MANIFEST_FILE="$MANIFEST_FILE" \
             GIT_SHA="$GIT_SHA" \
             OUT_DIR="$OUT_DIR" \
+            KERNEL_FILE="$KERNEL_FILE" \
             SYFT_BIN="$SYFT_BIN" \
             scripts/build-canonical-tarball.sh
 

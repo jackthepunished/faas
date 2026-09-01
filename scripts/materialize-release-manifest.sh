@@ -13,10 +13,11 @@ GIT_SHA=""
 OUTPUT=""
 BUILDER_BASE_DIGEST=""
 RUNTIME_BASES_ENV=""
+KERNEL_DIGEST=""
 
 usage() {
   cat >&2 <<'USAGE'
-usage: materialize-release-manifest.sh --git-sha SHA --output PATH --runtime-bases-env PATH [--template PATH] [--builder-base-digest DIGEST]
+usage: materialize-release-manifest.sh --git-sha SHA --output PATH --runtime-bases-env PATH [--template PATH] [--builder-base-digest DIGEST] [--kernel-digest DIGEST]
 USAGE
 }
 
@@ -47,6 +48,11 @@ while [[ $# -gt 0 ]]; do
       RUNTIME_BASES_ENV=$2
       shift 2
       ;;
+    --kernel-digest)
+      [[ $# -ge 2 ]] || { usage; exit 2; }
+      KERNEL_DIGEST=$2
+      shift 2
+      ;;
     -h|--help)
       usage >&2
       exit 0
@@ -75,6 +81,11 @@ if [[ -n "$BUILDER_BASE_DIGEST" && ! "$BUILDER_BASE_DIGEST" =~ ^(sha256:)?[0-9a-
   exit 2
 fi
 BUILDER_BASE_DIGEST="${BUILDER_BASE_DIGEST#sha256:}"
+if [[ -n "$KERNEL_DIGEST" && ! "$KERNEL_DIGEST" =~ ^(sha256:)?[0-9a-f]{64}$ ]]; then
+  echo "materialize-release-manifest: --kernel-digest must be a sha256 digest" >&2
+  exit 2
+fi
+KERNEL_DIGEST="${KERNEL_DIGEST#sha256:}"
 if [[ -z "$RUNTIME_BASES_ENV" || ! -f "$RUNTIME_BASES_ENV" ]]; then
   echo "materialize-release-manifest: --runtime-bases-env must name a generated runtime contract" >&2
   exit 2
@@ -106,6 +117,7 @@ trap 'rm -f "$tmp"' EXIT
 release_id="pre-1.0-${GIT_SHA:0:8}"
 awk -v release_id="$release_id" -v release_sha="$GIT_SHA" \
   -v builder_base_digest="$BUILDER_BASE_DIGEST" \
+  -v kernel_digest="$KERNEL_DIGEST" \
   -v minimal_ref="$MINIMAL_REF" \
   -v node22_ref="$NODE22_REF" \
   -v python312_ref="$PYTHON312_REF" \
@@ -147,6 +159,11 @@ awk -v release_id="$release_id" -v release_sha="$GIT_SHA" \
   in_release && builder_base_digest != "" && /^  builder_base_digest:[[:space:]]/ {
     print "  builder_base_digest: " builder_base_digest
     builder_base_digests++
+    next
+  }
+  in_release && kernel_digest != "" && /^  kernel_digest:[[:space:]]/ {
+    print "  kernel_digest: " kernel_digest
+    kernel_digests++
     next
   }
   in_release && /^    minimal:[[:space:]]/ {
@@ -194,6 +211,9 @@ awk -v release_id="$release_id" -v release_sha="$GIT_SHA" \
     }
     if (builder_base_digest != "" && builder_base_digests != 1) {
       fail("template must contain one indented release.builder_base_digest when an override is supplied")
+    }
+    if (kernel_digest != "" && kernel_digests != 1) {
+      fail("template must contain one indented release.kernel_digest when an override is supplied")
     }
     if (runtime_base_refs != 7) {
       fail("template must contain the seven runtime_base_refs entries")

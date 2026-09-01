@@ -229,6 +229,22 @@
         group: root
         mode: "0644"
 
+    - name: Stage the release-pinned Firecracker guest kernel
+      ansible.builtin.shell:
+        cmd: >-
+          set -euo pipefail;
+          umask 077;
+          tmp=$(mktemp /var/lib/faas/bootstrap/vmlinux.XXXXXX);
+          trap 'rm -f "$tmp"' EXIT;
+          tar --extract --gzip --file /var/lib/faas/bootstrap/release.tar.gz
+          --to-stdout vmlinux > "$tmp";
+          test -s "$tmp";
+          install -o root -g root -m 0644 "$tmp"
+          /var/lib/faas/bootstrap/vmlinux;
+          trap - EXIT
+        executable: /bin/bash
+      changed_when: true
+
     - name: Stage the release signature bundle
       ansible.builtin.copy:
         src: "{{ faas_join_release_signature_source }}"

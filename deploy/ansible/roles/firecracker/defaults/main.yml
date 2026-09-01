@@ -1,12 +1,14 @@
 # Pin: upgrade both fc_release AND fc_release_sha256 together.
-# FC releases (v1.7.0+) do NOT bundle kernels - we BUILD from source using
-# the FC CI kernel config. This ensures virtio-blk is built-in (not a module),
-# which is required for the kernel to mount root during boot.
+# FC releases (v1.7.0+) do NOT bundle kernels. Release CI builds the pinned
+# kernel once from the FC CI config and ships it in the signed release bundle;
+# image-seed/dev bootstrap retains the deterministic source-build fallback.
+# This ensures virtio-blk is built-in (not a module), which is required for
+# the kernel to mount root during boot.
 #
 # Kernel source and config:
 # - kernel source: https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.1.x.tar.xz
 # - FC kernel config: https://raw.githubusercontent.com/firecracker-microvm/firecracker/{{ fc_release }}/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config
-# - Required config change: CONFIG_BLK_DEV_VIRTIO=y (must be built-in, not module)
+# - Required config change: CONFIG_VIRTIO_BLK=y (must be built-in, not module)
 #
 # Build deps: make, gcc, flex, bison, libssl-dev, libelf-dev, bc, kmod, cpio, xz
 fc_release: "v1.7.0"
