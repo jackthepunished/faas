@@ -364,8 +364,20 @@ func TestPGBackend_AdmitRequestCancellationDoesNotCancelLifecycle(t *testing.T) 
 	case <-time.After(time.Second):
 		t.Fatal("admission lifecycle did not complete")
 	}
-	if got := b.HealthyCount("app-1"); got != 1 {
-		t.Fatalf("HealthyCount after detached admission = %d, want 1", got)
+	// blockingScheduler closes completed immediately before returning from
+	// AdmitInstance. The detached backend goroutine still has to receive that
+	// result and publish the target, so observing completed alone is not a
+	// synchronization point for the cache update.
+	deadline := time.NewTimer(time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer deadline.Stop()
+	defer ticker.Stop()
+	for b.HealthyCount("app-1") != 1 {
+		select {
+		case <-ticker.C:
+		case <-deadline.C:
+			t.Fatalf("HealthyCount after detached admission = %d, want 1", b.HealthyCount("app-1"))
+		}
 	}
 	if pick := b.Pick("app-1"); !pick.OK || pick.Target.InstanceID != "instance-after-timeout" {
 		t.Fatalf("Pick after detached admission = %+v, want instance-after-timeout", pick)
