@@ -12,21 +12,21 @@
 # producing engine rather than a busybox stub.
 #
 # Railpack is pulled as an upstream release tarball (it is not packaged in
-# Alpine). BuildKit is compiled from its checksum-pinned source below so the
-# daemon and client share the dependency and toolchain floor enforced by this
-# image. Versions are pinned via build-args so CI can override them per
-# release without churning this file.
+# Alpine). BuildKit and runc are compiled from their checksum-pinned sources
+# below so the image does not inherit stale Go dependencies from opaque
+# upstream binaries. Versions are pinned via build-args so CI can override
+# them per release without churning this file.
 
 # ---- railpack (Node/Python builder, spec §4.5) ---------------------------
 # Upstream switched from flat `-linux-amd64` binaries to Rust-target-triple
 # names in v0.10+. The current naming is `-x86_64-unknown-linux-musl` /
 # `-arm64-unknown-linux-musl`. v0.5.0 with the old naming is no longer
-# published, so bumping to v0.31.1 (current stable as of 2026-07) is mandatory.
-ARG RAILPACK_VERSION=0.31.1
-ARG RAILPACK_SHA256_AMD64=606403d40d7229e205554e0dba6bdaf8922308fa6447182dfc33dcc338a47a80
-ARG RAILPACK_SHA256_ARM64=0c4418d56877d67351f0853278235c003d2d94f8b3e58f4ca85ecb51bd07e851
+# published, so bumping to v0.38.0 (current stable as of 2026-08) is mandatory.
+ARG RAILPACK_VERSION=0.38.0
+ARG RAILPACK_SHA256_AMD64=7c3f0e70ca8bf80bde87e8c30cb0171414c2b6bbd794d6f60a19cc3b71772950
+ARG RAILPACK_SHA256_ARM64=d33716e87f0e39314898746c806e26d9edde890ac65156891b2f06c8d07ba8c4
 
-# Railpack 0.31.1 bootstraps mise 2026.7.6 using its glibc linux-x64
+# Railpack 0.38.0 bootstraps mise 2026.7.6 using its glibc linux-x64
 # asset. The builder rootfs is Alpine, so stage the matching musl asset and
 # let guest-init seed Railpack's expected cache path before prepare runs.
 ARG MISE_VERSION=2026.7.6
@@ -40,15 +40,13 @@ ARG BUILDKIT_VERSION=0.32.2
 ARG BUILDKIT_SOURCE_SHA256=b19deba3f8cf3eb05407aa85c246e22839770c437439a04d880ef3d645aed0aa
 ARG GO_ARCHIVE_VERSION=0.3.0
 
-# Alpine v3.22's packaged runc was built with Go 1.24.12. That leaves the
-# builder image exposed to GO-2026-4337 (CVE-2025-68121), which the runtime
-# admission gate correctly refuses. Use the upstream static runc release
-# instead of inheriting the vulnerable compiler/runtime from apk. The
-# checksums are for the official release assets and are deliberately kept
-# here beside the version so a bump cannot silently change the executable.
+# The latest upstream runc release still embeds golang.org/x/net v0.50.0 and
+# Go 1.25.12, which leaves this image exposed to fixed HIGH advisories. Build
+# the same release from checksum-pinned source with the image's Go 1.26.6
+# toolchain and an explicit dependency floor. The static-pie result runs on
+# Alpine without inheriting the host libc.
 ARG RUNC_VERSION=1.5.1
-ARG RUNC_SHA256_AMD64=177df879d50c913eb205e898d5c1c05a18f574053c0ce5524c471208eaf06f6f
-ARG RUNC_SHA256_ARM64=ca70e7dbd6616ca782a59b5d3ac86909123fdaa9fa3f89dcf29051c70eee7ce9
+ARG RUNC_SOURCE_SHA256=32286f18899a644ec7c1589688a9600ba54cc65264f23f1f5877ba214ca76e75
 
 # ---- guest-init version (issue #938 / PR-B / ADR-114) -------------------
 # Multi-arch builds CANNOT pre-stage guest-init in the build context because
@@ -89,6 +87,35 @@ ARG TARGETARCH
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
       go build -trimpath -tags linux \
         -o /out/faas-guest-init ./guest/init
+
+# ---- runc (builder OCI runtime) -----------------------------------------
+# The official runc asset is intentionally not copied into the final image:
+# its embedded module metadata contains fixed HIGH vulnerabilities. Build the
+# pinned release from source instead. We build on TARGETPLATFORM because runc
+# enables cgo for seccomp; buildx's QEMU path is bounded to this small binary
+# and keeps the cross-compiled BuildKit stages native and fast.
+FROM --platform=$TARGETPLATFORM golang:1.26.6@sha256:0d1d3a794be25f809dd2cb3160d8c73276c4056a9f8242a138e908ddeee7b6b6 AS runc-build
+WORKDIR /src/runc
+ARG RUNC_VERSION
+ARG RUNC_SOURCE_SHA256
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl libseccomp-dev && \
+      rm -rf /var/lib/apt/lists/* && \
+      curl -fsSL -o /tmp/runc-source.tgz \
+        "https://github.com/opencontainers/runc/archive/refs/tags/v${RUNC_VERSION}.tar.gz" && \
+      echo "${RUNC_SOURCE_SHA256}  /tmp/runc-source.tgz" | sha256sum -c - && \
+      tar -xzf /tmp/runc-source.tgz --strip-components=1 -C /src/runc && \
+      rm /tmp/runc-source.tgz && \
+      go mod edit -require=golang.org/x/net@v0.57.0 && \
+      go mod download && \
+      CGO_ENABLED=1 GOOS=linux GOARCH=${TARGETARCH} \
+        go build -mod=mod -trimpath -buildmode=pie \
+          -tags "seccomp urfave_cli_no_docs netgo osusergo" \
+          -ldflags "-linkmode external -extldflags -static-pie -X main.gitCommit=v${RUNC_VERSION}" \
+          -o /out/runc . && \
+      go version -m /out/runc | tee /tmp/runc-build-info && \
+      grep -q 'golang.org/x/net.*v0.57.0' /tmp/runc-build-info && \
+      ! grep -Eq 'v0.50.0|go1.25.12' /tmp/runc-build-info
 
 # BuildKit's server has a deliberately strict session liveness check. The
 # stock buildctl release has no flag for its per-session timeout header, while
@@ -153,8 +180,6 @@ ARG TARGETARCH
 ARG RAILPACK_SHA256_AMD64
 ARG RAILPACK_SHA256_ARM64
 ARG RUNC_VERSION
-ARG RUNC_SHA256_AMD64
-ARG RUNC_SHA256_ARM64
 
 # Railpack's mise/python-build path executes Bash scripts. Alpine's BusyBox
 # /bin/sh is not a substitute when invoked as "bash"; keep the real Bash
@@ -163,24 +188,13 @@ RUN apk add --no-cache \
       bash git ca-certificates curl xz shadow-subids fuse-overlayfs util-linux util-linux-misc && \
     apk upgrade --no-cache
 
-# Replace Alpine's runc build with the upstream static release. Besides
-# removing the stale Go standard library embedded in Alpine's package, the
-# static asset keeps this image portable across the glibc/musl boundary used
-# by the builder rootfs. Verify the architecture-specific release asset
-# before it becomes executable code in the VM.
-RUN case "${TARGETARCH}" in \
-      amd64) RUNC_ASSET=runc.amd64; RUNC_SHA256="${RUNC_SHA256_AMD64}" ;; \
-      arm64) RUNC_ASSET=runc.arm64; RUNC_SHA256="${RUNC_SHA256_ARM64}" ;; \
-      *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
-    esac && \
-    curl -fsSL -o /tmp/runc \
-      "https://github.com/opencontainers/runc/releases/download/v${RUNC_VERSION}/${RUNC_ASSET}" && \
-    echo "${RUNC_SHA256}  /tmp/runc" | sha256sum -c - && \
-    install -m 0755 /tmp/runc /usr/bin/runc && \
-    rm /tmp/runc
+# Install the source-built static-pie runtime. The build stage applies the
+# same target-architecture selection that the final image uses.
+COPY --from=runc-build /out/runc /usr/bin/runc
+RUN chmod 0755 /usr/bin/runc
 
 # guest-init and BuildKit use the stable platform path for the OCI runtime;
-# the verified upstream asset above is installed under /usr/bin.
+# the source-built static-pie binary above is installed under /usr/bin.
 RUN ln -s /usr/bin/runc /usr/local/bin/runc
 
 # guest-init uses util-linux unshare's automatic subordinate-ID mapping. The
