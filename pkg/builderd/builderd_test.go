@@ -20,6 +20,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/events"
+	"github.com/onebox-faas/faas/pkg/imaged"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/storage"
 	"github.com/onebox-faas/faas/pkg/wire"
@@ -163,7 +164,7 @@ func TestProcessOne_CacheHitSkipsSpawn(t *testing.T) {
 		t.Fatal(err)
 	}
 	hash, _ := hashFile(src)
-	if err := c.Store(hash, FrameworkNode, api.PlanPro, layerPath, 18); err != nil {
+	if err := c.StoreWithBase(hash, FrameworkNode, api.PlanPro, imaged.BaseRefMinimal, layerPath, 18); err != nil {
 		t.Fatal(err)
 	}
 
@@ -258,7 +259,7 @@ func TestProcessOne_VMSpawnSucceedsAndStamps(t *testing.T) {
 	}
 	// Cache should have been populated.
 	hash, _ := hashFile(srcTar)
-	if _, ok := c.Lookup(hash, FrameworkNode, api.PlanPro); !ok {
+	if _, ok := c.LookupWithBase(hash, FrameworkNode, api.PlanPro, imaged.BaseRefMinimal); !ok {
 		t.Error("expected cache populated after successful build")
 	}
 }
@@ -1151,7 +1152,7 @@ func TestProcessNext_FairnessWindow_ZeroDisablesFilter(t *testing.T) {
 		t.Fatal(err)
 	}
 	hash, _ := hashFile(src)
-	if err := c.Store(hash, FrameworkNode, api.PlanPro, srcCopy, 17); err != nil {
+	if err := c.StoreWithBase(hash, FrameworkNode, api.PlanPro, imaged.BaseRefMinimal, srcCopy, 17); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1209,7 +1210,7 @@ func TestProcessNext_FairnessWindow_PreferQuietAccount(t *testing.T) {
 		t.Fatal(err)
 	}
 	hash, _ := hashFile(src)
-	if err := c.Store(hash, FrameworkNode, api.PlanPro, srcCopy, 17); err != nil {
+	if err := c.StoreWithBase(hash, FrameworkNode, api.PlanPro, imaged.BaseRefMinimal, srcCopy, 17); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1266,7 +1267,7 @@ func TestProcessNext_RecordRecentBuildClaim_FailureDoesNotFailBuild(t *testing.T
 		t.Fatal(err)
 	}
 	hash, _ := hashFile(src)
-	if err := c.Store(hash, FrameworkNode, api.PlanPro, srcCopy, 17); err != nil {
+	if err := c.StoreWithBase(hash, FrameworkNode, api.PlanPro, imaged.BaseRefMinimal, srcCopy, 17); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1310,7 +1311,7 @@ func TestProcessOne_CacheHitPersistsProvenance(t *testing.T) {
 		t.Fatal(err)
 	}
 	hash, _ := hashFile(src)
-	if err := c.Store(hash, FrameworkNode, api.PlanPro, layerPath, 18); err != nil {
+	if err := c.StoreWithBase(hash, FrameworkNode, api.PlanPro, imaged.BaseRefMinimal, layerPath, 18); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1404,7 +1405,7 @@ func TestProcessOne_ProvenanceCopiesDeploymentSourceFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	hash, _ := hashFile(src)
-	if err := c.Store(hash, FrameworkNode, api.PlanPro, layerPath, 18); err != nil {
+	if err := c.StoreWithBase(hash, FrameworkNode, api.PlanPro, imaged.BaseRefMinimal, layerPath, 18); err != nil {
 		t.Fatal(err)
 	}
 

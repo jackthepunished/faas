@@ -305,6 +305,15 @@ func resolveDeployBaseRef(runtime string, envLookup func(string) string) (string
 	return ref, nil
 }
 
+// ResolveDeployBaseRef exposes the canonical runtime-to-base resolver to the
+// source builder. Keeping builderd and imaged on this one mapping is
+// important: the OCI image produced by Railpack must begin with the same
+// immutable base whose layers imaged removes before adding the app layer.
+// The envLookup seam is retained for deterministic unit tests.
+func ResolveDeployBaseRef(runtime string, envLookup func(string) string) (string, error) {
+	return resolveDeployBaseRef(runtime, envLookup)
+}
+
 func requireProductionBaseDigest(envKey, ref string, envLookup func(string) string) error {
 	if strings.TrimSpace(envLookup("FAAS_NODE_NAME")) == "" {
 		return nil

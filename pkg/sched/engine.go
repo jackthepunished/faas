@@ -1443,7 +1443,7 @@ func (e *Engine) AdmitInstance(ctx context.Context, appID, deploymentID, scope, 
 	if deploymentID == "" {
 		return e.admitAndDispatch(ctx, appID, trigger, true)
 	}
-	return e.admitAndDispatchForDeployment(ctx, appID, deploymentID, string(state.InstanceModeNormal), true)
+	return e.admitAndDispatchForDeployment(ctx, appID, deploymentID, string(state.InstanceModeNormal), true, trigger)
 }
 
 // scaleOutBurstContinuationKey marks the additional members of a single
@@ -1570,7 +1570,7 @@ func (e *Engine) AdmitMirrorInstance(ctx context.Context, appID, mirrorRuleID, m
 	// in one shot instead of INSERT mode='normal' then UPDATE to
 	// mode='mirror' (the latter had a race window readable by
 	// sampler / reaper between INSERT and UPDATE).
-	return e.admitAndDispatchForDeployment(ctx, appID, mirrorDeploymentID, string(state.InstanceModeMirror), false)
+	return e.admitAndDispatchForDeployment(ctx, appID, mirrorDeploymentID, string(state.InstanceModeMirror), false, TriggerMirror)
 }
 
 // ErrMirrorSlotAtCapacity (issue #72 / ADR-133 / ADR-125 PR-A3) is the
@@ -1615,12 +1615,11 @@ func (e *Engine) AdmitInstanceForDeployment(ctx context.Context, appID, deployme
 		// empty-deploymentID branch (which routes through
 		// admitAndDispatch and emits BootStarted/BootCompleted) carries
 		// the caller's closed-enum value. The deploymentID-set branch
-		// below uses admitAndDispatchForDeployment, which is a
-		// lightweight ledger admission that does NOT emit BootStarted —
-		// the trigger is captured for API symmetry but not consumed.
+		// below uses admitAndDispatchForDeployment, which carries the
+		// explicit deployment through the complete boot lifecycle.
 		return e.AdmitInstance(ctx, appID, "", scope, trigger)
 	}
-	return e.admitAndDispatchForDeployment(ctx, appID, deploymentID, string(state.InstanceModeNormal), true)
+	return e.admitAndDispatchForDeployment(ctx, appID, deploymentID, string(state.InstanceModeNormal), true, trigger)
 }
 
 // admitAndDispatchForDeployment mirrors admitAndDispatch but threads
@@ -1648,88 +1647,8 @@ func (e *Engine) AdmitInstanceForDeployment(ctx context.Context, appID, deployme
 // deployment path through the gate (which would require either
 // collapsing the two cap-enforcement layers or duplicating the
 // ledger write).
-func (e *Engine) admitAndDispatchForDeployment(ctx context.Context, appID, deploymentID, mode string, liftCapacityToResult bool) (WakeResult, error) {
-	// ── Phase 2: admit window, under appMu ──────────────────
-	release := e.lockApp(appID)
-	app, acct, limits, _, err := e.resolveApp(ctx, appID)
-	if err != nil {
-		release()
-		return WakeResult{}, err
-	}
-
-	// Worker class is the same short-circuit as admitAndDispatch.
-	if app.WorkloadClass == state.WorkloadClassWorker {
-		release()
-		e.IncAtCapacity(appID, "admit")
-		return WakeResult{AtCapacity: true}, nil
-	}
-
-	// Look up the override deployment; if it's gone or no longer live,
-	// treat as at-capacity (next tick re-evaluates).
-	dep, depErr := e.store.DeploymentByID(ctx, deploymentID)
-	if depErr != nil {
-		release()
-		if errors.Is(depErr, state.ErrNotFound) {
-			e.IncAtCapacity(appID, "admit")
-			return WakeResult{AtCapacity: true}, nil
-		}
-		return WakeResult{}, depErr
-	}
-	if dep.Status != state.DeployLive {
-		release()
-		e.IncAtCapacity(appID, "admit")
-		return WakeResult{AtCapacity: true}, nil
-	}
-
-	placement, err := e.choosePlacementLocked(ctx, Request{
-		AppID: appID, Plan: acct.Plan,
-		RAMMB: app.RAMMB, VCPU: limits.VCPU, MaxConcurrency: app.MaxConcurrency,
-	})
-	if err != nil {
-		release()
-		return WakeResult{}, err
-	}
-
-	wakeUUID, err := uuid.NewV7()
-	if err != nil {
-		wakeUUID = uuid.New()
-		if e.ops != nil {
-			e.ops.WakeIDV4Fallback().Inc()
-		}
-		e.log.Warn("floor admit: uuid.NewV7 failed, fell back to v4",
-			"app", appID, "deployment", deploymentID, "err", err)
-	}
-	wakeID := wakeUUID.String()
-
-	ins, err := e.store.CreateInstanceWithMode(ctx, appID, deploymentID, string(state.StateColdBooting), app.RAMMB, placement.NodeID, wakeID, mode)
-	if err != nil {
-		release()
-		return WakeResult{}, fmt.Errorf("sched: floor admit: create instance: %w", err)
-	}
-	e.emitInstanceChanged(ctx, ins.ID, appID, state.StateColdBooting, wakeID)
-
-	if err := e.ledger.Admit(Request{
-		Instance: ins.ID, AppID: appID, DeploymentID: deploymentID, Plan: acct.Plan,
-		RAMMB: app.RAMMB, VCPU: limits.VCPU, MaxConcurrency: app.MaxConcurrency,
-		NodeID:        placement.NodeID,
-		NodeCeilingMB: placement.CeilingMB,
-		VCPUBudget:    placement.VCPUBudget,
-	}); err != nil {
-		_ = e.store.DeleteInstance(ctx, ins.ID)
-		e.emitInstanceChanged(ctx, ins.ID, appID, state.StateFailed, wakeID)
-		if liftCapacityToResult {
-			var prob *api.Problem
-			if errors.As(err, &prob) {
-				e.IncAtCapacity(appID, "admit")
-				return WakeResult{AtCapacity: true}, nil
-			}
-		}
-		release()
-		return WakeResult{}, err
-	}
-
-	release()
-	return WakeResult{InstanceID: ins.ID, RequestCount: ins.RequestCount}, nil
+func (e *Engine) admitAndDispatchForDeployment(ctx context.Context, appID, deploymentID, mode string, liftCapacityToResult bool, trigger string) (WakeResult, error) {
+	return e.admitAndDispatchWithOptions(ctx, appID, deploymentID, mode, trigger, liftCapacityToResult, true)
 }
 
 // admitAndDispatch is the shared Phase 2–4 body used by both Wake and
@@ -1755,12 +1674,38 @@ func (e *Engine) admitAndDispatchForDeployment(ctx context.Context, appID, deplo
 //     bit-for-bit. The row falls back to the legacy "transition to
 //     FAILED, return problem" path.
 func (e *Engine) admitAndDispatch(ctx context.Context, appID, trigger string, liftCapacityToResult bool) (WakeResult, error) {
+	return e.admitAndDispatchWithOptions(ctx, appID, "", string(state.InstanceModeNormal), trigger, liftCapacityToResult, false)
+}
+
+// admitAndDispatchWithOptions is the single admission-to-vmmd pipeline. The
+// previous per-deployment helper stopped after inserting a COLD_BOOTING row
+// and admitting it into the ledger, leaving the floor path with no Create*
+// RPC and no Phase 4 commit. Explicit deployment callers still bypass the
+// request wake gates as before, but now share the complete boot lifecycle.
+func (e *Engine) admitAndDispatchWithOptions(ctx context.Context, appID, deploymentID, mode, trigger string, liftCapacityToResult, bypassGates bool) (WakeResult, error) {
 	// ── Phase 2: admit window, under appMu ──────────────────
 	release := e.lockApp(appID)
 	app, acct, limits, dep, err := e.resolveApp(ctx, appID)
 	if err != nil {
 		release()
 		return WakeResult{}, err
+	}
+	if deploymentID != "" {
+		explicitDep, depErr := e.store.DeploymentByID(ctx, deploymentID)
+		if depErr != nil {
+			release()
+			if errors.Is(depErr, state.ErrNotFound) {
+				e.IncAtCapacity(appID, "admit")
+				return WakeResult{AtCapacity: true}, nil
+			}
+			return WakeResult{}, fmt.Errorf("sched: resolve explicit deployment: %w", depErr)
+		}
+		if explicitDep.AppID != appID || explicitDep.Status != state.DeployLive {
+			release()
+			e.IncAtCapacity(appID, "admit")
+			return WakeResult{AtCapacity: true}, nil
+		}
+		dep = explicitDep
 	}
 
 	// PR-D (issue #462): worker-class first-check. Mirrors
@@ -1801,7 +1746,7 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID, trigger string, li
 	// Per-plan ceiling: api.Limits.WakeBurstPerApp / WakeBurstPerAccount
 	// (Free 1/1, Hobby 5/10, Pro 20/30, Scale 100/150 per minute).
 	// Fail-closed on unknown plan — mirrors pkg/gateway.Limiter.Allow.
-	if e.wakeLimiter != nil {
+	if !bypassGates && e.wakeLimiter != nil {
 		if !e.wakeLimiter.AllowWakeApp(appID, acct.Plan) || !e.wakeLimiter.AllowWakeAccount(string(acct.ID), acct.Plan) {
 			release()
 			e.IncAtCapacity(appID, "rate_limit")
@@ -1830,7 +1775,18 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID, trigger string, li
 	// branch stays on CodePlanLimitConcur (429) — no scale-out
 	// was attempted, the customer's request is asking for a wake
 	// that the floor already satisfies.
-	outcome, obsCents, capCents, concurrency, atCapacity := e.admitGate(ctx, &app, limits)
+	var (
+		outcome     wakeOutcome
+		obsCents    int64
+		capCents    int64
+		concurrency int
+		atCapacity  bool
+	)
+	if bypassGates {
+		concurrency = e.ledger.Concurrency(app.ID)
+	} else {
+		outcome, obsCents, capCents, concurrency, atCapacity = e.admitGate(ctx, &app, limits)
+	}
 	if outcome != wakeAdmit {
 		release()
 		switch outcome {
@@ -2026,7 +1982,10 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID, trigger string, li
 			WrittenAt: time.Now(),
 		})
 	}
-	ins, err := e.store.CreateInstanceWithMode(ctx, appID, dep.ID, string(initState), app.RAMMB, placement.NodeID, wakeID, string(state.InstanceModeNormal))
+	if mode == "" {
+		mode = string(state.InstanceModeNormal)
+	}
+	ins, err := e.store.CreateInstanceWithMode(ctx, appID, dep.ID, string(initState), app.RAMMB, placement.NodeID, wakeID, mode)
 	if err != nil {
 		release()
 		return WakeResult{}, fmt.Errorf("sched: wake: create instance: %w", err)
@@ -2104,8 +2063,10 @@ func (e *Engine) admitAndDispatch(ctx context.Context, appID, trigger string, li
 	// INSERT, and a rare concurrent wake sees NULL on the consult)
 	// is the SAFE direction: the wake-gate admitGate consults the
 	// stamp BEFORE the insert and bypasses cooldown on NULL.
-	if err := e.store.StampAppScaleOut(ctx, appID); err != nil {
-		e.log.Warn("sched: stamp apps.last_scale_out_at failed", "app", appID, "err", err)
+	if !bypassGates {
+		if err := e.store.StampAppScaleOut(ctx, appID); err != nil {
+			e.log.Warn("sched: stamp apps.last_scale_out_at failed", "app", appID, "err", err)
+		}
 	}
 
 	// issue #517 / PR-C / ADR-064 — emit wake.queue_accepted at
