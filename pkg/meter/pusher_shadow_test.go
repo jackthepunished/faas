@@ -72,6 +72,14 @@ type recordingStripe struct {
 	err   error
 }
 
+type recordingOverage struct {
+	recordingStripe
+}
+
+func (*recordingOverage) UsageMode() billing.UsageMode {
+	return billing.UsageModeOverage
+}
+
 type recordedCall struct {
 	AccountID string
 	Hour      time.Time

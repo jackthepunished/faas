@@ -68,16 +68,24 @@ clock-skew tolerance.
 | `FAAS_POLAR_PRO_PRODUCT_ID` | Yes for the Pro plan | apid checkout + webhook plan mapping |
 | `FAAS_POLAR_SCALE_PRODUCT_ID` | Yes for the Scale plan | apid checkout + webhook plan mapping |
 | `FAAS_POLAR_USAGE_EVENT_NAME` | Optional | Defaults to `faas_ram_usage` |
-| `FAAS_POLAR_METER_ID` | Recommended | Enables read-only usage reconciliation; meter must sum `gb_ram_hours` |
+| `FAAS_POLAR_METER_ID` | Yes | Meter used for ingestion and reconciliation; must sum `gb_ram_hours` |
 | `FAAS_POLAR_SUCCESS_URL` / `FAAS_POLAR_RETURN_URL` | Optional | Hosted-checkout redirects |
 | `FAAS_POLAR_WEBHOOK_TOLERANCE_SECONDS` | Optional | Standard Webhooks timestamp tolerance; defaults to 300 seconds |
 
 Polar products are not auto-created by this provider. In the Polar
-dashboard, create one recurring product per paid plan with the fixed monthly
-price and a metered price backed by a meter that filters on the configured
-event name and sums `gb_ram_hours`. The meterd pusher sends the exact local
-`mb_seconds` as audit metadata and the corresponding GB-RAM-hours quantity as
-the meter value.
+dashboard, create one active monthly recurring product per paid plan with:
+
+- one fixed EUR price matching Gregale's monthly plan price (€9, €29, or €99);
+- one EUR metered-unit price of `1` cent per unit, backed by the configured
+  meter, with no Polar cap; and
+- no `meter_credit` benefit. Gregale removes the plan's included allowance
+  locally because its quota resets on the UTC calendar month, while Polar
+  credits reset on a subscription billing cycle.
+
+The meter must filter the configured event name and sum `gb_ram_hours`. The
+meterd pusher sends only the net overage for the account's UTC calendar month;
+the event's `mb_seconds` metadata records that same net quantity exactly as an
+integer for reconciliation and audit.
 
 Configure a Polar webhook endpoint at
 `https://<your-api-host>/v1/webhooks/polar` and subscribe at least to
@@ -89,11 +97,12 @@ Webhooks headers (`webhook-id`, `webhook-timestamp`, and
 
 The implementation supports customer creation/reuse, hosted checkout,
 provider customer-portal sessions, metered event ingestion, scheduled
-cancellation, refunds, and optional read-only usage reconciliation. Set
+cancellation, refunds, and read-only usage reconciliation. Set
 `FAAS_POLAR_METER_ID` to the UUID of the meter that sums `gb_ram_hours`; the
 provider converts Polar's total back to the local integer `mb_seconds` unit.
-Without that setting, reconciliation remains explicitly unavailable rather
-than producing a false drift signal.
+The catalog preflight rejects missing or mismatched product prices, meters,
+archived resources, and attached Polar meter credits before either daemon
+starts.
 
 Polar does not expose a direct saved-card charge retry API, so `faas billing
 retry` returns a truthful 501 with the customer-portal URL; customers should
@@ -108,9 +117,11 @@ Polar outage cannot silently under-report usage.
 ### Production release gates
 
 Before enabling Polar in production, verify that the three paid-plan product
-IDs point to recurring EUR products containing the configured metered price.
-Both `apid` and `meterd` fail startup when a required product ID is missing.
-The deployment must use the hourly `meterd` pass and include migration `00588`.
+IDs point to active monthly recurring EUR products containing exactly the
+fixed and metered prices described above. Both `apid` and `meterd` fail
+startup when a required product, meter, price, or meter wiring check fails.
+The deployment must use the hourly `meterd` pass and include migration
+`00588`.
 
 Polar's raw `polar_whs_...` webhook secret is accepted alongside the existing
 base64/`whsec_` form. Invoice projections are persisted idempotently from
@@ -181,7 +192,7 @@ the legacy `stripe.Client`.
 | `transaction.paid` 503 or no state flip                   | Unknown customer (event's `data.customer_id` doesn't match `accounts.provider_customer_id`) or unavailable replay/state storage. 503 keeps the delivery retryable. | `journalctl -u faas-apid` shows `paddle_webhook.unknown_customer` or `paddle webhook replay/state …`. Check the mapping and database. |
 | `changePlan` 402 carries `paddle_checkout_url` but URL 404 | Paddle sandbox product/price IDs not yet created. Run `EnsurePlanProducts` manually (it's idempotent — re-running on an existing catalog is a no-op). | `faas billing price-catalog list` shows the catalog snapshot.                                       |
 | Duplicate Paddle events arriving within seconds            | Paddle redelivery (network blip). Deduped by `pkg/webhookdedupe` (5-min TTL). | `paddle_webhook_replay_suppressed_total` increments; audit row `webhook.replay_rejected` is emitted. |
-| Polar usage is missing after a restart/outage              | Stale meterd config or unapplied migrations.                                | Confirm `stripe_interval <= 1h`, migration `00588`, and `failed` entries from meterd `/healthz`. |
+| Polar usage is missing after a restart/outage              | Stale meterd config or unapplied migrations.                                | Confirm hourly meterd cadence, migration `00588`, and `failed` entries from meterd `/healthz`. |
 | Polar webhook returns 503                                   | Invoice/replay persistence is unavailable.                                  | Fix Postgres or migrations; Polar retries the non-2xx delivery. |
 | Polar invoice history is empty                              | `order.created` is not subscribed or the customer/product IDs do not map.   | Check Polar webhook subscriptions and `polar_webhook.unknown_customer` logs. |
 

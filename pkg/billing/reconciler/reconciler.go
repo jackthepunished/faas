@@ -2,8 +2,8 @@
 //
 // The reconciler is the read-only complement to meterd's pusher
 // (pkg/meter/pusher.go). Every FAAS_RECONCILE_INTERVAL it walks
-// every paid account, sums the last-24h mb_seconds from the local
-// usage_minutes table, and asks the active billing.Provider for the
+// every paid account, derives the last-24h provider billable quantity from
+// the local usage_minutes table, and asks the active billing.Provider for the
 // matching summary. The diff between local and pushed totals is
 // exposed as Prometheus gauges so the BillingDrift alert can page
 // on real Stripe / Paddle outages that would otherwise go unobserved
@@ -158,13 +158,21 @@ func (r *Reconciler) reconcileOne(ctx context.Context, acct state.Account, start
 	if !r.Provider.Capabilities().Has(billing.CapUsageReconcile) {
 		return nil
 	}
-	rows, err := r.Store.UsageByHour(ctx, acct.ID, start, end)
-	if err != nil {
-		return fmt.Errorf("usage by hour: %w", err)
-	}
 	var local int64
-	for _, u := range rows {
-		local += u.MBSeconds
+	var err error
+	if modeProvider, ok := r.Provider.(billing.UsageModeProvider); ok && modeProvider.UsageMode() == billing.UsageModeOverage {
+		local, err = billing.OverageMBSecondsForRange(ctx, r.Store, acct, start, end)
+		if err != nil {
+			return fmt.Errorf("usage by hour overage: %w", err)
+		}
+	} else {
+		rows, err := r.Store.UsageByHour(ctx, acct.ID, start, end)
+		if err != nil {
+			return fmt.Errorf("usage by hour: %w", err)
+		}
+		for _, u := range rows {
+			local += u.MBSeconds
+		}
 	}
 	pushed, err := r.Provider.ReconcileUsage(ctx, acct, start, end)
 	if err != nil {

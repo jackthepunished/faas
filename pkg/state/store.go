@@ -4564,8 +4564,9 @@ type Store interface {
 	// against every other.
 	ConsumeAccountCredit(ctx context.Context, p ConsumeAccountCreditParams) (ConsumeAccountCreditResult, error)
 	// CurrentMonthOverageCents returns the account's derived overage
-	// in integer cents for the current UTC month. 1 GB-h = 100 cents
-	// at €0.01/GB-h (CLAUDE.md: integer cents only, never float).
+	// in integer cents for the current UTC month. The account plan's
+	// included calendar-month allowance is subtracted before the
+	// €0.01/GB-h conversion (CLAUDE.md: integer cents only, never float).
 	// meterd consults this on every quota tick to decide whether the
 	// overage row should be capped. The PgStore implementation sums
 	// usage_minutes.mb_seconds since the UTC month start and converts

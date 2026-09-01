@@ -11028,9 +11028,9 @@ func (m *MemStore) LoadAllOverageCapCents(_ context.Context) (map[string]int64, 
 }
 
 // CurrentMonthOverageCents sums the account's usage_minutes.mb_seconds
-// from the UTC month start and converts to integer cents. Formula:
-// 1 GB-h = 3600 GB-seconds; at €0.01/GB-h → 1 GB-h = 100 cents.
-// Integer math only — never float on money (CLAUDE.md).
+// from the UTC month start, removes the account plan's included calendar-
+// month allowance, and converts the remainder to integer cents. Integer
+// math only — never float on money (CLAUDE.md).
 //
 // Mirrors pgstore.CurrentMonthOverageCents: the scan is O(rows-in-month)
 // which on a one-box is bounded. The `now` argument is the caller's
@@ -11040,6 +11040,10 @@ func (m *MemStore) CurrentMonthOverageCents(_ context.Context, accountID string)
 	defer m.mu.Unlock()
 	now := m.clock()
 	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	var plan api.Plan
+	if acct, ok := m.accounts[accountID]; ok {
+		plan = acct.Plan
+	}
 	var mbSeconds int64
 	for _, u := range m.usage {
 		if u.AccountID != accountID {
@@ -11050,7 +11054,7 @@ func (m *MemStore) CurrentMonthOverageCents(_ context.Context, accountID string)
 		}
 		mbSeconds += u.MBSeconds
 	}
-	return mbSeconds * 100 / 3600, nil
+	return api.OverageCentsForMBSeconds(plan, mbSeconds), nil
 }
 
 // UpdateAccountOverageCapCents writes accounts.overage_cap_cents for

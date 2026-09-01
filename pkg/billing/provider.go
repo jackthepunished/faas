@@ -116,8 +116,10 @@ type Provider interface {
 	// FAAS_RECONCILE_INTERVAL and asks each implementation how
 	// many mb_seconds it has actually pushed for the given hour
 	// window. The reconciler compares that sum against the local
-	// `usage_minutes` total and exposes the diff as Prometheus
-	// gauges + the BillingDrift alert.
+	// provider quantity and exposes the diff as Prometheus gauges +
+	// the BillingDrift alert. Providers implementing
+	// UsageModeProvider may use net calendar-month overage instead of
+	// raw local usage.
 	//
 	// Read-only against the provider — implementations MUST NOT
 	// mutate customer / subscription state from this call.
@@ -133,7 +135,8 @@ type Provider interface {
 	// implementation returns ErrNotImplemented until the upstream
 	// adds one. Polar: the configured meter quantities endpoint is
 	// summed when FAAS_POLAR_METER_ID is set; without a meter ID it
-	// returns ErrNotImplemented.
+	// returns ErrNotImplemented for direct callers (startup validation
+	// rejects that configuration).
 	ReconcileUsage(ctx context.Context, acct state.Account, start, end time.Time) (pushedMBSeconds int64, err error)
 
 	// Refund issues an operator-initiated refund against a charge
@@ -220,6 +223,27 @@ type Provider interface {
 	// (ErrNoAPIKey on Stripe when no SDK is constructed).
 	PaymentMethodSummary(ctx context.Context, acct state.Account) (PaymentMethod, error)
 }
+
+// UsageModeProvider is an optional provider contract for usage semantics.
+// Providers that return UsageModeOverage receive only the portion above
+// Gregale's included calendar-month quota. Providers without this optional
+// surface retain the historical raw-usage contract.
+type UsageModeProvider interface {
+	UsageMode() UsageMode
+}
+
+// UsageMode describes the quantity passed to PushUsageRecord and returned by
+// ReconcileUsage.
+type UsageMode string
+
+const (
+	// UsageModeRaw is the legacy provider contract: the quantity is all local
+	// usage in the requested window.
+	UsageModeRaw UsageMode = "raw"
+	// UsageModeOverage is the calendar-month net-overage contract. The
+	// included plan allowance is removed locally before provider ingestion.
+	UsageModeOverage UsageMode = "overage"
+)
 
 // CustomerPortalProvider is an optional provider surface for creating a
 // short-lived, customer-authenticated billing portal session. Providers that

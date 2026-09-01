@@ -42,7 +42,7 @@
 //	FAAS_POLAR_ACCESS_TOKEN required when Polar is active (apid + meterd)
 //	FAAS_POLAR_WEBHOOK_SECRET required when Polar is active (apid only)
 //	FAAS_POLAR_SANDBOX      "1" / "true" to use sandbox-api.polar.sh (apid + meterd)
-//	FAAS_POLAR_METER_ID    optional; enables usage reconciliation
+//	FAAS_POLAR_METER_ID    required when Polar is active; usage meter + reconciliation
 //	FAAS_POLAR_BASE_URL    optional; private API proxy / contract-test endpoint
 //
 // TOML config precedence: env > TOML > Defaults. The daemon's
@@ -373,9 +373,8 @@ func Providers() []ProviderMeta {
 //     the literal "paddle".
 //
 //   - cfg.Provider "polar" → constructs a *polar.Provider and
-//     requires its configured products (and optional meter) to pass
-//     the live catalog preflight before apid starts accepting billing
-//     traffic.
+//     requires its configured products and meter to pass the live
+//     catalog preflight before apid starts accepting billing traffic.
 //
 //   - Any other value → error so a typo fails the boot loudly.
 //

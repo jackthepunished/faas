@@ -40,3 +40,32 @@ func TestPushPendingRetriesFailedWindowsFromDurableUsage(t *testing.T) {
 		t.Fatalf("provider calls = %d, want 4 (two failed + two replayed windows)", got)
 	}
 }
+
+func TestPushHourOverageProviderExcludesIncludedCalendarMonthUsage(t *testing.T) {
+	ctx := context.Background()
+	store := state.NewMemStore()
+	acct := makeAccount(t, ctx, store, api.PlanHobby)
+	now := time.Date(2026, 8, 31, 11, 0, 0, 0, time.UTC)
+	start, _ := meter.HourWindow(now)
+
+	// The prior hour consumes the entire Hobby allowance. The current
+	// hour is therefore the first one Polar should receive, and only its
+	// two billable GB-hours should be sent.
+	if err := store.AppendUsage(ctx, acct.ID, "app-a", "instance-a", start.Add(-time.Minute), 50*api.SecondsPerGBHour, 0, 0, 0, 0, 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendUsage(ctx, acct.ID, "app-a", "instance-a", start.Add(5*time.Minute), 2*api.SecondsPerGBHour, 0, 0, 0, 0, 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	provider := &recordingOverage{}
+	pusher := meter.NewPusher(store, provider, discardLog(), func() time.Time { return now }, nil)
+	pushed, err := pusher.PushHour(ctx)
+	if err != nil || pushed != 1 {
+		t.Fatalf("PushHour = (%d, %v), want (1, nil)", pushed, err)
+	}
+	calls := provider.Calls()
+	if len(calls) != 1 || calls[0].MBSeconds != 2*api.SecondsPerGBHour {
+		t.Fatalf("Polar billable calls = %+v, want one call with two GB-hours", calls)
+	}
+}

@@ -46,8 +46,17 @@ func testConfig(baseURL string) Config {
 		ProProductID:     "pro-product",
 		ScaleProductID:   "scale-product",
 		UsageEventName:   "ram_usage",
+		MeterID:          "meter-1",
 		ToleranceSeconds: 300,
 	}
+}
+
+func catalogProductJSON(id string, fixedCents int64) string {
+	return `{"id":"` + id + `","recurring_interval":"month","recurring_interval_count":1,"is_recurring":true,"is_archived":false,"prices":[{"amount_type":"fixed","price_currency":"eur","price_amount":` + strconv.FormatInt(fixedCents, 10) + `,"is_archived":false},{"amount_type":"metered_unit","price_currency":"eur","unit_amount":"1","meter_id":"meter-1","cap_amount":null,"is_archived":false}],"benefits":[]}`
+}
+
+func catalogMeterJSON() string {
+	return `{"id":"meter-1","unit":"scalar","archived_at":null,"filter":{"conjunction":"and","clauses":[{"property":"name","operator":"eq","value":"ram_usage"}]},"aggregation":{"func":"sum","property":"gb_ram_hours"}}`
 }
 
 func TestNewProviderRequiresAccessToken(t *testing.T) {
@@ -71,13 +80,28 @@ func TestEnsurePlanProductsRequiresConfiguredIDs(t *testing.T) {
 func TestEnsurePlanProductsValidatesConfiguredCatalog(t *testing.T) {
 	var productRequests int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, "/v1/products/") {
+		if r.Method != http.MethodGet {
+			http.NotFound(w, r)
+			return
+		}
+		if r.URL.Path == "/v1/meters/meter-1" {
+			_, _ = io.WriteString(w, catalogMeterJSON())
+			return
+		}
+		if !strings.HasPrefix(r.URL.Path, "/v1/products/") {
 			http.NotFound(w, r)
 			return
 		}
 		productRequests++
 		id := strings.TrimPrefix(r.URL.Path, "/v1/products/")
-		_, _ = io.WriteString(w, `{"id":"`+id+`"}`)
+		fixed := int64(900)
+		switch id {
+		case "pro-product":
+			fixed = 2900
+		case "scale-product":
+			fixed = 9900
+		}
+		_, _ = io.WriteString(w, catalogProductJSON(id, fixed))
 	}))
 	defer server.Close()
 	p, err := NewProvider(testConfig(server.URL), nil)
@@ -89,6 +113,72 @@ func TestEnsurePlanProductsValidatesConfiguredCatalog(t *testing.T) {
 	}
 	if productRequests != 3 {
 		t.Fatalf("catalog product requests = %d, want 3", productRequests)
+	}
+}
+
+func TestEnsurePlanProductsRejectsWrongPriceBeforeStartup(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/meters/meter-1" {
+			_, _ = io.WriteString(w, catalogMeterJSON())
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/v1/products/") {
+			id := strings.TrimPrefix(r.URL.Path, "/v1/products/")
+			_, _ = io.WriteString(w, catalogProductJSON(id, 1))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	p, err := NewProvider(testConfig(server.URL), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.EnsurePlanProducts(context.Background()); err == nil || !strings.Contains(err.Error(), "fixed price") {
+		t.Fatalf("EnsurePlanProducts error = %v, want fixed-price validation", err)
+	}
+}
+
+func TestEnsurePlanProductsRejectsPolarMeterCredits(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/meters/meter-1" {
+			_, _ = io.WriteString(w, catalogMeterJSON())
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/v1/products/") {
+			id := strings.TrimPrefix(r.URL.Path, "/v1/products/")
+			fixed := int64(900)
+			switch id {
+			case "pro-product":
+				fixed = 2900
+			case "scale-product":
+				fixed = 9900
+			}
+			product := strings.Replace(catalogProductJSON(id, fixed), `"benefits":[]`, `"benefits":[{"type":"meter_credit","is_deleted":false}]`, 1)
+			_, _ = io.WriteString(w, product)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	p, err := NewProvider(testConfig(server.URL), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.EnsurePlanProducts(context.Background()); err == nil || !strings.Contains(err.Error(), "meter credits") {
+		t.Fatalf("EnsurePlanProducts error = %v, want meter-credit validation", err)
+	}
+}
+
+func TestEnsurePlanProductsRequiresMeterID(t *testing.T) {
+	cfg := testConfig("http://example.test")
+	cfg.MeterID = ""
+	p, err := NewProvider(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.EnsurePlanProducts(context.Background()); err == nil || !strings.Contains(err.Error(), "FAAS_POLAR_METER_ID") {
+		t.Fatalf("EnsurePlanProducts error = %v, want meter-id validation", err)
 	}
 }
 
@@ -301,7 +391,9 @@ func TestReconcileUsageReadsMeterTotal(t *testing.T) {
 }
 
 func TestReconcileUsageWithoutMeterIsUnsupported(t *testing.T) {
-	p, err := NewProvider(testConfig("http://example.test"), nil)
+	cfg := testConfig("http://example.test")
+	cfg.MeterID = ""
+	p, err := NewProvider(cfg, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
