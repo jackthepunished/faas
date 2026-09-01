@@ -563,8 +563,10 @@ node-claim-check: ## Validate checked-in provider-neutral ComputeNodeClaim examp
 	@test -x ./bin/gregalectl || $(GO) build -o ./bin/gregalectl ./cmd/gregalectl
 	@for f in deploy/claims/*.yaml; do \
 	  test -f "$$f" || continue; \
-	  ./bin/gregalectl deploy claim validate --file "$$f"; \
+		./bin/gregalectl deploy claim validate --file "$$f"; \
 	done
+	$(ANSIBLE_PLAYBOOK) -i $(ANSIBLE_INVENTORY) deploy/ansible/node_join.yml --syntax-check
+	$(ANSIBLE_PLAYBOOK) -i $(ANSIBLE_INVENTORY) deploy/ansible/node_join_control_plane.yml --syntax-check
 
 .PHONY: tidy
 tidy: ## go mod tidy
