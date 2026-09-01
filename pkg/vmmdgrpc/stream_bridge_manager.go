@@ -39,6 +39,9 @@ type streamBridgeEntry struct {
 	stderr    *bytes.Buffer
 	client    *http.Client
 	transport *http2.Transport
+	waitDone  chan struct{}
+	waitMu    sync.Mutex
+	waitErr   error
 
 	ready    chan struct{}
 	starting bool
@@ -105,6 +108,15 @@ func (m *streamBridgeManager) acquire(ctx context.Context, req *vmmdpb.ForwardHT
 	// The reaper belongs to the VMMD server, not to this request. It is
 	// canceled by Server.Close, so it intentionally outlives ctx.
 	m.startReaper() //nolint:contextcheck // manager lifetime is longer than one RPC
+	m.mu.Lock()
+	// A persistent bridge is owned by this manager, not by the request that
+	// happened to start it. Passing ctx here would make exec.CommandContext
+	// kill the bridge as soon as that request's gRPC stream closes, leaving a
+	// stale entry and socket for the next request. The reaper context is
+	// canceled only by manager shutdown and therefore matches the child
+	// lifetime exactly.
+	bridgeCtx := m.reaperCtx
+	m.mu.Unlock()
 	for {
 		m.mu.Lock()
 		if m.closed {
@@ -124,7 +136,7 @@ func (m *streamBridgeManager) acquire(ctx context.Context, req *vmmdpb.ForwardHT
 			m.starts.Add(1)
 			m.mu.Unlock()
 
-			err := m.startEntry(ctx, entry, req)
+			err := m.startEntry(bridgeCtx, entry, req) //nolint:contextcheck // persistent bridge follows manager lifetime, not RPC lifetime
 			m.starts.Done()
 			if err != nil {
 				return nil, err
@@ -201,6 +213,9 @@ func (m *streamBridgeManager) startEntryProcess(ctx context.Context, entry *stre
 	if port == 0 {
 		port = netns.AppPort
 	}
+	if err := os.Remove(entry.socket); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove stale stream bridge socket: %w", err)
+	}
 	deadline := m.now().Add(streamBridgeSessionDeadline).UTC().Format(time.RFC3339)
 	cmd, stderr, err := m.spawn(ctx, bridgePath, entry.netns, entry.socket, netns.GuestIP, port, deadline, streamBridgeStaticEnv(req))
 	if err != nil {
@@ -208,12 +223,65 @@ func (m *streamBridgeManager) startEntryProcess(ctx context.Context, entry *stre
 	}
 	entry.cmd = cmd
 	entry.stderr = stderr
+	entry.waitDone = make(chan struct{})
+	go m.watchEntry(entry, cmd)
 	if err := m.waitSocket(entry.socket, streamBridgeSocketReadyTimeout); err != nil {
 		return fmt.Errorf("stream bridge socket not ready: %w", err)
 	}
-	entry.transport = m.newTransport(entry.socket)
-	entry.client = &http.Client{Transport: entry.transport}
+	select {
+	case <-entry.waitDone:
+		return fmt.Errorf("stream bridge exited before becoming ready: %w", entry.waitError())
+	default:
+	}
+	transport := m.newTransport(entry.socket)
+	m.mu.Lock()
+	if entry.closed {
+		m.mu.Unlock()
+		transport.CloseIdleConnections()
+		return fmt.Errorf("stream bridge exited before becoming ready: %w", entry.waitError())
+	}
+	entry.transport = transport
+	entry.client = &http.Client{Transport: transport}
+	m.mu.Unlock()
 	return nil
+}
+
+// watchEntry reaps a persistent bridge even when it exits without a manager
+// shutdown. Without a waiter, a terminated child can remain a zombie and
+// still pass kill(0), causing the manager to reuse a dead entry and socket.
+func (m *streamBridgeManager) watchEntry(entry *streamBridgeEntry, cmd *exec.Cmd) {
+	err := cmd.Wait()
+	entry.waitMu.Lock()
+	entry.waitErr = err
+	close(entry.waitDone)
+	entry.waitMu.Unlock()
+
+	m.mu.Lock()
+	current := m.entries[entry.instance] == entry && !entry.closed
+	unexpected := current && !m.closed
+	if current {
+		delete(m.entries, entry.instance)
+		entry.closed = true
+	}
+	transport := entry.transport
+	socket := entry.socket
+	m.mu.Unlock()
+	if !current {
+		return
+	}
+	if transport != nil {
+		transport.CloseIdleConnections()
+	}
+	_ = os.Remove(socket)
+	if unexpected && err != nil {
+		m.log.Warn("vmmd: persistent stream bridge exited", "instance", entry.instance, "err", err)
+	}
+}
+
+func (e *streamBridgeEntry) waitError() error {
+	e.waitMu.Lock()
+	defer e.waitMu.Unlock()
+	return e.waitErr
 }
 
 func (m *streamBridgeManager) release(entry *streamBridgeEntry) {
@@ -249,11 +317,46 @@ func (m *streamBridgeManager) closeEntry(ctx context.Context, entry *streamBridg
 		entry.transport.CloseIdleConnections()
 	}
 	if entry.cmd != nil {
-		if err := m.stop(ctx, entry.cmd, entry.stderr); err != nil {
+		var err error
+		if entry.waitDone == nil {
+			err = m.stop(ctx, entry.cmd, entry.stderr)
+		} else {
+			err = m.stopWatchedEntry(ctx, entry)
+		}
+		if err != nil {
 			m.log.Warn("vmmd: persistent stream bridge cleanup failed", "instance", entry.instance, "err", err)
 		}
 	}
 	_ = os.Remove(entry.socket)
+}
+
+func (m *streamBridgeManager) stopWatchedEntry(ctx context.Context, entry *streamBridgeEntry) error {
+	select {
+	case <-entry.waitDone:
+		return nil
+	default:
+	}
+	if entry.cmd.Process != nil {
+		_ = entry.cmd.Process.Signal(syscall.SIGTERM)
+	}
+	timer := time.NewTimer(streamBridgeShutdownTimeout)
+	defer timer.Stop()
+	select {
+	case <-entry.waitDone:
+		return nil
+	case <-ctx.Done():
+		if entry.cmd.Process != nil {
+			_ = entry.cmd.Process.Kill()
+		}
+		<-entry.waitDone
+		return nil
+	case <-timer.C:
+		if entry.cmd.Process != nil {
+			_ = entry.cmd.Process.Kill()
+		}
+		<-entry.waitDone
+		return nil
+	}
 }
 
 func (m *streamBridgeManager) startReaper() {
