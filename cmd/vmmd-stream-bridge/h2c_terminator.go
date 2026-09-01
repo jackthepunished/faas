@@ -61,6 +61,7 @@ import (
 	"net/http"
 	"runtime/debug"
 	"strconv"
+	"strings"
 	"time"
 
 	"golang.org/x/net/http2"
@@ -152,6 +153,7 @@ const (
 func handleH2CStream(w http.ResponseWriter, r *http.Request, guestIP string, guestPort uint16, deadline time.Time) {
 	ctx, cancel := context.WithDeadline(r.Context(), deadline)
 	defer cancel()
+	guestPort = bridgeRequestPort(r, guestPort)
 
 	// ADR-127 §D2 (Layer 9) — panic recovery. The bridge is a
 	// per-instance child of vmmd; a panic that escapes to the
@@ -176,7 +178,7 @@ func handleH2CStream(w http.ResponseWriter, r *http.Request, guestIP string, gue
 	if uri == "" {
 		uri = "/"
 	}
-	host := r.Host
+	host := bridgeRequestHost(r, r.Host)
 	if host == "" {
 		// Defense-in-depth: never send an empty :authority
 		// pseudo-header. Use the bridge's bound guest IP. HTTP/2
@@ -235,16 +237,14 @@ func handleH2CStream(w http.ResponseWriter, r *http.Request, guestIP string, gue
 	for k, vs := range r.Header {
 		// Skip hop-by-hop headers (RFC 7230 §6.1) and HTTP/2
 		// frame-control headers that the transport owns.
-		if isHopByHopHeader(k) {
+		if isHopByHopHeader(k) || isBridgeRequestHeader(k) || strings.EqualFold(k, "Host") {
 			continue
 		}
 		for _, v := range vs {
 			outboundReq.Header.Add(k, v)
 		}
 	}
-	if outboundReq.Header.Get("Host") == "" {
-		outboundReq.Header.Set("Host", host)
-	}
+	outboundReq.Host = host
 
 	// RoundTrip — this writes the HTTP/2 connection preface +
 	// client SETTINGS to the guest, opens a new H2 stream, sends
