@@ -10688,11 +10688,10 @@ func (s *PgStore) CreateInstance(ctx context.Context, appID, deploymentID, state
 	// path that left the column NULL — though migration 00028 enforces
 	// NOT NULL post-apply, the COALESCE keeps scanInstance round-tripping
 	// a non-empty string even on half-migrated test DBs.
-	// Cast $6 to text before the empty-string test — Postgres otherwise
-	// infers $6 as uuid from the column type and the untyped '' literal
-	// fails with "COALESCE types text and uuid cannot be matched"
-	// (SQLSTATE 42804). The CASE shape also keeps the gen_random_uuid()
-	// branch on the text path so the whole expression resolves to uuid.
+	// Keep every reference to $6 on the text path until after the
+	// empty-string test. A direct $6::uuid in the ELSE branch makes
+	// Postgres type the bind parameter as uuid before CASE evaluation,
+	// so an empty wakeID fails before the generated-UUID branch runs.
 	//
 	// Multi-host safety cluster PR-5 (audit F4): the partial unique
 	// index instances_wake_attempt_active_idx (migration 00384)
@@ -10714,7 +10713,7 @@ func (s *PgStore) CreateInstance(ctx context.Context, appID, deploymentID, state
 	// the chain and lets the typed sentinel surface.
 	row := s.pool.QueryRow(ctx,
 		`insert into instances (app_id, deployment_id, state, ram_mb, node_id, wake_id, started_at)
-		 values ($1, nullif($2::text, '')::uuid, $3, $4, $5, case when $6::text = '' then gen_random_uuid() else $6::uuid end, now())
+		 values ($1, nullif($2::text, '')::uuid, $3, $4, $5, case when $6::text = '' then gen_random_uuid() else ($6::text)::uuid end, now())
 		 returning id, coalesce(app_id, ''), coalesce(deployment_id, ''), state, coalesce(netns,''), coalesce(guest_uid,0),
 		           coalesce(host(host_ip),''), ram_mb, started_at, last_request_at, parked_at, node_id, wake_id, framework_ready_at, tail_count`,
 		appID, deploymentID, state, ramMB, nodeID, wakeID)
@@ -10754,7 +10753,7 @@ func scanCreatedInstance(row pgx.Row, wakeID, appID string) (Instance, error) {
 func (s *PgStore) CreateInstanceWithMode(ctx context.Context, appID, deploymentID, state string, ramMB int, nodeID, wakeID, mode string) (Instance, error) {
 	row := s.pool.QueryRow(ctx,
 		`insert into instances (app_id, deployment_id, state, ram_mb, node_id, wake_id, started_at, mode)
-		 values ($1, nullif($2::text, '')::uuid, $3, $4, $5, case when $6::text = '' then gen_random_uuid() else $6::uuid end, now(), $7)
+		 values ($1, nullif($2::text, '')::uuid, $3, $4, $5, case when $6::text = '' then gen_random_uuid() else ($6::text)::uuid end, now(), $7)
 		 returning id, coalesce(app_id, ''), coalesce(deployment_id, ''), state, coalesce(netns,''), coalesce(guest_uid,0),
 		           coalesce(host(host_ip),''), ram_mb, started_at, last_request_at, parked_at, node_id, wake_id, framework_ready_at, tail_count`,
 		appID, deploymentID, state, ramMB, nodeID, wakeID, mode)
@@ -10771,7 +10770,7 @@ func (s *PgStore) CreateJobInstance(ctx context.Context, instanceID, jobID, runI
 	row := s.pool.QueryRow(ctx,
 		`insert into instances (id, app_id, deployment_id, job_id, kind, state, ram_mb, node_id, wake_id, started_at, mode)
 		 values ($1::uuid, null, null, $2::uuid, 'job_task', $3, $4, $5::uuid,
-		         case when $6::text = '' then gen_random_uuid() else $6::uuid end, now(), 'job')
+		         case when $6::text = '' then gen_random_uuid() else ($6::text)::uuid end, now(), 'job')
 		 returning id, coalesce(app_id, ''), coalesce(deployment_id, ''), state, coalesce(netns,''), coalesce(guest_uid,0),
 		           coalesce(host(host_ip),''), ram_mb, started_at, last_request_at, parked_at, node_id, wake_id, framework_ready_at, tail_count`,
 		instanceID, jobID, state, ramMB, nodeID, wakeID)
