@@ -113,6 +113,7 @@ func (s *server) polarWebhook(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+//nolint:contextcheck // The worker intentionally outlives the acknowledged webhook request; it preserves context values while applying its own 30-second timeout.
 func (s *server) requestPolarInvoicePDFAsync(parentCtx context.Context, requester billing.InvoicePDFRequester, orderID, eventID string) {
 	if requester == nil || orderID == "" {
 		return
