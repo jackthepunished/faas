@@ -16,8 +16,8 @@
 //
 //  2. Speaks H2C on that socket (cleartext HTTP/2, no TLS).
 //
-//  3. For each inbound H2C request, opens a fresh TCP connection
-//     to the guest at 10.0.0.2:<port> and bridges the envelope:
+//  3. For each inbound H2C request, reuses a bounded per-instance
+//     guest transport for 10.0.0.2:<port> and bridges the envelope:
 //
 //     - app_protocol=http1 (default) →
 //
@@ -270,7 +270,8 @@ func main() {
 //     long-poll / H2 DATA frames past the deadline) is the
 //     supported shape for both H1 and H2C paths.
 func buildServer(guestIP string, guestPort uint16, deadline time.Time) *http.Server {
-	return &http.Server{
+	guestPool := newGuestTransportPool(guestIP)
+	srv := &http.Server{
 		//nolint:staticcheck // ADR-127 §D2 (Layer 9) — the inner Handler is wrapped with
 		// h2c.NewHandler so the listener negotiates H2C prior-knowledge
 		// AND we get to pin per-protocol http2.Server knobs that
@@ -281,7 +282,7 @@ func buildServer(guestIP string, guestPort uint16, deadline time.Time) *http.Ser
 		// wrapped handler. See the import-block comment for the same
 		// rationale; once stdlib exposes a Protocols.Get indirection,
 		// both annotations can be removed in lockstep.
-		Handler: h2c.NewHandler(newHandler(guestIP, guestPort, deadline), &http2.Server{
+		Handler: h2c.NewHandler(newHandlerWithPool(guestIP, guestPort, deadline, guestPool), &http2.Server{
 			MaxConcurrentStreams: h2cMaxConcurrentStreams, // 100
 			MaxReadFrameSize:     h2cMaxReadFrameSize,     // 1 MiB
 			// MaxHeaderListSize is a client-side SETTINGS capability
@@ -301,11 +302,13 @@ func buildServer(guestIP string, guestPort uint16, deadline time.Time) *http.Ser
 		IdleTimeout:       120 * time.Second,
 		// ReadTimeout is intentionally UNSET. stdlib's ReadTimeout caps the ENTIRE request lifetime (headers + body), not just the headers; a 30s cap would regress slow H1 uploads (Hobby+ plans allow up to 100 MB streaming body) and any H2C request whose body takes >30s. The ReadHeaderTimeout above is the Slowloris defence; the per-request ctx deadline bounds the in-flight request lifetime. WriteTimeout is also UNSET — streaming (SSE / long-poll / H2 DATA frames past the deadline) is the supported shape for both H1 and H2C paths.
 	}
+	srv.RegisterOnShutdown(guestPool.closeIdleConnections)
+	return srv
 }
 
 // newHandler builds the H2C handler that proxies requests to the guest at
-// <guestIP>:<port>. Each inbound request opens a fresh guest dial, while the
-// bridge process, unix socket, and host-side H2C transport are reusable.
+// <guestIP>:<port>. The bridge process, unix socket, and guest-side H1/H2C
+// transports are reusable for the lifetime of this per-instance process.
 //
 // Legacy request parts are taken from env vars set by vmmd from the
 // ForwardHTTPRequestInit frame. Persistent requests use the inbound
@@ -326,14 +329,16 @@ func buildServer(guestIP string, guestPort uint16, deadline time.Time) *http.Ser
 //     handleH2CStream — new H2C terminator (h2c_terminator.go)
 //     that originates HTTP/2 prior-knowledge frames to the guest.
 //
-// We do NOT keep a long-lived guest conn per H2C stream. The
-// guest at 10.0.0.2:<port> is either HTTP/1.1 (legacy) or
-// HTTP/2 prior-knowledge (new H2C path) and a long-lived conn
-// would have to serialize requests through it; the simpler shape
-// is "one H2C request = one guest dial." A future optimisation
-// (HTTP/2 stream multiplexing across N guest streams on one conn)
-// is out of scope for the cutover.
+// Persistent requests keep a bounded guest-side transport per port. H2C
+// requests multiplex independent streams on reusable guest connections; H1
+// requests use net/http keep-alive pooling. Upgrade traffic remains on the
+// separate raw-stream path. The pool is closed from buildServer's shutdown
+// hook, and port entries are evicted when the bounded map is full.
 func newHandler(guestIP string, guestPort uint16, deadline time.Time) http.Handler {
+	return newHandlerWithPool(guestIP, guestPort, deadline, newGuestTransportPool(guestIP))
+}
+
+func newHandlerWithPool(guestIP string, guestPort uint16, deadline time.Time, guestPool *guestTransportPool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Read FAAS_BRIDGE_PROTOCOL once per request: currentBridgeFraming uses the same value for dispatch, and the slog line below logs the raw string verbatim (operator correlation with FAAS_BRIDGE_PROTOCOL env flips). One syscall beats two.
 		bridgeProtoEnv := os.Getenv("FAAS_BRIDGE_PROTOCOL")
@@ -367,9 +372,9 @@ func newHandler(guestIP string, guestPort uint16, deadline time.Time) http.Handl
 		w.Header().Set("X-Faas-Bridge-Framing", framing.String())
 		switch framing {
 		case framingH2C:
-			handleH2CStream(w, r, guestIP, requestPort, deadline)
+			handleH2CStream(w, r, guestIP, requestPort, deadline, guestPool)
 		default:
-			handleH1Stream(w, r, guestIP, requestPort, deadline)
+			handleH1Stream(w, r, guestIP, requestPort, deadline, guestPool)
 		}
 	})
 }
@@ -379,7 +384,7 @@ func newHandler(guestIP string, guestPort uint16, deadline time.Time) http.Handl
 // app_protocol=http1 (default) rides this path; setting
 // FAAS_BRIDGE_PROTOCOL=h1 on the bridge process forces it for
 // any app_protocol (the surgical rollback switch).
-func handleH1Stream(w http.ResponseWriter, r *http.Request, guestIP string, guestPort uint16, deadline time.Time) {
+func handleH1Stream(w http.ResponseWriter, r *http.Request, guestIP string, guestPort uint16, deadline time.Time, pools ...*guestTransportPool) {
 	ctx, cancel := context.WithDeadline(r.Context(), deadline)
 	defer cancel()
 
@@ -418,7 +423,68 @@ func handleH1Stream(w http.ResponseWriter, r *http.Request, guestIP string, gues
 		extraHeaders[i].Name = sanitizeCRLF(extraHeaders[i].Name)
 		extraHeaders[i].Value = sanitizeCRLF(extraHeaders[i].Value)
 	}
+	// Keep the environment-driven rollback path byte-compatible. Production
+	// persistent requests always carry wire metadata and use the pooled
+	// net/http transport below; legacy callers may intentionally supply values
+	// that the strict net/http Host validator would normalize or reject.
+	if !bridgeRequestUsesWireMetadata(r) {
+		handleH1StreamLegacy(w, r, ctx, guestIP, guestPort, method, url, host, extraHeaders)
+		return
+	}
 
+	// Use net/http's H1 transport so a fully consumed response can return its
+	// guest TCP connection to the per-instance keep-alive pool. Upgrade traffic
+	// uses ForwardRawStream and never reaches this normal HTTP path.
+	var pool *guestTransportPool
+	if len(pools) > 0 {
+		pool = pools[0]
+	}
+	var transport *http.Transport
+	if pool != nil {
+		transport = pool.h1(guestPort)
+	} else {
+		transport = newGuestH1Transport(guestIP, guestPort)
+	}
+
+	outboundURL := "http://" + net.JoinHostPort(guestIP, strconv.FormatUint(uint64(guestPort), 10)) + url
+	outboundReq, err := http.NewRequestWithContext(ctx, method, outboundURL, r.Body)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("build outbound request: %v", err), http.StatusBadGateway)
+		return
+	}
+	for _, h := range extraHeaders {
+		if strings.EqualFold(h.Name, "Host") || isHopByHopHeader(h.Name) {
+			continue
+		}
+		outboundReq.Header.Add(h.Name, h.Value)
+	}
+	// The raw legacy bridge did not synthesize a User-Agent. An explicit empty
+	// value prevents net/http from adding its default while preserving a
+	// customer-supplied User-Agent from extraHeaders.
+	if _, ok := outboundReq.Header[http.CanonicalHeaderKey("User-Agent")]; !ok {
+		outboundReq.Header.Set("User-Agent", "")
+	}
+	if host == "" {
+		host = net.JoinHostPort(guestIP, strconv.FormatUint(uint64(guestPort), 10))
+	}
+	outboundReq.Host = sanitizeCRLF(host)
+
+	resp, err := transport.RoundTrip(outboundReq)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("guest h1 roundtrip: %v", err), http.StatusBadGateway)
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+	for k, vs := range resp.Header {
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+}
+
+func handleH1StreamLegacy(w http.ResponseWriter, r *http.Request, ctx context.Context, guestIP string, guestPort uint16, method, url, host string, extraHeaders []headerEntry) {
 	d := net.Dialer{Timeout: dialTimeout}
 	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(guestIP, strconv.FormatUint(uint64(guestPort), 10)))
 	if err != nil {
@@ -427,11 +493,6 @@ func handleH1Stream(w http.ResponseWriter, r *http.Request, guestIP string, gues
 	}
 	defer func() { _ = conn.Close() }()
 
-	// ctx.Done() watcher: close the guest conn when the H2C
-	// request is cancelled so the in-flight io.Copy(s) unblock
-	// with `use of closed network connection` rather than
-	// hanging on a dead guest. The deferred conn.Close() above
-	// is the safety net; this goroutine is the eager path.
 	stopWatch := make(chan struct{})
 	defer func() { close(stopWatch) }()
 	go func() {
@@ -442,32 +503,16 @@ func handleH1Stream(w http.ResponseWriter, r *http.Request, guestIP string, gues
 		}
 	}()
 
-	// Write the H1 request line + headers + chunked framing
-	// before the body. Mirrors the v1 shell script output
-	// (forward.go:998-1024) byte-for-byte modulo path-style
-	// differences; the guest's net/http must see the same
-	// envelope to handle the request correctly.
 	if err := writeH1RequestHead(conn, method, url, host, guestIP, guestPort, extraHeaders); err != nil {
 		http.Error(w, fmt.Sprintf("write request head: %v", err), http.StatusBadGateway)
 		return
 	}
 
-	// Bridge request body → guest, in chunked-encoded chunks.
-	// The bridge writes the chunk-size line, then the bytes,
-	// then a CRLF, repeating until r.Body returns EOF, then a
-	// final "0\r\n\r\n" terminator. The guest's net/http
-	// stack decodes the encoding transparently.
 	bodyErr := make(chan error, 1)
 	go func() {
 		bodyErr <- writeChunkedBody(conn, r.Body)
 	}()
 
-	// Bound ONLY the response-head read at readHeaderTimeout so
-	// a wedged guest doesn't hang the H2C stream waiting for the
-	// first byte. The streaming body io.Copy below MUST run with
-	// no conn deadline so SSE / WS / long-poll responses can
-	// stream past 30 s; that bound is the ctx deadline (24 h by
-	// default) which the watcher goroutine respects via Close.
 	_ = conn.SetReadDeadline(time.Now().Add(readHeaderTimeout))
 	br := newBufioReader(conn)
 	resp, err := http.ReadResponse(br, r)
@@ -477,10 +522,6 @@ func handleH1Stream(w http.ResponseWriter, r *http.Request, guestIP string, gues
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
-
-	// Mirror guest response headers back to the H2C caller.
-	// Chunked-decoded on the way out so the H2C client sees
-	// the same body semantics as the v1 forward.go path.
 	for k, vs := range resp.Header {
 		for _, v := range vs {
 			w.Header().Add(k, v)
@@ -489,24 +530,12 @@ func handleH1Stream(w http.ResponseWriter, r *http.Request, guestIP string, gues
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
 
-	// Drain the body goroutine best-effort. The handler is
-	// returning; if writeChunkedBody hasn't finished (e.g.
-	// the guest stopped reading the request body and r.Body
-	// never reaches EOF), don't block here — the ctx watcher
-	// has already closed conn, which will unblock r.Body.Read
-	// with `use of closed network connection` and the body
-	// goroutine will exit on its own. We only wait briefly
-	// so a clean finish logs any encoding error to stderr.
 	select {
 	case err := <-bodyErr:
 		if err != nil && !errors.Is(err, io.EOF) {
-			// Best-effort: the response is already written,
-			// so we can't change the status. Log to stderr.
 			fmt.Fprintf(os.Stderr, "writeChunkedBody: %v\n", err)
 		}
 	case <-ctx.Done():
-		// Body goroutine still running; the ctx watcher
-		// already closed conn — let it finish on its own.
 	}
 }
 

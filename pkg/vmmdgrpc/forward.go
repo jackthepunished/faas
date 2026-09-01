@@ -1426,6 +1426,7 @@ func (s *Server) forwardHTTPStreamV2(stream grpc.BidiStreamingServer[vmmdpb.Forw
 		dialPort = netns.AppPort
 	}
 	persistent := persistentStreamBridgeEnabled()
+	requestBridgeProtocol := streamBridgeProtocol(reqInit)
 	var (
 		bridgeLease  *streamBridgeLease
 		client       *http.Client
@@ -1519,7 +1520,7 @@ func (s *Server) forwardHTTPStreamV2(stream grpc.BidiStreamingServer[vmmdpb.Forw
 		// not through process-wide environment variables. The bridge strips
 		// these private headers before it forwards anything to the guest.
 		httpReq.Header.Set("X-Faas-Bridge-Persistent", "1")
-		httpReq.Header.Set("X-Faas-Bridge-Protocol", streamBridgeProtocol(reqInit))
+		httpReq.Header.Set("X-Faas-Bridge-Protocol", requestBridgeProtocol)
 		httpReq.Header.Set("X-Faas-Bridge-Port", strconv.FormatUint(uint64(dialPort), 10))
 		for _, h := range reqInit.GetHeaders() {
 			if strings.EqualFold(h.GetName(), "Host") {
@@ -1566,8 +1567,20 @@ func (s *Server) forwardHTTPStreamV2(stream grpc.BidiStreamingServer[vmmdpb.Forw
 		}
 	}()
 
-	// 7. Issue the H2C request and read the response head.
+	// 7. Issue the bridge request and read the response head. This phase is
+	// intentionally measured separately from the full RPC: it captures the
+	// vmmd Unix-socket hop plus the bridge-to-guest dial/protocol setup and
+	// response-header latency. The metric makes connection-pool changes
+	// observable instead of relying on end-to-end latency alone.
+	bridgeOp := "bridge_h1_roundtrip"
+	if requestBridgeProtocol == "h2c" {
+		bridgeOp = "bridge_h2c_roundtrip"
+	}
+	bridgeStart := time.Now()
 	httpResp, err := client.Do(httpReq)
+	if s.ops != nil {
+		s.ops.Observe(bridgeOp, time.Since(bridgeStart), err)
+	}
 	if err != nil {
 		_ = bodyPr.Close()
 		_ = bodyPw.Close()
