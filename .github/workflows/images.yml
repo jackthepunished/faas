@@ -157,7 +157,7 @@ jobs:
     env:
       IMAGE_NAME: ghcr.io/poyrazk/builder-base
       BUILDKIT_VERSION: "0.32.2"
-      RAILPACK_VERSION: "0.31.1"
+      RAILPACK_VERSION: "0.38.0"
     steps:
       - uses: actions/checkout@v7
 
@@ -336,11 +336,13 @@ jobs:
         run: bash scripts/ci/update-grype-db.sh
 
       # Scan both exact architecture artifacts produced by this job before
-      # either can become a release input. The helper prints the full report
-      # and blocks only actionable fixed CRITICAL findings.
-      - name: Scan builder base for critical vulnerabilities
+      # either can become a release input. Builder binaries are compiled from
+      # source in the Dockerfile, so fixed HIGH findings are release blockers
+      # here (runtime bases retain the stricter operational CRITICAL gate).
+      - name: Scan builder base for high vulnerabilities
         env:
           GRYPE_BIN: ${{ runner.temp }}/grype
+          GRYPE_FAIL_ON: high
         run: |
           set -euo pipefail
           if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF}" == "refs/heads/main" ]]; then

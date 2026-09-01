@@ -14,9 +14,10 @@ staging time.
 Every matrix job validates the concrete OCI artifact it built, runs the
 runtime contract smoke, and fails on actionable (fixed) CRITICAL Grype
 findings before promoting the `latest` or `sha-*` tags. The scan prints all
-matches, but only fixed CRITICAL matches block publication; vendor-unfixed and
-unknown matches do not block a base whose upstream has not published a fix. The
-builder job performs those checks for both
+matches, but only fixed CRITICAL matches block runtime-base publication;
+vendor-unfixed and unknown matches do not block a base whose upstream has not
+published a fix. The builder job uses a HIGH gate because it ships the
+BuildKit daemon and client, and performs those checks for both
 linux/amd64 and linux/arm64. BuildKit, Railpack, mise, crane, and the BuildKit
 source archive are checksum-verified before they enter the build or image
 verification path.
