@@ -197,8 +197,8 @@ func NewProvider(apiKey, webhookSecret string, sandbox bool, log *slog.Logger) (
 	if log == nil {
 		log = slog.Default()
 	}
-// Explicit Paddle deployments must provide an API key. Refuse to construct a
-// *Provider with an empty apiKey —
+	// Explicit Paddle deployments must provide an API key. Refuse to construct a
+	// *Provider with an empty apiKey —
 	// the SDK accepts empty keys silently, EnsurePlanProducts then dials
 	// api.paddle.com (or api.sandbox.paddle.com) with no auth, and the
 	// whole boot-time catalog hydration degrades to a per-call 401 that
