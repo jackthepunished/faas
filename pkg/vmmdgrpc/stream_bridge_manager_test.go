@@ -103,6 +103,67 @@ func TestStreamBridgeManagerBridgeContextOutlivesRequest(t *testing.T) {
 	}
 }
 
+func TestStreamBridgeManagerRemovesExitedEntry(t *testing.T) {
+	bridgePath, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(streamBridgePathEnv, bridgePath)
+
+	manager := newTestStreamBridgeManager(t, func() {})
+	var starts atomic.Int32
+	var first *exec.Cmd
+	manager.spawn = func(_ context.Context, _, _, _, _ string, _ uint32, _ string, _ []string) (*exec.Cmd, *bytes.Buffer, error) {
+		cmd := exec.Command("sleep", "60")
+		if err := cmd.Start(); err != nil {
+			return nil, nil, err
+		}
+		if starts.Add(1) == 1 {
+			first = cmd
+		}
+		return cmd, &bytes.Buffer{}, nil
+	}
+
+	req := &vmmdpb.ForwardHTTPRequestInit{Instance: "instance-exit", Port: 8080}
+	lease, err := manager.acquire(context.Background(), req, "fc-instance-exit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease.release()
+	if first == nil || first.Process == nil {
+		t.Fatal("first bridge process was not started")
+	}
+	if err := first.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		manager.mu.Lock()
+		removed := manager.entries[req.GetInstance()] == nil
+		manager.mu.Unlock()
+		if removed {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	manager.mu.Lock()
+	removed := manager.entries[req.GetInstance()] == nil
+	manager.mu.Unlock()
+	if !removed {
+		t.Fatal("exited bridge entry was retained")
+	}
+
+	secondLease, err := manager.acquire(context.Background(), req, "fc-instance-exit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondLease.release()
+	if got := starts.Load(); got != 2 {
+		t.Fatalf("bridge starts after child exit = %d, want 2", got)
+	}
+}
+
 func TestStreamBridgeManagerReapsIdleEntry(t *testing.T) {
 	bridgePath, err := os.Executable()
 	if err != nil {
