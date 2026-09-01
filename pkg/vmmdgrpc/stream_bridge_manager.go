@@ -133,7 +133,7 @@ func (m *streamBridgeManager) acquire(ctx context.Context, req *vmmdpb.ForwardHT
 			m.starts.Add(1)
 			m.mu.Unlock()
 
-			err := m.startEntry(bridgeCtx, entry, req)
+			err := m.startEntry(bridgeCtx, entry, req) //nolint:contextcheck // persistent bridge follows manager lifetime, not RPC lifetime
 			m.starts.Done()
 			if err != nil {
 				return nil, err
