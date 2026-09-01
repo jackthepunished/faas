@@ -16106,6 +16106,7 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleGeoAction' }
             - { $ref: '#/components/schemas/EdgeRuleThrottleAction' }
             - { $ref: '#/components/schemas/EdgeRuleBudgetAction' }
+            - { $ref: '#/components/schemas/EdgeRuleCacheAction' }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
 
@@ -20919,12 +20920,11 @@ components:
     ObsCapacityNode:
       description: Per-node capacity - resident and reserved footprint against the node size.
       type: object
-      required: [id, name, active, vcpus, vcpu_budget, mem_mb, admission_ceiling_mb, instances_live, instances_running, instances_waking, instances_cold_booting, ram_used_mb, admission_margin_mb, apps_count, tenants_count]
+      required: [id, name, active, vpcpus, vcpu_budget, mem_mb, admission_ceiling_mb, instances_live, instances_running, instances_waking, instances_cold_booting, ram_used_mb, admission_margin_mb, apps_count, tenants_count]
       properties:
         id: { type: string, format: uuid }
         name: { type: string }
         active: { type: boolean }
-        vcpus: { type: integer }
         vpcpus: { type: integer }
         vcpu_budget: { type: integer }
         mem_mb: { type: integer }
@@ -20940,12 +20940,11 @@ components:
     ObsNodeRow:
       description: One compute node with live utilization counters.
       type: object
-      required: [id, name, active, vcpus, mem_mb, max_concurrency, admission_ceiling_mb, created_at, instances_live, instances_running, instances_waking, instances_cold_booting, ram_used_mb, admission_margin_mb]
+      required: [id, name, active, vpcpus, mem_mb, max_concurrency, admission_ceiling_mb, created_at, instances_live, instances_running, instances_waking, instances_cold_booting, ram_used_mb, admission_margin_mb]
       properties:
         id: { type: string, format: uuid }
         name: { type: string }
         active: { type: boolean }
-        vcpus: { type: integer }
         vpcpus: { type: integer }
         mem_mb: { type: integer }
         max_concurrency: { type: integer }

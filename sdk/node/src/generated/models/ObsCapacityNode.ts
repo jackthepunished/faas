@@ -9,8 +9,7 @@ export type ObsCapacityNode = {
   id: string;
   name: string;
   active: boolean;
-  vcpus: number;
-  vpcpus?: number;
+  vpcpus: number;
   vcpu_budget: number;
   mem_mb: number;
   admission_ceiling_mb: number;

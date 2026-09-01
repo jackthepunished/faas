@@ -9,8 +9,7 @@ export type ObsNodeRow = {
   id: string;
   name: string;
   active: boolean;
-  vcpus: number;
-  vpcpus?: number;
+  vpcpus: number;
   mem_mb: number;
   max_concurrency: number;
   admission_ceiling_mb: number;
