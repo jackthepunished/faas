@@ -87,8 +87,8 @@ image (no runner shim).
 The runtime base is **auto-staged** by `imaged` through
 `pkg/imaged/base_stage.go::EnsureRuntimeBase`. The deployment pipeline
 must write `FAAS_DEPLOY_BASE_REF_PYTHON313` as an immutable OCI digest in
-`sealed.env`; the default `:latest` is for unnamed development daemons
-only.
+`/etc/faas/runtime-bases.env`; the default `:latest` is for unnamed
+development daemons only.
 
 The production workflow is:
 1. Publish the `images/runner-python313.Dockerfile` image to
@@ -104,8 +104,8 @@ to fall back to a hand-staged artifact.
 
 If a non-digest-pinned `FAAS_DEPLOY_BASE_REF_PYTHON313` is set
 (e.g. `:latest`), imaged aborts startup loud with a one-line error
-naming the offending env var — the same posture as
-`FAAS_DEPLOY_BASE_REF` (deploy-time override).
+naming the offending env var. The retired global `FAAS_DEPLOY_BASE_REF` is
+rejected.
 
 ## Detection priority
 

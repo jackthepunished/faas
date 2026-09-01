@@ -15,7 +15,7 @@
 # RPCs land here.
 socket_path = "/run/faas/builderd.sock"
 
-# Postgres DSN read from /etc/faas/sealed.env (DATABASE_URL). The TOML
+# Postgres DSN read from /etc/faas/compute-db.env (DATABASE_URL). The TOML
 # override is the single-box dev path; production ships the env-var.
 # database_url = "postgres://faas@127.0.0.1:5432/faas?sslmode=disable"
 

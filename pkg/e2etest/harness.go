@@ -283,7 +283,7 @@ kernel_path = %q
 			}
 		}
 		if dbr := os.Getenv("FAAS_TEST_DEPLOY_BASE_REF"); dbr != "" {
-			env = append(env, "FAAS_DEPLOY_BASE_REF="+dbr)
+			env = append(env, "FAAS_TEST_DEPLOY_BASE_REF="+dbr)
 		}
 		h.procs = append(h.procs, startProc(t, bin, "imaged", env))
 	}
@@ -331,6 +331,9 @@ build_export_dir = %q
 			"DATABASE_URL=" + dbURL,
 			"PATH=" + os.Getenv("PATH"),
 			"HOME=" + os.Getenv("HOME"),
+		}
+		if dbr := os.Getenv("FAAS_TEST_DEPLOY_BASE_REF"); dbr != "" {
+			env = append(env, "FAAS_TEST_DEPLOY_BASE_REF="+dbr)
 		}
 		h.procs = append(h.procs, startProc(t, bin, "builderd", env))
 		h.BuilderdCfg = cfgPath
