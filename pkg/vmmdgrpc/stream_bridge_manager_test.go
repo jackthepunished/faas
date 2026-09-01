@@ -66,15 +66,17 @@ func TestStreamBridgeManagerBridgeContextOutlivesRequest(t *testing.T) {
 
 	manager := newTestStreamBridgeManager(t, func() {})
 	spawnContextDone := make(chan struct{})
+	spawned := make(chan *exec.Cmd, 1)
 	manager.spawn = func(ctx context.Context, _, _, _, _ string, _ uint32, _ string, _ []string) (*exec.Cmd, *bytes.Buffer, error) {
 		go func() {
 			<-ctx.Done()
 			close(spawnContextDone)
 		}()
-		cmd := exec.Command("sleep", "60")
+		cmd := exec.CommandContext(ctx, "sleep", "60")
 		if err := cmd.Start(); err != nil {
 			return nil, nil, err
 		}
+		spawned <- cmd
 		return cmd, &bytes.Buffer{}, nil
 	}
 
@@ -85,12 +87,16 @@ func TestStreamBridgeManagerBridgeContextOutlivesRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	lease.release()
+	cmd := <-spawned
 	cancelRequest()
 
 	select {
 	case <-spawnContextDone:
 		t.Fatal("persistent bridge context was canceled with the request")
 	case <-time.After(50 * time.Millisecond):
+	}
+	if !streamBridgeProcessAlive(cmd) {
+		t.Fatal("persistent bridge process was canceled with the request")
 	}
 
 	if err := manager.close(context.Background()); err != nil {
