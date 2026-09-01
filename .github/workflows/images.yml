@@ -42,7 +42,7 @@
 #   #5 `localhost:5000` everywhere + custom buildkit driver — the
 #      curl/wait loop succeeded (curl on the runner namespace hits
 #      the bridge gateway), but the buildx push (running inside a
-#      separate `moby/buildkit:v0.31.2` container) hit
+#      separate `moby/buildkit:v0.32.2` container) hit
 #      `dial tcp [::1]:5000: connect: connection refused`.
 #   #6 `registry:5000` (service label) everywhere — runner's curl
 #      cannot resolve the label (DNS resolver doesn't try the
@@ -156,7 +156,7 @@ jobs:
           - 5000:5000
     env:
       IMAGE_NAME: ghcr.io/poyrazk/builder-base
-      BUILDKIT_VERSION: "0.31.2"
+      BUILDKIT_VERSION: "0.32.2"
       RAILPACK_VERSION: "0.31.1"
     steps:
       - uses: actions/checkout@v7
@@ -183,7 +183,7 @@ jobs:
         #   - default driver + service label `registry:5000` →
         #     `dial tcp: lookup registry on 168.63.129.16:53: no
         #     such host` (DNS lookup misses; also no network join).
-        #   - explicit `image=moby/buildkit:v0.31.2` driver +
+        #   - explicit `image=moby/buildkit:v0.32.2` driver +
         #     `localhost:5000` → `dial tcp [::1]:5000: connect:
         #     connection refused` (custom container is on its own
         #     namespace; no host loopback).
@@ -314,6 +314,34 @@ jobs:
             exit 1
           fi
           echo "OK: ${REF}@${DIGEST} contains /usr/local/bin/faas-guest-init"
+
+      # The compute admission gate refuses any staged builder ext4 with a
+      # CRITICAL finding. Scan the exact registry artifact produced by this
+      # job before a main-branch image can become the release input; otherwise
+      # the first vulnerability signal arrives only after imaged has staged
+      # the image on a production node and every builder wake is blocked.
+      - name: Scan builder base for critical vulnerabilities
+        env:
+          GRYPE_VERSION: "0.116.0"
+          GRYPE_SHA256: "40aff724297312f91ea390d003bed8d8651c74cc7f5b26732db80b3a408d2fc5"
+        run: |
+          set -euo pipefail
+          tarball="$RUNNER_TEMP/grype_${GRYPE_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL -o "$tarball" \
+            "https://github.com/anchore/grype/releases/download/v${GRYPE_VERSION}/grype_${GRYPE_VERSION}_linux_amd64.tar.gz"
+          echo "${GRYPE_SHA256}  ${tarball}" | sha256sum --check --strict
+          tar -xzf "$tarball" -C "$RUNNER_TEMP" grype
+          chmod 0755 "$RUNNER_TEMP/grype"
+          "$RUNNER_TEMP/grype" db update
+          if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF}" == "refs/heads/main" ]]; then
+            ref="${IMAGE_NAME}:sha-${GITHUB_SHA}"
+          else
+            ref="localhost:5000/pr-${GITHUB_SHA::12}"
+          fi
+          "$RUNNER_TEMP/grype" "registry:${ref}" \
+            --platform linux/amd64 \
+            --fail-on critical \
+            -o table
 
   # Runtime bases are single-arch artifacts today because the image lock and
   # the production compute fleet pin linux/amd64 children. They are published

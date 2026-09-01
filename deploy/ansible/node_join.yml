@@ -108,6 +108,31 @@
         mode: "0600"
       no_log: true
 
+    # These files were used by the pre-release/live-e2e rollout path. The
+    # signed runtime-bases.env and storage.env are now the only sources of
+    # truth; leaving the legacy files in place would clear or override the
+    # release EnvironmentFiles, make builderd and imaged resolve different
+    # bases, and retain obsolete registry credentials on the host.
+    - name: Remove legacy imaged runtime EnvironmentFile override
+      ansible.builtin.file:
+        path: /etc/systemd/system/faas-imaged.service.d/99-release-runtime.conf
+        state: absent
+
+    - name: Remove legacy per-runtime Environment override
+      ansible.builtin.file:
+        path: /etc/systemd/system/faas-imaged.service.d/zz-faas-function-runners.conf
+        state: absent
+
+    - name: Remove legacy builderd OCI environment override
+      ansible.builtin.file:
+        path: /etc/systemd/system/faas-builderd.service.d/99-codex-oci-source.conf
+        state: absent
+
+    - name: Remove legacy live-E2E environment file
+      ansible.builtin.file:
+        path: /etc/faas/oci-e2e.env
+        state: absent
+
     - name: Stage the compute trust bundle (the source never includes the CA private key)
       ansible.builtin.copy:
         src: "{{ faas_join_pki_source }}/"

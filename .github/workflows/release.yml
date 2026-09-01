@@ -416,6 +416,7 @@ jobs:
           }
 
           declare -a RUNTIME_IMAGES=(
+            "MINIMAL base-minimal"
             "NODE22 runner-node22"
             "PYTHON312 runner-python312"
             "GO124 runner-go124"

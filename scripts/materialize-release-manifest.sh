@@ -85,13 +85,14 @@ runtime_ref() {
   awk -F= -v key="$key" '$1 == key { print substr($0, index($0, "=") + 1); found = 1; exit } END { if (!found) exit 1 }' "$RUNTIME_BASES_ENV"
 }
 
+MINIMAL_REF=$(runtime_ref FAAS_DEPLOY_BASE_REF_MINIMAL)
 NODE22_REF=$(runtime_ref FAAS_DEPLOY_BASE_REF_NODE22)
 PYTHON312_REF=$(runtime_ref FAAS_DEPLOY_BASE_REF_PYTHON312)
 GO124_REF=$(runtime_ref FAAS_DEPLOY_BASE_REF_GO124)
 GO124_ALPINE_REF=$(runtime_ref FAAS_DEPLOY_BASE_REF_GO124_ALPINE)
 NODE24_REF=$(runtime_ref FAAS_DEPLOY_BASE_REF_NODE24)
 PYTHON313_REF=$(runtime_ref FAAS_DEPLOY_BASE_REF_PYTHON313)
-for runtime_ref_value in "$NODE22_REF" "$PYTHON312_REF" "$GO124_REF" "$GO124_ALPINE_REF" "$NODE24_REF" "$PYTHON313_REF"; do
+for runtime_ref_value in "$MINIMAL_REF" "$NODE22_REF" "$PYTHON312_REF" "$GO124_REF" "$GO124_ALPINE_REF" "$NODE24_REF" "$PYTHON313_REF"; do
   if [[ ! "$runtime_ref_value" =~ ^[^#[:space:]=]+@sha256:[0-9a-f]{64}$ ]]; then
     echo "materialize-release-manifest: runtime contract contains an invalid digest-pinned OCI reference" >&2
     exit 2
@@ -105,6 +106,7 @@ trap 'rm -f "$tmp"' EXIT
 release_id="pre-1.0-${GIT_SHA:0:8}"
 awk -v release_id="$release_id" -v release_sha="$GIT_SHA" \
   -v builder_base_digest="$BUILDER_BASE_DIGEST" \
+  -v minimal_ref="$MINIMAL_REF" \
   -v node22_ref="$NODE22_REF" \
   -v python312_ref="$PYTHON312_REF" \
   -v go124_ref="$GO124_REF" \
@@ -145,6 +147,11 @@ awk -v release_id="$release_id" -v release_sha="$GIT_SHA" \
   in_release && builder_base_digest != "" && /^  builder_base_digest:[[:space:]]/ {
     print "  builder_base_digest: " builder_base_digest
     builder_base_digests++
+    next
+  }
+  in_release && /^    minimal:[[:space:]]/ {
+    print "    minimal: " minimal_ref
+    runtime_base_refs++
     next
   }
   in_release && /^    node22:[[:space:]]/ {
@@ -188,8 +195,8 @@ awk -v release_id="$release_id" -v release_sha="$GIT_SHA" \
     if (builder_base_digest != "" && builder_base_digests != 1) {
       fail("template must contain one indented release.builder_base_digest when an override is supplied")
     }
-    if (runtime_base_refs != 6) {
-      fail("template must contain the six runtime_base_refs entries")
+    if (runtime_base_refs != 7) {
+      fail("template must contain the seven runtime_base_refs entries")
     }
   }
 ' "$TEMPLATE" > "$tmp"
