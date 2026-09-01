@@ -219,6 +219,14 @@ Strict mode also requires an HTTPS registry and rejects stale-cache fallback;
 the cache may still accelerate successful remote reads, but it cannot serve a
 last-known-good blob after the registry reports an error.
 
+For production compute joins, the signed release tarball also carries the
+release-pinned `vmlinux`. `node_join.yml` extracts it before importing the
+bootstrap playbook; the `firecracker` role copies those exact bytes into
+`/srv/fc/base` and `/srv/fc/kernel` and refuses to rebuild a host-local
+kernel. This keeps the kernel digest identical across GCP, Hetzner, OVH, and
+other bare-metal providers. The local source build remains only for
+image-seed/dev bootstrap, with deterministic build metadata.
+
 The database DSNs remain in the separate root-only
 `/etc/faas/compute-db.env`; the shared storage contract and registry
 credentials live in `roles/_shared/files/storage.env.example` and remain

@@ -14,6 +14,7 @@ OUT_B="$TMP_DIR/production-manifest-second.yaml"
 OUT_OVERRIDE="$TMP_DIR/production-manifest-override.yaml"
 RUNTIME_BASES_ENV="$TMP_DIR/runtime-bases.env"
 BUILDER_DIGEST=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+KERNEL_DIGEST=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 
 cat > "$RUNTIME_BASES_ENV" <<'EOF'
 FAAS_DEPLOY_BASE_REF_MINIMAL=ghcr.io/poyrazk/base-minimal@sha256:0000000000000000000000000000000000000000000000000000000000000000
@@ -29,13 +30,18 @@ bash "$SCRIPT" --template "$TEMPLATE" --git-sha "$SHA" --runtime-bases-env "$RUN
 bash "$SCRIPT" --template "$TEMPLATE" --git-sha "$SHA" --runtime-bases-env "$RUNTIME_BASES_ENV" --output "$OUT_B"
 bash "$SCRIPT" --template "$TEMPLATE" --git-sha "$SHA" \
   --builder-base-digest "sha256:$BUILDER_DIGEST" \
+  --kernel-digest "sha256:$KERNEL_DIGEST" \
   --runtime-bases-env "$RUNTIME_BASES_ENV" --output "$OUT_OVERRIDE"
 
 grep -Fqx '  id: pre-1.0-01234567' "$OUT_A"
 grep -Fqx "  git_sha: $SHA" "$OUT_A"
 cmp -s "$OUT_A" "$OUT_B"
-! cmp -s "$TEMPLATE" "$OUT_A"
+if cmp -s "$TEMPLATE" "$OUT_A"; then
+  echo "materializer returned the unchanged template" >&2
+  exit 1
+fi
 grep -Fqx "  builder_base_digest: $BUILDER_DIGEST" "$OUT_OVERRIDE"
+grep -Fqx "  kernel_digest: $KERNEL_DIGEST" "$OUT_OVERRIDE"
 grep -Fqx '    minimal: ghcr.io/poyrazk/base-minimal@sha256:0000000000000000000000000000000000000000000000000000000000000000' "$OUT_A"
 grep -Fqx '    node22: ghcr.io/poyrazk/runner-node22@sha256:1111111111111111111111111111111111111111111111111111111111111111' "$OUT_A"
 go run "$REPO_ROOT/cmd/gregalectl" manifest validate --file "$OUT_OVERRIDE" >/dev/null
