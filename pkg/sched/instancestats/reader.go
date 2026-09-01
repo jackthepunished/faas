@@ -2,6 +2,7 @@ package instancestats
 
 import (
 	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -82,8 +83,16 @@ type InstanceStat struct {
 	// ActivityTracker; PR-A leaves it zero and the poller
 	// falls back to state.Instance.LastRequestAt.
 	LastRequestAt time.Time
-	// SampledAt is the wall-clock time the underlying vmmd sample was
-	// taken. Signal readers reject rows older than DefaultFreshness;
+	// RequestCountTotal is the cumulative number of ForwardHTTP
+	// requests observed by vmmd for this instance. The counter is
+	// process-local and may reset when vmmd or the instance is
+	// recreated; Reader detects that regression and establishes a
+	// new baseline. RequestCountValid distinguishes a real zero from
+	// a wire that did not provide the counter.
+	RequestCountTotal uint64
+	RequestCountValid bool
+	// SampledAt is the wall-clock time the poller stamped this
+	// row. Signal readers reject rows older than DefaultFreshness;
 	// snapshot consumers can still inspect the row for diagnostics.
 	SampledAt time.Time
 	// CPU is the validity of CPUPct. PR-A semantics: Unknown
@@ -182,6 +191,24 @@ type InstanceStat struct {
 // once per 200 ms).
 type Reader struct {
 	snap atomic.Pointer[[]InstanceStat]
+
+	// rateMu protects the cumulative-counter baselines and their
+	// derived app-level rates. These are deliberately separate from
+	// snap: Replace is the only writer, while the scale-up trigger can
+	// read a rate concurrently with a poller tick.
+	rateMu       sync.Mutex
+	previousRate map[string]requestRateSample
+	requestRates map[string]requestRate
+}
+
+type requestRateSample struct {
+	count   uint64
+	sampled time.Time
+}
+
+type requestRate struct {
+	rps   float64
+	valid bool
 }
 
 // NewReader returns a Reader with an empty snapshot. Safe to call
@@ -207,7 +234,71 @@ func (r *Reader) Replace(next []InstanceStat) {
 	})
 	cp := make([]InstanceStat, len(next))
 	copy(cp, next)
+	r.updateRequestRates(cp)
 	r.snap.Store(&cp)
+}
+
+// updateRequestRates converts each instance's cumulative vmmd request
+// counter into an aggregate app-level RPS signal. A first sample, a missing
+// counter, a timestamp regression, or a counter regression only establishes
+// a new baseline; it never turns an old counter value into a burst.
+func (r *Reader) updateRequestRates(rows []InstanceStat) {
+	r.rateMu.Lock()
+	defer r.rateMu.Unlock()
+	if r.previousRate == nil {
+		r.previousRate = make(map[string]requestRateSample)
+	}
+	if r.requestRates == nil {
+		r.requestRates = make(map[string]requestRate)
+	}
+
+	nextRates := make(map[string]requestRate)
+	seenInstances := make(map[string]struct{}, len(rows))
+	for _, row := range rows {
+		if row.AppID == "" || row.InstanceID == "" {
+			continue
+		}
+		seenInstances[row.InstanceID] = struct{}{}
+		if !row.RequestCountValid || row.SampledAt.IsZero() {
+			continue
+		}
+		current := requestRateSample{count: row.RequestCountTotal, sampled: row.SampledAt}
+		previous, ok := r.previousRate[row.InstanceID]
+		if ok && current.sampled.After(previous.sampled) && current.count >= previous.count {
+			elapsed := current.sampled.Sub(previous.sampled).Seconds()
+			if elapsed > 0 {
+				rate := float64(current.count-previous.count) / elapsed
+				value := nextRates[row.AppID]
+				value.rps += rate
+				value.valid = true
+				nextRates[row.AppID] = value
+			}
+		}
+		r.previousRate[row.InstanceID] = current
+	}
+	for instanceID := range r.previousRate {
+		if _, ok := seenInstances[instanceID]; !ok {
+			delete(r.previousRate, instanceID)
+		}
+	}
+	r.requestRates = nextRates
+}
+
+// RequestsPerSecond returns the aggregate request rate observed across the
+// app's live instances during the latest pair of stats snapshots. It is an
+// optional fallback signal for scale-up when gateway Prometheus scraping is
+// unavailable, and returns false until a valid delta exists.
+func (r *Reader) RequestsPerSecond(appID string) (float64, bool) {
+	if r == nil || appID == "" {
+		return 0, false
+	}
+	r.rateMu.Lock()
+	defer r.rateMu.Unlock()
+	rate, ok := r.requestRates[appID]
+	if !ok || !rate.valid {
+		return 0, false
+	}
+	return rate.rps, true
 }
 
 // SnapshotAll returns every row in the latest snapshot, in

@@ -334,8 +334,7 @@ func (p *Poller) tickNode(ctx context.Context, node state.ComputeNode, siblings 
 	}
 	// Index durable sibling state by instance id for the join.
 	// The poller uses state.Instance.LastRequestAt as the
-	// fallback for LastRequestAt when the wire is zero (PR-A
-	// only; PR-B will populate wire from ActivityTracker).
+	// fallback for LastRequestAt when the wire is zero or absent.
 	sibByID := make(map[string]state.Instance, len(siblings))
 	for _, in := range siblings {
 		sibByID[in.ID] = in
@@ -370,6 +369,10 @@ func (p *Poller) tickNode(ctx context.Context, node state.ComputeNode, siblings 
 			// failed — both collapse to the legacy no-sidecar
 			// admission form on the meterd side.
 			SidecarMBs: sidecarByDeploy[durable.DeploymentID],
+		}
+		if in.RequestCountTotal != nil && *in.RequestCountTotal >= 0 {
+			row.RequestCountTotal = uint64(*in.RequestCountTotal)
+			row.RequestCountValid = true
 		}
 		wireRow := wire.InstanceStatRow{
 			AppID:            durable.AppID,

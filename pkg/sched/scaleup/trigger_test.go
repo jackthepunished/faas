@@ -145,10 +145,12 @@ func (s *sequenceScraper) Scrape(_ context.Context) (map[string]int64, error) {
 // fakeInstats is a minimal InstatsReader. Returns the per-app
 // max-CPU from byCPU; nil is the no-signal case. After PR-C
 // (issue #462) the interface also requires MaxInflightForApp —
-// byInflight is the per-app map; nil is the no-signal case.
+// byInflight is the per-app map; nil is the no-signal case. byRPS
+// exercises the optional provider-independent request-rate fallback.
 type fakeInstats struct {
 	byCPU      map[string]float64
 	byInflight map[string]int64
+	byRPS      map[string]float64
 }
 
 func (i *fakeInstats) MaxCPU(appID string) (float64, bool) {
@@ -167,6 +169,14 @@ func (i *fakeInstats) MaxInflightForApp(appID string) (int64, bool) {
 	return v, ok
 }
 
+func (i *fakeInstats) RequestsPerSecond(appID string) (float64, bool) {
+	if i == nil || i.byRPS == nil {
+		return 0, false
+	}
+	v, ok := i.byRPS[appID]
+	return v, ok
+}
+
 // --- tests ---------------------------------------------------------------
 
 // TestTrigger_AdmitOnRPSTargetHit is the happy path: a single app
@@ -180,10 +190,10 @@ func TestTrigger_AdmitOnRPSTargetHit(t *testing.T) {
 	ledger := &fakeLedger{conc: map[string]int{"app1": 2}}
 	engine := &fakeEngine{}
 	m := wire.NewOpsMetrics("test")
-	tr := New(store, nil, &fakeScraper{byApp: map[string]int64{"app1": 140}}, engine, ledger, Options{Metrics: m})
+	tr := New(store, nil, &fakeScraper{byApp: map[string]int64{"app1": 700}}, engine, ledger, Options{Metrics: m})
 	// Pretend the previous tick already seeded cumulative=0 so
-	// the first Touch sees a delta of 140 (matching 70 RPS/instance
-	// × 2 instances).
+	// the first Touch sees a delta of 700 (140 app RPS over the
+	// configured 5-second window, or 70 RPS/instance × 2).
 	tr.ring.Touch(t0(), map[string]int64{"app1": 0})
 	if err := tr.Tick(context.Background()); err != nil {
 		t.Fatalf("Tick: %v", err)
@@ -202,15 +212,33 @@ func TestTrigger_UsesBoundedDesiredCapacityBurst(t *testing.T) {
 	}}
 	ledger := &fakeLedger{conc: map[string]int{"app1": 1}}
 	engine := &burstFakeEngine{fakeEngine: &fakeEngine{}}
-	tr := New(store, nil, &fakeScraper{byApp: map[string]int64{"app1": 500}}, engine, ledger, Options{})
+	tr := New(store, nil, &fakeScraper{byApp: map[string]int64{"app1": 2500}}, engine, ledger, Options{})
 	tr.ring.Touch(t0(), map[string]int64{"app1": 0})
 	if err := tr.Tick(context.Background()); err != nil {
 		t.Fatalf("Tick: %v", err)
 	}
+	// 2500 requests over the configured 5-second window = 500 RPS;
 	// 500 RPS / 50 target = 10 desired, but the app has one
 	// instance and the trigger's per-tick burst bound is four.
 	if len(engine.burstCounts) != 1 || engine.burstCounts[0] != 4 {
 		t.Fatalf("burst counts = %v, want [4]", engine.burstCounts)
+	}
+}
+
+func TestTrigger_UsesInstanceStatsRPSWhenPrometheusUnavailable(t *testing.T) {
+	store := &fakeStore{apps: []state.App{
+		{ID: "app1", AutoscaleTargetRPS: 5, MaxConcurrency: 5},
+	}}
+	ledger := &fakeLedger{conc: map[string]int{"app1": 1}}
+	engine := &fakeEngine{}
+	instats := &fakeInstats{byRPS: map[string]float64{"app1": 6}}
+	tr := New(store, instats, nil, engine, ledger, Options{})
+
+	if err := tr.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if len(engine.admitCalls) != 1 || engine.admitCalls[0] != "app1" {
+		t.Fatalf("engine.admitCalls = %v, want [app1]", engine.admitCalls)
 	}
 }
 
@@ -224,7 +252,7 @@ func TestTrigger_RejectAtCap(t *testing.T) {
 	ledger := &fakeLedger{conc: map[string]int{"app1": 5}}
 	engine := &fakeEngine{}
 	m := wire.NewOpsMetrics("test")
-	tr := New(store, nil, &fakeScraper{byApp: map[string]int64{"app1": 500}}, engine, ledger, Options{Metrics: m})
+	tr := New(store, nil, &fakeScraper{byApp: map[string]int64{"app1": 1500}}, engine, ledger, Options{Metrics: m})
 	tr.ring.Touch(t0(), map[string]int64{"app1": 0})
 	if err := tr.Tick(context.Background()); err != nil {
 		t.Fatalf("Tick: %v", err)
@@ -283,7 +311,7 @@ func TestTrigger_NilEngineNoOp(t *testing.T) {
 		{ID: "app1", AutoscaleTargetRPS: 50, MaxConcurrency: 5},
 	}}
 	ledger := &fakeLedger{conc: map[string]int{"app1": 2}}
-	tr := New(store, nil, &fakeScraper{byApp: map[string]int64{"app1": 140}}, nil, ledger, Options{})
+	tr := New(store, nil, &fakeScraper{byApp: map[string]int64{"app1": 700}}, nil, ledger, Options{})
 	if err := tr.Tick(context.Background()); err != nil {
 		t.Fatalf("Tick: %v", err)
 	}
@@ -331,7 +359,7 @@ func TestTrigger_EngineReturnsAtCapacityObservesRejectAtCap(t *testing.T) {
 		},
 	}
 	m := wire.NewOpsMetrics("test")
-	tr := New(store, nil, &fakeScraper{byApp: map[string]int64{"app1": 140}}, engine, ledger, Options{Metrics: m})
+	tr := New(store, nil, &fakeScraper{byApp: map[string]int64{"app1": 700}}, engine, ledger, Options{Metrics: m})
 	tr.ring.Touch(t0(), map[string]int64{"app1": 0})
 	if err := tr.Tick(context.Background()); err != nil {
 		t.Fatalf("Tick: %v", err)
@@ -398,7 +426,7 @@ func TestTrigger_EngineErrorLogsNotPropagates(t *testing.T) {
 			"app1": errors.New("vmmd dial: connection refused"),
 		},
 	}
-	tr := New(store, nil, &fakeScraper{byApp: map[string]int64{"app1": 140}}, engine, ledger, Options{})
+	tr := New(store, nil, &fakeScraper{byApp: map[string]int64{"app1": 700}}, engine, ledger, Options{})
 	tr.ring.Touch(t0(), map[string]int64{"app1": 0})
 	if err := tr.Tick(context.Background()); err != nil {
 		t.Errorf("Tick should swallow engine errors, got %v", err)
@@ -412,7 +440,7 @@ func TestTrigger_ScrapeFailureDisablesStaleRPS(t *testing.T) {
 	ledger := &fakeLedger{conc: map[string]int{"app1": 2}}
 	engine := &fakeEngine{}
 	scraper := &sequenceScraper{
-		first: map[string]int64{"app1": 140},
+		first: map[string]int64{"app1": 700},
 		err:   errors.New("metrics endpoint unavailable"),
 	}
 	tr := New(store, nil, scraper, engine, ledger, Options{})

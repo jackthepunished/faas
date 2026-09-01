@@ -150,6 +150,14 @@ type InstatsReader interface {
 	MaxInflightForApp(appID string) (n int64, ok bool)
 }
 
+// RequestRateReader is an optional provider-independent RPS signal. The
+// concrete instancestats.Reader derives it from VMMD's cumulative activity
+// counter, so split-box and bare-metal deployments do not need to expose a
+// gateway metrics listener across node boundaries.
+type RequestRateReader interface {
+	RequestsPerSecond(appID string) (rps float64, ok bool)
+}
+
 // AppStats is the snapshot of inputs the pure decide() function
 // reads. Splitting this out keeps decide() trivially testable — no
 // mocks, no goroutines, no engine. The trigger's Tick assembles an
@@ -163,7 +171,7 @@ type AppStats struct {
 	PerInstanceRPS float64 // measured, 0 when no RPS signal
 	PerInstanceCPU float64 // measured, 0 when no CPU signal
 	HaveCPU        bool    // true iff InstatsReader returned a sample
-	HaveRPS        bool    // true iff the ring buffer has a sample
+	HaveRPS        bool    // true iff a current RPS signal is available
 }
 
 // Decision is the result of the pure decide() function. The trigger
@@ -388,10 +396,11 @@ func (t *Trigger) Tick(ctx context.Context) error {
 	if t == nil || t.appStore == nil {
 		return nil
 	}
-	// Feed the ring buffer one fresh scrape. A failed scrape must not make
-	// the previous counter window look current: CPU can still drive this
-	// trigger, but RPS is disabled for this tick.
-	scrapeOK := false
+	// Feed the ring buffer one fresh scrape. Keep the set of apps present
+	// in this scrape separately from the ring: an old ring observation must
+	// not mask a current scrape failure or make a disappeared app look like
+	// a fresh Prometheus signal.
+	var promApps map[string]struct{}
 	if t.promScraper != nil {
 		counts, err := t.promScraper.Scrape(ctx)
 		if err != nil {
@@ -403,7 +412,10 @@ func (t *Trigger) Tick(ctx context.Context) error {
 			t.log.Warn("scaleup: scrape failed", "err", err)
 		} else {
 			t.ring.Touch(time.Now(), counts)
-			scrapeOK = true
+			promApps = make(map[string]struct{}, len(counts))
+			for appID := range counts {
+				promApps[appID] = struct{}{}
+			}
 		}
 	}
 	// Phase 2 / Gate A: per-schedd slice. ownerNodeID set via
@@ -431,17 +443,28 @@ func (t *Trigger) Tick(ctx context.Context) error {
 		if t.ledger != nil {
 			conc = t.ledger.Concurrency(app.ID)
 		}
-		// Per-instance RPS = sum(window) / max(1, conc).
+		// Per-instance RPS = windowed requests/second / conc.
 		// When conc=0 (cold path: no instances yet), the rollup
 		// is undefined; we treat HaveRPS=false so the trigger
 		// fires no_signal. The first instant wake that lands an
 		// instance will be picked up by the next tick.
 		var perInstRPS float64
 		haveRPS := false
-		if conc > 0 && t.promScraper != nil && scrapeOK {
-			rps := t.ring.AppRPS(app.ID, time.Now())
-			perInstRPS = rps / float64(conc)
-			haveRPS = true
+		if conc > 0 {
+			_, promAvailable := promApps[app.ID]
+			if promAvailable && t.ring.HasObservation(app.ID) {
+				rps := t.ring.AppRate(app.ID, time.Now())
+				perInstRPS = rps / float64(conc)
+				haveRPS = true
+			}
+		}
+		if conc > 0 && !haveRPS {
+			if reader, ok := t.instats.(RequestRateReader); ok {
+				if rps, ok := reader.RequestsPerSecond(app.ID); ok {
+					perInstRPS = rps / float64(conc)
+					haveRPS = true
+				}
+			}
 		}
 		var perInstCPU float64
 		haveCPU := false
