@@ -515,7 +515,7 @@ Deploy (--image REF | --tarball PATH | --repo OWNER/NAME --ref REF | --github | 
 | `--repo` | deploy from a GitHub repo |  |
 | `--ref` | git ref for --repo (branch, tag, or 40-char SHA) |  |
 | `--github` | emit a GitHub Actions workflow snippet for faas-deploy-action |  |
-| `--template` | scaffold from a built-in template | one of `hello-node` · `hello-python` · `hello-go` · `cron-example` · `function-node` · `function-python` · `function-go` · `s3-uploader` · `slack-bot` · `rest-api-postgres` · `cron-worker` · `webhook-receiver` · `ai-chat` |
+| `--template` | scaffold from a built-in template | one of `hello-node` · `hello-python` · `hello-go` · `cron-example` · `function-node` · `function-python` · `function-go` · `function-node24` · `function-python313` · `s3-uploader` · `slack-bot` · `rest-api-postgres` · `cron-worker` · `webhook-receiver` · `ai-chat` |
 | `--reason` | free-text deploy reason (≤280 chars) |  |
 | `--tag` | annotation tag | one of `incident_recovery` · `hotfix` · `scheduled_maintenance` · `compliance_hold` · `partner_request` |
 | `--deployed-by` | operator label (auto-resolved from git config user.name) |  |
@@ -677,7 +677,7 @@ Scaffold a reference project from a built-in template (--template NAME --path DI
 
 | Flag | Meaning | |
 |---|---|---|
-| `--template` | template name | required; one of `hello-node` · `hello-python` · `hello-go` · `cron-example` · `function-node` · `function-python` · `function-go` · `s3-uploader` · `slack-bot` · `rest-api-postgres` · `cron-worker` · `webhook-receiver` · `ai-chat` |
+| `--template` | template name | required; one of `hello-node` · `hello-python` · `hello-go` · `cron-example` · `function-node` · `function-python` · `function-go` · `function-node24` · `function-python313` · `s3-uploader` · `slack-bot` · `rest-api-postgres` · `cron-worker` · `webhook-receiver` · `ai-chat` |
 | `--path` | target directory | required |
 | `--deploy` | deploy after scaffolding |  |
 
