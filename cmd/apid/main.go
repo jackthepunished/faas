@@ -1598,6 +1598,19 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		log.Info("background re-seal disabled; set FAAS_REKEY_ENABLED=true to opt in (see docs/ops/host-age-rotation.md)")
 	}
 
+	// A single reconnecting LISTEN session fans invocation_done events out
+	// to all synchronous requests. If the optimization cannot start, keep
+	// the legacy per-request listener path so a transient database/listener
+	// issue does not prevent apid from serving traffic.
+	if deps.pool != nil {
+		completion := newInvocationCompletionWaiter(deps.pool, log)
+		if err := completion.Start(ctx); err != nil {
+			log.Warn("invocation completion fan-out unavailable; using per-request LISTEN fallback", "err", err)
+		} else {
+			srv.WithInvocationCompletionWaiter(completion)
+		}
+	}
+
 	// Optional pre-listen hook (DNS poller in production; nil in tests).
 	if deps.bgBefore != nil {
 		deps.bgBefore(ctx, log, srv)

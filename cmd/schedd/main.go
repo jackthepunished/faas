@@ -1736,6 +1736,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// goroutine added a 7th long-term subscriber that tipped
 	// pool.MaxConns=16 over the edge and starved the async-invoke
 	// drain's BeginTx under e2e query bursts.
+	drainDispatchConcurrency := sched.DefaultDrainDispatchConcurrency
+	if v := strings.TrimSpace(os.Getenv("FAAS_SCHEDD_INVOCATION_DISPATCH_CONCURRENCY")); v != "" {
+		n, parseErr := strconv.Atoi(v)
+		if parseErr != nil || n < 1 {
+			return fmt.Errorf("FAAS_SCHEDD_INVOCATION_DISPATCH_CONCURRENCY must be a positive integer: %q", v)
+		}
+		drainDispatchConcurrency = n
+	}
 
 	// Move 1 drain: a second goroutine inside schedd that drains the
 	// unified invocations table on a 1s safety tick + invocation_due
@@ -1756,7 +1764,8 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			drain := sched.NewDrain(engine.Store(), engine,
 				sched.WithDrainGatewaySynth(synth),
 				sched.WithDrainNotifier(engine.Notifier()),
-				sched.WithDrainLogger(log))
+				sched.WithDrainLogger(log),
+				sched.WithDrainDispatchConcurrency(drainDispatchConcurrency))
 			notifC, subErr := db.SubscribeWithReconnect(ctx, pool,
 				[]string{db.NotifyInvocationDue}, log)
 			if subErr != nil {
