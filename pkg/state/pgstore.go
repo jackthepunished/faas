@@ -14098,10 +14098,9 @@ func (s *PgStore) LoadAllOverageCapCents(ctx context.Context) (map[string]int64,
 }
 
 // CurrentMonthOverageCents returns the account's derived overage in
-// integer cents for the current UTC month. 1 GB-h = 3600 GB-seconds;
-// at €0.01/GB-h → 1 GB-h = 100 cents. The overage-row SUM is
-// mb_seconds; we multiply by 100/3600_000 to get cents. Integer math
-// only — never float on money (CLAUDE.md).
+// integer cents for the current UTC month. It removes the account plan's
+// included calendar-month allowance before converting the remainder to
+// cents. Integer math only — never float on money (CLAUDE.md).
 //
 // Hand-written: the formula is meterd-internal and not on the read
 // surface. The migration on usage_minutes is unchanged; we SELECT
@@ -14118,17 +14117,17 @@ func (s *PgStore) CurrentMonthOverageCents(ctx context.Context, accountID string
 	now := time.Now().UTC()
 	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
 	var mbSeconds int64
+	var plan api.Plan
 	if err := s.pool.QueryRow(ctx,
-		`select COALESCE(SUM(mb_seconds), 0)::bigint
-		   from usage_minutes
-		  where account_id = $1
-		    and minute >= $2`,
-		accountID, monthStart).Scan(&mbSeconds); err != nil {
+		`select COALESCE(SUM(u.mb_seconds), 0)::bigint,
+		        COALESCE((select a.plan from accounts a where a.id = $1), 'free')
+		   from usage_minutes u
+		  where u.account_id = $1
+		    and u.minute >= $2`,
+		accountID, monthStart).Scan(&mbSeconds, &plan); err != nil {
 		return 0, err
 	}
-	// mb_seconds / 3600 = GB-h; GB-h * 100 = cents. Integer math.
-	cents := mbSeconds * 100 / 3600
-	return cents, nil
+	return api.OverageCentsForMBSeconds(plan, mbSeconds), nil
 }
 
 // UsageByHour returns per-app usage rolled up from the per-minute rows

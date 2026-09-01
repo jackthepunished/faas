@@ -24,6 +24,7 @@ type stubProvider struct {
 	pushed int64
 	err    error
 	caps   billing.CapabilitySet
+	mode   billing.UsageMode
 }
 
 func (s *stubProvider) EnsurePlanProducts(context.Context) error { return nil }
@@ -57,6 +58,7 @@ func (s *stubProvider) PaymentMethodSummary(_ context.Context, _ state.Account) 
 func (s *stubProvider) Capabilities() billing.CapabilitySet {
 	return s.caps
 }
+func (s *stubProvider) UsageMode() billing.UsageMode { return s.mode }
 
 // seedMemStore constructs a MemStore with one account + a row
 // of per-hour usage. MemStore.CreateAccount generates a fresh
@@ -135,6 +137,30 @@ func TestReconciler_ZeroDriftIsHappyPath(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "meterd_billing_drift_ratio") {
 		t.Errorf("expected ratio metric name in scrape body, got:\n%s", body)
+	}
+}
+
+func TestReconciler_OverageProviderUsesNetCalendarMonthUsage(t *testing.T) {
+	store, id := seedMemStore(t, "acct_overage", api.PlanHobby, int64(api.PlanHobby.PlanIncludedGBHours()+2)*api.SecondsPerGBHour)
+	prov := &stubProvider{
+		pushed: 2 * api.SecondsPerGBHour,
+		mode:   billing.UsageModeOverage,
+		caps:   billing.CapabilitySet(billing.CapUsageReconcile),
+	}
+	rec := New("polar", store, prov, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	if err := rec.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	srv := httptest.NewServer(rec.Handler())
+	defer srv.Close()
+	resp, err := srv.Client().Get(srv.URL)
+	if err != nil {
+		t.Fatalf("scrape GET: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), `meterd_billing_drift_mb_seconds{account_id="`+id+`",provider="polar"} 0`) {
+		t.Fatalf("net overage drift was not zero:\n%s", body)
 	}
 }
 

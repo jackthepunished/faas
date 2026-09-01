@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sort"
 	"time"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/billing"
 	"github.com/onebox-faas/faas/pkg/billing/paddle"
 	"github.com/onebox-faas/faas/pkg/billing/polar"
@@ -16,7 +18,7 @@ import (
 
 // Pusher is the meterd daemon's billing-pusher loop. It walks every paid
 // account with a customer id (Stripe cus_… or Paddle ctm_…), sums the past
-// billing window's billable mb_seconds, and pushes a single metered usage
+// billing window's mb_seconds, and pushes a single metered usage
 // record. The active provider (FAAS_BILLING_PROVIDER=paddle for Paddle, "" or
 // "stripe" for Stripe) is dispatched through billing.Provider — the local
 // StripePusher interface that predated PR #3 was collapsed into the Provider
@@ -70,7 +72,7 @@ func HourWindow(at time.Time) (start, end time.Time) {
 	return start, end
 }
 
-// PushHour pushes the billable mb_seconds for one billing window for
+// PushHour pushes the provider's billable quantity for one billing window for
 // every paid account. Free accounts are skipped (no customer id, no
 // overage). Returns the number of accounts it pushed for so the loop
 // can log a line; errors push loop backoff decisions up to the caller.
@@ -146,19 +148,27 @@ func (p *Pusher) PushHour(ctx context.Context) (int, error) {
 		if mbSec <= 0 {
 			continue
 		}
+		billableMBSeconds, err := p.billableUsage(ctx, acct, start, mbSec)
+		if err != nil {
+			p.log.Warn("meter: calculate billable usage", "account", acct.ID, "hour", start, "mb_seconds", mbSec, "err", err)
+			continue
+		}
+		if billableMBSeconds <= 0 {
+			continue
+		}
 		pushStart := time.Now()
-		perr := p.pusher.PushUsageRecord(ctx, acct, start, mbSec)
+		perr := p.pusher.PushUsageRecord(ctx, acct, start, billableMBSeconds)
 		code := ops.classify(perr)
 		dur := time.Since(pushStart)
 		p.ops.ObserveCode(ops.opLabel, code, dur)
 		ops.observe(p.ops, code, dur)
 		if perr != nil {
 			p.log.Warn("meter: push usage", "account", acct.ID, "hour", start,
-				"code", code, "mb_seconds", mbSec, "err", perr)
+				"code", code, "mb_seconds", mbSec, "billable_mb_seconds", billableMBSeconds, "err", perr)
 			continue
 		}
 		p.log.Info("meter: push usage", "account", acct.ID, "hour", start,
-			"code", code, "mb_seconds", mbSec)
+			"code", code, "mb_seconds", mbSec, "billable_mb_seconds", billableMBSeconds)
 		pushed++
 	}
 	return pushed, nil
@@ -192,15 +202,44 @@ func (p *Pusher) PushPending(ctx context.Context, lookback time.Duration) (int, 
 		byID[acct.ID] = acct
 	}
 	ops := providerOpsFor(p.pusher)
+	mode := providerUsageMode(p.pusher)
+	ordered := append([]state.UsageWindow(nil), windows...)
+	if mode == billing.UsageModeOverage {
+		// Postgres already returns hour order; sorting the copy also makes the
+		// in-memory implementation and narrow test stores obey the same
+		// cumulative-month contract.
+		sort.SliceStable(ordered, func(i, j int) bool {
+			left, right := ordered[i], ordered[j]
+			if !left.Hour.Equal(right.Hour) {
+				return left.Hour.Before(right.Hour)
+			}
+			return left.AccountID < right.AccountID
+		})
+	}
+	cursors := make(map[string]overageCursor)
 	pushed := 0
 	var firstErr error
-	for _, window := range windows {
+	for _, window := range ordered {
 		acct, ok := byID[window.AccountID]
 		if !ok || acct.Plan == "free" || acct.Status == state.AccountSuspended || acct.Status == state.AccountDeletedPending {
 			continue
 		}
+		billableMBSeconds := window.MBSeconds
+		if mode == billing.UsageModeOverage {
+			billableMBSeconds, err = p.billablePendingUsage(ctx, acct, window, cursors)
+			if err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				p.log.Warn("meter: calculate replay billable usage", "account", acct.ID, "hour", window.Hour, "mb_seconds", window.MBSeconds, "err", err)
+				continue
+			}
+		}
+		if billableMBSeconds <= 0 {
+			continue
+		}
 		pushStart := time.Now()
-		perr := p.pusher.PushUsageRecord(ctx, acct, window.Hour, window.MBSeconds)
+		perr := p.pusher.PushUsageRecord(ctx, acct, window.Hour, billableMBSeconds)
 		code := ops.classify(perr)
 		dur := time.Since(pushStart)
 		p.ops.ObserveCode(ops.opLabel, code, dur)
@@ -210,14 +249,74 @@ func (p *Pusher) PushPending(ctx context.Context, lookback time.Duration) (int, 
 				firstErr = perr
 			}
 			p.log.Warn("meter: push usage", "account", acct.ID, "hour", window.Hour,
-				"replay", true, "code", code, "mb_seconds", window.MBSeconds, "err", perr)
+				"replay", true, "code", code, "mb_seconds", window.MBSeconds, "billable_mb_seconds", billableMBSeconds, "err", perr)
 			continue
 		}
 		pushed++
 		p.log.Info("meter: push usage", "account", acct.ID, "hour", window.Hour,
-			"replay", true, "code", code, "mb_seconds", window.MBSeconds)
+			"replay", true, "code", code, "mb_seconds", window.MBSeconds, "billable_mb_seconds", billableMBSeconds)
 	}
 	return pushed, firstErr
+}
+
+type overageCursor struct {
+	rawBefore int64
+}
+
+func providerUsageMode(provider billing.Provider) billing.UsageMode {
+	if modeProvider, ok := provider.(billing.UsageModeProvider); ok {
+		if mode := modeProvider.UsageMode(); mode == billing.UsageModeOverage {
+			return mode
+		}
+	}
+	return billing.UsageModeRaw
+}
+
+func (p *Pusher) billableUsage(ctx context.Context, acct state.Account, hour time.Time, raw int64) (int64, error) {
+	if providerUsageMode(p.pusher) != billing.UsageModeOverage {
+		return raw, nil
+	}
+	window := hour.UTC().Truncate(time.Hour)
+	monthStart := time.Date(window.Year(), window.Month(), 1, 0, 0, 0, 0, time.UTC)
+	prior, err := sumUsageRows(ctx, p.store, acct.ID, monthStart, window)
+	if err != nil {
+		return 0, err
+	}
+	return api.BillableMBSeconds(acct.Plan, prior+raw) - api.BillableMBSeconds(acct.Plan, prior), nil
+}
+
+func (p *Pusher) billablePendingUsage(ctx context.Context, acct state.Account, window state.UsageWindow, cursors map[string]overageCursor) (int64, error) {
+	hour := window.Hour.UTC().Truncate(time.Hour)
+	monthStart := time.Date(hour.Year(), hour.Month(), 1, 0, 0, 0, 0, time.UTC)
+	key := acct.ID + "\x00" + monthStart.Format("2006-01")
+	cursor, ok := cursors[key]
+	if !ok {
+		prior, err := sumUsageRows(ctx, p.store, acct.ID, monthStart, hour)
+		if err != nil {
+			return 0, err
+		}
+		cursor = overageCursor{rawBefore: prior}
+	}
+	before := api.BillableMBSeconds(acct.Plan, cursor.rawBefore)
+	cursor.rawBefore += window.MBSeconds
+	after := api.BillableMBSeconds(acct.Plan, cursor.rawBefore)
+	cursors[key] = cursor
+	return after - before, nil
+}
+
+func sumUsageRows(ctx context.Context, store state.Store, accountID string, start, end time.Time) (int64, error) {
+	if !start.Before(end) {
+		return 0, nil
+	}
+	rows, err := store.UsageByHour(ctx, accountID, start, end)
+	if err != nil {
+		return 0, err
+	}
+	var total int64
+	for _, row := range rows {
+		total += row.MBSeconds
+	}
+	return total, nil
 }
 
 // providerOps is the per-provider seam — one struct, three closures,

@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -64,9 +65,16 @@ func polarCatalogServer(t *testing.T, includeMeter bool) string {
 				http.NotFound(w, r)
 				return
 			}
-			_, _ = io.WriteString(w, `{"id":"`+id+`"}`)
+			fixed := 900
+			switch id {
+			case "pro-product":
+				fixed = 2900
+			case "scale-product":
+				fixed = 9900
+			}
+			_, _ = io.WriteString(w, `{"id":"`+id+`","recurring_interval":"month","recurring_interval_count":1,"is_recurring":true,"is_archived":false,"prices":[{"amount_type":"fixed","price_currency":"eur","price_amount":`+strconv.Itoa(fixed)+`,"is_archived":false},{"amount_type":"metered_unit","price_currency":"eur","unit_amount":"1","meter_id":"meter-1","cap_amount":null,"is_archived":false}],"benefits":[]}`)
 		case includeMeter && r.URL.Path == "/v1/meters/meter-1":
-			_, _ = io.WriteString(w, `{"id":"meter-1"}`)
+			_, _ = io.WriteString(w, `{"id":"meter-1","unit":"scalar","archived_at":null,"filter":{"conjunction":"and","clauses":[{"property":"name","operator":"eq","value":"ram_usage"}]},"aggregation":{"func":"sum","property":"gb_ram_hours"}}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -198,13 +206,15 @@ func TestLoadProviderForAPID_Polar_BuildsProvider(t *testing.T) {
 func TestLoadProviderForMeterd_Polar_BuildsProvider(t *testing.T) {
 	t.Parallel()
 	store := state.NewMemStore()
-	catalogURL := polarCatalogServer(t, false)
+	catalogURL := polarCatalogServer(t, true)
 	env := mapEnv(map[string]string{
 		"FAAS_BILLING_PROVIDER":       "polar",
 		"FAAS_POLAR_ACCESS_TOKEN":     "polar_test_token",
 		"FAAS_POLAR_HOBBY_PRODUCT_ID": "hobby-product",
 		"FAAS_POLAR_PRO_PRODUCT_ID":   "pro-product",
 		"FAAS_POLAR_SCALE_PRODUCT_ID": "scale-product",
+		"FAAS_POLAR_USAGE_EVENT_NAME": "ram_usage",
+		"FAAS_POLAR_METER_ID":         "meter-1",
 		"FAAS_POLAR_SANDBOX":          "1",
 		"FAAS_POLAR_BASE_URL":         catalogURL,
 	})
