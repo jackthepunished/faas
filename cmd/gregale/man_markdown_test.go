@@ -32,18 +32,42 @@ func TestMarkdownReferenceShape(t *testing.T) {
 		Subcommands: []cliSub{{
 			Name:  "show",
 			Short: "Print the plan.",
-			Flags: []cliFlag{{Name: "org", Short: "org slug", Req: true}},
+			Flags: []cliFlag{{Name: "org", Short: "org slug", Req: true, Value: "slug"}},
 		}},
 	}})
 	out := buf.String()
 	for _, want := range []string{
 		"# gregale CLI reference",
 		"## plan",
-		"`gregale plan <subcommand> <plan> [--json]`",
+		"`gregale plan [<subcommand>] <plan> [--json]`",
 		"`free` · `hobby`",
 		"| `--json` | machine output |  |",
 		"### plan show",
-		"| `--org` | org slug | required |",
+		"| `--org <slug>` | org slug | required |",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in:\n%s", want, out)
+		}
+	}
+}
+
+func TestMarkdownReferenceEscapesPlaceholdersAndFlagValues(t *testing.T) {
+	var buf bytes.Buffer
+	renderMarkdownReference(&buf, []cliCommand{{
+		Name:  "tail",
+		Short: "Filter by <slug> | <owner>.",
+		Flags: []cliFlag{
+			{Name: "app", Short: "app <slug>", Value: "slug"},
+			{Name: "include-stateless", Short: "boolean switch"},
+		},
+		Subcommands: []cliSub{{Name: "show", Short: "Show <id>"}},
+	}})
+	out := buf.String()
+	for _, want := range []string{
+		"Filter by &lt;slug&gt; \\| &lt;owner&gt;.",
+		"`gregale tail [<subcommand>] [--app <slug>] [--include-stateless]`",
+		"| `--app <slug>` | app &lt;slug&gt; |  |",
+		"Show &lt;id&gt;",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %q in:\n%s", want, out)

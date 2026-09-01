@@ -5,13 +5,13 @@ Generated from the CLI's command manifest by `gregale man --markdown`. Do not ed
 | Command | What it does |
 |---|---|
 | [`account`](#account) | Manage the local account (account export\|delete\|restore\|status\|dpa\|slo) |
-| [`admin`](#admin) | Operator-only billing ops (admin credit --reason <text> <uuid> <cents>) |
-| [`alerts`](#alerts) | Per-app alert rules (alerts list\|add\|info\|update\|rm\|rotate-secret\|preset --app <slug>) |
-| [`audit-events`](#audit-events) | Audit-log query (audit-events list\|get <id>) |
+| [`admin`](#admin) | Operator-only billing ops (admin credit --reason &lt;text&gt; &lt;uuid&gt; &lt;cents&gt;) |
+| [`alerts`](#alerts) | Per-app alert rules (alerts list\|add\|info\|update\|rm\|rotate-secret\|preset --app &lt;slug&gt;) |
+| [`audit-events`](#audit-events) | Audit-log query (audit-events list\|get &lt;id&gt;) |
 | [`apps`](#apps) | List your apps |
-| [`app`](#app) | Get/update one app (gregale app <slug> [scale\|rename <new>\|--ram N\|…]) |
+| [`app`](#app) | Get/update one app (gregale app &lt;slug&gt; [scale\|rename &lt;new&gt;\|--ram N\|…]) |
 | [`billing`](#billing) | Manage billing (portal, invoices, subscription, card on file) |
-| [`build`](#build) | Build provenance + sbom (build provenance <id>\|build sbom <id>) |
+| [`build`](#build) | Build provenance + sbom (build provenance &lt;id&gt;\|build sbom &lt;id&gt;) |
 | [`connect`](#connect) | Connect a third-party service (github \| repo OWNER/NAME) |
 | [`cors`](#cors) | Configure CORS for an app (allow\|ls\|rm\|show) |
 | [`crons`](#crons) | Manage scheduled requests |
@@ -20,64 +20,64 @@ Generated from the CLI's command manifest by `gregale man --markdown`. Do not ed
 | [`doctor`](#doctor) | Preflight: scan your source for the 8 source-side failure modes (--strict, --json, [path]) |
 | [`delayed-task`](#delayed-task) | Schedule a deferred invocation (delayed-task add\|get\|cancel) |
 | [`deployments`](#deployments) | List deployments (--limit N \| --before C \| --all) |
-| [`deployment`](#deployment) | Get one deployment (<id> \| set-min-instances <id> --min N) |
+| [`deployment`](#deployment) | Get one deployment (&lt;id&gt; \| set-min-instances &lt;id&gt; --min N) |
 | [`deploys`](#deploys) | Deployment drill-downs (deploys show\|status\|cancel\|reorder\|clear\|clear-obsolete) |
 | [`deploy`](#deploy) | Deploy (--image REF \| --tarball PATH \| --repo OWNER/NAME --ref REF \| --github \| --template NAME) |
 | [`domains`](#domains) | Manage custom domains |
 | [`preview`](#preview) | Manage preview environments (Mega-C PR-1 / issue #961 leaf 3) |
 | [`tenant-surfaces`](#tenant-surfaces) | Manage tenant surfaces (multi-hostname SAN bundle per app) |
-| [`edge-rules`](#edge-rules) | Per-app edge rules (edge-rules list\|create\|get\|update\|delete --app <slug>) |
-| [`openapi`](#openapi) | Pre-publish openapi schema-drift gate (openapi diff <baseline> <proposed>) |
-| [`env`](#env) | Pull/push .env <-> sealed secrets (--app <slug>) |
+| [`edge-rules`](#edge-rules) | Per-app edge rules (edge-rules list\|create\|get\|update\|delete --app &lt;slug&gt;) |
+| [`openapi`](#openapi) | Pre-publish openapi schema-drift gate (openapi diff &lt;baseline&gt; &lt;proposed&gt;) |
+| [`env`](#env) | Pull/push .env &lt;-&gt; sealed secrets (--app &lt;slug&gt;) |
 | [`init`](#init) | Scaffold a reference project from a built-in template (--template NAME --path DIR [--deploy]) |
-| [`inspect`](#inspect) | Read-only operator surface (inspect <slug> --upstreams [--scope <scope>] [--json]) |
-| [`invoke`](#invoke) | Functional smoke test (invoke [--async] <slug> [--payload J\|@file\|-]) |
-| [`invocations`](#invocations) | Per-account invocation ledger (invocations list\|get <id>) |
+| [`inspect`](#inspect) | Read-only operator surface (inspect &lt;slug&gt; --upstreams [--scope &lt;scope&gt;] [--json]) |
+| [`invoke`](#invoke) | Functional smoke test (invoke [--async] &lt;slug&gt; [--payload J\|@file\|-]) |
+| [`invocations`](#invocations) | Per-account invocation ledger (invocations list\|get &lt;id&gt;) |
 | [`debug`](#debug) | Production debugger (ADR-127 / PR-B) |
-| [`invitations`](#invitations) | Standalone invitation actions (invitations peek <token>\|accept <token>) |
+| [`invitations`](#invitations) | Standalone invitation actions (invitations peek &lt;token&gt;\|accept &lt;token&gt;) |
 | [`invoices`](#invoices) | List issued invoices |
 | [`keys`](#keys) | Manage API keys (keys list\|add\|rm\|rotate\|grace-window) |
 | [`login`](#login) | Authenticate this machine (--token for CI) |
 | [`logout`](#logout) | Remove the stored token |
 | [`signup`](#signup) | Create a new account (signup [--email-only EMAIL \| --password-stdin]) |
 | [`logs`](#logs) | Tail app or deployment logs (--follow) |
-| [`metrics`](#metrics) | Per-app or account-wide metrics (gregale metrics <slug> [--range 5m] \| --account) |
+| [`metrics`](#metrics) | Per-app or account-wide metrics (gregale metrics &lt;slug&gt; [--range 5m] \| --account) |
 | [`mfa`](#mfa) | Manage account MFA (mfa enroll\|confirm\|verify\|recover\|disable) |
-| [`open`](#open) | Open the app's URL (or its dashboard page) in your browser |
+| [`open`](#open) | Open the app&#39;s URL (or its dashboard page) in your browser |
 | [`orgs`](#orgs) | Manage orgs + members (orgs ls\|create\|info\|rm\|members ...\|keys ...\|transfer-ownership\|seat-usage\|invitations ...\|me) |
-| [`overage-cap`](#overage-cap) | Set / clear the account's overage cap (--clear \| <cents>) |
+| [`overage-cap`](#overage-cap) | Set / clear the account&#39;s overage cap (--clear \| &lt;cents&gt;) |
 | [`park`](#park) | Park an app cold (kill all live instances) |
 | [`plan`](#plan) | Change plan (free\|hobby\|pro\|scale) |
 | [`ps`](#ps) | Show live instances + state for an app |
 | [`queue`](#queue) | Inspect the wake-queue depth (queue tail\|send\|receive\|state\|peek\|dead-letter\|ack) |
-| [`registry`](#registry) | Per-app private container registry credentials (registry list\|set\|rm --app <slug>) |
+| [`registry`](#registry) | Per-app private container registry credentials (registry list\|set\|rm --app &lt;slug&gt;) |
 | [`rollback`](#rollback) | Re-promote the previous deployment |
-| [`rollouts`](#rollouts) | Operator manual rollout recovery (rollouts recover <slug> --action advance\|promote\|abort --reason <text>) |
+| [`rollouts`](#rollouts) | Operator manual rollout recovery (rollouts recover &lt;slug&gt; --action advance\|promote\|abort --reason &lt;text&gt;) |
 | [`scan`](#scan) | Decomposition dry-run (--tarball \| --path \| --repo OWNER/NAME) |
 | [`secrets`](#secrets) | Manage env secrets (secrets list\|set\|unset\|list-all\|rotate) |
 | [`github-webhook-secret`](#github-webhook-secret) | Manage per-tenant GitHub App webhook secrets (admin) |
-| [`slo`](#slo) | Per-app SLO panel (gregale slo <slug> [--window 24h]) |
+| [`slo`](#slo) | Per-app SLO panel (gregale slo &lt;slug&gt; [--window 24h]) |
 | [`status`](#status) | Personal SLO numbers (availability, wake p95, build success) |
 | [`tail`](#tail) | Live tail of the unified event stream |
 | [`trusted-publishers`](#trusted-publishers) | Per-app cosign trusted-publisher list (admin; trusted-publishers add\|remove\|list) |
-| [`usage`](#usage) | Show this month's usage (gregale usage [--month YYYY-MM]\|daily [--day YYYY-MM-DD]\|storage [--day YYYY-MM-DD]\|summary) |
+| [`usage`](#usage) | Show this month&#39;s usage (gregale usage [--month YYYY-MM]\|daily [--day YYYY-MM-DD]\|storage [--day YYYY-MM-DD]\|summary) |
 | [`version`](#version) | Print the CLI version |
-| [`wake-timeline`](#wake-timeline) | Walk the per-wake event stream (wake-timeline <slug> <wake-id> [--since RFC3339] [--limit N] [--all]) |
-| [`throttle-suggestions`](#throttle-suggestions) | Per-route throttle recommendations + dry-run preview (gregale throttle-suggestions <slug> [--range 5m] [--dry-run --candidate-rps N --candidate-burst N]) |
+| [`wake-timeline`](#wake-timeline) | Walk the per-wake event stream (wake-timeline &lt;slug&gt; &lt;wake-id&gt; [--since RFC3339] [--limit N] [--all]) |
+| [`throttle-suggestions`](#throttle-suggestions) | Per-route throttle recommendations + dry-run preview (gregale throttle-suggestions &lt;slug&gt; [--range 5m] [--dry-run --candidate-rps N --candidate-burst N]) |
 | [`mail`](#mail) | Mail operator dry-run (issue #246 acceptance item 6): `gregale mail dry-run [--unsubscribe-url URL]` renders every production template against a fixture account + day and writes the wire payload as JSON. The eyeball gate before flipping a box to FAAS_MAIL_TRANSPORT=resend. |
 | [`wake`](#wake) | Wake a parked app (pulls out of snapshot) |
 | [`traffic`](#traffic) | Manage deployment traffic split (issue #556; Pro/Scale only) |
-| [`mirror`](#mirror) | Manage traffic mirroring (mirror list\|create\|info\|update\|rm\|summary --app <slug>; issue #72 / ADR-124; Pro/Scale only) |
+| [`mirror`](#mirror) | Manage traffic mirroring (mirror list\|create\|info\|update\|rm\|summary --app &lt;slug&gt;; issue #72 / ADR-124; Pro/Scale only) |
 | [`webhooks`](#webhooks) | Manage outbound webhooks (webhooks list\|add\|info\|update\|rm\|deliveries\|retry\|rotate-secret) |
 | [`whoami`](#whoami) | Show the authenticated account |
 | [`completion`](#completion) | Print a shell completion script (bash\|zsh\|fish\|powershell) |
-| [`man`](#man) | Print the gregale(1) man page (or gregale-<command>(1) with one arg) |
+| [`man`](#man) | Print the gregale(1) man page (or gregale-&lt;command&gt;(1) with one arg) |
 
 ## account
 
 Manage the local account (account export|delete|restore|status|dpa|slo)
 
-`gregale account <subcommand>`
+`gregale account [<subcommand>]`
 
 ### account export
 
@@ -106,9 +106,9 @@ Account-wide SLO panel
 
 ## admin
 
-Operator-only billing ops (admin credit --reason <text> <uuid> <cents>)
+Operator-only billing ops (admin credit --reason &lt;text&gt; &lt;uuid&gt; &lt;cents&gt;)
 
-`gregale admin <subcommand> <uuid> <cents>`
+`gregale admin [<subcommand>] <uuid> <cents>`
 
 ### admin credit
 
@@ -116,18 +116,18 @@ Issue a billing credit
 
 | Flag | Meaning | |
 |---|---|---|
-| `--reason` | credit reason text | required |
+| `--reason <text>` | credit reason text | required |
 
 
 ## alerts
 
-Per-app alert rules (alerts list|add|info|update|rm|rotate-secret|preset --app <slug>)
+Per-app alert rules (alerts list|add|info|update|rm|rotate-secret|preset --app &lt;slug&gt;)
 
-`gregale alerts <subcommand> [--app]`
+`gregale alerts [<subcommand>] [--app <slug>]`
 
 | Flag | Meaning | |
 |---|---|---|
-| `--app` | app slug |  |
+| `--app <slug>` | app slug |  |
 
 ### alerts list
 
@@ -135,7 +135,7 @@ List alert rules
 
 | Flag | Meaning | |
 |---|---|---|
-| `--app` | app slug | required |
+| `--app <slug>` | app slug | required |
 
 ### alerts add
 
@@ -155,18 +155,18 @@ Delete one alert rule
 
 ### alerts rotate-secret
 
-Rotate the alert's webhook secret
+Rotate the alert&#39;s webhook secret
 
 ### alerts preset
 
-Alert preset catalog (preset list|enable --app <slug>)
+Alert preset catalog (preset list|enable --app &lt;slug&gt;)
 
 
 ## audit-events
 
-Audit-log query (audit-events list|get <id>)
+Audit-log query (audit-events list|get &lt;id&gt;)
 
-`gregale audit-events <subcommand> <id>`
+`gregale audit-events [<subcommand>] <id>`
 
 ### audit-events list
 
@@ -181,7 +181,7 @@ Show one audit event
 
 List your apps
 
-`gregale apps <subcommand> [--q] [--quiet]`
+`gregale apps [<subcommand>] [--q] [--quiet]`
 
 | Flag | Meaning | |
 |---|---|---|
@@ -202,24 +202,24 @@ Per-app streaming classification probe (ADR-102 D6)
 
 ### apps -q
 
-Delete one app (positional: <slug>)
+Delete one app (positional: &lt;slug&gt;)
 
 ### apps --quiet
 
-Delete one app (positional: <slug>)
+Delete one app (positional: &lt;slug&gt;)
 
 
 ## app
 
-Get/update one app (gregale app <slug> [scale|rename <new>|--ram N|…])
+Get/update one app (gregale app &lt;slug&gt; [scale|rename &lt;new&gt;|--ram N|…])
 
-`gregale app <subcommand> <slug> [--ram] [--max-concurrency] [--require-signed]`
+`gregale app [<subcommand>] <slug> [--ram <MB>] [--max-concurrency <N>] [--require-signed <value>]`
 
 | Flag | Meaning | |
 |---|---|---|
-| `--ram` | set RAM in MB |  |
-| `--max-concurrency` | set max_concurrency |  |
-| `--require-signed` | toggle require_signed | one of `true` · `false` |
+| `--ram <MB>` | set RAM in MB |  |
+| `--max-concurrency <N>` | set max_concurrency |  |
+| `--require-signed <value>` | toggle require_signed | one of `true` · `false` |
 
 ### app scale
 
@@ -242,7 +242,7 @@ List admitted per-route labels for one app (ADR-093)
 
 Manage billing (portal, invoices, subscription, card on file)
 
-`gregale billing <subcommand>`
+`gregale billing [<subcommand>]`
 
 ### billing portal
 
@@ -283,9 +283,9 @@ Send a signed test webhook (operator)
 
 ## build
 
-Build provenance + sbom (build provenance <id>|build sbom <id>)
+Build provenance + sbom (build provenance &lt;id&gt;|build sbom &lt;id&gt;)
 
-`gregale build <subcommand>`
+`gregale build [<subcommand>]`
 
 ### build provenance
 
@@ -300,7 +300,7 @@ Show the build SBOM
 
 Connect a third-party service (github | repo OWNER/NAME)
 
-`gregale connect <subcommand>`
+`gregale connect [<subcommand>]`
 
 ### connect github
 
@@ -308,22 +308,22 @@ Connect a GitHub account for repo deploys
 
 ### connect repo
 
-Open the dashboard wizard to bind <owner>/<name> to a Gregale app
+Open the dashboard wizard to bind &lt;owner&gt;/&lt;name&gt; to a Gregale app
 
 
 ## cors
 
 Configure CORS for an app (allow|ls|rm|show)
 
-`gregale cors <subcommand>`
+`gregale cors [<subcommand>]`
 
 ### cors allow
 
-Attach a CORS rule to <slug>
+Attach a CORS rule to &lt;slug&gt;
 
 ### cors ls
 
-List CORS rules bound to <slug>
+List CORS rules bound to &lt;slug&gt;
 
 ### cors rm
 
@@ -338,7 +338,7 @@ Show per-app default CORS + active rules
 
 Manage scheduled requests
 
-`gregale crons <subcommand>`
+`gregale crons [<subcommand>]`
 
 ### crons list
 
@@ -369,7 +369,7 @@ Show execution history
 
 Manage jobs (run-to-completion workloads)
 
-`gregale jobs <subcommand>`
+`gregale jobs [<subcommand>]`
 
 ### jobs list
 
@@ -435,7 +435,7 @@ Preflight: scan your source for the 8 source-side failure modes (--strict, --jso
 
 Schedule a deferred invocation (delayed-task add|get|cancel)
 
-`gregale delayed-task <subcommand>`
+`gregale delayed-task [<subcommand>]`
 
 ### delayed-task add
 
@@ -458,25 +458,25 @@ Cancel a delayed task
 
 List deployments (--limit N | --before C | --all)
 
-`gregale deployments [--limit] [--before] [--all]`
+`gregale deployments [--limit <N>] [--before <cursor>] [--all]`
 
 | Flag | Meaning | |
 |---|---|---|
-| `--limit` | page size (1-200) |  |
-| `--before` | pagination cursor (RFC3339Nano) |  |
+| `--limit <N>` | page size (1-200) |  |
+| `--before <cursor>` | pagination cursor (RFC3339Nano) |  |
 | `--all` | walk every page |  |
 
 
 ## deployment
 
-Get one deployment (<id> | set-min-instances <id> --min N)
+Get one deployment (&lt;id&gt; | set-min-instances &lt;id&gt; --min N)
 
-`gregale deployment <subcommand> <id> [--show-scan] [--min]`
+`gregale deployment [<subcommand>] <id> [--show-scan] [--min <N>]`
 
 | Flag | Meaning | |
 |---|---|---|
 | `--show-scan` | include the per-deploy grype scan payload |  |
-| `--min` | min_instances floor (>= 0) |  |
+| `--min <N>` | min_instances floor (&gt;= 0) |  |
 
 ### deployment set-min-instances
 
@@ -487,7 +487,7 @@ Set the per-deployment cold-wake floor
 
 Deployment drill-downs (deploys show|status|cancel|reorder|clear|clear-obsolete)
 
-`gregale deploys <subcommand> <id>`
+`gregale deploys [<subcommand>] <id>`
 
 ### deploys show
 
@@ -499,28 +499,28 @@ Print the stage summary with terminal-status footer (live since / failed at)
 
 ### deploys retry
 
-Retry a failed deployment from a specific stage (--from=<stage>)
+Retry a failed deployment from a specific stage (--from=&lt;stage&gt;)
 
 
 ## deploy
 
 Deploy (--image REF | --tarball PATH | --repo OWNER/NAME --ref REF | --github | --template NAME)
 
-`gregale deploy [--image] [--tarball] [--repo] [--ref] [--github] [--template] [--reason] [--tag] [--deployed-by] [--pr-number] [--exclude] [--show-affected] [--persist-exclude]`
+`gregale deploy [--image <REF>] [--tarball <PATH>] [--repo <OWNER/NAME>] [--ref <REF>] [--github] [--template <NAME>] [--reason <text>] [--tag <TAG>] [--deployed-by <NAME>] [--pr-number <N>] [--exclude <SLUGS>] [--show-affected] [--persist-exclude]`
 
 | Flag | Meaning | |
 |---|---|---|
-| `--image` | deploy from a container image reference |  |
-| `--tarball` | deploy from a source tarball |  |
-| `--repo` | deploy from a GitHub repo |  |
-| `--ref` | git ref for --repo (branch, tag, or 40-char SHA) |  |
+| `--image <REF>` | deploy from a container image reference |  |
+| `--tarball <PATH>` | deploy from a source tarball |  |
+| `--repo <OWNER/NAME>` | deploy from a GitHub repo |  |
+| `--ref <REF>` | git ref for --repo (branch, tag, or 40-char SHA) |  |
 | `--github` | emit a GitHub Actions workflow snippet for faas-deploy-action |  |
-| `--template` | scaffold from a built-in template | one of `hello-node` · `hello-python` · `hello-go` · `cron-example` · `function-node` · `function-python` · `function-go` · `function-node24` · `function-python313` · `s3-uploader` · `slack-bot` · `rest-api-postgres` · `cron-worker` · `webhook-receiver` · `ai-chat` |
-| `--reason` | free-text deploy reason (≤280 chars) |  |
-| `--tag` | annotation tag | one of `incident_recovery` · `hotfix` · `scheduled_maintenance` · `compliance_hold` · `partner_request` |
-| `--deployed-by` | operator label (auto-resolved from git config user.name) |  |
-| `--pr-number` | GitHub PR number (positive int; 0 = absent). CI paths stamp via the GitHub Action. |  |
-| `--exclude` | omit workloads (slug, comma-separated; mutex with --only; ADR-124) |  |
+| `--template <NAME>` | scaffold from a built-in template | one of `hello-node` · `hello-python` · `hello-go` · `cron-example` · `function-node` · `function-python` · `function-go` · `function-node24` · `function-python313` · `s3-uploader` · `slack-bot` · `rest-api-postgres` · `cron-worker` · `webhook-receiver` · `ai-chat` |
+| `--reason <text>` | free-text deploy reason (≤280 chars) |  |
+| `--tag <TAG>` | annotation tag | one of `incident_recovery` · `hotfix` · `scheduled_maintenance` · `compliance_hold` · `partner_request` |
+| `--deployed-by <NAME>` | operator label (auto-resolved from git config user.name) |  |
+| `--pr-number <N>` | GitHub PR number (positive int; 0 = absent). CI paths stamp via the GitHub Action. |  |
+| `--exclude <SLUGS>` | omit workloads (slug, comma-separated; mutex with --only; ADR-124) |  |
 | `--show-affected` | render the WillDeploy + Skipped + Unaffected + Removed partition (ADR-124) |  |
 | `--persist-exclude` | record --exclude slugs into deployment_scope_exclusions (apply path only; ADR-124 follow-up #3) |  |
 
@@ -529,7 +529,7 @@ Deploy (--image REF | --tarball PATH | --repo OWNER/NAME --ref REF | --github | 
 
 Manage custom domains
 
-`gregale domains <subcommand>`
+`gregale domains [<subcommand>]`
 
 ### domains list
 
@@ -549,7 +549,7 @@ Re-verify DNS + cert for a domain
 
 ### domains show
 
-Show a domain's cert details
+Show a domain&#39;s cert details
 
 ### domains doctor
 
@@ -560,7 +560,7 @@ Show a domain's cert details
 
 Manage preview environments (Mega-C PR-1 / issue #961 leaf 3)
 
-`gregale preview <subcommand>`
+`gregale preview [<subcommand>]`
 
 ### preview destroy
 
@@ -571,11 +571,11 @@ Tear down a preview app (POST /v1/preview/{slug}/destroy)
 
 Manage tenant surfaces (multi-hostname SAN bundle per app)
 
-`gregale tenant-surfaces <subcommand> [--app]`
+`gregale tenant-surfaces [<subcommand>] [--app <slug>]`
 
 | Flag | Meaning | |
 |---|---|---|
-| `--app` | app slug |  |
+| `--app <slug>` | app slug |  |
 
 ### tenant-surfaces list
 
@@ -583,7 +583,7 @@ List tenant surfaces on an app
 
 | Flag | Meaning | |
 |---|---|---|
-| `--app` | app slug (required) |  |
+| `--app <slug>` | app slug (required) |  |
 
 ### tenant-surfaces add
 
@@ -600,14 +600,14 @@ Manage hostnames on a surface (add|rm)
 
 ## edge-rules
 
-Per-app edge rules (edge-rules list|create|get|update|delete --app <slug>)
+Per-app edge rules (edge-rules list|create|get|update|delete --app &lt;slug&gt;)
 
-`gregale edge-rules <subcommand> --app <value> [--kind]`
+`gregale edge-rules [<subcommand>] --app <slug> [--kind <value>]`
 
 | Flag | Meaning | |
 |---|---|---|
-| `--app` | app slug | required |
-| `--kind` | rule kind | one of `route` · `rewrite` · `redirect` · `headers` · `cors` · `jwt` · `ip` · `validate` · `limit` · `geo` · `maintenance` · `throttle` · `budget` · `cache` |
+| `--app <slug>` | app slug | required |
+| `--kind <value>` | rule kind | one of `route` · `rewrite` · `redirect` · `headers` · `cors` · `jwt` · `ip` · `validate` · `limit` · `geo` · `maintenance` · `throttle` · `budget` · `cache` |
 
 ### edge-rules list
 
@@ -615,8 +615,8 @@ List edge rules
 
 | Flag | Meaning | |
 |---|---|---|
-| `--app` | filter to a single app slug |  |
-| `--kind` | filter to a single kind | one of `route` · `rewrite` · `redirect` · `headers` · `cors` · `jwt` · `ip` · `validate` · `limit` · `geo` · `maintenance` · `throttle` · `budget` · `cache` |
+| `--app <slug>` | filter to a single app slug |  |
+| `--kind <value>` | filter to a single kind | one of `route` · `rewrite` · `redirect` · `headers` · `cors` · `jwt` · `ip` · `validate` · `limit` · `geo` · `maintenance` · `throttle` · `budget` · `cache` |
 
 ### edge-rules create
 
@@ -637,9 +637,9 @@ Delete one edge rule
 
 ## openapi
 
-Pre-publish openapi schema-drift gate (openapi diff <baseline> <proposed>)
+Pre-publish openapi schema-drift gate (openapi diff &lt;baseline&gt; &lt;proposed&gt;)
 
-`gregale openapi <subcommand>`
+`gregale openapi [<subcommand>]`
 
 ### openapi diff
 
@@ -648,13 +648,13 @@ Diff two openapi.yaml files; exit 2 on any BREAKING row
 
 ## env
 
-Pull/push .env <-> sealed secrets (--app <slug>)
+Pull/push .env &lt;-&gt; sealed secrets (--app &lt;slug&gt;)
 
-`gregale env <subcommand> --app <value>`
+`gregale env [<subcommand>] --app <slug>`
 
 | Flag | Meaning | |
 |---|---|---|
-| `--app` | app slug | required |
+| `--app <slug>` | app slug | required |
 
 ### env pull
 
@@ -673,44 +673,44 @@ Render the env-diff matrix (presence / value-equality across scopes)
 
 Scaffold a reference project from a built-in template (--template NAME --path DIR [--deploy])
 
-`gregale init --template <value> --path <value> [--deploy]`
+`gregale init --template <NAME> --path <DIR> [--deploy]`
 
 | Flag | Meaning | |
 |---|---|---|
-| `--template` | template name | required; one of `hello-node` · `hello-python` · `hello-go` · `cron-example` · `function-node` · `function-python` · `function-go` · `function-node24` · `function-python313` · `s3-uploader` · `slack-bot` · `rest-api-postgres` · `cron-worker` · `webhook-receiver` · `ai-chat` |
-| `--path` | target directory | required |
+| `--template <NAME>` | template name | required; one of `hello-node` · `hello-python` · `hello-go` · `cron-example` · `function-node` · `function-python` · `function-go` · `function-node24` · `function-python313` · `s3-uploader` · `slack-bot` · `rest-api-postgres` · `cron-worker` · `webhook-receiver` · `ai-chat` |
+| `--path <DIR>` | target directory | required |
 | `--deploy` | deploy after scaffolding |  |
 
 
 ## inspect
 
-Read-only operator surface (inspect <slug> --upstreams [--scope <scope>] [--json])
+Read-only operator surface (inspect &lt;slug&gt; --upstreams [--scope &lt;scope&gt;] [--json])
 
-`gregale inspect <slug> [--upstreams] [--scope]`
+`gregale inspect <slug> [--upstreams] [--scope <scope>]`
 
 | Flag | Meaning | |
 |---|---|---|
 | `--upstreams` | List data upstreams captured for this app (ADR-098 §9.A) |  |
-| `--scope` | filter by scope (forwarded as ?scope=, used with --upstreams) |  |
+| `--scope <scope>` | filter by scope (forwarded as ?scope=, used with --upstreams) |  |
 
 
 ## invoke
 
-Functional smoke test (invoke [--async] <slug> [--payload J|@file|-])
+Functional smoke test (invoke [--async] &lt;slug&gt; [--payload J|@file|-])
 
-`gregale invoke <slug> [--async] [--payload]`
+`gregale invoke <slug> [--async] [--payload <J|@file|->]`
 
 | Flag | Meaning | |
 |---|---|---|
 | `--async` | return immediately with status_url |  |
-| `--payload` | JSON payload (inline \| @file \| -) |  |
+| `--payload <J|@file|->` | JSON payload (inline \| @file \| -) |  |
 
 
 ## invocations
 
-Per-account invocation ledger (invocations list|get <id>)
+Per-account invocation ledger (invocations list|get &lt;id&gt;)
 
-`gregale invocations <subcommand> <id>`
+`gregale invocations [<subcommand>] <id>`
 
 ### invocations list
 
@@ -725,7 +725,7 @@ Show one invocation
 
 Production debugger (ADR-127 / PR-B)
 
-`gregale debug <subcommand> <slug>`
+`gregale debug [<subcommand>] <slug>`
 
 ### debug requests
 
@@ -742,9 +742,9 @@ Per-route deployment-vs-deployment compare
 
 ## invitations
 
-Standalone invitation actions (invitations peek <token>|accept <token>)
+Standalone invitation actions (invitations peek &lt;token&gt;|accept &lt;token&gt;)
 
-`gregale invitations <subcommand> <token>`
+`gregale invitations [<subcommand>] <token>`
 
 ### invitations peek
 
@@ -766,7 +766,7 @@ List issued invoices
 
 Manage API keys (keys list|add|rm|rotate|grace-window)
 
-`gregale keys <subcommand>`
+`gregale keys [<subcommand>]`
 
 ### keys list
 
@@ -793,11 +793,11 @@ Set the rotation grace window
 
 Authenticate this machine (--token for CI)
 
-`gregale login [--token]`
+`gregale login [--token <TOKEN>]`
 
 | Flag | Meaning | |
 |---|---|---|
-| `--token` | use a pre-minted token (CI) |  |
+| `--token <TOKEN>` | use a pre-minted token (CI) |  |
 
 
 ## logout
@@ -811,11 +811,11 @@ Remove the stored token
 
 Create a new account (signup [--email-only EMAIL | --password-stdin])
 
-`gregale signup [--email-only] [--password-stdin]`
+`gregale signup [--email-only <EMAIL>] [--password-stdin]`
 
 | Flag | Meaning | |
 |---|---|---|
-| `--email-only` | send a one-time signup link to this email (no password prompt) |  |
+| `--email-only <EMAIL>` | send a one-time signup link to this email (no password prompt) |  |
 | `--password-stdin` | read password from stdin (CI; mutually exclusive with --email-only) |  |
 
 
@@ -832,13 +832,13 @@ Tail app or deployment logs (--follow)
 
 ## metrics
 
-Per-app or account-wide metrics (gregale metrics <slug> [--range 5m] | --account)
+Per-app or account-wide metrics (gregale metrics &lt;slug&gt; [--range 5m] | --account)
 
-`gregale metrics <slug> [--range] [--account]`
+`gregale metrics <slug> [--range <WINDOW>] [--account]`
 
 | Flag | Meaning | |
 |---|---|---|
-| `--range` | window (5m\|15m\|1h\|6h\|24h\|7d) | one of `5m` · `15m` · `1h` · `6h` · `24h` · `7d` |
+| `--range <WINDOW>` | window (5m\|15m\|1h\|6h\|24h\|7d) | one of `5m` · `15m` · `1h` · `6h` · `24h` · `7d` |
 | `--account` | account-wide roll-up |  |
 
 
@@ -846,7 +846,7 @@ Per-app or account-wide metrics (gregale metrics <slug> [--range 5m] | --account
 
 Manage account MFA (mfa enroll|confirm|verify|recover|disable)
 
-`gregale mfa <subcommand>`
+`gregale mfa [<subcommand>]`
 
 ### mfa enroll
 
@@ -871,20 +871,20 @@ Disable MFA
 
 ## open
 
-Open the app's URL (or its dashboard page) in your browser
+Open the app&#39;s URL (or its dashboard page) in your browser
 
-`gregale open <subcommand>`
+`gregale open [<subcommand>]`
 
 ### open docs
 
-Open a CLI docs page (open docs [<slug>])
+Open a CLI docs page (open docs [&lt;slug&gt;])
 
 
 ## orgs
 
 Manage orgs + members (orgs ls|create|info|rm|members ...|keys ...|transfer-ownership|seat-usage|invitations ...|me)
 
-`gregale orgs <subcommand>`
+`gregale orgs [<subcommand>]`
 
 ### orgs ls
 
@@ -933,7 +933,7 @@ Update org metadata
 
 ## overage-cap
 
-Set / clear the account's overage cap (--clear | <cents>)
+Set / clear the account&#39;s overage cap (--clear | &lt;cents&gt;)
 
 `gregale overage-cap <cents> [--clear]`
 
@@ -967,7 +967,7 @@ Show live instances + state for an app
 
 Inspect the wake-queue depth (queue tail|send|receive|state|peek|dead-letter|ack)
 
-`gregale queue <subcommand>`
+`gregale queue [<subcommand>]`
 
 ### queue tail
 
@@ -1000,13 +1000,13 @@ Ack a wake
 
 ## registry
 
-Per-app private container registry credentials (registry list|set|rm --app <slug>)
+Per-app private container registry credentials (registry list|set|rm --app &lt;slug&gt;)
 
-`gregale registry <subcommand> --app <value>`
+`gregale registry [<subcommand>] --app <value>`
 
 | Flag | Meaning | |
 |---|---|---|
-| `--app` | app slug | required |
+| `--app <value>` | app slug | required |
 
 ### registry list
 
@@ -1030,14 +1030,14 @@ Re-promote the previous deployment
 
 ## rollouts
 
-Operator manual rollout recovery (rollouts recover <slug> --action advance|promote|abort --reason <text>)
+Operator manual rollout recovery (rollouts recover &lt;slug&gt; --action advance|promote|abort --reason &lt;text&gt;)
 
-`gregale rollouts <subcommand> <slug> --action <value> [--reason]`
+`gregale rollouts [<subcommand>] <slug> --action <value> [--reason <text>]`
 
 | Flag | Meaning | |
 |---|---|---|
-| `--action` | recover action | required; one of `advance` · `promote` · `abort` |
-| `--reason` | operator-supplied reason (logged to deployment_audit) |  |
+| `--action <value>` | recover action | required; one of `advance` · `promote` · `abort` |
+| `--reason <text>` | operator-supplied reason (logged to deployment_audit) |  |
 
 ### rollouts recover
 
@@ -1048,14 +1048,14 @@ Manually advance / promote / abort a stuck rollout (operator escape hatch)
 
 Decomposition dry-run (--tarball | --path | --repo OWNER/NAME)
 
-`gregale scan [--tarball] [--path] [--repo] [--exclude] [--show-affected] [--persist-exclude]`
+`gregale scan [--tarball <PATH>] [--path <DIR>] [--repo <OWNER/NAME>] [--exclude <SLUGS>] [--show-affected] [--persist-exclude]`
 
 | Flag | Meaning | |
 |---|---|---|
-| `--tarball` | scan a source tarball |  |
-| `--path` | scan a local directory |  |
-| `--repo` | scan a GitHub repo |  |
-| `--exclude` | omit workloads (slug, comma-separated; mutex with --only; ADR-124) |  |
+| `--tarball <PATH>` | scan a source tarball |  |
+| `--path <DIR>` | scan a local directory |  |
+| `--repo <OWNER/NAME>` | scan a GitHub repo |  |
+| `--exclude <SLUGS>` | omit workloads (slug, comma-separated; mutex with --only; ADR-124) |  |
 | `--show-affected` | render the WillDeploy + Unaffected tables (ADR-124) |  |
 | `--persist-exclude` | record --exclude slugs into deployment_scope_exclusions (apply path only; ADR-124 follow-up #3) |  |
 
@@ -1064,7 +1064,7 @@ Decomposition dry-run (--tarball | --path | --repo OWNER/NAME)
 
 Manage env secrets (secrets list|set|unset|list-all|rotate)
 
-`gregale secrets <subcommand>`
+`gregale secrets [<subcommand>]`
 
 ### secrets list
 
@@ -1091,7 +1091,7 @@ Re-seal one secret under the current host key
 
 Manage per-tenant GitHub App webhook secrets (admin)
 
-`gregale github-webhook-secret <subcommand>`
+`gregale github-webhook-secret [<subcommand>]`
 
 ### github-webhook-secret set
 
@@ -1100,13 +1100,13 @@ Rotate the secret for one installation_id
 
 ## slo
 
-Per-app SLO panel (gregale slo <slug> [--window 24h])
+Per-app SLO panel (gregale slo &lt;slug&gt; [--window 24h])
 
-`gregale slo <slug> [--window]`
+`gregale slo <slug> [--window <WINDOW>]`
 
 | Flag | Meaning | |
 |---|---|---|
-| `--window` | window (1h\|24h\|7d) | one of `1h` · `24h` · `7d` |
+| `--window <WINDOW>` | window (1h\|24h\|7d) | one of `1h` · `24h` · `7d` |
 
 
 ## status
@@ -1120,11 +1120,11 @@ Personal SLO numbers (availability, wake p95, build success)
 
 Live tail of the unified event stream
 
-`gregale tail [--app] [--include-stateless]`
+`gregale tail [--app <slug>] [--include-stateless]`
 
 | Flag | Meaning | |
 |---|---|---|
-| `--app` | filter to a single app slug (optional) |  |
+| `--app <slug>` | filter to a single app slug (optional) |  |
 | `--include-stateless` | also print stateless.advisory frames (default: hide) |  |
 
 
@@ -1132,7 +1132,7 @@ Live tail of the unified event stream
 
 Per-app cosign trusted-publisher list (admin; trusted-publishers add|remove|list)
 
-`gregale trusted-publishers <subcommand>`
+`gregale trusted-publishers [<subcommand>]`
 
 ### trusted-publishers add
 
@@ -1149,14 +1149,14 @@ List trusted publishers
 
 ## usage
 
-Show this month's usage (gregale usage [--month YYYY-MM]|daily [--day YYYY-MM-DD]|storage [--day YYYY-MM-DD]|summary)
+Show this month&#39;s usage (gregale usage [--month YYYY-MM]|daily [--day YYYY-MM-DD]|storage [--day YYYY-MM-DD]|summary)
 
-`gregale usage <subcommand> [--month] [--day]`
+`gregale usage [<subcommand>] [--month <YYYY-MM>] [--day <YYYY-MM-DD>]`
 
 | Flag | Meaning | |
 |---|---|---|
-| `--month` | month (YYYY-MM) |  |
-| `--day` | day (YYYY-MM-DD) |  |
+| `--month <YYYY-MM>` | month (YYYY-MM) |  |
+| `--day <YYYY-MM-DD>` | day (YYYY-MM-DD) |  |
 
 ### usage daily
 
@@ -1180,40 +1180,40 @@ Print the CLI version
 
 ## wake-timeline
 
-Walk the per-wake event stream (wake-timeline <slug> <wake-id> [--since RFC3339] [--limit N] [--all])
+Walk the per-wake event stream (wake-timeline &lt;slug&gt; &lt;wake-id&gt; [--since RFC3339] [--limit N] [--all])
 
-`gregale wake-timeline <slug> <wake-id> [--since] [--limit] [--all]`
+`gregale wake-timeline <slug> <wake-id> [--since <RFC3339>] [--limit <N>] [--all]`
 
 | Flag | Meaning | |
 |---|---|---|
-| `--since` | RFC3339 timestamp |  |
-| `--limit` | page size (1..1000) |  |
+| `--since <RFC3339>` | RFC3339 timestamp |  |
+| `--limit <N>` | page size (1..1000) |  |
 | `--all` | walk every page |  |
 
 
 ## throttle-suggestions
 
-Per-route throttle recommendations + dry-run preview (gregale throttle-suggestions <slug> [--range 5m] [--dry-run --candidate-rps N --candidate-burst N])
+Per-route throttle recommendations + dry-run preview (gregale throttle-suggestions &lt;slug&gt; [--range 5m] [--dry-run --candidate-rps N --candidate-burst N])
 
-`gregale throttle-suggestions <slug> [--range] [--dry-run] [--candidate-rps] [--candidate-burst]`
+`gregale throttle-suggestions <slug> [--range <WINDOW>] [--dry-run] [--candidate-rps <N>] [--candidate-burst <N>]`
 
 | Flag | Meaning | |
 |---|---|---|
-| `--range` | observation window (e.g. 5m\|1h\|24h) | one of `5m` · `15m` · `1h` · `6h` · `24h` |
+| `--range <WINDOW>` | observation window (e.g. 5m\|1h\|24h) | one of `5m` · `15m` · `1h` · `6h` · `24h` |
 | `--dry-run` | enable the dry-run preview pass (requires --candidate-rps) |  |
-| `--candidate-rps` | candidate rate-limit rps for the dry-run preview |  |
-| `--candidate-burst` | candidate burst for the dry-run preview |  |
+| `--candidate-rps <N>` | candidate rate-limit rps for the dry-run preview |  |
+| `--candidate-burst <N>` | candidate burst for the dry-run preview |  |
 
 
 ## mail
 
 Mail operator dry-run (issue #246 acceptance item 6): `gregale mail dry-run [--unsubscribe-url URL]` renders every production template against a fixture account + day and writes the wire payload as JSON. The eyeball gate before flipping a box to FAAS_MAIL_TRANSPORT=resend.
 
-`gregale mail <subcommand> [--unsubscribe-url]`
+`gregale mail [<subcommand>] [--unsubscribe-url <URL>]`
 
 | Flag | Meaning | |
 |---|---|---|
-| `--unsubscribe-url` | List-Unsubscribe URL (RFC 8058); empty disables the header |  |
+| `--unsubscribe-url <URL>` | List-Unsubscribe URL (RFC 8058); empty disables the header |  |
 
 ### mail dry-run
 
@@ -1231,7 +1231,7 @@ Wake a parked app (pulls out of snapshot)
 
 Manage deployment traffic split (issue #556; Pro/Scale only)
 
-`gregale traffic <subcommand>`
+`gregale traffic [<subcommand>]`
 
 ### traffic set
 
@@ -1239,15 +1239,15 @@ Set the traffic split for a deployment
 
 | Flag | Meaning | |
 |---|---|---|
-| `--deployment` | deployment id to set the traffic split on | required |
-| `--percent` | traffic weight in [0, 100]; -1 = unset (server default 100) | required |
+| `--deployment <ID>` | deployment id to set the traffic split on | required |
+| `--percent <N>` | traffic weight in [0, 100]; -1 = unset (server default 100) | required |
 
 
 ## mirror
 
-Manage traffic mirroring (mirror list|create|info|update|rm|summary --app <slug>; issue #72 / ADR-124; Pro/Scale only)
+Manage traffic mirroring (mirror list|create|info|update|rm|summary --app &lt;slug&gt;; issue #72 / ADR-124; Pro/Scale only)
 
-`gregale mirror <subcommand>`
+`gregale mirror [<subcommand>]`
 
 ### mirror list
 
@@ -1255,7 +1255,7 @@ List mirror rules
 
 | Flag | Meaning | |
 |---|---|---|
-| `--app` | app slug | required |
+| `--app <slug>` | app slug | required |
 
 ### mirror create
 
@@ -1263,12 +1263,12 @@ Create a mirror rule
 
 | Flag | Meaning | |
 |---|---|---|
-| `--app` | app slug | required |
-| `--source` | source deployment id (live) | required |
-| `--mirror` | mirror deployment id (live; same app) | required |
-| `--percent` | fan-out percent in [0, 100]; 100 = every request |  |
+| `--app <slug>` | app slug | required |
+| `--source <ID>` | source deployment id (live) | required |
+| `--mirror <ID>` | mirror deployment id (live; same app) | required |
+| `--percent <N>` | fan-out percent in [0, 100]; 100 = every request |  |
 | `--include-body` | include request/response bodies in the comparison ledger |  |
-| `--redact-header` | extra header name to redact (repeatable) |  |
+| `--redact-header <NAME>` | extra header name to redact (repeatable) |  |
 
 ### mirror info
 
@@ -1276,8 +1276,8 @@ Show one mirror rule
 
 | Flag | Meaning | |
 |---|---|---|
-| `--app` | app slug | required |
-| `--id` | mirror rule id | required |
+| `--app <slug>` | app slug | required |
+| `--id <ID>` | mirror rule id | required |
 
 ### mirror update
 
@@ -1285,15 +1285,15 @@ Patch a mirror rule (patch semantics)
 
 | Flag | Meaning | |
 |---|---|---|
-| `--app` | app slug | required |
-| `--id` | mirror rule id | required |
-| `--percent` | new percent in [0, 100] |  |
+| `--app <slug>` | app slug | required |
+| `--id <ID>` | mirror rule id | required |
+| `--percent <N>` | new percent in [0, 100] |  |
 | `--enable` | enable the rule (mutually exclusive with --disable) |  |
 | `--disable` | disable the rule (mutually exclusive with --enable) |  |
 | `--include-body` | enable body capture (mutually exclusive with --no-include-body) |  |
 | `--no-include-body` | disable body capture |  |
-| `--redact-header` | extra header name to redact (repeatable) |  |
-| `--clear-redact` | clear the customer's redact_headers list (drop to always-stripped only) |  |
+| `--redact-header <NAME>` | extra header name to redact (repeatable) |  |
+| `--clear-redact` | clear the customer&#39;s redact_headers list (drop to always-stripped only) |  |
 
 ### mirror rm
 
@@ -1301,8 +1301,8 @@ Delete a mirror rule
 
 | Flag | Meaning | |
 |---|---|---|
-| `--app` | app slug | required |
-| `--id` | mirror rule id | required |
+| `--app <slug>` | app slug | required |
+| `--id <ID>` | mirror rule id | required |
 
 ### mirror summary
 
@@ -1310,16 +1310,16 @@ Aggregate mirror drift counts over a window
 
 | Flag | Meaning | |
 |---|---|---|
-| `--app` | app slug | required |
-| `--id` | mirror rule id | required |
-| `--window` | summary window: 1h \| 24h \| 7d (default 1h) | one of `1h` · `24h` · `7d` |
+| `--app <slug>` | app slug | required |
+| `--id <ID>` | mirror rule id | required |
+| `--window <WINDOW>` | summary window: 1h \| 24h \| 7d (default 1h) | one of `1h` · `24h` · `7d` |
 
 
 ## webhooks
 
 Manage outbound webhooks (webhooks list|add|info|update|rm|deliveries|retry|rotate-secret)
 
-`gregale webhooks <subcommand>`
+`gregale webhooks [<subcommand>]`
 
 ### webhooks list
 
@@ -1365,7 +1365,7 @@ Show the authenticated account
 
 Print a shell completion script (bash|zsh|fish|powershell)
 
-`gregale completion <subcommand>`
+`gregale completion [<subcommand>]`
 
 ### completion bash
 
@@ -1386,7 +1386,7 @@ Print the powershell completion snippet
 
 ## man
 
-Print the gregale(1) man page (or gregale-<command>(1) with one arg)
+Print the gregale(1) man page (or gregale-&lt;command&gt;(1) with one arg)
 
 `gregale man <command>`
 
