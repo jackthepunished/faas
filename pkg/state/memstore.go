@@ -8124,6 +8124,42 @@ func (m *MemStore) CreateInstanceWithMode(_ context.Context, appID, deploymentID
 	return ins, nil
 }
 
+// CreateJobInstance mirrors the PostgreSQL job-task insert. Job instances
+// have no app or deployment row: the job definition owns the OCI image and
+// the run/task coordinates live on the job task row.
+func (m *MemStore) CreateJobInstance(_ context.Context, instanceID, jobID, runID string, taskIndex int, state string, ramMB int, nodeID, wakeID string) (Instance, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.jobs[jobID]; !ok {
+		return Instance{}, ErrNotFound
+	}
+	if instanceID == "" {
+		instanceID = newID()
+	}
+	if _, exists := m.instances[instanceID]; exists {
+		return Instance{}, ErrConflict
+	}
+	ins := Instance{
+		ID:           instanceID,
+		State:        state,
+		RAMMB:        ramMB,
+		NodeID:       nodeID,
+		StartedAt:    time.Now(),
+		Mode:         string(InstanceModeJob),
+		Kind:         "job_task",
+		JobID:        jobID,
+		JobRunID:     runID,
+		JobTaskIndex: taskIndex,
+	}
+	if wakeID != "" {
+		ins.WakeID = wakeID
+	} else {
+		ins.WakeID = uuid.NewString()
+	}
+	m.instances[ins.ID] = ins
+	return ins, nil
+}
+
 // StampAppScaleOut (PR-C, issue #462) records the apps
 // LastScaleOutAt timestamp. The MemStore mirrors the PG contract
 // (PgStore.StampAppScaleOut): a single UPDATE; no row existence

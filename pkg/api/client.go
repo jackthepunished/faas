@@ -104,9 +104,22 @@ func NewClient(baseURL, token string) *Client {
 	return &Client{
 		baseURL: baseURL,
 		token:   token,
-		http:    &http.Client{Timeout: 30 * time.Second},
+		http:    &http.Client{Timeout: 30 * time.Second, Transport: newClientTransport()},
 		cache:   NewCompletionCache(),
 	}
+}
+
+// newClientTransport returns a private copy of the standard transport. The
+// default HTTP transport is process-global; httptest.Server.Close calls
+// CloseIdleConnections on it, so sharing it makes independent clients race
+// when tests (or applications) close test servers while another request is
+// in flight. Clone preserves the standard proxy, dial, TLS, and idle-pool
+// settings without coupling this client to that global lifecycle.
+func newClientTransport() http.RoundTripper {
+	if transport, ok := http.DefaultTransport.(*http.Transport); ok {
+		return transport.Clone()
+	}
+	return http.DefaultTransport
 }
 
 // SetCompletionCache wires a (possibly nil) cache. Passing nil
@@ -136,7 +149,7 @@ func (c *Client) CompletionCache() *CompletionCache {
 func NewClientWithDeployTimeout(baseURL, token string, deployTimeout time.Duration) *Client {
 	c := NewClient(baseURL, token)
 	if deployTimeout > 0 {
-		c.deployHTTP = &http.Client{Timeout: deployTimeout}
+		c.deployHTTP = &http.Client{Timeout: deployTimeout, Transport: newClientTransport()}
 	}
 	return c
 }

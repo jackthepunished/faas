@@ -728,7 +728,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// + reaper tickers in loop.Run are gated on jobsDispatched;
 	// the engine methods stay wired so a missed tick in one
 	// window drains on the next).
-	jobsDispatched := os.Getenv("FAAS_JOBS_DISPATCH") != ""
+	jobsDispatched := jobsDispatchEnabled(os.Getenv("FAAS_JOBS_DISPATCH"))
 	if jobsDispatched {
 		log.Info("schedd jobs dispatch enabled — clustering flag FAAS_JOBS_DISPATCH=1 set")
 	} else {
@@ -1838,6 +1838,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	}
 	_ = lis.Close()
 	return nil
+}
+
+// jobsDispatchEnabled is intentionally an exact opt-in. Treating any
+// non-empty value (including "0" or "false") as enabled makes a templated
+// production environment unexpectedly activate an incomplete jobs path.
+func jobsDispatchEnabled(value string) bool {
+	return strings.TrimSpace(value) == "1"
 }
 
 // subscribeWithReconnect drains a pg_notify-style feed via the

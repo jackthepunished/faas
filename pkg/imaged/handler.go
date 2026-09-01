@@ -2830,12 +2830,11 @@ func (h *Handler) aboveBaseLayers(ctx context.Context, mp oci.ManifestPuller,
 	}
 	baseRef := h.deployBaseRefOverride
 	if baseRef == "" {
-		// Per-runtime env var (FAAS_DEPLOY_BASE_REF_<RUNTIME>) takes
-		// precedence over the legacy single-string global
-		// FAAS_DEPLOY_BASE_REF (wired at cmd/imaged/main.go:255).
-		// Matches the posture of EnsureBases (startup auto-stage):
-		// per-runtime is the canonical operator surface, the single
-		// global is the test-harness / legacy knob. Unknown runtimes
+		// Per-runtime env var (FAAS_DEPLOY_BASE_REF_<RUNTIME>) is the
+		// production contract. The retired single-string global
+		// FAAS_DEPLOY_BASE_REF is rejected by cmd/imaged/main.go.
+		// Matches the posture of EnsureBases (startup auto-stage).
+		// Unknown runtimes
 		// fall through to baseRefFor's default (BaseRefMinimal for
 		// the "" / customer-uploaded-image case). Same
 		// digest-pin validation as the row-level override gate.

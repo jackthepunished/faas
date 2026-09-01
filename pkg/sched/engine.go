@@ -223,14 +223,14 @@ type Engine struct {
 	// real tracker via WithLivenessWindow).
 	livenessWindow *LivenessWindow
 
-	// jobLeaser (issue #1184 Workstream A / ADR-099) is the lease
-	// primitive pkg/sched.Leaser[T] that WakeJob + HandleJobExit
+	// jobLeaser (issue #1184 Workstream A / ADR-099) is the token-only
+	// lease primitive that WakeJob + HandleJobExit
 	// use to mint + release per-task leases. nil is tolerated by
 	// the unit tests that don't exercise the job surface
 	// (WakeJob returns ErrJobTaskAlreadyClaimed without touching
 	// the leaser). Production cmd/schedd wires a real PgLeaser via
 	// WithJobLeaser.
-	jobLeaser Leaser[any]
+	jobLeaser JobLeaser
 	// jobVmmClient is the vmmd gRPC surface for cold-booting
 	// job-task VMs. nil means "unit-test mode" — WakeJob returns
 	// a synthetic JobWakeResult without touching vmmd. Production
@@ -2113,6 +2113,7 @@ func (e *Engine) admitAndDispatchWithOptions(ctx context.Context, appID, deploym
 
 	sealedEnv, err := e.loadSealedEnvFor(ctx, acct.ID, appID, dep.Scope, envSecretsFromDep(dep))
 	if err != nil {
+		e.rollbackAdmittedInstance(ctx, ins.ID, appID, "wake_sealed_env_invalid")
 		return WakeResult{}, fmt.Errorf("sched: wake: load sealed env: %w", err)
 	}
 	spec := AppSpec{
@@ -4117,6 +4118,7 @@ func (e *Engine) Prime(ctx context.Context, appID, deploymentID string) error {
 	// loaded (so no extra DB read).
 	sealedEnv, err := e.loadSealedEnvFor(ctx, acct.ID, appID, dep.Scope, envSecretsFromDep(dep))
 	if err != nil {
+		e.rollbackAdmittedInstance(ctx, ins.ID, appID, "prime_sealed_env_invalid")
 		return fmt.Errorf("sched: prime: load sealed env: %w", err)
 	}
 	spec := AppSpec{
@@ -6570,6 +6572,18 @@ func (e *Engine) ParkDeployment(ctx context.Context, deploymentID, reason string
 // reserved today is "watchdog_timeout" (set by KillStuck).
 func (e *Engine) transition(ctx context.Context, instanceID, appID string, to state.State) {
 	e.transitionWithKind(ctx, instanceID, appID, to, "state_transition", "")
+}
+
+// rollbackAdmittedInstance closes the small window between ledger admission
+// and boot-spec construction. Secret-resolution failures are deterministic
+// input errors, not watchdog work: release the RAM reservation immediately
+// and leave an auditable terminal row so the next wake cannot count the
+// abandoned instance as live.
+func (e *Engine) rollbackAdmittedInstance(ctx context.Context, instanceID, appID, reason string) {
+	e.ledger.Release(instanceID)
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	e.transitionWithKind(cleanupCtx, instanceID, appID, state.StateFailed, "wake_boot_error", reason)
 }
 
 // transitionWithKind is the audit-log-emitting variant of transition.
