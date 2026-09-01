@@ -105,6 +105,15 @@ func (m *streamBridgeManager) acquire(ctx context.Context, req *vmmdpb.ForwardHT
 	// The reaper belongs to the VMMD server, not to this request. It is
 	// canceled by Server.Close, so it intentionally outlives ctx.
 	m.startReaper() //nolint:contextcheck // manager lifetime is longer than one RPC
+	m.mu.Lock()
+	// A persistent bridge is owned by this manager, not by the request that
+	// happened to start it. Passing ctx here would make exec.CommandContext
+	// kill the bridge as soon as that request's gRPC stream closes, leaving a
+	// stale entry and socket for the next request. The reaper context is
+	// canceled only by manager shutdown and therefore matches the child
+	// lifetime exactly.
+	bridgeCtx := m.reaperCtx
+	m.mu.Unlock()
 	for {
 		m.mu.Lock()
 		if m.closed {
@@ -124,7 +133,7 @@ func (m *streamBridgeManager) acquire(ctx context.Context, req *vmmdpb.ForwardHT
 			m.starts.Add(1)
 			m.mu.Unlock()
 
-			err := m.startEntry(ctx, entry, req)
+			err := m.startEntry(bridgeCtx, entry, req)
 			m.starts.Done()
 			if err != nil {
 				return nil, err

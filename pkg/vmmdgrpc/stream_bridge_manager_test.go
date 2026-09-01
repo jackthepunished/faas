@@ -57,6 +57,52 @@ func TestStreamBridgeManagerSharesConcurrentStartup(t *testing.T) {
 	}
 }
 
+func TestStreamBridgeManagerBridgeContextOutlivesRequest(t *testing.T) {
+	bridgePath, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(streamBridgePathEnv, bridgePath)
+
+	manager := newTestStreamBridgeManager(t, func() {})
+	spawnContextDone := make(chan struct{})
+	manager.spawn = func(ctx context.Context, _, _, _, _ string, _ uint32, _ string, _ []string) (*exec.Cmd, *bytes.Buffer, error) {
+		go func() {
+			<-ctx.Done()
+			close(spawnContextDone)
+		}()
+		cmd := exec.Command("sleep", "60")
+		if err := cmd.Start(); err != nil {
+			return nil, nil, err
+		}
+		return cmd, &bytes.Buffer{}, nil
+	}
+
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	req := &vmmdpb.ForwardHTTPRequestInit{Instance: "instance-context", Port: 8080}
+	lease, err := manager.acquire(requestCtx, req, "fc-instance-context")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease.release()
+	cancelRequest()
+
+	select {
+	case <-spawnContextDone:
+		t.Fatal("persistent bridge context was canceled with the request")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	if err := manager.close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-spawnContextDone:
+	case <-time.After(time.Second):
+		t.Fatal("persistent bridge context was not canceled when manager closed")
+	}
+}
+
 func TestStreamBridgeManagerReapsIdleEntry(t *testing.T) {
 	bridgePath, err := os.Executable()
 	if err != nil {
