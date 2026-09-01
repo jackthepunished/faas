@@ -1085,31 +1085,56 @@ func TestConcurrentBootAndDestroyNoLeak(t *testing.T) {
 	m := newTestManager(run, vmm)
 	const n = 50 // M1: boot 50 VMs concurrently
 
-	var wg sync.WaitGroup
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			if _, err := m.ColdBoot(context.Background(), req(fmt.Sprintf("i%d", i))); err != nil {
-				t.Errorf("boot i%d: %v", i, err)
-			}
-		}(i)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	type bootResult struct {
+		instance string
+		err      error
 	}
-	wg.Wait()
+	bootResults := make(chan bootResult, n)
+	for i := 0; i < n; i++ {
+		bootCtx, bootCancel := context.WithTimeout(ctx, time.Second)
+		go func(i int, bootCtx context.Context, bootCancel context.CancelFunc) {
+			defer bootCancel()
+			instance := fmt.Sprintf("i%d", i)
+			_, err := m.ColdBoot(bootCtx, req(instance))
+			bootResults <- bootResult{instance: instance, err: err}
+		}(i, bootCtx, bootCancel)
+	}
+	for i := 0; i < n; i++ {
+		select {
+		case result := <-bootResults:
+			if result.err != nil {
+				t.Errorf("boot %s: %v", result.instance, result.err)
+			}
+		case <-ctx.Done():
+			t.Fatalf("concurrent boot batch exceeded deadline: %v", ctx.Err())
+		}
+	}
 	if m.LiveCount() != n || m.LeasedCount() != n {
 		t.Fatalf("after boot: live=%d leased=%d, want %d/%d", m.LiveCount(), m.LeasedCount(), n, n)
 	}
 
+	destroyResults := make(chan bootResult, n)
 	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			if err := m.Destroy(context.Background(), fmt.Sprintf("i%d", i)); err != nil {
-				t.Errorf("destroy i%d: %v", i, err)
-			}
-		}(i)
+		destroyCtx, destroyCancel := context.WithTimeout(ctx, time.Second)
+		go func(i int, destroyCtx context.Context, destroyCancel context.CancelFunc) {
+			defer destroyCancel()
+			instance := fmt.Sprintf("i%d", i)
+			err := m.Destroy(destroyCtx, instance)
+			destroyResults <- bootResult{instance: instance, err: err}
+		}(i, destroyCtx, destroyCancel)
 	}
-	wg.Wait()
+	for i := 0; i < n; i++ {
+		select {
+		case result := <-destroyResults:
+			if result.err != nil {
+				t.Errorf("destroy %s: %v", result.instance, result.err)
+			}
+		case <-ctx.Done():
+			t.Fatalf("concurrent destroy batch exceeded deadline: %v", ctx.Err())
+		}
+	}
 	if m.LiveCount() != 0 || m.LeasedCount() != 0 {
 		t.Fatalf("after teardown: live=%d leased=%d, want 0/0 (LEAK)", m.LiveCount(), m.LeasedCount())
 	}
