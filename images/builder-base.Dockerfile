@@ -21,16 +21,23 @@
 # `-arm64-unknown-linux-musl`. v0.5.0 with the old naming is no longer
 # published, so bumping to v0.31.1 (current stable as of 2026-07) is mandatory.
 ARG RAILPACK_VERSION=0.31.1
+ARG RAILPACK_SHA256_AMD64=606403d40d7229e205554e0dba6bdaf8922308fa6447182dfc33dcc338a47a80
+ARG RAILPACK_SHA256_ARM64=0c4418d56877d67351f0853278235c003d2d94f8b3e58f4ca85ecb51bd07e851
 
 # Railpack 0.31.1 bootstraps mise 2026.7.6 using its glibc linux-x64
 # asset. The builder rootfs is Alpine, so stage the matching musl asset and
 # let guest-init seed Railpack's expected cache path before prepare runs.
 ARG MISE_VERSION=2026.7.6
+ARG MISE_SHA256_AMD64=debdf9d7e776c3c0f9e3dfa7c4067bf02f3592fdc7c5d2bb5027fb2325c9916f
+ARG MISE_SHA256_ARM64=926914f938c55e86e48875f1c9253573ddf6d5efb5abb6e8721ea061fe2767f7
 
 # ---- buildkit (Dockerfile builds, spec §4.5 fallback path) ----------------
 # Rootless inside the VM — rootless-runc inside a VM is functionally root, and
 # the VM boundary is the actual security perimeter (ADR-003).
 ARG BUILDKIT_VERSION=0.32.2
+ARG BUILDKIT_SOURCE_SHA256=b19deba3f8cf3eb05407aa85c246e22839770c437439a04d880ef3d645aed0aa
+ARG BUILDKIT_SHA256_AMD64=2975d0f651ad96ba8b80b9992ae1f9a964f4408569af5b6dc36544165c3926af
+ARG BUILDKIT_SHA256_ARM64=9e8f46bf309ec0ab262967be5538a4dbe06be756a82621f98253933bac5dcf92
 
 # Alpine v3.22's packaged runc was built with Go 1.24.12. That leaves the
 # builder image exposed to GO-2026-4337 (CVE-2025-68121), which the runtime
@@ -93,11 +100,15 @@ WORKDIR /src/buildkit
 ARG BUILDKIT_VERSION
 ARG TARGETOS
 ARG TARGETARCH
+ARG BUILDKIT_SOURCE_SHA256
 COPY images/buildkit-session-health.patch /tmp/buildkit-session-health.patch
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git && \
       rm -rf /var/lib/apt/lists/* && \
-      curl -fsSL "https://github.com/moby/buildkit/archive/refs/tags/v${BUILDKIT_VERSION}.tar.gz" | \
-        tar -xzf - --strip-components=1 -C /src/buildkit && \
+      curl -fsSL -o /tmp/buildkit-source.tgz \
+        "https://github.com/moby/buildkit/archive/refs/tags/v${BUILDKIT_VERSION}.tar.gz" && \
+      echo "${BUILDKIT_SOURCE_SHA256}  /tmp/buildkit-source.tgz" | sha256sum -c - && \
+      tar -xzf /tmp/buildkit-source.tgz --strip-components=1 -C /src/buildkit && \
+      rm /tmp/buildkit-source.tgz && \
       git apply /tmp/buildkit-session-health.patch && \
       CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
         go build -trimpath -o /out/buildctl ./cmd/buildctl
@@ -119,8 +130,14 @@ FROM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc
 # line. CI runs `make images-lock-check` to fail any PR that drifts.
 ARG RAILPACK_VERSION
 ARG BUILDKIT_VERSION
+ARG BUILDKIT_SHA256_AMD64
+ARG BUILDKIT_SHA256_ARM64
 ARG MISE_VERSION
+ARG MISE_SHA256_AMD64
+ARG MISE_SHA256_ARM64
 ARG TARGETARCH
+ARG RAILPACK_SHA256_AMD64
+ARG RAILPACK_SHA256_ARM64
 ARG RUNC_VERSION
 ARG RUNC_SHA256_AMD64
 ARG RUNC_SHA256_ARM64
@@ -171,6 +188,12 @@ RUN printf 'root:100000:65536\n' > /etc/subuid && \
 RUN mkdir -p /opt/buildkit && \
       curl -fsSL -o /tmp/buildkit.tgz \
       "https://github.com/moby/buildkit/releases/download/v${BUILDKIT_VERSION}/buildkit-v${BUILDKIT_VERSION}.linux-${TARGETARCH}.tar.gz" && \
+      case "${TARGETARCH}" in \
+        amd64) BUILDKIT_SHA256="${BUILDKIT_SHA256_AMD64}" ;; \
+        arm64) BUILDKIT_SHA256="${BUILDKIT_SHA256_ARM64}" ;; \
+        *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+      esac && \
+      echo "${BUILDKIT_SHA256}  /tmp/buildkit.tgz" | sha256sum -c - && \
       tar -C /opt/buildkit -xzf /tmp/buildkit.tgz && \
       rm /tmp/buildkit.tgz && \
       install -m 0755 /opt/buildkit/bin/buildkitd /usr/local/bin/buildkitd && \
@@ -188,6 +211,12 @@ RUN case "${TARGETARCH}" in \
     esac && \
     curl -fsSL -o /tmp/railpack.tgz \
       "https://github.com/railwayapp/railpack/releases/download/v${RAILPACK_VERSION}/railpack-v${RAILPACK_VERSION}-${RAILPACK_ARCH}-unknown-linux-musl.tar.gz" && \
+    case "${TARGETARCH}" in \
+      amd64) RAILPACK_SHA256="${RAILPACK_SHA256_AMD64}" ;; \
+      arm64) RAILPACK_SHA256="${RAILPACK_SHA256_ARM64}" ;; \
+      *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac && \
+    echo "${RAILPACK_SHA256}  /tmp/railpack.tgz" | sha256sum -c - && \
     tar -C /usr/local/bin -xzf /tmp/railpack.tgz railpack && \
       chmod +x /usr/local/bin/railpack && \
       rm /tmp/railpack.tgz && \
@@ -204,6 +233,12 @@ RUN case "${TARGETARCH}" in \
     mkdir -p /usr/local/lib/faas/mise /opt/mise && \
     curl -fsSL -o /tmp/mise.tgz \
       "https://github.com/jdx/mise/releases/download/v${MISE_VERSION}/mise-v${MISE_VERSION}-linux-${MISE_ARCH}-musl.tar.gz" && \
+    case "${TARGETARCH}" in \
+      amd64) MISE_SHA256="${MISE_SHA256_AMD64}" ;; \
+      arm64) MISE_SHA256="${MISE_SHA256_ARM64}" ;; \
+      *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac && \
+    echo "${MISE_SHA256}  /tmp/mise.tgz" | sha256sum -c - && \
     tar -C /opt/mise -xzf /tmp/mise.tgz && \
     install -m 0755 /opt/mise/mise/bin/mise \
       "/usr/local/lib/faas/mise/mise-${MISE_VERSION}" && \
