@@ -335,9 +335,9 @@ jobs:
           GRYPE_BIN: ${{ runner.temp }}/grype
         run: bash scripts/ci/update-grype-db.sh
 
-      # The compute admission gate refuses any staged builder ext4 with a
-      # CRITICAL finding. Scan both exact architecture artifacts produced by
-      # this job before either can become a release input.
+      # Scan both exact architecture artifacts produced by this job before
+      # either can become a release input. The helper prints the full report
+      # and blocks only actionable fixed CRITICAL findings.
       - name: Scan builder base for critical vulnerabilities
         env:
           GRYPE_BIN: ${{ runner.temp }}/grype

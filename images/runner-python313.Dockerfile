@@ -13,5 +13,8 @@
 # (CLAUDE.md "load-bearing — DO NOT fix").
 FROM python:3.13-slim-bookworm@sha256:2f2e5a876c71a6757f55ec57f2add0225ddaf01c802a33fcc29073943f94d907
 # Issue #197 B3.6: mutable tag pinned via images/Dockerfile.lock.
-RUN id app 2>/dev/null || useradd -u 1000 -m app
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive \
+    apt-get upgrade -y --no-install-recommends && \
+    rm -rf /var/lib/apt/lists/* && \
+    (id app 2>/dev/null || useradd -u 1000 -m app)
 WORKDIR /app

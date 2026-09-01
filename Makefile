@@ -497,7 +497,7 @@ scan-images: ## Scan concrete locally-loaded OCI refs (IMAGE_REFS="ref1 ref2 ...
 	@command -v grype >/dev/null 2>&1 || { echo "grype required: https://github.com/anchore/grype/releases" >&2; exit 1; }
 	@for ref in $(IMAGE_REFS); do \
 	  echo "Scanning docker:$$ref"; \
-	  grype "docker:$$ref" --platform linux/amd64 --fail-on critical --only-fixed=false -o table; \
+	  bash scripts/ci/scan-oci-image.sh docker "$$ref" linux/amd64; \
 	done
 
 .PHONY: public-endpoint-check

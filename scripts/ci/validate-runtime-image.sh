@@ -27,8 +27,13 @@ case "${runtime_image}" in
   runner-python312|runner-python313)
     required=(etc/passwd usr/local/bin/python3)
     ;;
-  runner-go124|runner-go124-alpine)
-    required=(etc/passwd usr/local/go/bin/go)
+  runner-go124)
+    # Go customer artifacts are compiled in the builder and executed
+    # directly; the compiler is deliberately absent from the runtime base.
+    required=(etc/passwd usr/lib/x86_64-linux-gnu/libc.so.6)
+    ;;
+  runner-go124-alpine)
+    required=(etc/passwd lib/ld-musl-x86_64.so.1)
     ;;
   *)
     echo "unsupported runtime image ${runtime_image}" >&2

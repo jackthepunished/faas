@@ -16,7 +16,11 @@ FROM node:24-bookworm-slim@sha256:6642ef280aebc09c4541bee0b15c9f89f0f3f3c247ddee
 # The official image already reserves uid 1000 for `node`; reuse that
 # identity under the platform's canonical `app` name instead of attempting
 # a duplicate uid.
-RUN if id app >/dev/null 2>&1; then :; \
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive \
+    apt-get upgrade -y --no-install-recommends && \
+    rm -rf /var/lib/apt/lists/* /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack && \
+    rm -f /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack && \
+    if id app >/dev/null 2>&1; then :; \
     elif id node >/dev/null 2>&1; then sed -i 's/^node:/app:/' /etc/passwd; \
     else useradd -u 1000 -m app; fi
 WORKDIR /app
