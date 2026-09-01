@@ -495,7 +495,7 @@ jobs:
               -o "$RELEASE_ROOT/$asset" "$asset_url"
           }
           for asset in release.tar.gz release.cosign.bundle release.sbom.json \
-            release-manifest.json production-manifest.yaml SHA256SUMS; do
+            release-manifest.json production-manifest.yaml runtime-bases.env SHA256SUMS; do
             download_asset "$asset"
           done
           (
@@ -541,6 +541,10 @@ jobs:
           for asset in release.tar.gz release.cosign.bundle release.sbom.json production-manifest.yaml; do
             install -m 0644 "$RELEASE_ROOT/$asset" "$ARTIFACT_DIR/$asset"
           done
+          # This file is a release contract, not a secret, but keep the
+          # controller-side copy private because it is immediately staged as
+          # root:root 0600 on the adopted host.
+          install -m 0600 "$RELEASE_ROOT/runtime-bases.env" "$ARTIFACT_DIR/runtime-bases.env"
           tar --extract --gzip --file "$RELEASE_ROOT/release.tar.gz" \
             --to-stdout gregalectl > "$ARTIFACT_DIR/gregalectl-linux-amd64"
           chmod 0755 "$ARTIFACT_DIR/gregalectl-linux-amd64"
