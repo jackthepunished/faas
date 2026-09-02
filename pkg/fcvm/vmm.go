@@ -1708,7 +1708,7 @@ func (v *JailerVMM) InstancePID(instance string) (int, bool) {
 	cmd, ok := v.proc[instance]
 	rec := v.recs[instance]
 	v.mu.Unlock()
-	if !ok || rec == nil || rec.exited || cmd == nil || cmd.Process == nil {
+	if !ok || rec == nil || rec.exited || cmd == nil || cmd.Process == nil || cmd.ProcessState != nil {
 		return 0, false
 	}
 	return cmd.Process.Pid, true

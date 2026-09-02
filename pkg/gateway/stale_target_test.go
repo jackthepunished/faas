@@ -6,10 +6,27 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/onebox-faas/faas/pkg/api"
 )
+
+func TestMarkStaleTargetClaimsRecoveryOnce(t *testing.T) {
+	var calls atomic.Int32
+	signal := &staleTargetSignal{onStale: func() { calls.Add(1) }}
+	ctx := withStaleTargetSignal(context.Background(), signal)
+
+	markStaleTarget(ctx)
+	markStaleTarget(ctx)
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("stale handler calls = %d, want 1", got)
+	}
+	if !staleTargetDetected(ctx) {
+		t.Fatal("stale target was not marked")
+	}
+}
 
 type staleTargetTestBackend struct {
 	*fakeBackend
@@ -42,6 +59,9 @@ func TestHandlerEvictsOnlyForwarderMarkedStaleTarget(t *testing.T) {
 	h.WithForwarding(func(_ Target) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			markStaleTarget(r.Context())
+			if b.evictedInstance == "" {
+				t.Errorf("stale target was not evicted before forwarder returned")
+			}
 			http.Error(w, "instance gone", http.StatusServiceUnavailable)
 		})
 	})

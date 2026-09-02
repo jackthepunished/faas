@@ -718,6 +718,8 @@ func (s *Server) ForceRestartInstance(ctx context.Context, req *scheddpb.ForceRe
 //   - liveness_conn_err      — wire-shape or syscall failure
 //   - liveness_non_200       — guest-init returned a non-2xx
 //   - liveness_n_consecutive — the catch-all "counter reached N"
+//   - liveness_infrastructure — transport miss correlated with local request pressure
+//   - liveness_process_exited — transport miss corroborated by a dead Firecracker process
 //
 // Anything outside the closed set is still accepted by the
 // schedd side (the reason string flows verbatim into the
