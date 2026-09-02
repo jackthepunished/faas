@@ -1800,7 +1800,8 @@ func TestEngineWake_AdmissionDeniedReturnsProblem(t *testing.T) {
 	store := state.NewMemStore()
 	_, app, _ := seedApp(t, store, api.PlanFree, 128, 1)
 	vmm := &fakeVMM{}
-	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+	warm := NewWarmAffinity(0)
+	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0").WithWarmAffinity(warm)
 
 	// Fill the ledger to the ceiling so the wake is refused for
 	// capacity. PR #113 moved the resident counter to a per-node
@@ -1849,6 +1850,9 @@ func TestEngineWake_AdmissionDeniedReturnsProblem(t *testing.T) {
 	rows, _ := store.ListInstancesForApp(context.Background(), app.ID)
 	if len(rows) != 1 || rows[0].State != string(state.StateFailed) {
 		t.Errorf("rows = %+v, want one failed row", rows)
+	}
+	if _, ok := warm.LastWarmNode(app.ID); ok {
+		t.Fatal("capacity-denied wake must not leave a warm placement hint")
 	}
 }
 
