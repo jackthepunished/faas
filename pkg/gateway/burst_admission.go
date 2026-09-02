@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/sched"
@@ -105,7 +106,24 @@ func (h *Handler) maybeBurstCapacity(ctx context.Context, app App, maxInstances,
 			if count > api.ScaleUpMaxBurstPerTick {
 				count = api.ScaleUpMaxBurstPerTick
 			}
-			admitted, err := admitter.AdmitBurst(lifecycleCtx, app.ID, app.Scope, sched.TriggerGateway, maxInstances, count)
+			policy := WakeAdmissionPolicyForPlan(app.Plan)
+			var admitted int
+			var err error
+			var queued bool
+			var wait time.Duration
+			admit := func(admitCtx context.Context) error {
+				var admitErr error
+				admitted, admitErr = admitter.AdmitBurst(admitCtx, app.ID, app.Scope, sched.TriggerGateway, maxInstances, count)
+				return admitErr
+			}
+			if h.admissionQueue != nil {
+				queued, wait, err = h.admissionQueue.Do(lifecycleCtx, app.ID, string(app.Plan), policy, admit)
+				if h.metrics != nil {
+					h.metrics.ObserveWakeAdmission(string(app.Plan), err, queued, wait)
+				}
+			} else {
+				err = admit(lifecycleCtx)
+			}
 			if err != nil && h.log != nil {
 				h.log.Warn("gateway: burst admission failed", "app_id", app.ID, "requested", count, "admitted", admitted, "err", err)
 			}
