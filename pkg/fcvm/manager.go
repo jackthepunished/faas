@@ -3175,11 +3175,12 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 		err = writePlanCgroup(req.Instance, req.Plan, req.MemSizeMiB)
 	}
 	if err != nil {
-		// Cgroup fence spec §4.4 but may fail in constrained environments
-		// (cgroup namespace isolation). VM is already up; continue without memory cap.
-		// Useful for local metal testing only.
-		m.log.Warn("cgroup fence: writePlanCgroup failed, continuing",
-			"instance", req.Instance, "plan", req.Plan, "err", err)
+		// Cgroup setup is a mandatory isolation boundary. The VM is already
+		// up, but returning the error routes through Wake's deferred cleanup
+		// so the instance cannot become reachable without its memory and CPU
+		// fences. Local environments that cannot provide cgroup v2 must use
+		// the existing fake VMM/unit-test path rather than weakening this
+		// production invariant.
 		// Issue #1059 / ADR-127: closed-reason counter. Hardcoded
 		// reason="cgroup_fail" per ADR §3 — the wrap already names
 		// the surface, and the §11 invariant "cgroups v2 with
@@ -3188,6 +3189,7 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 		if m.wakeFailureMetrics != nil {
 			m.wakeFailureMetrics.WakeFailure("", req.AppID, WakeReasonCgroupFail).Inc()
 		}
+		return nil, fmt.Errorf("wake %s: cgroup fence: %w", req.Instance, err)
 	}
 
 	// Issue #463 / ADR-069 / PR-B: per-workload cgroup scopes. The

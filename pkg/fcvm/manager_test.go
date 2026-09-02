@@ -146,6 +146,9 @@ type fakeVMM struct {
 	// (e.g. memory.max WriteFile failing due to permissions) without
 	// depending on filesystem permissions that may be bypassed by root.
 	bootCgroupFail error
+	// postBootCgroupBlock makes the fake jailer scope's memory.max a directory
+	// so the Manager's post-boot cgroup fence write fails after bringUp.
+	postBootCgroupBlock bool
 	// M6 builder-VM path: DestroyWithExport returns this exit code, copies
 	// nothing. App VMs just see "destroyed" the same way Kill did.
 	destroyWithExportExit int
@@ -263,6 +266,11 @@ func (v *fakeVMM) Boot(_ context.Context, l Lease, _ VMConfig, _ string) error {
 	// depending on filesystem permissions that root can bypass.
 	if v.bootCgroupFail != nil {
 		return v.bootCgroupFail
+	}
+	if v.postBootCgroupBlock {
+		if err := os.Mkdir(filepath.Join(scopePath, "memory.max"), 0o755); err != nil {
+			return err
+		}
 	}
 	return v.bootErr
 }
@@ -1939,6 +1947,30 @@ func TestWakeCgroupWriteFailureUnwindsNetns(t *testing.T) {
 	// so the cleanup defer must have torn it down.
 	if !run.ran("netns del fc-cgroup-fail") {
 		t.Error("cleanup did not delete netns on cgroup failure")
+	}
+}
+
+// TestWakePostBootCgroupFenceFailsClosed covers the production fence write
+// itself. fakeVMM.Boot creates the jailer scope but intentionally leaves the
+// memory.max/cpu.max files absent, so Manager.Wake reaches writePlanCgroup and
+// must reject the otherwise-ready VM instead of exposing it uncapped.
+func TestWakePostBootCgroupFenceFailsClosed(t *testing.T) {
+	withFakeCgroupRoot(t)
+	run, vmm := &fakeRunner{}, &fakeVMM{postBootCgroupBlock: true}
+	m := newTestManager(run, vmm)
+
+	_, err := m.ColdBoot(context.Background(), req("post-cgroup-fail"))
+	if err == nil {
+		t.Fatal("expected post-boot cgroup fence failure")
+	}
+	if m.LeasedCount() != 0 {
+		t.Errorf("lease leaked after post-boot cgroup failure: leased=%d", m.LeasedCount())
+	}
+	if m.LiveCount() != 0 {
+		t.Errorf("VM remained live after post-boot cgroup failure: live=%d", m.LiveCount())
+	}
+	if !run.ran("netns del fc-post-cgroup-fail") {
+		t.Error("cleanup did not delete netns after post-boot cgroup failure")
 	}
 }
 

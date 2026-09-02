@@ -311,6 +311,13 @@ func guestStage(stage string) {
 // BuildEnv path; nil in one of them short-circuits to the other layer's
 // 3-arg shape via BuildEnvWithSecrets's nil-tolerant map reads.
 func runAppWithEnv(m api.AppManifest, secrets, apiEnv map[string]string, sup *Supervisor) error {
+	return runAppWithRAM(m, secrets, apiEnv, sup, 0)
+}
+
+// runAppWithRAM is the workload-aware variant of runAppWithEnv. ramMB is
+// supplied by the workload roster when present; zero preserves the legacy
+// single-workload path, whose host-side cgroup is the authoritative cap.
+func runAppWithRAM(m api.AppManifest, secrets, apiEnv map[string]string, sup *Supervisor, ramMB int) error {
 	argv := m.Entrypoint
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = m.EffectiveWorkingDir()
@@ -365,18 +372,13 @@ func runAppWithEnv(m api.AppManifest, secrets, apiEnv map[string]string, sup *Su
 	// in-guest cgroup v2 partition for the main workload.
 	// mkdir + write memory.max BEFORE Start. The main
 	// workload gets a "main-app" leaf so its OOM is
-	// scoped separately from any sidecar's. ram_mb = 0
-	// (legacy single-workload wakes) floors at 1 MiB in
-	// partitionInto. The customer-facing API gate already
-	// enforces plan RAM bounds upstream; this leaf is
-	// defense-in-depth (host-side writePlanCgroup is the
-	// primary cap).
-	mainLeaf := leafDir("main", "app")
-	if mainLeaf != "" {
-		if perr := partitionInto(mainLeaf, 0); perr != nil {
-			slog.Default().Warn("cgroup partition into main leaf failed",
-				"leaf", mainLeaf, "err", perr)
-		}
+	// scoped separately from any sidecar's. Legacy
+	// single-workload wakes have no per-workload RAM value
+	// and therefore skip this child leaf; the host-side
+	// writePlanCgroup remains their authoritative cap.
+	mainLeaf, cgroupErr := prepareWorkloadCgroup("main", "app", ramMB, slog.Default())
+	if cgroupErr != nil {
+		return fmt.Errorf("prepare main workload cgroup: %w", cgroupErr)
 	}
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("run %v: %w", argv, err)
