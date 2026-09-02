@@ -12,12 +12,14 @@ import (
 )
 
 // WakeAdmissionPolicy is the gateway-side policy for one app's cold-wake
-// admission. The waiter cap is per app; the priority is used only when the
-// gateway's bounded cross-app admission queue is contended.
+// admission. The waiter cap is per app. Priority is retained in the policy
+// shape for compatibility with the first admission-control slice, but is not
+// used to order customer work: equal users must get equal scheduler access.
 //
-// These are deliberately plan-derived defaults for this first slice. The
-// policy is carried as a value so a later app-level override can be hydrated
-// without changing WakeGate or the queue contract.
+// These are deliberately plan-derived capacity/wait defaults. They do not
+// grant one plan precedence over another. The policy is carried as a value so
+// a later app-level override can be hydrated without changing WakeGate or the
+// queue contract.
 type WakeAdmissionPolicy struct {
 	MaxWaiters int
 	MaxWait    time.Duration
@@ -26,6 +28,9 @@ type WakeAdmissionPolicy struct {
 
 // WakeAdmissionPolicyForPlan returns the bounded cold-wake policy for plan.
 // Unknown plans fail closed with a single waiter and the shortest wait budget.
+// All known plans use the same priority for observability compatibility.
+// Queue ordering itself is always arrival sequence, so strict plan ordering
+// cannot starve a lower plan during a sustained burst.
 func WakeAdmissionPolicyForPlan(plan api.Plan) WakeAdmissionPolicy {
 	switch plan {
 	case api.PlanFree:
@@ -37,7 +42,7 @@ func WakeAdmissionPolicyForPlan(plan api.Plan) WakeAdmissionPolicy {
 	case api.PlanScale:
 		return WakeAdmissionPolicy{MaxWaiters: api.GatewayWakeAdmissionScaleMaxWaiters, MaxWait: api.GatewayWakeAdmissionPaidMaxWait, Priority: api.GatewayWakeAdmissionScalePriority}
 	default:
-		return WakeAdmissionPolicy{MaxWaiters: 1, MaxWait: api.GatewayWakeAdmissionFreeMaxWait, Priority: 0}
+		return WakeAdmissionPolicy{MaxWaiters: 1, MaxWait: api.GatewayWakeAdmissionFreeMaxWait, Priority: api.GatewayWakeAdmissionFreePriority}
 	}
 }
 
@@ -149,7 +154,6 @@ func wakeAdmissionOutcome(err error) string {
 type admissionTicket struct {
 	appID    string
 	plan     string
-	priority int
 	sequence uint64
 	started  bool
 	removed  bool
@@ -162,9 +166,6 @@ type admissionTicketHeap []*admissionTicket
 func (h admissionTicketHeap) Len() int { return len(h) }
 
 func (h admissionTicketHeap) Less(i, j int) bool {
-	if h[i].priority != h[j].priority {
-		return h[i].priority > h[j].priority
-	}
 	return h[i].sequence < h[j].sequence
 }
 
@@ -197,9 +198,9 @@ type admissionDepthUpdate struct {
 
 // wakeAdmissionQueue bounds concurrent cold-wake admissions in one gateway
 // process. Each queued item is a WakeGate leader, so one bursting app cannot
-// consume one scheduler slot per incoming request. The heap makes the plan
-// priority meaningful across different apps while sequence preserves FIFO
-// ordering within a plan.
+// consume one scheduler slot per incoming request. Sequence gives FIFO
+// ordering across apps as well as within an app. The priority field remains
+// only as a compatibility field and cannot alter customer ordering.
 type wakeAdmissionQueue struct {
 	mu            sync.Mutex
 	capacity      int
@@ -257,7 +258,6 @@ func (q *wakeAdmissionQueue) Do(ctx context.Context, appID, plan string, policy 
 	ticket := &admissionTicket{
 		appID:    appID,
 		plan:     plan,
-		priority: policy.Priority,
 		sequence: q.nextSequence,
 		start:    make(chan struct{}),
 	}

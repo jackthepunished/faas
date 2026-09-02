@@ -22,9 +22,9 @@ func TestWakeAdmissionPolicyForPlan(t *testing.T) {
 		priority int
 	}{
 		{api.PlanFree, 4, 10 * time.Second, 1},
-		{api.PlanHobby, 16, 30 * time.Second, 2},
-		{api.PlanPro, 64, 30 * time.Second, 3},
-		{api.PlanScale, 128, 30 * time.Second, 4},
+		{api.PlanHobby, 16, 30 * time.Second, 1},
+		{api.PlanPro, 64, 30 * time.Second, 1},
+		{api.PlanScale, 128, 30 * time.Second, 1},
 	}
 	for _, tc := range cases {
 		t.Run(string(tc.plan), func(t *testing.T) {
@@ -35,12 +35,12 @@ func TestWakeAdmissionPolicyForPlan(t *testing.T) {
 		})
 	}
 	unknown := WakeAdmissionPolicyForPlan(api.Plan("unknown"))
-	if unknown.MaxWaiters != 1 || unknown.MaxWait != 10*time.Second || unknown.Priority != 0 {
+	if unknown.MaxWaiters != 1 || unknown.MaxWait != 10*time.Second || unknown.Priority != 1 {
 		t.Fatalf("unknown policy = %+v, want fail-closed policy", unknown)
 	}
 }
 
-func TestWakeAdmissionQueuePrioritizesPlan(t *testing.T) {
+func TestWakeAdmissionQueueIsFairAcrossPlans(t *testing.T) {
 	q := newWakeAdmissionQueue(1, 4, nil)
 	block := make(chan struct{})
 	started := make(chan struct{})
@@ -81,8 +81,8 @@ func TestWakeAdmissionQueuePrioritizesPlan(t *testing.T) {
 	}
 	first := <-order
 	second := <-order
-	if first != string(api.PlanScale) || second != string(api.PlanFree) {
-		t.Fatalf("queue order = [%s %s], want [scale free]", first, second)
+	if first != string(api.PlanFree) || second != string(api.PlanScale) {
+		t.Fatalf("queue order = [%s %s], want FIFO [free scale]", first, second)
 	}
 }
 
