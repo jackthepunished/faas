@@ -5,7 +5,7 @@ Generated from the CLI's command manifest by `gregale man --markdown`. Do not ed
 | Command | What it does |
 |---|---|
 | [`account`](#account) | Manage the local account (account export\|delete\|restore\|status\|dpa\|slo) |
-| [`admin`](#admin) | Operator-only billing ops (admin credit --reason &lt;text&gt; &lt;uuid&gt; &lt;cents&gt;) |
+| [`admin`](#admin) | Operator-only billing ops (admin credit\|refund\|consume-credits) |
 | [`alerts`](#alerts) | Per-app alert rules (alerts list\|add\|info\|update\|rm\|rotate-secret\|preset --app &lt;slug&gt;) |
 | [`audit-events`](#audit-events) | Audit-log query (audit-events list\|get &lt;id&gt;) |
 | [`apps`](#apps) | List your apps |
@@ -106,7 +106,7 @@ Account-wide SLO panel
 
 ## admin
 
-Operator-only billing ops (admin credit --reason &lt;text&gt; &lt;uuid&gt; &lt;cents&gt;)
+Operator-only billing ops (admin credit|refund|consume-credits)
 
 `gregale admin [<subcommand>] <uuid> <cents>`
 
@@ -117,6 +117,19 @@ Issue a billing credit
 | Flag | Meaning | |
 |---|---|---|
 | `--reason <text>` | credit reason text | required |
+
+### admin refund
+
+Refund a paid Polar invoice
+
+| Flag | Meaning | |
+|---|---|---|
+| `--reason <text>` | refund reason text | required |
+| `--idempotency-key <key>` | stable provider retry key |  |
+
+### admin consume-credits
+
+Consume credits against an invoice
 
 
 ## alerts
@@ -246,11 +259,11 @@ Manage billing (portal, invoices, subscription, card on file)
 
 ### billing portal
 
-Open the Stripe billing portal
+Open the active billing provider&#39;s portal
 
 ### billing retry
 
-Retry the latest failed invoice payment
+Retry failed payment when supported; Polar uses the portal
 
 ### billing cancel
 

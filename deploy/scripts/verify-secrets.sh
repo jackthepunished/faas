@@ -143,6 +143,10 @@ if [[ -f /etc/faas/sealed.env ]]; then
     check "sealed.env has FAAS_POLAR_WEBHOOK_SECRET" bash -c '
       grep -qE "^FAAS_POLAR_WEBHOOK_SECRET=(whsec_[A-Za-z0-9+/=_-]+|polar_whs_[A-Za-z0-9_-]+|[A-Za-z0-9+/=_-]+)$" /etc/faas/sealed.env
     '
+    check "Polar usage meter id is configured" bash -c '
+      grep -q "^FAAS_POLAR_METER_ID=." /etc/faas/sealed.env \
+        || grep -qsE "^[[:space:]]*meter_id[[:space:]]*=[[:space:]]+\"[^\"]+\"" /etc/faas/apid.toml /etc/faas/meterd.toml 2>/dev/null
+    '
     for polar_product in hobby pro scale; do
       polar_product_env=${polar_product^^}
       check "Polar ${polar_product} product id is configured" bash -c "

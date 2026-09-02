@@ -1077,6 +1077,7 @@ jobs:
           bash -n deploy/scripts/verify-secrets.sh
           grep -q "FAAS_POLAR_ACCESS_TOKEN" deploy/scripts/verify-secrets.sh
           grep -q "FAAS_BILLING_PROVIDER=polar" deploy/scripts/verify-secrets.sh
+          grep -q "FAAS_POLAR_METER_ID" deploy/scripts/verify-secrets.sh
 
       # Cross-PR slot collision. TestMigrationsUniquePrefixes (in the static
       # step above) only sees one branch at a time: a PR builds against

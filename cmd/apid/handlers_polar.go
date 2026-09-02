@@ -89,7 +89,7 @@ func (s *server) polarWebhook(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if err := s.handleBillingEvent(r.Context(), ev, acct); err != nil {
+	if err := s.handlePolarBillingEvent(r.Context(), ev, acct); err != nil {
 		s.log.Error("polar webhook state application failed", "event_id", logsanitize.Field(ev.EventID), "err", err)
 		if releaser, ok := s.store.(state.WebhookDeliveryReleaser); ok {
 			if releaseErr := releaser.ReleaseWebhookDelivery(r.Context(), string(webhookdedupe.ProviderPolar), ev.EventID); releaseErr != nil {

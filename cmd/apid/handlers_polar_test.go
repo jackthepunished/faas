@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/billing"
+	"github.com/onebox-faas/faas/pkg/state"
 )
 
 type invoicePDFRequesterStub struct {
@@ -93,5 +94,52 @@ func TestRequestPolarInvoicePDFAsyncDoesNotBlockCaller(t *testing.T) {
 			t.Fatalf("invoice PDF worker calls = %d, want 3", requester.Calls())
 		case <-time.After(25 * time.Millisecond):
 		}
+	}
+}
+
+type blockingBillingMailer struct {
+	started  chan struct{}
+	release  chan struct{}
+	finished chan struct{}
+}
+
+func (m *blockingBillingMailer) Send(ctx context.Context, _ Message) error {
+	close(m.started)
+	select {
+	case <-m.release:
+		close(m.finished)
+		return nil
+	case <-ctx.Done():
+		close(m.finished)
+		return ctx.Err()
+	}
+}
+
+func TestPolarBillingTransitionMailDoesNotBlockWebhookPath(t *testing.T) {
+	mailer := &blockingBillingMailer{
+		started:  make(chan struct{}),
+		release:  make(chan struct{}),
+		finished: make(chan struct{}),
+	}
+	srv := &server{
+		mailer: mailer,
+		log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	startedAt := time.Now()
+	srv.sendBillingTransitionMail(context.Background(), state.Account{ID: "acct-1", Email: "alice@example.com"}, "payment failed", "body", true, "payment_failed")
+	if elapsed := time.Since(startedAt); elapsed > 100*time.Millisecond {
+		t.Fatalf("Polar mail helper blocked caller for %s", elapsed)
+	}
+	select {
+	case <-mailer.started:
+	case <-time.After(time.Second):
+		t.Fatal("Polar mail worker did not start")
+	}
+	close(mailer.release)
+	select {
+	case <-mailer.finished:
+	case <-time.After(time.Second):
+		t.Fatal("Polar mail worker did not finish")
 	}
 }

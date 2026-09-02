@@ -434,6 +434,10 @@ var methodRouteMap = map[string]string{
 	// artifact; the SDK verb is "issue" (the operator's mental
 	// model) so the explicit map takes precedence.
 	"POST /v1/admin/accounts/{id}/credits": "IssueAccountCredit",
+	// Operator refunds use a local invoice binding and the provider's
+	// idempotency key; the SDK follows the operator mental model rather than
+	// the generated PostAdminAccountsIdRefunds name.
+	"POST /v1/admin/accounts/{id}/refunds": "RefundAccount",
 	// PR-D / ADR-012 §7 amendment — per-tenant webhook secret
 	// rotation. Auto-derivation produces
 	// "PostAdminGithub-webhook-secrets" (literal hyphen); the SDK

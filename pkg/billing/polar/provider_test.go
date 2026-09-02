@@ -654,3 +654,27 @@ func TestCancelAndRefund(t *testing.T) {
 		t.Fatalf("API paths = %v", paths)
 	}
 }
+
+func TestRefundUsesContextIdempotencyKey(t *testing.T) {
+	var got string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/refunds" {
+			http.NotFound(w, r)
+			return
+		}
+		got = r.Header.Get("Idempotency-Key")
+		_, _ = io.WriteString(w, `{"id":"refund-operator","amount":250,"currency":"eur","status":"pending"}`)
+	}))
+	defer server.Close()
+	p, err := NewProvider(testConfig(server.URL), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := billing.ContextWithIdempotencyKey(context.Background(), "operator-refund-42")
+	if _, err := p.Refund(ctx, "order-1", 250); err != nil {
+		t.Fatalf("Refund: %v", err)
+	}
+	if got != "operator-refund-42" {
+		t.Fatalf("refund idempotency key = %q, want operator-refund-42", got)
+	}
+}
