@@ -1043,6 +1043,14 @@ func (b *PGBackend) admitSynchronous(ctx context.Context, appID, deploymentID, s
 	if err != nil {
 		return "", WakeMethodUnspecified, false, err
 	}
+	return b.recordAdmission(ctx, appID, deploymentID, instanceID, nodeID, returnedDeploymentID, wakeID, rawMethod, atCapacity, port)
+}
+
+// recordAdmission applies one successful schedd result to the gateway's
+// target picker. Keeping this separate from the RPC wrapper lets the bounded
+// burst path reuse the exact same cache and deployment-bucket semantics as a
+// normal Admit call.
+func (b *PGBackend) recordAdmission(ctx context.Context, appID, deploymentID, instanceID, nodeID, returnedDeploymentID, wakeID string, rawMethod int32, atCapacity bool, port int) (string, WakeMethod, bool, error) {
 	// Use the deploymentID schedd actually used (matches the
 	// bucket the picker will route to); fall through to the
 	// caller's hint if schedd returned "".
@@ -1079,7 +1087,7 @@ func (b *PGBackend) admitSynchronous(ctx context.Context, appID, deploymentID, s
 		bucket = "_legacy"
 	}
 	b.tgtMu.Lock()
-	picker = b.appsPicker[appID]
+	picker := b.appsPicker[appID]
 	if picker == nil {
 		// Lazy-create a picker. If the store is wired, the
 		// notify path seeds weights via RefreshDeploymentWeights

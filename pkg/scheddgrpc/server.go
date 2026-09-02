@@ -454,7 +454,14 @@ func (s *Server) AdmitInstance(ctx context.Context, req *scheddpb.AdmitInstanceR
 	// PR-B (issue #272): scope threaded through AdmitInstance the
 	// same way as Wake. Empty scope = legacy prod; the engine's
 	// resolveApp then reads the LiveDeployment row by appID only.
-	res, err := s.engine.AdmitInstance(ctx, req.GetAppId(), req.GetDeploymentId(), req.GetScope(), req.GetTrigger())
+	// A burst continuation carries the scheduler's narrow cooldown
+	// bypass marker; it does not change any capacity or placement
+	// checks in Engine.AdmitInstance.
+	engineCtx := ctx
+	if req.GetBurstContinuation() {
+		engineCtx = sched.WithBurstContinuation(ctx)
+	}
+	res, err := s.engine.AdmitInstance(engineCtx, req.GetAppId(), req.GetDeploymentId(), req.GetScope(), req.GetTrigger())
 	s.ops.Observe(op, time.Since(start), err)
 	if err != nil {
 		return nil, grpcerr.ToStatus(toProblem(err))
