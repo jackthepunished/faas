@@ -1246,3 +1246,19 @@ add `deploy/ansible/roles/metal-h2c-acceptance/`).
     `deploy/ansible/metal-h2c-acceptance.yml`; the normal production
     `bootstrap.yml` remains unchanged. G19.2 still owns enabling the Go
     metal tests once a real acceptance host is available.
+
+## M8.7 — Public-release backend hardening foundation (ADR-140). 🚧
+
+This slice closes three backend failure modes that are disproportionately
+expensive in a public deployment:
+
+- warm placement hints are committed only after instance creation and ledger
+  admission;
+- stale schedd residency data fails closed after 30 seconds, preserving only
+  the guaranteed builder slot; and
+- HTTP and raw gateway streams actively cancel and drain request-body copying
+  on upstream failure or client disconnect.
+
+Remaining public-release gates are tracked separately: durable event replay,
+M9 two-node and leak-drill acceptance, service-replica convergence, real OTLP
+export, and the remaining state/export scale work.
