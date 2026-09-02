@@ -612,10 +612,12 @@ func TestAccountRateLimitReturns429(t *testing.T) {
 	}
 }
 
-// TestConcurrentColdRequestsCoalesceToOneWake (issue #168) — at the
-// Free-plan cap of max_concurrency=1, 50 concurrent cold requests still
-// coalesce to exactly ONE admit (the WakeGate's single-flight guarantee).
-// Higher plans admit more; covered by TestCapThreeAdmitsThreeDistinctInstances.
+// TestConcurrentColdRequestsRespectPlanWakeWaiterCap (issue #168) — at the
+// Free-plan cap of max_concurrency=1, concurrent cold requests still
+// coalesce to exactly ONE admit. The plan-derived wake waiter budget is four,
+// so excess followers receive bounded 503 responses instead of creating an
+// unbounded queue. Higher plans admit more; covered by
+// TestCapThreeAdmitsThreeDistinctInstances.
 func TestConcurrentColdRequestsCoalesceToOneWake(t *testing.T) {
 	h, b, _ := newTestHandler(t)
 	b.app.Plan = api.PlanFree // cap = 1 → coalesces to one admit
@@ -623,6 +625,8 @@ func TestConcurrentColdRequestsCoalesceToOneWake(t *testing.T) {
 	h.WithAccountLimiter(unlimitedAccountLimiter()) // ADR-040 — 50 concurrent > Free per-account burst 50
 
 	var wg sync.WaitGroup
+	var successes atomic.Int32
+	var rejected atomic.Int32
 	for i := 0; i < 50; i++ {
 		wg.Add(1)
 		go func() {
@@ -630,14 +634,22 @@ func TestConcurrentColdRequestsCoalesceToOneWake(t *testing.T) {
 			req := httptest.NewRequest("GET", "http://jane-api.apps.dom/", nil)
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, req)
-			if rec.Code != http.StatusOK {
-				t.Errorf("status = %d, want 200", rec.Code)
+			switch rec.Code {
+			case http.StatusOK:
+				successes.Add(1)
+			case http.StatusServiceUnavailable:
+				rejected.Add(1)
+			default:
+				t.Errorf("status = %d, want 200 or bounded 503", rec.Code)
 			}
 		}()
 	}
 	wg.Wait()
 	if got := atomic.LoadInt32(b.Admits()); got != 1 {
 		t.Errorf("50 concurrent cold requests should trigger 1 admit, got %d", got)
+	}
+	if got := successes.Load() + rejected.Load(); got != 50 {
+		t.Errorf("all concurrent cold requests should finish with 200 or bounded 503, got %d/50", got)
 	}
 }
 
