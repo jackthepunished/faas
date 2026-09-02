@@ -145,7 +145,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
       git apply /tmp/buildkit-session-health.patch && \
       go mod edit -require=github.com/moby/go-archive@v${GO_ARCHIVE_VERSION} && \
       go mod edit -require=golang.org/x/net@v0.57.0 && \
-      go mod edit -require=google.golang.org/grpc@v1.82.1 && \
+      go mod edit -require=google.golang.org/grpc@v1.83.1 && \
       go mod download github.com/moby/go-archive@v${GO_ARCHIVE_VERSION} && \
       archive_module="$(go env GOMODCACHE)/github.com/moby/go-archive@v${GO_ARCHIVE_VERSION}" && \
       rm -rf vendor/github.com/moby/go-archive && \
