@@ -1,6 +1,7 @@
 package state_test
 
 import (
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -13,11 +14,11 @@ func TestPgStoreAuditEventOutboxRoundTrip(t *testing.T) {
 	subject := "00000000-0000-0000-0000-000000000140"
 	payload := []byte(`{"app_id":"` + subject + `"}`)
 
-	id, err := s.EnqueueAuditEvent(ctx, "imaged", "app.signature_invalid", &subject, payload, "signature:pg-dep-1")
+	id, err := s.EnqueueAuditEvent(ctx, "apid", "app.signature_invalid", &subject, payload, "signature:pg-dep-1")
 	if err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
-	duplicateID, err := s.EnqueueAuditEvent(ctx, "imaged", "app.signature_invalid", &subject, []byte(`{"replacement":true}`), "signature:pg-dep-1")
+	duplicateID, err := s.EnqueueAuditEvent(ctx, "apid", "app.signature_invalid", &subject, []byte(`{"replacement":true}`), "signature:pg-dep-1")
 	if err != nil {
 		t.Fatalf("duplicate enqueue: %v", err)
 	}
@@ -45,7 +46,16 @@ func TestPgStoreAuditEventOutboxRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list events: %v", err)
 	}
-	if len(events) != 1 || events[0].Kind != "app.signature_invalid" || string(events[0].Data) != string(payload) {
+	var gotData, wantData map[string]string
+	if len(events) == 1 {
+		if err := json.Unmarshal(events[0].Data, &gotData); err != nil {
+			t.Fatalf("decode delivered event data: %v", err)
+		}
+		if err := json.Unmarshal(payload, &wantData); err != nil {
+			t.Fatalf("decode expected event data: %v", err)
+		}
+	}
+	if len(events) != 1 || events[0].Kind != "app.signature_invalid" || len(gotData) != len(wantData) || gotData["app_id"] != wantData["app_id"] {
 		t.Fatalf("events = %+v, want one original audit event", events)
 	}
 
@@ -64,7 +74,7 @@ func TestPgStoreAuditEventOutboxRoundTrip(t *testing.T) {
 		t.Fatalf("deliver after prune = %v, want ErrNotFound", err)
 	}
 
-	retryID, err := s.EnqueueAuditEvent(ctx, "imaged", "app.signature_missing", &subject, []byte(`{}`), "signature:pg-dep-2")
+	retryID, err := s.EnqueueAuditEvent(ctx, "apid", "app.signature_missing", &subject, []byte(`{}`), "signature:pg-dep-2")
 	if err != nil {
 		t.Fatalf("retry enqueue: %v", err)
 	}

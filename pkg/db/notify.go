@@ -364,7 +364,7 @@ const (
 	// NotifyAuditEvent {"outbox_id":N, "kind":"app.signature_missing|...",
 	//                    "app_id":uuid, "deployment_id":uuid,
 	//                    "ref":"...", "signer":"..."}
-//   imaged → apid-side audit (issue #472 / ADR-054 / ADR-141):
+	//   imaged → apid-side audit (issue #472 / ADR-054 / ADR-141):
 	//   the imaged-side signature audit path now persists a durable
 	//   audit_event_outbox row and uses pg_notify as the low-latency
 	//   wakeup. Apid's subscriber delivers the referenced row;
