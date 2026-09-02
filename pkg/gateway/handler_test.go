@@ -88,6 +88,23 @@ type reconcileBackend struct {
 	reconcileRelease chan struct{}
 }
 
+// warmPathBackend exposes the production-only warm-path seam while retaining
+// fakeBackend's normal admission behavior for any unexpected fallback.
+type warmPathBackend struct {
+	*fakeBackend
+	warmPick     PickResult
+	healthyCalls atomic.Int32
+}
+
+func (b *warmPathBackend) PickWarm(_ string) PickResult {
+	return b.warmPick
+}
+
+func (b *warmPathBackend) HealthyCount(appID string) int {
+	b.healthyCalls.Add(1)
+	return b.fakeBackend.HealthyCount(appID)
+}
+
 func (b *reconcileBackend) ReconcileLiveTargets(context.Context, string) error {
 	b.reconcileCalls.Add(1)
 	if b.reconcileStart != nil {
@@ -343,6 +360,45 @@ func TestHotPathDoesNotWakeOrTagCold(t *testing.T) {
 	}
 	if atomic.LoadInt32(b.Admits()) != 0 {
 		t.Errorf("hot path must not trigger an admit, got %d", atomic.LoadInt32(b.Admits()))
+	}
+}
+
+func TestHandlerWarmPathSkipsCapacityProbe(t *testing.T) {
+	t.Parallel()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("hello from app"))
+	}))
+	t.Cleanup(upstream.Close)
+
+	base := &fakeBackend{
+		app:      App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanScale},
+		host:     "jane-api.apps.dom",
+		upstream: upstream.Listener.Addr().String(),
+	}
+	b := &warmPathBackend{
+		fakeBackend: base,
+		warmPick: PickResult{
+			Target: Target{NodeID: base.upstream, InstanceID: "i-warm"},
+			OK:     true,
+		},
+	}
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+
+	req := httptest.NewRequest("GET", "http://jane-api.apps.dom/", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", rec.Code, rec.Body)
+	}
+	if got := b.healthyCalls.Load(); got != 0 {
+		t.Fatalf("warm path HealthyCount calls = %d, want 0", got)
+	}
+	if got := b.pickCalls.Load(); got != 0 {
+		t.Fatalf("warm path fallback Pick calls = %d, want 0", got)
+	}
+	if got := atomic.LoadInt32(b.Admits()); got != 0 {
+		t.Fatalf("warm path admits = %d, want 0", got)
 	}
 }
 

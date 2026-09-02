@@ -690,7 +690,10 @@ const RouteCacheCap = 10_000
 // both the route (host→app_id) and app (app_id→plan) caches. A Router error or
 // an unknown host both yield ok=false so the handler writes a 404.
 func (b *PGBackend) Lookup(ctx context.Context, host string) (App, bool) {
-	if appID, ok := b.routes.Get(host); ok {
+	// Lookup is on every request. Use the read-mostly cache operation so
+	// concurrent hits do not serialize behind LRU promotion; route changes
+	// still invalidate the cache through the existing notifier path.
+	if appID, ok := b.routes.Peek(host); ok {
 		if app, ok := b.getApp(appID); ok {
 			return app, true
 		}
@@ -841,6 +844,16 @@ func (b *PGBackend) Pick(appID string) PickResult {
 	}
 	t.DeploymentID = chosen
 	return PickResult{Target: t, OK: true, Picked: chosen}
+}
+
+// PickWarm is the production-only warm-path probe used by Handler. It keeps
+// the fast path explicit at the seam: a routable target is sufficient evidence
+// to skip HealthyCount and the wake gate, while an empty picker falls back to
+// the existing ensureCapacity path. The method delegates to Pick so there is
+// only one picker implementation and no divergence in deployment weighting or
+// stale-target handling.
+func (b *PGBackend) PickWarm(appID string) PickResult {
+	return b.Pick(appID)
 }
 
 // HealthyCount returns the number of routable Targets currently
