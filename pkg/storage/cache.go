@@ -19,9 +19,12 @@
 //     and populates the cache. On parent failure, Get returns
 //     the wrapped error UNLESS FAAS_STORAGE_CACHE_SERVE_STALE=true,
 //     in which case Get serves the last-known-good blob from the
-//     cache (Warn-level log + observer notification). The
-//     fail-loud default is pinned by TestLocalCacheBackend_ParentFailureSurfaces
-//     — single-box operators are not surprised by silent staleness.
+//     cache (Warn-level log + observer notification). A caller can
+//     set FAAS_STORAGE_CACHE_REFRESH=true for one controlled read to
+//     bypass and replace an existing cache entry; refresh never falls
+//     back to stale bytes. The fail-loud default is pinned by
+//     TestLocalCacheBackend_ParentFailureSurfaces — single-box
+//     operators are not surprised by silent staleness.
 //   - Delete evicts from cache + forwards to parent. Best-effort
 //     propagation: a parent-side delete that fails is logged and
 //     the cache entry is evicted anyway, because stale data is
@@ -339,23 +342,27 @@ var errCacheBlobOversized = errors.New("storage: cache: blob exceeds maxBytes")
 // On parent failure, Get returns the wrapped error UNLESS
 // FAAS_STORAGE_CACHE_SERVE_STALE=true, in which case Get serves the
 // last-known-good cached blob (must have been Put earlier — the cache
-// only stores blobs the parent has accepted). The first openCache call
-// at the top of Get is the cache-first path; the second openCache call
-// below is the stale-fallback path. Both run only when the cache holds
-// the key (Put has mirrored it). When the cache is empty, stale-fallback
-// is a no-op and the wrapped parent error is returned regardless of the
-// env var. Cache hits and parent misses are file-backed so large OCI
-// layers never become a heap-sized byte slice.
+// only stores blobs the parent has accepted). A caller can set
+// FAAS_STORAGE_CACHE_REFRESH=true for one controlled read to bypass
+// and replace an existing cache entry; refresh never falls back to
+// stale bytes. Cache hits and parent misses are file-backed so large
+// OCI layers never become a heap-sized byte slice.
 func (c *LocalCacheBackend) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	if err := validateKey(key); err != nil {
 		return nil, err
 	}
-	if cached, ok := c.openCache(key); ok {
-		return cached, nil
+	refresh := c.refresh()
+	if !refresh {
+		if cached, ok := c.openCache(key); ok {
+			return cached, nil
+		}
 	}
 	rc, err := c.parent.Get(ctx, key)
 	if err != nil {
-		if c.serveStale() {
+		// A refresh is an explicit integrity operation (used when
+		// adopting a newly signed release). Never let the normal
+		// stale-fallback policy turn it into another cache hit.
+		if !refresh && c.serveStale() {
 			if cached, ok := c.openCache(key); ok {
 				c.notifyStaleFallback()
 				return cached, nil
@@ -369,6 +376,19 @@ func (c *LocalCacheBackend) Get(ctx context.Context, key string) (io.ReadCloser,
 		return nil, fmt.Errorf("storage: cache: get %q: parent read: %w", key, err)
 	}
 	return cached, nil
+}
+
+// refresh reports whether the next Get must read the parent and replace the
+// local entry. It is intentionally an environment seam rather than a
+// permanent cache mode: release adoption sets it only around the explicit
+// prewarm verification, while normal daemon reads retain cache-first latency.
+func (c *LocalCacheBackend) refresh() bool {
+	v := os.Getenv("FAAS_STORAGE_CACHE_REFRESH")
+	if v == "" {
+		return false
+	}
+	on, err := strconv.ParseBool(v)
+	return err == nil && on
 }
 
 // SetObserver wires a CacheObserver onto the cache. The observer

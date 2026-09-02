@@ -2,10 +2,10 @@
 //
 // Multi-box compute nodes use the OCI storage backend for every shared
 // artifact. The release bundle carries the release-pinned Firecracker kernel,
-// but carrying a file in the bundle is not enough: vmmd resolves
-// kernel/<firecracker-version> through StorageBackend at wake time. These
-// commands make the release pipeline publish that exact key and make node
-// adoption fail before a node can become schedulable when the key is absent.
+// but carrying a file in the bundle is not enough: vmmd resolves the
+// release-pinned kernel through StorageBackend at wake time. These commands
+// make the release pipeline publish that exact key and make node adoption
+// fail before a node can become schedulable when the key is absent.
 
 package main
 
@@ -88,7 +88,8 @@ Flags:
   --env-file PATH       storage.env containing the shared storage contract (required)
   --manifest-file PATH  signed production manifest (required)
   --file PATH           release vmlinux file (publish only)
-  --no-cache            bypass the local read-through cache (publisher only)
+  --no-cache            bypass the local read-through cache
+  --refresh              fetch from shared storage and replace the local cache (verify only)
   --json                emit a machine-readable report
 
 Examples:
@@ -101,6 +102,7 @@ type artifactOptions struct {
 	manifestFile string
 	file         string
 	noCache      bool
+	refresh      bool
 }
 
 func parseArtifactFlags(args []string, operation string) (artifactOptions, int, bool) {
@@ -111,6 +113,7 @@ func parseArtifactFlags(args []string, operation string) (artifactOptions, int, 
 	fs.StringVar(&opts.manifestFile, "manifest-file", "", "production manifest path (required)")
 	fs.StringVar(&opts.file, "file", "", "artifact file (required for publish)")
 	fs.BoolVar(&opts.noCache, "no-cache", false, "bypass the local read-through cache")
+	fs.BoolVar(&opts.refresh, "refresh", false, "fetch from shared storage and replace the local cache (verify only)")
 	if err := fs.Parse(args); err != nil {
 		return artifactOptions{}, 2, false
 	}
@@ -128,6 +131,10 @@ func parseArtifactFlags(args []string, operation string) (artifactOptions, int, 
 	}
 	if operation == "verify" && opts.file != "" {
 		fmt.Fprintln(os.Stderr, "gregalectl artifact verify: --file is not supported")
+		return artifactOptions{}, 2, false
+	}
+	if operation == "publish" && opts.refresh {
+		fmt.Fprintln(os.Stderr, "gregalectl artifact publish: --refresh is only supported by verify")
 		return artifactOptions{}, 2, false
 	}
 	return opts, 0, true
@@ -195,6 +202,19 @@ func cmdArtifactVerify(args []string) int {
 		if err := os.Setenv("FAAS_STORAGE_CACHE_DIR", ""); err != nil {
 			return printErr("gregalectl artifact verify", err)
 		}
+	}
+	if opts.refresh {
+		previous, wasSet := os.LookupEnv("FAAS_STORAGE_CACHE_REFRESH")
+		if err := os.Setenv("FAAS_STORAGE_CACHE_REFRESH", "true"); err != nil {
+			return printErr("gregalectl artifact verify", err)
+		}
+		defer func() {
+			if wasSet {
+				_ = os.Setenv("FAAS_STORAGE_CACHE_REFRESH", previous)
+			} else {
+				_ = os.Unsetenv("FAAS_STORAGE_CACHE_REFRESH")
+			}
+		}()
 	}
 	be, err := storage.BackendFromEnv()
 	if err != nil {
