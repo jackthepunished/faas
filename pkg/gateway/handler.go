@@ -5286,7 +5286,26 @@ haveApp:
 	// the same dead target forever. The signal is internal and only set by the
 	// bridge on transport/liveness failures; ordinary guest 502/503 responses
 	// are therefore left untouched.
-	staleSignal := &staleTargetSignal{}
+	staleContext := r.Context()
+	staleSignal := &staleTargetSignal{
+		onStale: func() {
+			// Evict synchronously with the transport failure so a
+			// concurrent request cannot pick this known-dead target.
+			// RecoverStaleTarget detaches and bounds lifecycle work in
+			// the production backend; it does not inherit the client
+			// cancellation even though the request context is passed in.
+			if evictor, ok := h.backend.(interface {
+				EvictInstance(appID, instanceID string)
+			}); ok {
+				evictor.EvictInstance(app.ID, target.InstanceID)
+				h.log.Warn("gateway: evicted stale target", "app_id", app.ID,
+					"instance_id", target.InstanceID, "node_id", target.NodeID)
+			}
+			if recovery, ok := h.backend.(staleTargetRecovery); ok {
+				recovery.RecoverStaleTarget(staleContext, app.ID, app.Scope, limits.MaxConcurrency)
+			}
+		},
+	}
 	//nolint:contextcheck // withStaleTargetSignal intentionally inherits r.Context.
 	r = r.WithContext(withStaleTargetSignal(r.Context(), staleSignal))
 
@@ -5537,23 +5556,6 @@ haveApp:
 		planCap := app.Plan.MaxResponseBodyBytes()
 		capped := h.setupBufferedCapWriter(w, app, planCap)
 		h.proxyFor(target.NodeID, planCap).ServeHTTP(capped, r)
-	}
-	//nolint:contextcheck // staleTargetDetected only reads the marker from r.Context.
-	if staleTargetDetected(r.Context()) {
-		if evictor, ok := h.backend.(interface {
-			EvictInstance(appID, instanceID string)
-		}); ok {
-			evictor.EvictInstance(app.ID, target.InstanceID)
-			h.log.Warn("gateway: evicted stale target", "app_id", app.ID,
-				"instance_id", target.InstanceID, "node_id", target.NodeID)
-		}
-		if recovery, ok := h.backend.(staleTargetRecovery); ok {
-			// The client request may already be canceled after a bridge
-			// failure. Recovery is lifecycle work for the fleet, not work
-			// owned by that client, so the production backend detaches it
-			// and bounds the admission internally.
-			recovery.RecoverStaleTarget(r.Context(), app.ID, app.Scope, limits.MaxConcurrency)
-		}
 	}
 	// Issue #471 / ADR-047 PR-A buffered-fallback AC. The
 	// per-app streaming_enabled flag (ap.StreamingEnabled,

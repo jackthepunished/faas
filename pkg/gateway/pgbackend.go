@@ -329,6 +329,12 @@ type PGBackend struct {
 	// target eviction. Without this guard, a burst that discovers the same
 	// dead instance could start one replacement per failed request.
 	staleTargetRecovery singleflight.Group
+	// staleTargets quarantines instances that the forwarding transport has
+	// proved unusable. The database row can remain RUNNING until vmmd's
+	// liveness report reaches schedd; without this short-lived fence,
+	// ReconcileLiveTargets can immediately put the same dead instance back
+	// into the picker and recreate a 503 storm.
+	staleTargets map[string]time.Time
 
 	// publicAuthCache is the unsealed basic-auth credential
 	// cache (issue #477 / ADR-079). nil = no caching; the
@@ -573,13 +579,14 @@ func NewPGBackend(router Router, sched Scheduler, log *slog.Logger) *PGBackend {
 		log = slog.Default()
 	}
 	return &PGBackend{
-		router:      router,
-		sched:       sched,
-		log:         log,
-		routes:      NewRouteCache(RouteCacheCap),
-		apps:        map[string]App{},
-		appsPicker:  map[string]*appPicker{},
-		mirrorRules: map[string][]MirrorRuleRow{},
+		router:       router,
+		sched:        sched,
+		log:          log,
+		routes:       NewRouteCache(RouteCacheCap),
+		apps:         map[string]App{},
+		appsPicker:   map[string]*appPicker{},
+		mirrorRules:  map[string][]MirrorRuleRow{},
+		staleTargets: map[string]time.Time{},
 	}
 }
 
@@ -879,6 +886,10 @@ func (b *PGBackend) RecordTarget(appID string, target Target) {
 }
 
 func (b *PGBackend) recordTargetLocked(appID string, target Target) {
+	b.purgeStaleTargetsLocked(time.Now())
+	if until, ok := b.staleTargets[staleTargetKey(appID, target.InstanceID)]; ok && until.After(time.Now()) {
+		return
+	}
 	picker := b.appsPicker[appID]
 	if picker == nil {
 		picker = &appPicker{sets: map[string]*targetSet{}}
@@ -899,6 +910,23 @@ func (b *PGBackend) recordTargetLocked(appID string, target Target) {
 		picker.cum = []int{100}
 	}
 	set.add(target)
+}
+
+const staleTargetQuarantine = 30 * time.Second
+
+func staleTargetKey(appID, instanceID string) string {
+	return appID + "\x00" + instanceID
+}
+
+// purgeStaleTargetsLocked bounds the quarantine map without adding work to
+// Pick. It runs only on cache mutation/reconciliation paths, which are already
+// uncommon compared with request routing.
+func (b *PGBackend) purgeStaleTargetsLocked(now time.Time) {
+	for key, until := range b.staleTargets {
+		if !until.After(now) {
+			delete(b.staleTargets, key)
+		}
+	}
 }
 
 // Admit asks schedd to admit ONE additional instance for appID
@@ -1112,6 +1140,12 @@ func (b *PGBackend) EvictInstance(appID, instanceID string) {
 		return
 	}
 	b.tgtMu.Lock()
+	if b.staleTargets == nil {
+		b.staleTargets = make(map[string]time.Time)
+	}
+	now := time.Now()
+	b.purgeStaleTargetsLocked(now)
+	b.staleTargets[staleTargetKey(appID, instanceID)] = now.Add(staleTargetQuarantine)
 	picker := b.appsPicker[appID]
 	if picker == nil {
 		b.tgtMu.Unlock()

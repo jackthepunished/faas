@@ -768,6 +768,11 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		WithSlowSubscriberCallback(func() {
 			ops.IncLogDropped("slow_subscriber")
 		})
+	// Activity tracker (PR-B, issue #462): per-instance in-flight
+	// ForwardHTTP request counter. It is shared by the gRPC server's
+	// stats surface and the liveness loop so load-correlated probe misses
+	// can receive the bounded infrastructure grace (issue #1267).
+	activityTracker := activity.NewWithDefaults()
 	mgr := fcvm.NewManager(
 		wire.ExecRunner{},
 		jailer,
@@ -815,7 +820,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		},
 	).WithLivenessProbeStarter(func(ctx context.Context, instance string, slot int, deploymentID string, cfg fcvm.LivenessProbeConfig) context.CancelFunc {
 		return startLivenessLoopHelper(ctx, mgr, log, instance, slot, deploymentID, cfg,
-			jailer.VsockUDSSocketPath(instance))
+			jailer.VsockUDSSocketPath(instance), activityTracker)
 	})
 	mgr.SetHostIdentities(hostIdentities)
 	// issue #299: wire the artifact backend the Manager uses to
@@ -1097,13 +1102,6 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// nil to vmmdgrpc.NewWithCPUAndNet and skip the sample
 	// loop entirely.
 	netCache := netstats.NewWithDefaults()
-	// Activity tracker (PR-B, issue #462): per-instance in-flight
-	// ForwardHTTP request counter, fed by vmmdgrpc.ForwardHTTP's
-	// Begin/End defer pair (forward.go) and consumed by
-	// vmmdgrpc.Server.Stats as the inflight_requests and
-	// last_request_at wire fields. PR-C reads them via
-	// instancestats.Reader.MaxInflightForApp.
-	activityTracker := activity.NewWithDefaults()
 	gsrv := grpc.NewServer(append(
 		wire.ServerCredsOrEmpty(serverTLS),
 		wire.TraceServerOptions()...,
