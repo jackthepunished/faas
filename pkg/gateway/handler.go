@@ -577,6 +577,11 @@ type Handler struct {
 	// drains and before the wake gate (a schedd gRPC RPC) is touched.
 	accountLimiter *Limiter
 	gate           *WakeGate
+	// burstPressure is the immediate request-pressure signal used to
+	// trigger bounded scale-out during a public burst. It is local to
+	// this gateway process and deliberately separate from scraped
+	// metrics, which arrive too late to protect a cold burst.
+	burstPressure *burstPressure
 	// metrics may be nil; nil-guarded everywhere it is read.
 	metrics *Metrics
 	// mirrorRoundTripper (issue #72 / ADR-124 PR-A3) is the
@@ -926,6 +931,7 @@ func NewHandlerWith(backend Backend, m *Metrics, log *slog.Logger) *Handler {
 		routeConsumerLimiter: NewLimiterWithLRU(EdgeRuleConsumerCacheCap),
 		accountLimiter:       NewLimiter(),
 		gate:                 NewWakeGate(api.WakeQueueCap, time.Duration(api.WakeQueueTTLSeconds)*time.Second),
+		burstPressure:        &burstPressure{},
 		metrics:              m,
 		log:                  log,
 		// mirrorSlots is sync.Map (zero value ready); the cap is
@@ -5145,6 +5151,8 @@ haveApp:
 	// shouldWake predicate runs HealthyCount against the plan's
 	// effective max_concurrency, so a burst of N requests admits up to
 	// N instances before short-circuiting.
+	burstDone := h.burstPressure.begin(app.ID)
+	defer burstDone()
 	limits, _ := api.LimitsFor(app.Plan)
 	//nolint:contextcheck // request ctx at handler boundary.
 	cold, wakeID, wakeMethod, err := h.ensureCapacity(r.Context(), app.ID, app.AccountID, app.Scope, limits.MaxConcurrency)
@@ -5164,6 +5172,13 @@ haveApp:
 		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
 		return
 	}
+	// The first request above guarantees one routable target. Use the
+	// request pressure accumulated by the whole burst to start bounded
+	// background admissions for the remaining desired capacity. This is
+	// intentionally detached from the current request's cancellation so
+	// a client disconnect cannot abandon a capacity reservation already
+	// handed to the scheduler.
+	h.maybeBurstCapacity(r.Context(), app, limits.MaxConcurrency, limits.ConcurrencyPerVMBound)
 
 	// Pick one routable Target via atomic round-robin. After a
 	// successful ensure, HealthyCount ≥ 1, so this should succeed

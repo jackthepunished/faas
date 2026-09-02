@@ -1456,6 +1456,24 @@ func withScaleOutBurstContinuation(ctx context.Context) context.Context {
 	return context.WithValue(ctx, scaleOutBurstContinuationKey{}, true)
 }
 
+// WithBurstContinuation marks a schedd admission as a continuation of a
+// bounded, already-approved burst. The marker is intentionally narrow: it
+// bypasses only the per-app scale-out cooldown; every continuation still
+// goes through the normal ledger, placement, resource, and boot pipeline.
+// The gRPC adapter uses this when carrying Engine.AdmitInstances semantics
+// across the process boundary.
+func WithBurstContinuation(ctx context.Context) context.Context {
+	return withScaleOutBurstContinuation(ctx)
+}
+
+// IsBurstContinuation reports whether a schedd admission carries the bounded
+// burst continuation marker. It is used by the gRPC boundary tests and by
+// adapters that need to preserve the Engine.AdmitInstances contract without
+// exposing the private context-key type.
+func IsBurstContinuation(ctx context.Context) bool {
+	return isScaleOutBurstContinuation(ctx)
+}
+
 func isScaleOutBurstContinuation(ctx context.Context) bool {
 	value, _ := ctx.Value(scaleOutBurstContinuationKey{}).(bool)
 	return value
