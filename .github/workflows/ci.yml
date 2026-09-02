@@ -315,6 +315,41 @@ jobs:
           ansible-playbook --syntax-check deploy/ansible/node_join.yml
           ansible-playbook --syntax-check deploy/ansible/node_join_control_plane.yml
 
+      # Render the control-plane Prometheus artifacts with the production
+      # inventory. Syntax-check does not evaluate Jinja, so it would not catch
+      # a template stored in the wrong role directory or a missing HTTP-SD
+      # target for the split-box compute fleet.
+      - name: prometheus template convergence
+        run: |
+          set -euo pipefail
+          cd deploy/ansible
+          test ! -e roles/prometheus/files/prometheus.service
+          ansible control_plane -i inventory/hosts.ini -c local \
+            -e @roles/prometheus/defaults/main.yml \
+            -e ansible_hostname=ci-control-plane \
+            -m ansible.builtin.template \
+            -a "src=$(pwd)/roles/prometheus/templates/prometheus.yml.j2 dest=$RUNNER_TEMP/prometheus.yml"
+          ansible control_plane -i inventory/hosts.ini -c local \
+            -e @roles/prometheus/defaults/main.yml \
+            -e ansible_hostname=ci-control-plane \
+            -m ansible.builtin.template \
+            -a "src=$(pwd)/roles/prometheus/templates/prometheus.service.j2 dest=$RUNNER_TEMP/prometheus.service"
+          grep -q 'job_name: "gatewayd-internal"' "$RUNNER_TEMP/prometheus.yml"
+          grep -q 'http://127.0.0.1:8081/v1/internal/metrics/targets' "$RUNNER_TEMP/prometheus.yml"
+          grep -q -- '--web.listen-address=127.0.0.1:9095' "$RUNNER_TEMP/prometheus.service"
+          if grep -q '{{' "$RUNNER_TEMP/prometheus.service"; then
+            echo 'rendered Prometheus systemd unit contains an unresolved template placeholder' >&2
+            exit 1
+          fi
+
+          rules_dir="$RUNNER_TEMP/prometheus-rules"
+          mkdir -p "$rules_dir"
+          cp roles/prometheus/files/{faas.rules.yml,bridge.rules.yml,pg_backup.rules.yml} "$rules_dir/"
+          cp ../../pkg/promqlrules/data_placement.yaml "$rules_dir/"
+          sed "s#/etc/prometheus#$rules_dir#g" \
+            "$RUNNER_TEMP/prometheus.yml" > "$RUNNER_TEMP/prometheus-checked.yml"
+          promtool check config "$RUNNER_TEMP/prometheus-checked.yml"
+
       # Daemon smoke: every cmd/<daemon>/main.go is a one-box binary that wires
       # through pkg/wire.Daemon. `--help` must exit 0 with non-empty usage text
       # (a silent success here usually means init() truncated on a bad flag
