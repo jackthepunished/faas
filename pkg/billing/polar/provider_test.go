@@ -114,6 +114,18 @@ func TestEnsurePlanProductsValidatesConfiguredCatalog(t *testing.T) {
 	if productRequests != 3 {
 		t.Fatalf("catalog product requests = %d, want 3", productRequests)
 	}
+	entries := p.ListBillingCatalog(context.Background())
+	if len(entries) != 3 {
+		t.Fatalf("Polar catalog entries = %d, want 3", len(entries))
+	}
+	for _, entry := range entries {
+		if entry.Kind != api.BillingCatalogKindProduct || entry.Handle == "" {
+			t.Errorf("catalog entry = %+v, want a product handle", entry)
+		}
+		if entry.SyncedAt.IsZero() {
+			t.Errorf("catalog entry %s has zero synced_at", entry.Plan)
+		}
+	}
 }
 
 func TestEnsurePlanProductsRejectsWrongPriceBeforeStartup(t *testing.T) {
@@ -349,6 +361,44 @@ func TestCreateCustomerPortalSession(t *testing.T) {
 	}
 	if got != "https://polar.test/portal/session-1" {
 		t.Fatalf("portal URL = %q, want Polar session URL", got)
+	}
+}
+
+func TestChangeSubscriptionPlanSchedulesNextPeriodUpdate(t *testing.T) {
+	var gotIdempotency string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPatch || r.URL.Path != "/v1/subscriptions/sub-1" {
+			http.NotFound(w, r)
+			return
+		}
+		gotIdempotency = r.Header.Get("Idempotency-Key")
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body["product_id"] != "pro-product" || body["proration_behavior"] != "next_period" {
+			t.Fatalf("subscription update body = %v", body)
+		}
+		_, _ = io.WriteString(w, `{"id":"sub-1","current_period_end":"2026-09-30T00:00:00Z","pending_update":{"applies_at":"2026-09-30T00:00:00Z"}}`)
+	}))
+	defer server.Close()
+
+	p, err := NewProvider(testConfig(server.URL), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	effectiveAt, err := p.ChangeSubscriptionPlan(context.Background(), state.Account{
+		ID: "acct-1", StripeSubscriptionItem: "sub-1",
+	}, api.PlanPro)
+	if err != nil {
+		t.Fatalf("ChangeSubscriptionPlan: %v", err)
+	}
+	want := time.Date(2026, 9, 30, 0, 0, 0, 0, time.UTC)
+	if !effectiveAt.Equal(want) {
+		t.Fatalf("effective_at = %v, want %v", effectiveAt, want)
+	}
+	if gotIdempotency != "faas-plan-change-acct-1-pro" {
+		t.Fatalf("idempotency key = %q", gotIdempotency)
 	}
 }
 

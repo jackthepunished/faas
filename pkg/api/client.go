@@ -3049,7 +3049,7 @@ func (c *Client) ListDeployments(ctx context.Context, before string, limit int) 
 	return out, c.do(ctx, "GET", path, nil, &out)
 }
 
-// GetBillingPortal returns the operator-configured Stripe billing
+// GetBillingPortal returns the active provider's billing
 // portal URL for the authenticated account (issue #253). Empty string
 // means the box has FAAS_BILLING_PORTAL_URL unset — the CLI prints a
 // friendly hint instead of opening the browser to "". The endpoint

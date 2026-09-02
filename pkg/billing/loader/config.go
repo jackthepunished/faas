@@ -44,8 +44,8 @@ const (
 // loader doesn't import pkg/billing.
 type RootBillingConfig struct {
 	// Provider selects the active provider. Empty defaults to
-	// "paddle" (the production billing provider at v2 per
-	// ADR-032 v2). Use cfg.DefaultProvider() to read with the
+	// "polar" (the production billing provider for the public
+	// release). Use cfg.DefaultProvider() to read with the
 	// implicit default applied. Valid values: "stripe", "paddle",
 	// "polar".
 	// Unknown values fail the daemon boot with the same error
@@ -68,11 +68,11 @@ type RootBillingConfig struct {
 }
 
 // DefaultProvider returns the active provider literal with the
-// implicit-default applied (v2 = "paddle"). LoadProviderForAPID
+// implicit-default applied (public release = "polar"). LoadProviderForAPID
 // and LoadProviderForMeterd both go through this method so the
 // default lives in exactly one place. A future ADR that flips the
 // default (e.g. LemonSqueezy) updates this method + the test pin
-// at TestRootBillingConfig_DefaultProvider_PaddleAtV2, and the two
+// at TestRootBillingConfig_DefaultProvider_Polar, and the two
 // loader sites change mechanically.
 //
 // The legacy "stripe" opt-in (FAAS_BILLING_PROVIDER=stripe) is
@@ -80,7 +80,7 @@ type RootBillingConfig struct {
 // when Provider == "".
 func (c *RootBillingConfig) DefaultProvider() string {
 	if c == nil || c.Provider == "" {
-		return providerPaddle
+		return providerPolar
 	}
 	return c.Provider
 }

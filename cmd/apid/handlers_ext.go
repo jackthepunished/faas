@@ -3153,11 +3153,70 @@ func (s *server) changePlan(w http.ResponseWriter, r *http.Request, acct state.A
 		api.WriteProblem(w, prob)
 		return
 	}
+	// A downgrade is a provider-side subscription mutation, not a local
+	// entitlement mutation. Applying it locally first can leave a customer on
+	// Free while Polar continues charging the previous paid subscription. The
+	// provider webhook is the only source of truth for the eventual local plan.
+	if acct.Plan != plan {
+		prob := &api.Problem{
+			Status: http.StatusPaymentRequired,
+			Code:   api.CodePayment,
+			Title:  "Billing confirmation required",
+			Detail: "plan downgrades must be scheduled with the billing provider; the current plan remains active until provider confirmation",
+		}
+		if s.billingProvider == nil || acct.StripeSubscriptionItem == "" {
+			prob.BillingPortalURL = s.billingPortalURLForProvider(r.Context(), acct)
+			api.WriteProblem(w, prob)
+			return
+		}
+		changer, ok := s.billingProvider.(billing.SubscriptionPlanChangeProvider)
+		if !ok {
+			prob.Detail = "this billing provider does not support API plan downgrades; use the billing portal; the current plan remains active until provider confirmation"
+			prob.BillingPortalURL = s.billingPortalURLForProvider(r.Context(), acct)
+			api.WriteProblem(w, prob)
+			return
+		}
+		effectiveAt, err := changer.ChangeSubscriptionPlan(r.Context(), acct, plan)
+		if err != nil {
+			s.log.Error("schedule plan change failed",
+				"account", acct.ID,
+				"from", logsanitize.Field(string(acct.Plan)),
+				"to", logsanitize.Field(string(plan)),
+				"err", err)
+			if errors.Is(err, billing.ErrAlreadyCancelled) {
+				api.WriteProblem(w, api.NewProblem(http.StatusConflict,
+					api.CodeConflict, "billing subscription unavailable",
+					"the billing subscription is no longer active; refresh billing and try again"))
+				return
+			}
+			api.WriteProblem(w, api.NewProblem(http.StatusBadGateway,
+				"billing_plan_change_failed", "billing plan change failed",
+				"the provider could not schedule this plan change; the current plan remains active"))
+			return
+		}
+		updated, err := s.store.AccountByID(r.Context(), acct.ID)
+		if err != nil {
+			updated = acct
+		}
+		status := "pending_provider_confirmation"
+		response := s.accountResponse(r.Context(), updated, r)
+		response.PlanChangeStatus = status
+		response.RequestedPlan = string(plan)
+		if !effectiveAt.IsZero() {
+			response.EffectiveAt = &effectiveAt
+		}
+		writeJSON(w, http.StatusAccepted, response)
+		return
+	}
 	if err := s.store.UpdateAccountPlan(r.Context(), acct.ID, plan); err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not update plan"))
 		return
 	}
-	updated, _ := s.store.AccountByID(r.Context(), acct.ID)
+	updated, err := s.store.AccountByID(r.Context(), acct.ID)
+	if err != nil {
+		updated = acct
+		updated.Plan = plan
+	}
 	// CodeQL go/log-injection (CWE-117): plan was enum-validated against
 	// the 4 Plan constants (free|hobby|pro|scale) by plan.Valid() in this
 	// handler — a bad value is rejected with 400 before reaching here,
@@ -3173,9 +3232,7 @@ func (s *server) changePlan(w http.ResponseWriter, r *http.Request, acct state.A
 		"from": string(acct.Plan),
 		"to":   string(plan),
 	})
-	writeJSON(w, http.StatusOK, api.AccountResponse{
-		ID: updated.ID, Email: updated.Email, Plan: string(updated.Plan), Status: string(updated.Status),
-	})
+	writeJSON(w, http.StatusOK, s.accountResponse(r.Context(), updated, r))
 }
 
 // --- spend cap raise (issue #561) --------------------------------------------
@@ -3216,9 +3273,7 @@ func (s *server) raiseOverageCap(w http.ResponseWriter, r *http.Request, acct st
 		api.WriteProblem(w, api.ErrInternal("could not update overage cap"))
 		return
 	}
-	writeJSON(w, http.StatusOK, api.AccountResponse{
-		ID: updated.ID, Email: updated.Email, Plan: string(updated.Plan), Status: string(updated.Status),
-	})
+	writeJSON(w, http.StatusOK, s.accountResponse(r.Context(), updated, r))
 }
 
 // raiseOverageCapSvc is the shared validation-free mutation body used
@@ -3400,8 +3455,9 @@ func (s *server) billingWebhookTolerance() time.Duration {
 // 200'd). Returns 400 on bad payload / bad signature. Unknown event
 // types return 200 so Paddle stops retrying.
 func (s *server) paddleWebhook(w http.ResponseWriter, r *http.Request) {
-	if s.billingProvider == nil {
+	if s.billingProvider == nil || providerName(s.billingProvider) != "paddle" {
 		s.log.Error("paddle_webhook.no_provider",
+			"provider", providerName(s.billingProvider),
 			"err", "FAAS_BILLING_PROVIDER != paddle; refusing to process events")
 		api.WriteProblem(w, api.NewProblem(http.StatusServiceUnavailable, api.CodeCapacity,
 			"paddle webhook not configured",

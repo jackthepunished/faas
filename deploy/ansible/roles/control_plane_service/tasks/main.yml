@@ -574,35 +574,30 @@
 # (Original block referenced faas-imaged.service; see the matching
 # task in compute_only_service/tasks/main.yml.)
 
-# PR-P4 — soft assert on Paddle provider secrets (operator warning).
-# When FAAS_BILLING_PROVIDER=paddle is in /etc/faas/sealed.env, the
-# apid daemon refuses to boot without FAAS_PADDLE_API_KEY, so a
-# missing key already fails loud at the daemon level — we surface
-# it here too as a belt-and-braces so the operator sees it BEFORE
-# the systemd daemon-reload attempts the apid start. Soft assert:
-# not failed_when, because (a) the env may not be populated yet on
-# a fresh box where the operator intends to fill it post-bootstrap
-# and (b) the actual fail-closed is the daemon's own boot error.
-# The debug line is only emitted when the provider selector is set
-# to paddle — a Stripe-default install reports nothing.
-- name: control_plane_service — soft assert FAAS_PADDLE_API_KEY present when provider=paddle (PR-P4)
+# Public-release billing — soft assert on Polar provider secrets (operator warning).
+# When Polar is selected (or the selector is omitted), the apid and meterd
+# daemons fail closed without the access token. Surface the missing token
+# before systemd attempts the restart; the daemon remains the authoritative
+# fail-closed gate and this task intentionally stays a warning.
+- name: control_plane_service — soft assert Polar access token present
   ansible.builtin.shell: |
     set -euo pipefail
-    if grep -qE '^FAAS_BILLING_PROVIDER=paddle$' /etc/faas/sealed.env 2>/dev/null; then
-      if ! grep -qE '^FAAS_PADDLE_API_KEY=pdl_' /etc/faas/sealed.env; then
-        echo "WARNING: FAAS_BILLING_PROVIDER=paddle set but FAAS_PADDLE_API_KEY is missing or empty; apid will refuse to boot. Fill in /etc/faas/sealed.env before restarting the daemon."
+    if grep -qE '^FAAS_BILLING_PROVIDER=polar$' /etc/faas/sealed.env 2>/dev/null \
+      || ! grep -qE '^FAAS_BILLING_PROVIDER=' /etc/faas/sealed.env 2>/dev/null; then
+      if ! grep -qE '^FAAS_POLAR_ACCESS_TOKEN=.' /etc/faas/sealed.env; then
+        echo "WARNING: Polar is the active billing provider but FAAS_POLAR_ACCESS_TOKEN is missing or empty; apid and meterd will refuse to boot. Fill in /etc/faas/sealed.env before restarting the daemons."
         exit 0
       fi
-      echo "Paddle billing provider selected — FAAS_PADDLE_API_KEY present (mode-tripwire deferred to verify-secrets.sh + daemon-level fail-closed)."
+      echo "Polar billing provider selected — FAAS_POLAR_ACCESS_TOKEN present (catalog tripwire deferred to verify-secrets.sh + daemon-level fail-closed)."
     fi
   args:
     executable: /bin/bash
   changed_when: false
-  register: faas_paddle_soft_assert
-- name: control_plane_service — debug Paddle soft assert
+  register: faas_polar_soft_assert
+- name: control_plane_service — debug Polar soft assert
   ansible.builtin.debug:
-    msg: "{{ faas_paddle_soft_assert.stdout }}"
-  when: faas_paddle_soft_assert.stdout != ""
+    msg: "{{ faas_polar_soft_assert.stdout }}"
+  when: faas_polar_soft_assert.stdout != ""
 
 # Issue #246 / ADR-115 / spec G4 closure — mail transport must
 # be selected (or dev-mode explicit) before the daemon boots in

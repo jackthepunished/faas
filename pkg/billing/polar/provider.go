@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -57,6 +58,8 @@ type Provider struct {
 	dedupe        usageDedupe
 	webhookTol    time.Duration
 	now           func() time.Time
+	catalogMu     sync.RWMutex
+	lastSyncAt    time.Time
 }
 
 var _ billing.Provider = (*Provider)(nil)
@@ -186,6 +189,13 @@ func (p *Provider) EnsurePlanProducts(ctx context.Context) error {
 	if err := p.validateCatalog(ctx); err != nil {
 		return err
 	}
+	p.catalogMu.Lock()
+	stamp := time.Now().UTC()
+	if p.now != nil {
+		stamp = p.now().UTC()
+	}
+	p.lastSyncAt = stamp
+	p.catalogMu.Unlock()
 	return nil
 }
 
@@ -628,6 +638,52 @@ type subscriptionResponse struct {
 	ID                string    `json:"id"`
 	CurrentPeriodEnd  time.Time `json:"current_period_end"`
 	CancelAtPeriodEnd bool      `json:"cancel_at_period_end"`
+	PendingUpdate     *struct {
+		AppliesAt time.Time `json:"applies_at"`
+	} `json:"pending_update"`
+}
+
+// ChangeSubscriptionPlan schedules an existing Polar subscription for the
+// requested plan. Paid-to-paid changes use Polar's next_period proration
+// mode, which creates a pending update instead of charging or changing the
+// entitlement in the middle of the current period. Free is represented by a
+// period-end cancellation because Gregale does not maintain a free Polar
+// product.
+//
+// The caller intentionally waits for subscription.updated/revoked before
+// changing the local account plan. This prevents a successful provider API
+// response followed by a lost webhook from granting the wrong entitlement.
+func (p *Provider) ChangeSubscriptionPlan(ctx context.Context, acct state.Account, targetPlan api.Plan) (time.Time, error) {
+	if acct.StripeSubscriptionItem == "" {
+		return time.Time{}, fmt.Errorf("polar: change subscription account=%s: %w", acct.ID, billing.ErrAlreadyCancelled)
+	}
+	if targetPlan == api.PlanFree {
+		return p.CancelAtPeriodEnd(ctx, acct)
+	}
+	if !targetPlan.IsPaid() {
+		return time.Time{}, fmt.Errorf("polar: invalid target plan=%q", targetPlan)
+	}
+	productID := strings.TrimSpace(p.products[targetPlan])
+	if productID == "" {
+		return time.Time{}, fmt.Errorf("polar: product id missing for plan=%s", targetPlan)
+	}
+	body := map[string]any{
+		"product_id":         productID,
+		"proration_behavior": "next_period",
+	}
+	var sub subscriptionResponse
+	path := "/v1/subscriptions/" + url.PathEscape(acct.StripeSubscriptionItem)
+	idem := fmt.Sprintf("faas-plan-change-%s-%s", acct.ID, targetPlan)
+	if err := p.doJSON(ctx, http.MethodPatch, path, body, &sub, idem); err != nil {
+		return time.Time{}, fmt.Errorf("polar: change subscription account=%s target=%s: %w", acct.ID, targetPlan, err)
+	}
+	if sub.PendingUpdate != nil && !sub.PendingUpdate.AppliesAt.IsZero() {
+		return sub.PendingUpdate.AppliesAt, nil
+	}
+	if !sub.CurrentPeriodEnd.IsZero() {
+		return sub.CurrentPeriodEnd, nil
+	}
+	return time.Time{}, fmt.Errorf("polar: change subscription account=%s returned no effective date", acct.ID)
 }
 
 // CancelAtPeriodEnd calls Polar's documented PATCH subscription operation.

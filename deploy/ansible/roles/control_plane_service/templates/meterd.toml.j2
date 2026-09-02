@@ -24,6 +24,6 @@ egress_tls_ca_path = "{{ faas_meterd_egress_tls_ca_path }}"
 stripe_interval = "1h"
 
 [billing]
-# Production defaults to Paddle. Operators may explicitly select the
-# documented Stripe rollback through FAAS_BILLING_PROVIDER in sealed.env.
-provider = "paddle"
+# Production defaults to Polar. Operators may explicitly select the
+# legacy Stripe or Paddle provider through FAAS_BILLING_PROVIDER in sealed.env.
+provider = "polar"

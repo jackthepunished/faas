@@ -1066,7 +1066,7 @@ jobs:
       # Paddle + Stripe blocks added by Streams A + B). The
       # script itself runs against /etc/faas/sealed.env on a real
       # control-plane node; CI only checks it parses + has the
-      # expected Paddle+Stripe block headers, via a hermetic
+      # expected Polar+legacy-provider block headers, via a hermetic
       # SECRETS_FILE override (an empty fixture that the script
       # must not reject as malformed). see cmd/gregale/_test for
       # the equivalent CLI flag parse-tripwire pattern.
@@ -1075,8 +1075,8 @@ jobs:
           set -euo pipefail
           test -x deploy/scripts/verify-secrets.sh
           bash -n deploy/scripts/verify-secrets.sh
-          grep -q "FAAS_PADDLE_API_KEY" deploy/scripts/verify-secrets.sh
-          grep -q "FAAS_BILLING_PROVIDER=paddle" deploy/scripts/verify-secrets.sh
+          grep -q "FAAS_POLAR_ACCESS_TOKEN" deploy/scripts/verify-secrets.sh
+          grep -q "FAAS_BILLING_PROVIDER=polar" deploy/scripts/verify-secrets.sh
 
       # Cross-PR slot collision. TestMigrationsUniquePrefixes (in the static
       # step above) only sees one branch at a time: a PR builds against
