@@ -15,6 +15,7 @@ import (
 	"net/netip"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -577,6 +578,16 @@ type Handler struct {
 	// drains and before the wake gate (a schedd gRPC RPC) is touched.
 	accountLimiter *Limiter
 	gate           *WakeGate
+	// admissionQueue protects the control plane from a simultaneous cold
+	// burst across many apps. It is intentionally separate from gate:
+	// gate coalesces waiters for one app, while admissionQueue orders the
+	// resulting app leaders across plan priorities.
+	admissionQueue *wakeAdmissionQueue
+	// burstPressure is the immediate request-pressure signal used to
+	// trigger bounded scale-out during a public burst. It is local to
+	// this gateway process and deliberately separate from scraped
+	// metrics, which arrive too late to protect a cold burst.
+	burstPressure *burstPressure
 	// metrics may be nil; nil-guarded everywhere it is read.
 	metrics *Metrics
 	// mirrorRoundTripper (issue #72 / ADR-124 PR-A3) is the
@@ -926,8 +937,18 @@ func NewHandlerWith(backend Backend, m *Metrics, log *slog.Logger) *Handler {
 		routeConsumerLimiter: NewLimiterWithLRU(EdgeRuleConsumerCacheCap),
 		accountLimiter:       NewLimiter(),
 		gate:                 NewWakeGate(api.WakeQueueCap, time.Duration(api.WakeQueueTTLSeconds)*time.Second),
-		metrics:              m,
-		log:                  log,
+		admissionQueue: newWakeAdmissionQueue(
+			api.GatewayWakeAdmissionParallelism,
+			api.GatewayWakeAdmissionQueueCap,
+			func(plan string, depth int) {
+				if m != nil {
+					m.SetWakeAdmissionQueueDepth(plan, depth)
+				}
+			},
+		),
+		burstPressure: &burstPressure{},
+		metrics:       m,
+		log:           log,
 		// mirrorSlots is sync.Map (zero value ready); the cap is
 		// loaded from api.MirrorMaxConcurrentPerRule (default 5)
 		// so the per-rule VM cost circuit matches the MirrorMaxLifetimeSeconds
@@ -5145,10 +5166,19 @@ haveApp:
 	// shouldWake predicate runs HealthyCount against the plan's
 	// effective max_concurrency, so a burst of N requests admits up to
 	// N instances before short-circuiting.
+	burstDone := h.burstPressure.begin(app.ID)
+	defer burstDone()
 	limits, _ := api.LimitsFor(app.Plan)
 	//nolint:contextcheck // request ctx at handler boundary.
-	cold, wakeID, wakeMethod, err := h.ensureCapacity(r.Context(), app.ID, app.AccountID, app.Scope, limits.MaxConcurrency)
+	cold, wakeID, wakeMethod, err := h.ensureCapacity(r.Context(), app.ID, app.AccountID, app.Scope, limits.MaxConcurrency, app.Plan)
 	if err != nil {
+		// The per-app gate rejects excess cold-wake followers before the
+		// gateway-wide admission queue is reached. Count that outcome on
+		// the same bounded admission surface so operators can distinguish
+		// an app-local queue from a saturated gateway queue.
+		if h.metrics != nil && errors.Is(err, ErrQueueFull) {
+			h.metrics.ObserveWakeAdmission(string(app.Plan), err, false, 0)
+		}
 		// ADR-122 §Decision: kind=cache stale-on-error path.
 		// On wake failure (queue full, bootstrap abort, etc.)
 		// consult the cache for a stale entry BEFORE falling
@@ -5164,6 +5194,13 @@ haveApp:
 		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
 		return
 	}
+	// The first request above guarantees one routable target. Use the
+	// request pressure accumulated by the whole burst to start bounded
+	// background admissions for the remaining desired capacity. This is
+	// intentionally detached from the current request's cancellation so
+	// a client disconnect cannot abandon a capacity reservation already
+	// handed to the scheduler.
+	h.maybeBurstCapacity(r.Context(), app, limits.MaxConcurrency, limits.ConcurrencyPerVMBound)
 
 	// Pick one routable Target via atomic round-robin. After a
 	// successful ensure, HealthyCount ≥ 1, so this should succeed
@@ -5286,7 +5323,26 @@ haveApp:
 	// the same dead target forever. The signal is internal and only set by the
 	// bridge on transport/liveness failures; ordinary guest 502/503 responses
 	// are therefore left untouched.
-	staleSignal := &staleTargetSignal{}
+	staleContext := r.Context()
+	staleSignal := &staleTargetSignal{
+		onStale: func() {
+			// Evict synchronously with the transport failure so a
+			// concurrent request cannot pick this known-dead target.
+			// RecoverStaleTarget detaches and bounds lifecycle work in
+			// the production backend; it does not inherit the client
+			// cancellation even though the request context is passed in.
+			if evictor, ok := h.backend.(interface {
+				EvictInstance(appID, instanceID string)
+			}); ok {
+				evictor.EvictInstance(app.ID, target.InstanceID)
+				h.log.Warn("gateway: evicted stale target", "app_id", app.ID,
+					"instance_id", target.InstanceID, "node_id", target.NodeID)
+			}
+			if recovery, ok := h.backend.(staleTargetRecovery); ok {
+				recovery.RecoverStaleTarget(staleContext, app.ID, app.Scope, limits.MaxConcurrency)
+			}
+		},
+	}
 	//nolint:contextcheck // withStaleTargetSignal intentionally inherits r.Context.
 	r = r.WithContext(withStaleTargetSignal(r.Context(), staleSignal))
 
@@ -5537,23 +5593,6 @@ haveApp:
 		planCap := app.Plan.MaxResponseBodyBytes()
 		capped := h.setupBufferedCapWriter(w, app, planCap)
 		h.proxyFor(target.NodeID, planCap).ServeHTTP(capped, r)
-	}
-	//nolint:contextcheck // staleTargetDetected only reads the marker from r.Context.
-	if staleTargetDetected(r.Context()) {
-		if evictor, ok := h.backend.(interface {
-			EvictInstance(appID, instanceID string)
-		}); ok {
-			evictor.EvictInstance(app.ID, target.InstanceID)
-			h.log.Warn("gateway: evicted stale target", "app_id", app.ID,
-				"instance_id", target.InstanceID, "node_id", target.NodeID)
-		}
-		if recovery, ok := h.backend.(staleTargetRecovery); ok {
-			// The client request may already be canceled after a bridge
-			// failure. Recovery is lifecycle work for the fleet, not work
-			// owned by that client, so the production backend detaches it
-			// and bounds the admission internally.
-			recovery.RecoverStaleTarget(r.Context(), app.ID, app.Scope, limits.MaxConcurrency)
-		}
 	}
 	// Issue #471 / ADR-047 PR-A buffered-fallback AC. The
 	// per-app streaming_enabled flag (ap.StreamingEnabled,
@@ -6466,7 +6505,7 @@ func (s *statusRecorder) finalFlush() {
 // prod app's. Empty = prod (legacy). When the cold-start path calls
 // coldStart and coldStart in turn calls Admit, scope is plumbed
 // through both paths.
-func (h *Handler) ensureCapacity(ctx context.Context, appID, accountID, scope string, maxConcurrency int) (cold bool, wakeID string, method WakeMethod, err error) {
+func (h *Handler) ensureCapacity(ctx context.Context, appID, accountID, scope string, maxConcurrency int, plan api.Plan) (cold bool, wakeID string, method WakeMethod, err error) {
 	// HealthyCount is intentionally process-local for the hot path, but an
 	// empty process-local cache is not authoritative in a multi-node fleet.
 	// Reconcile before entering the cold path so a VM admitted by another
@@ -6481,7 +6520,7 @@ func (h *Handler) ensureCapacity(ctx context.Context, appID, accountID, scope st
 	if h.backend.HealthyCount(appID) > 0 {
 		return false, "", WakeMethodUnspecified, nil
 	}
-	cold, wakeID, method, err = h.coldStart(ctx, appID, accountID, scope, maxConcurrency)
+	cold, wakeID, method, err = h.coldStart(ctx, appID, accountID, scope, maxConcurrency, plan)
 	if err != nil {
 		return false, "", WakeMethodUnspecified, err
 	}
@@ -6492,13 +6531,14 @@ func (h *Handler) ensureCapacity(ctx context.Context, appID, accountID, scope st
 // through the WakeGate's single-flight coalescing. shouldWake is held
 // under the gate lock and re-runs HealthyCount; if a peer's admit has
 // just landed, we skip the redundant cold boot.
-func (h *Handler) coldStart(ctx context.Context, appID, accountID, scope string, maxConcurrency int) (bool, string, WakeMethod, error) {
+func (h *Handler) coldStart(ctx context.Context, appID, accountID, scope string, maxConcurrency int, plan api.Plan) (bool, string, WakeMethod, error) {
 	var (
 		admittedWakeID string
 		cold           bool
 		method         WakeMethod
 	)
-	werr := h.gate.Wait(ctx, appID, accountID,
+	policy := WakeAdmissionPolicyForPlan(plan)
+	werr := h.gate.WaitWithPolicy(ctx, appID, accountID, policy,
 		func() bool {
 			// max_concurrency is a ceiling for scheduler-driven scale-up,
 			// not a reason for the request path to create another VM. Once
@@ -6506,8 +6546,21 @@ func (h *Handler) coldStart(ctx context.Context, appID, accountID, scope string,
 			return h.backend.HealthyCount(appID) == 0
 		},
 		func(ctx context.Context) error {
-			if ensurer, ok := h.backend.(warmEnsurer); ok && scope == "" {
-				id, m, atCapacity, e := ensurer.EnsureWarm(ctx, appID, scope, sched.TriggerGateway)
+			admit := func(admitCtx context.Context) error {
+				if ensurer, ok := h.backend.(warmEnsurer); ok && scope == "" {
+					id, m, atCapacity, e := ensurer.EnsureWarm(admitCtx, appID, scope, sched.TriggerGateway)
+					if e != nil {
+						return e
+					}
+					if atCapacity {
+						return nil
+					}
+					admittedWakeID = id
+					method = m
+					cold = true
+					return nil
+				}
+				id, m, atCapacity, e := h.backend.Admit(admitCtx, appID, "", scope, sched.TriggerGateway, maxConcurrency)
 				if e != nil {
 					return e
 				}
@@ -6519,17 +6572,14 @@ func (h *Handler) coldStart(ctx context.Context, appID, accountID, scope string,
 				cold = true
 				return nil
 			}
-			id, m, atCapacity, e := h.backend.Admit(ctx, appID, "", scope, sched.TriggerGateway, maxConcurrency)
-			if e != nil {
-				return e
+			if h.admissionQueue == nil {
+				return admit(ctx)
 			}
-			if atCapacity {
-				return nil
+			queued, wait, admitErr := h.admissionQueue.Do(ctx, appID, string(plan), policy, admit)
+			if h.metrics != nil {
+				h.metrics.ObserveWakeAdmission(string(plan), admitErr, queued, wait)
 			}
-			admittedWakeID = id
-			method = m
-			cold = true
-			return nil
+			return admitErr
 		},
 		// ADR-098 C7: bootstrap-cap predicate. The detached leader
 		// polls this on a 1s tick; if the queue drained (the gate
@@ -6559,10 +6609,21 @@ func (h *Handler) coldStart(ctx context.Context, appID, accountID, scope string,
 
 func writeWakeError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, ErrWakeQueueWaitTimeout):
+		retryAfter := wakeRetryAfterSeconds(err, 5)
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+		api.WriteProblem(w, api.NewProblem(http.StatusServiceUnavailable, api.CodeCapacity,
+			"Wake queue wait budget exceeded", "the app remained cold beyond its queue wait budget; retry shortly"))
 	case errors.Is(err, ErrQueueFull):
-		w.Header().Set("Retry-After", "5")
+		retryAfter := wakeRetryAfterSeconds(err, 5)
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 		api.WriteProblem(w, api.NewProblem(http.StatusServiceUnavailable, api.CodeCapacity,
 			"Briefly at capacity", "the wake queue is full; retry shortly"))
+	case errors.Is(err, ErrWakeAdmissionQueueFull):
+		retryAfter := wakeRetryAfterSeconds(err, 5)
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+		api.WriteProblem(w, api.NewProblem(http.StatusServiceUnavailable, api.CodeCapacity,
+			"Wake admission is busy", "the gateway is admitting other cold wakes; retry shortly"))
 	case errors.Is(err, ErrBootstrapAborted):
 		// ADR-098 C7: the leader aborted under the bootstrap cap
 		// (queue empty AND no live instance). The customer should
@@ -6579,6 +6640,37 @@ func writeWakeError(w http.ResponseWriter, err error) {
 		}
 		api.WriteProblem(w, api.ErrCapacity("wake failed"))
 	}
+}
+
+func wakeRetryAfterSeconds(err error, fallback int) int {
+	if fallback < 1 {
+		fallback = 1
+	}
+	var retryAfter time.Duration
+	var perAppFull *WakeQueueFullError
+	var perAppTimeout *WakeQueueWaitTimeoutError
+	var globalFull *WakeAdmissionQueueFullError
+	var globalTimeout *WakeAdmissionQueueWaitTimeoutError
+	switch {
+	case errors.As(err, &perAppFull):
+		retryAfter = perAppFull.RetryAfter
+	case errors.As(err, &perAppTimeout):
+		retryAfter = perAppTimeout.RetryAfter
+	case errors.As(err, &globalFull):
+		retryAfter = globalFull.RetryAfter
+	case errors.As(err, &globalTimeout):
+		retryAfter = globalTimeout.RetryAfter
+	default:
+		return fallback
+	}
+	seconds := int(retryAfter / time.Second)
+	if retryAfter%time.Second != 0 {
+		seconds++
+	}
+	if seconds < 1 {
+		return fallback
+	}
+	return seconds
 }
 
 // sharedUpstreamTransport is the single *http.Transport gatewayd-internal uses to

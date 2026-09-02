@@ -227,6 +227,17 @@ kernel. This keeps the kernel digest identical across GCP, Hetzner, OVH, and
 other bare-metal providers. The local source build remains only for
 image-seed/dev bootstrap, with deterministic build metadata.
 
+The release workflow also publishes that same file through the configured
+shared storage backend at `kernel/<firecracker_version>` before the node join
+starts. `gregalectl artifact publish` is immutable and idempotent: it refuses
+to overwrite an existing object whose SHA-256 differs from the signed
+`release.kernel_digest`. `node_join.yml` runs `gregalectl artifact verify` with
+the staged `storage.env` and manifest before bootstrap/service restart, which
+both catches a missing remote artifact early and prewarms the node cache.
+This is the required path for remote-only OCI mode; local `/srv/fc/kernel` is
+still staged for the host contract but is not used as a hidden split-box
+fallback.
+
 The database DSNs remain in the separate root-only
 `/etc/faas/compute-db.env`; the shared storage contract and registry
 credentials live in `roles/_shared/files/storage.env.example` and remain

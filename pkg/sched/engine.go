@@ -1456,6 +1456,24 @@ func withScaleOutBurstContinuation(ctx context.Context) context.Context {
 	return context.WithValue(ctx, scaleOutBurstContinuationKey{}, true)
 }
 
+// WithBurstContinuation marks a schedd admission as a continuation of a
+// bounded, already-approved burst. The marker is intentionally narrow: it
+// bypasses only the per-app scale-out cooldown; every continuation still
+// goes through the normal ledger, placement, resource, and boot pipeline.
+// The gRPC adapter uses this when carrying Engine.AdmitInstances semantics
+// across the process boundary.
+func WithBurstContinuation(ctx context.Context) context.Context {
+	return withScaleOutBurstContinuation(ctx)
+}
+
+// IsBurstContinuation reports whether a schedd admission carries the bounded
+// burst continuation marker. It is used by the gRPC boundary tests and by
+// adapters that need to preserve the Engine.AdmitInstances contract without
+// exposing the private context-key type.
+func IsBurstContinuation(ctx context.Context) bool {
+	return isScaleOutBurstContinuation(ctx)
+}
+
 func isScaleOutBurstContinuation(ctx context.Context) bool {
 	value, _ := ctx.Value(scaleOutBurstContinuationKey{}).(bool)
 	return value
@@ -5881,8 +5899,12 @@ func (e *Engine) KillStuck(ctx context.Context, instanceID, appID string, reason
 //     truth for the §13 idle reaper.
 //
 // `reason` is the wire-side string from the vmmd poll goroutine
-// (closed set {liveness_n_consecutive, liveness_timeout,
-// liveness_conn_refused, liveness_conn_err, liveness_non_200}).
+// (probe set {liveness_n_consecutive, liveness_timeout,
+// liveness_conn_refused, liveness_conn_err, liveness_non_200} plus
+// source classifications {liveness_infrastructure,
+// liveness_process_exited}). Infrastructure is recoverable but is
+// deliberately excluded from the app-wide permanent-eviction budget;
+// process_exited remains eligible for that budget.
 // Audit-kind discriminator is `liveness_failed` (the state-machine
 // event); `reason` lands in the audit row's data JSON so the
 // dashboard can group by outcome class.
@@ -5978,8 +6000,9 @@ func (e *Engine) DestroyForLivenessFailure(ctx context.Context, instanceID, reas
 	// Firecracker cannot pin the goroutine past the deadline —
 	// the destroy times out and the liveness_resume hook on
 	// the next cold-boot instance takes over.
-	if err := e.timedDestroy(ctx, freshLocked.NodeID, instanceID, 5*time.Second); err != nil {
-		e.log.Warn("liveness: destroy failed (best-effort)", "instance", instanceID, "reason", reason, "err", err)
+	destroyErr := e.timedDestroy(ctx, freshLocked.NodeID, instanceID, 5*time.Second)
+	if destroyErr != nil {
+		e.log.Warn("liveness: destroy failed (best-effort)", "instance", instanceID, "reason", reason, "err", destroyErr)
 	}
 
 	// Audit row + metric. The audit kind is
@@ -6039,15 +6062,26 @@ func (e *Engine) DestroyForLivenessFailure(ctx context.Context, instanceID, reas
 		}
 	}
 
-	// Sliding-window check: N restarts in the window parks the
+	// Sliding-window check: N confirmed guest restarts in the window parks the
 	// parent app so further traffic is rejected at the wake gate.
 	// shouldPark=true flips apps.status='evicted_cold' + emits
 	// the instances.parked_liveness_exhausted audit row. Best-effort:
 	// the destroy above is the source of truth; a window miss
 	// just means the next liveness failure repaints the same
-	// state. nil window → no check (test-only opt-out).
-	if e.livenessWindow != nil {
-		if shouldPark, _ := e.livenessWindow.RecordRestart(deploymentID, now); shouldPark {
+	// state. Infrastructure-correlated recovery is intentionally
+	// excluded: it can replace a VM, but it cannot permanently
+	// evict a healthy app. A destroy timeout is excluded too,
+	// because the control plane has no proof that a restart completed.
+	// nil window → no check (test-only opt-out).
+	budgetedRestart := destroyErr == nil && reason != fcvm.LivenessReasonInfrastructure
+	if !budgetedRestart {
+		e.log.Info("liveness: restart excluded from eviction budget",
+			"instance", instanceID,
+			"reason", reason,
+			"destroy_succeeded", destroyErr == nil)
+	}
+	if e.livenessWindow != nil && budgetedRestart {
+		if shouldPark, _ := e.livenessWindow.RecordRestartOnNode(deploymentID, freshLocked.NodeID, now); shouldPark {
 			if err := e.ParkDeployment(ctx, deploymentID, "liveness_exhausted"); err != nil {
 				e.log.Warn("liveness: park deployment failed", "deployment", deploymentID, "err", err)
 			}
@@ -6060,8 +6094,10 @@ func (e *Engine) DestroyForLivenessFailure(ctx context.Context, instanceID, reas
 	// a column bump miss just means the persistent source-of-truth
 	// lags by one restart (the next bump catches up). Mirrors the
 	// AuditWriteFail warning posture above — log + continue.
-	if err := e.store.RecordRestart(ctx, deploymentID); err != nil {
-		e.log.Warn("liveness: persist restart count failed", "deployment", deploymentID, "err", err)
+	if budgetedRestart {
+		if err := e.store.RecordRestart(ctx, deploymentID); err != nil {
+			e.log.Warn("liveness: persist restart count failed", "deployment", deploymentID, "err", err)
+		}
 	}
 	return nil
 }

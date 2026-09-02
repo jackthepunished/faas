@@ -2975,6 +2975,30 @@ const (
 	WakeQueueCap        = 512              // per-app wake queue
 	WakeQueueTTLSeconds = 30
 
+	// GatewayWakeAdmissionParallelism bounds concurrent cold-wake
+	// admissions in one gateway process. The gateway still coalesces
+	// requests per app; this cap protects the control plane when many
+	// different apps become cold at the same time.
+	GatewayWakeAdmissionParallelism = 4
+	// GatewayWakeAdmissionQueueCap bounds distinct app leaders waiting
+	// for a gateway admission slot. Per-app waiter caps are enforced by
+	// WakeAdmissionPolicyForPlan in pkg/gateway; this is the cross-app bound.
+	GatewayWakeAdmissionQueueCap = 128
+
+	// Gateway wake admission defaults are plan policy, kept here with the
+	// rest of the platform's quotas so gateway and scheduler-facing code do
+	// not grow separate copies of customer limits.
+	GatewayWakeAdmissionFreeMaxWaiters  = 4
+	GatewayWakeAdmissionHobbyMaxWaiters = 16
+	GatewayWakeAdmissionProMaxWaiters   = 64
+	GatewayWakeAdmissionScaleMaxWaiters = 128
+	GatewayWakeAdmissionFreeMaxWait     = 10 * time.Second
+	GatewayWakeAdmissionPaidMaxWait     = 30 * time.Second
+	GatewayWakeAdmissionFreePriority    = 1
+	GatewayWakeAdmissionHobbyPriority   = 2
+	GatewayWakeAdmissionProPriority     = 3
+	GatewayWakeAdmissionScalePriority   = 4
+
 	// MirrorMaxLifetimeSeconds (issue #72 / ADR-125) is the hard
 	// upper bound on how long a single mirror goroutine can run.
 	// The gateway derives a per-request context via
