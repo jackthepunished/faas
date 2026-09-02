@@ -150,7 +150,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
       archive_module="$(go env GOMODCACHE)/github.com/moby/go-archive@v${GO_ARCHIVE_VERSION}" && \
       rm -rf vendor/github.com/moby/go-archive && \
       cp -a "${archive_module}" vendor/github.com/moby/go-archive && \
-      sed -i "s#github.com/moby/go-archive v0.2.0#github.com/moby/go-archive v${GO_ARCHIVE_VERSION}#" vendor/modules.txt && \
+      sed -i \
+        -e "s#github.com/moby/go-archive v0.2.0#github.com/moby/go-archive v${GO_ARCHIVE_VERSION}#" \
+        -e "s#google.golang.org/grpc v1.82.1#google.golang.org/grpc v1.83.1#" \
+        vendor/modules.txt && \
       CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
         go build -mod=vendor -trimpath -o /out/buildkitd ./cmd/buildkitd && \
       CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
