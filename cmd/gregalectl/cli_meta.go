@@ -103,6 +103,7 @@ var cliCommands = []cliCommand{
 					{Name: "env-file", Short: "storage.env path (required)"},
 					{Name: "manifest-file", Short: "production manifest path (required)"},
 					{Name: "no-cache", Short: "bypass the local read-through cache"},
+					{Name: "refresh", Short: "fetch from shared storage and replace the local cache"},
 				},
 			},
 		},

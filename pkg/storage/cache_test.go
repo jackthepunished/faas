@@ -126,6 +126,49 @@ func TestLocalCacheBackend_PutGetRoundTrip(t *testing.T) {
 	}
 }
 
+// TestLocalCacheBackend_RefreshReplacesExistingEntry pins the release
+// adoption path. A node can already have the previous release's bytes under
+// the same storage key; a refresh must bypass that entry, read the canonical
+// parent, and replace the cache before the next normal read.
+func TestLocalCacheBackend_RefreshReplacesExistingEntry(t *testing.T) {
+	parent := newFakeBackend()
+	cache, err := storage.NewLocalCacheBackend(parent, filepath.Join(t.TempDir(), "cache"), 0)
+	if err != nil {
+		t.Fatalf("NewLocalCacheBackend: %v", err)
+	}
+	ctx := context.Background()
+	if err := parent.Put(ctx, "kernel/1.7.0", strings.NewReader("old-kernel")); err != nil {
+		t.Fatalf("parent.Put old: %v", err)
+	}
+	if got, err := readAll(ctx, cache, "kernel/1.7.0"); err != nil || got != "old-kernel" {
+		t.Fatalf("initial Get = %q, %v; want old-kernel", got, err)
+	}
+
+	parent.blobs["kernel/1.7.0"] = []byte("new-kernel")
+	t.Setenv("FAAS_STORAGE_CACHE_REFRESH", "true")
+	got, err := readAll(ctx, cache, "kernel/1.7.0")
+	if err != nil {
+		t.Fatalf("refresh Get: %v", err)
+	}
+	if got != "new-kernel" {
+		t.Fatalf("refresh Get = %q, want new-kernel", got)
+	}
+
+	// Disable refresh for the normal path; the replacement must now be a
+	// cache hit rather than another parent read.
+	t.Setenv("FAAS_STORAGE_CACHE_REFRESH", "false")
+	got, err = readAll(ctx, cache, "kernel/1.7.0")
+	if err != nil {
+		t.Fatalf("post-refresh Get: %v", err)
+	}
+	if got != "new-kernel" {
+		t.Fatalf("post-refresh Get = %q, want new-kernel", got)
+	}
+	if parent.gets.Load() != 2 {
+		t.Errorf("parent.gets = %d, want 2 (initial miss + refresh)", parent.gets.Load())
+	}
+}
+
 // TestLocalCacheBackend_LocalPathDelegates pins the local-file capability
 // used by large ext4 scans. The cache must not redirect callers to its hashed
 // cache file; the parent path is the canonical artifact path.

@@ -289,6 +289,10 @@
           - /etc/faas/storage.env
           - --manifest-file
           - /etc/faas/manifest.yaml
+          # The node may already cache the previous release under the same
+          # logical key. Refresh forces this integrity check to read the
+          # shared store and replace that entry before vmmd can be promoted.
+          - --refresh
       register: faas_release_kernel_prewarm
       changed_when: false
 
