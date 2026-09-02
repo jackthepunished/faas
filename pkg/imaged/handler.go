@@ -408,15 +408,72 @@ func (h *Handler) verifyImageSignature(ctx context.Context, app state.App, dep s
 // + data.ref + data.signer). signer is empty on missing/invalid.
 //
 // imaged-side audit events travel via pg_notify('audit_event') —
-// pkg/audit (apid-side) subscribes and writes the rows. This keeps
-// the audit write surface single-sourced (apid) while letting imaged
-// surface operator-visible events.
+// pkg/audit (apid-side) subscribes and writes the rows. The durable
+// outbox is the recovery path when that notification is missed; the
+// notification remains the low-latency fast path.
+type signatureAuditPayload struct {
+	OutboxID     int64  `json:"outbox_id,omitempty"`
+	Kind         string `json:"kind"`
+	AppID        string `json:"app_id"`
+	DeploymentID string `json:"deployment_id"`
+	Ref          string `json:"ref"`
+	Signer       string `json:"signer"`
+}
+
+type signatureAuditData struct {
+	AppID        string `json:"app_id"`
+	DeploymentID string `json:"deployment_id"`
+	Ref          string `json:"ref"`
+	Signer       string `json:"signer"`
+}
+
 func (h *Handler) emitSignatureAudit(ctx context.Context, kind string, app state.App, dep state.Deployment, ref, signer string) {
 	h.log.Warn(kind, "app", app.Slug, "deployment", dep.ID, "ref", ref, "signer", signer)
+	base := signatureAuditPayload{
+		Kind:         kind,
+		AppID:        app.ID,
+		DeploymentID: dep.ID,
+		Ref:          ref,
+		Signer:       signer,
+	}
+	data, err := json.Marshal(signatureAuditData{
+		AppID:        app.ID,
+		DeploymentID: dep.ID,
+		Ref:          ref,
+		Signer:       signer,
+	})
+	if err != nil {
+		h.log.Error("imaged: marshal signature audit", "kind", kind, "deployment", dep.ID, "err", err)
+		return
+	}
+	if outbox, ok := h.store.(state.AuditEventOutboxStore); ok {
+		dedupeKey := "imaged.signature." + kind + "." + dep.ID
+		if dep.ID == "" {
+			dedupeKey = "imaged.signature." + kind + "." + app.ID + "." + ref
+		}
+		// "apid" preserves the existing events.actor attribution: apid
+		// remains the audit writer even though imaged owns the observation.
+		outboxID, enqueueErr := outbox.EnqueueAuditEvent(ctx, "apid", kind, &app.ID, data, dedupeKey)
+		if enqueueErr == nil {
+			base.OutboxID = outboxID
+			payload, marshalErr := json.Marshal(base)
+			if marshalErr != nil {
+				// base only contains scalar fields, so this is a
+				// programmer error; the durable row is still safe
+				// for the apid replay loop.
+				h.log.Error("imaged: marshal signature audit notification", "kind", kind, "deployment", dep.ID, "err", marshalErr)
+				return
+			}
+			if h.notif != nil {
+				_ = h.notif.Notify(ctx, "audit_event", string(payload))
+			}
+			return
+		}
+		h.log.Warn("imaged: enqueue durable signature audit failed; using notification fallback",
+			"kind", kind, "deployment", dep.ID, "err", enqueueErr)
+	}
 	if h.notif != nil {
-		payload := fmt.Sprintf(`{"kind":%q,"app_id":%q,"deployment_id":%q,"ref":%q,"signer":%q}`,
-			kind, app.ID, dep.ID, ref, signer)
-		_ = h.notif.Notify(ctx, "audit_event", payload)
+		_ = h.notif.Notify(ctx, "audit_event", string(data))
 	}
 }
 
@@ -1238,11 +1295,11 @@ func (h *Handler) HandleNotification(ctx context.Context, n db.Notification) {
 			h.log.Warn("imaged: trusted_signer_changed refresh failed", "err", err)
 		}
 	case "audit_event":
-		// imaged-side audit emits (app.signature_missing /
-		// app.signature_invalid) are routed via pg_notify and
-		// eventually written by apid-side pkg/audit. The Loop in
-		// pkg/loop subscribes; this arm is a no-op so the typed
-		// payload reaches pkg/audit unchanged.
+		// audit_event is an imaged → apid handoff. New producers
+		// persist it in audit_event_outbox and apid consumes the
+		// notification; this imaged-side subscription is retained
+		// for channel compatibility and intentionally does not
+		// re-process the event.
 	}
 }
 

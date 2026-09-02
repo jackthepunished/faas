@@ -79,6 +79,21 @@ type paddleOverageClaimState struct {
 	mbSecondsSum int64
 }
 
+// auditEventOutboxRow is the in-memory mirror of audit_event_outbox. The
+// public queue item intentionally omits mutable claim metadata; keeping that
+// metadata private prevents callers from treating a stale claim as authority.
+type auditEventOutboxRow struct {
+	AuditEventOutbox
+	state       string
+	availableAt time.Time
+	claimedBy   string
+	claimedAt   time.Time
+	leaseUntil  time.Time
+	deliveredAt time.Time
+	createdAt   time.Time
+	lastError   string
+}
+
 // MemStore is an in-memory Store for tests and local development. It is safe for
 // concurrent use and enforces the same uniqueness constraints as the schema
 // (unique email, unique slug, unique key hash) so tests exercise real error
@@ -352,6 +367,12 @@ type MemStore struct {
 	// fan-out. Legacy snapshots without an entry remain globally eligible.
 	snapshotOrigins map[string]snapshotOriginRow
 	events          []Event
+	// auditOutbox mirrors audit_event_outbox. It is separate from the
+	// events slice because delivery claims need leases and retry state,
+	// while the resulting audit event remains append-only.
+	auditOutbox       map[int64]auditEventOutboxRow
+	auditOutboxByKey  map[string]int64
+	nextAuditOutboxID int64
 	// auditLog (issue #755 / PR-6) is the in-memory mirror of the
 	// pgstore.audit_log table. Append-only by spec — MemStore has no
 	// UpdateAuditLog / DeleteAuditLog pair. The DeleteAccount path
@@ -754,6 +775,9 @@ func NewMemStore() *MemStore {
 		snapshotReplicas:        map[snapshotReplicaKey]snapshotReplicaRow{},
 		snapshotOrigins:         map[string]snapshotOriginRow{},
 		events:                  []Event{},
+		auditOutbox:             map[int64]auditEventOutboxRow{},
+		auditOutboxByKey:        map[string]int64{},
+		nextAuditOutboxID:       1,
 		usage:                   []usageMinute{},
 		usageByMonth:            []Usage{},
 		idem:                    map[string]idemEntry{},
