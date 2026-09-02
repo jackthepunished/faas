@@ -529,6 +529,15 @@ type liveTargetReconciler interface {
 	ReconcileLiveTargets(ctx context.Context, appID string) error
 }
 
+// warmPathPicker is implemented by the production PGBackend. It lets the
+// handler probe the already-hydrated picker before entering ensureCapacity,
+// while legacy/test backends retain the original ensure-then-pick ordering.
+// Keeping this additive avoids widening Backend and preserves custom adapters
+// that intentionally model a pick failure after admission.
+type warmPathPicker interface {
+	PickWarm(appID string) PickResult
+}
+
 // staleTargetRecovery is an optional production capability. When the
 // forwarder proves that the selected target is stale, the backend removes it
 // from the picker and asynchronously admits a replacement if that eviction
@@ -5165,34 +5174,58 @@ haveApp:
 	burstDone := h.burstPressure.begin(app.ID)
 	defer burstDone()
 	limits, _ := api.LimitsFor(app.Plan)
-	// Per-app fan-out admission (issue #168). The WakeGate's
-	// shouldWake predicate runs HealthyCount against the plan's
-	// effective max_concurrency, so a burst of N requests admits up to
-	// N instances before short-circuiting.
-	//nolint:contextcheck // request ctx at handler boundary.
-	cold, wakeID, wakeMethod, err := h.ensureCapacity(r.Context(), app.ID, app.AccountID, app.Scope, limits.MaxConcurrency, app.Plan)
-	if err != nil {
-		// The per-app gate rejects excess cold-wake followers before the
-		// gateway-wide admission queue is reached. Count that outcome on
-		// the same bounded admission surface so operators can distinguish
-		// an app-local queue from a saturated gateway queue.
-		if h.metrics != nil && errors.Is(err, ErrQueueFull) {
-			h.metrics.ObserveWakeAdmission(string(app.Plan), err, false, 0)
-		}
-		// ADR-122 §Decision: kind=cache stale-on-error path.
-		// On wake failure (queue full, bootstrap abort, etc.)
-		// consult the cache for a stale entry BEFORE falling
-		// through to writeWakeError. A stale serve on origin
-		// failure is strictly better than a hard 503 — the
-		// body is recent enough that the customer experience
-		// stays smooth, and the alternative (503) loses both
-		// the request AND the wake budget for nothing.
-		if served, _ := h.tryServeStaleOnWakeError(w, r, app, rec); served {
+	var (
+		cold       bool
+		wakeID     string
+		wakeMethod WakeMethod
+		err        error
+	)
+
+	// PickWarm is the combined warm-path decision for the production backend. A
+	// routable target proves that no wake is needed, so avoid the previous
+	// HealthyCount → ensureCapacity → Pick sequence and its extra target-cache
+	// synchronization on every warm request. Legacy/custom backends retain the
+	// original ordering so their test seams and post-admission race behavior do
+	// not change. A failed warm probe still enters the existing single-flight
+	// wake path; the gate re-checks HealthyCount under its lock.
+	pick := PickResult{}
+	if warmPicker, ok := h.backend.(warmPathPicker); ok {
+		pick = warmPicker.PickWarm(app.ID)
+	}
+	if !pick.OK {
+		// Per-app fan-out admission (issue #168). The WakeGate's
+		// shouldWake predicate runs HealthyCount against the plan's
+		// effective max_concurrency, so a burst of N requests admits up to
+		// N instances before short-circuiting.
+		//nolint:contextcheck // request ctx at handler boundary.
+		cold, wakeID, wakeMethod, err = h.ensureCapacity(r.Context(), app.ID, app.AccountID, app.Scope, limits.MaxConcurrency, app.Plan)
+		if err != nil {
+			// The per-app gate rejects excess cold-wake followers before the
+			// gateway-wide admission queue is reached. Count that outcome on
+			// the same bounded admission surface so operators can distinguish
+			// an app-local queue from a saturated gateway queue.
+			if h.metrics != nil && errors.Is(err, ErrQueueFull) {
+				h.metrics.ObserveWakeAdmission(string(app.Plan), err, false, 0)
+			}
+			// ADR-122 §Decision: kind=cache stale-on-error path.
+			// On wake failure (queue full, bootstrap abort, etc.)
+			// consult the cache for a stale entry BEFORE falling
+			// through to writeWakeError. A stale serve on origin
+			// failure is strictly better than a hard 503 — the
+			// body is recent enough that the customer experience
+			// stays smooth, and the alternative (503) loses both
+			// the request AND the wake budget for nothing.
+			if served, _ := h.tryServeStaleOnWakeError(w, r, app, rec); served {
+				return
+			}
+			writeWakeError(w, err)
+			h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
 			return
 		}
-		writeWakeError(w, err)
-		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
-		return
+		// The wake guarantees one routable target in the normal case. Re-pick
+		// after the gate because the target may have been populated by a peer
+		// or by the leader's admission.
+		pick = h.backend.Pick(app.ID)
 	}
 	// The first request above guarantees one routable target. Use the
 	// request pressure accumulated by the whole burst to start bounded
@@ -5202,13 +5235,6 @@ haveApp:
 	// handed to the scheduler.
 	h.maybeBurstCapacity(r.Context(), app, limits.MaxConcurrency, limits.ConcurrencyPerVMBound)
 
-	// Pick one routable Target via atomic round-robin. After a
-	// successful ensure, HealthyCount ≥ 1, so this should succeed
-	// unless every cached instance was evicted between admit and pick
-	// (an instance_changed notification race). On that rare miss, fall
-	// through to the capacity problem — the WakeGate will retry on the
-	// next request.
-	pick := h.backend.Pick(app.ID)
 	// Wake-fan-out (issue #556 / PR-C): when Pick landed on a
 	// cold bucket in a multi-deployment app, signal the handler
 	// via ColdBucket. Admit an instance on that specific

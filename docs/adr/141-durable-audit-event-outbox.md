@@ -1,4 +1,4 @@
-# ADR-140 · Durable imaged→apid audit-event delivery
+# ADR-141 · Durable imaged→apid audit-event delivery
 
 - **Status:** accepted
 - **Date:** 2026-09-03

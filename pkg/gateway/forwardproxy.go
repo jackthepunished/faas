@@ -389,10 +389,10 @@ func fwdStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 	// failure) wins; the receiver goroutine below surfaces
 	// it via sendErr so the bidi close is clean.
 	//
-	// Cancellation: when r.Context() is cancelled (client
-	// disconnect, gateway-side deadline), the goroutine exits
-	// promptly via the inner ctxReader.Read returning
-	// ctx.Err(). Without this, a client that uploads 1 byte
+	// Cancellation: when the derived stream context is cancelled
+	// (client disconnect, gateway-side deadline, or upstream
+	// receiver failure), the goroutine exits promptly via the
+	// ctxReader closing r.Body. Without this, a client that uploads 1 byte
 	// per second and then disconnects would leave the
 	// goroutine blocked on r.Body.Read until the gateway's
 	// http.Server.ReadTimeout fires — that's a goroutine
@@ -400,8 +400,9 @@ func fwdStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 	// review F3 fix.)
 	bodyErrCh := make(chan error, 1)
 	go func() {
+		cr, stopReader := newCtxReader(ctx, r.Body)
+		defer stopReader()
 		buf := make([]byte, 8*1024)
-		cr := &ctxReader{r: r.Body, ctx: r.Context()}
 		for {
 			n, err := cr.Read(buf)
 			if n > 0 {
@@ -439,11 +440,10 @@ func fwdStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 			break
 		}
 		if err != nil {
-			// Drain the body goroutine so we don't leak.
-			select {
-			case <-bodyErrCh:
-			default:
-			}
+			// Cancel the derived stream context so the request body is
+			// closed and the body goroutine can finish before return.
+			cancel()
+			<-bodyErrCh
 			if st, ok := status.FromError(err); ok && st.Code() == codes.Unavailable {
 				markStaleTarget(r.Context())
 				log.Warn("gateway: forwarder stream Unavailable; surfacing 503",
@@ -509,6 +509,7 @@ func fwdStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 				// is still unwinding.
 				log.Debug("gateway: forwarder stream client write failed",
 					"node", t.NodeID, "err", werr.Error())
+				cancel()
 				<-bodyErrCh
 				return
 			}
@@ -665,10 +666,10 @@ func rawStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 	// chunks. The first error wins; the receiver loop below
 	// surfaces it via bodyErrCh so the bidi close is clean.
 	//
-	// Cancellation: when r.Context() is cancelled (client
-	// disconnect, gateway-side deadline), the goroutine exits
-	// promptly via the inner ctxReader.Read returning
-	// ctx.Err(). Same F3 fix as fwdStreamOnceWithEvents.
+	// Cancellation: when the derived stream context is cancelled
+	// (client disconnect, gateway-side deadline, or upstream
+	// receiver failure), the goroutine exits promptly via the
+	// ctxReader closing r.Body. Same F3 fix as fwdStreamOnceWithEvents.
 	//
 	// Issue #676 / ADR-080 follow-up, PR-B: the tx byte counter
 	// increments per `stream.Send` (the bytes flowing
@@ -680,8 +681,9 @@ func rawStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 	// receiver loop is race-free without a mutex.
 	bodyErrCh := make(chan error, 1)
 	go func() {
+		cr, stopReader := newCtxReader(ctx, r.Body)
+		defer stopReader()
 		buf := make([]byte, 8*1024)
-		cr := &ctxReader{r: r.Body, ctx: r.Context()}
 		for {
 			n, err := cr.Read(buf)
 			if n > 0 {
@@ -748,11 +750,10 @@ func rawStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 			break
 		}
 		if err != nil {
-			// Drain the body goroutine so we don't leak.
-			select {
-			case <-bodyErrCh:
-			default:
-			}
+			// Cancel the derived stream context so the request body is
+			// closed and the body goroutine can finish before return.
+			cancel()
+			<-bodyErrCh
 			if st, ok := status.FromError(err); ok && st.Code() == codes.Unavailable {
 				wsOutcome = WSOutcomeUpstreamUnavailable
 				log.Warn("gateway: raw forwarder stream Unavailable; surfacing 503",
@@ -854,6 +855,7 @@ func rawStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 				wsOutcome = WSOutcomeClientDisconnect
 				log.Debug("gateway: raw forwarder stream client write failed",
 					"node", t.NodeID, "err", werr.Error())
+				cancel()
 				<-bodyErrCh
 				return
 			}
@@ -998,14 +1000,12 @@ func ForwardingRawReverseProxyWithEventsAndDrain(nodes NodeClientLookup, log *sl
 	}
 }
 
-// ctxReader is a context-aware io.Reader wrapper used by
-// fwdStreamOnce's body-copy goroutine. It checks cancellation before
-// every read, avoiding a helper goroutine allocation for every body
-// chunk. net/http closes an inbound Request.Body when the request
-// context is cancelled, so a blocked production body read is released
-// by the server; the pre-read check handles already-cancelled contexts
-// without touching the body. The base reader is otherwise used
-// unchanged on the data path.
+// ctxReader is a context-aware io.Reader wrapper used by the
+// stream body-copy goroutines. Request bodies normally implement
+// io.Closer, so newCtxReader watches the derived stream context and
+// closes them to unblock a real network read. The pre-read check handles
+// already-cancelled contexts without touching the body and avoids a
+// helper goroutine allocation for every body chunk.
 //
 // Issue #471 review F3: the body goroutine still exits when an inbound
 // HTTP request is cancelled because the server closes its Request.Body.
@@ -1013,8 +1013,38 @@ func ForwardingRawReverseProxyWithEventsAndDrain(nodes NodeClientLookup, log *sl
 // channel for every Read call, which amplified allocations and goroutine
 // pressure for large uploads.
 type ctxReader struct {
-	r   io.Reader
-	ctx context.Context
+	r        io.Reader
+	ctx      context.Context
+	closer   io.Closer
+	done     chan struct{}
+	stopOnce sync.Once
+}
+
+// newCtxReader attaches cancellation to a closable reader. The returned stop
+// function must be called when the owning goroutine exits so the watcher does
+// not outlive a completed request body.
+func newCtxReader(ctx context.Context, r io.Reader) (*ctxReader, func()) {
+	cr := &ctxReader{r: r, ctx: ctx}
+	closer, ok := r.(io.Closer)
+	if !ok {
+		return cr, func() {}
+	}
+	cr.closer = closer
+	cr.done = make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = closer.Close()
+		case <-cr.done:
+		}
+	}()
+	return cr, cr.stop
+}
+
+func (cr *ctxReader) stop() {
+	if cr.done != nil {
+		cr.stopOnce.Do(func() { close(cr.done) })
+	}
 }
 
 func (cr *ctxReader) Read(p []byte) (int, error) {
@@ -1028,7 +1058,13 @@ func (cr *ctxReader) Read(p []byte) (int, error) {
 		default:
 		}
 	}
-	return cr.r.Read(p)
+	n, err := cr.r.Read(p)
+	if cr.ctx != nil {
+		if ctxErr := cr.ctx.Err(); ctxErr != nil {
+			return 0, ctxErr
+		}
+	}
+	return n, err
 }
 
 // NodeClientCache is the production implementation of NodeClientLookup.
