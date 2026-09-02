@@ -261,6 +261,37 @@
         group: root
         mode: "0644"
 
+    # The signed release tarball carries vmlinux, but production split-box
+    # storage is remote-only. vmmd therefore resolves the kernel through the
+    # shared OCI backend at wake time. Verify and prewarm that exact key before
+    # bootstrap handlers or service restarts can make this node schedulable.
+    - name: Verify the release-pinned kernel is present in shared storage
+      ansible.builtin.command:
+        argv:
+          - /var/lib/faas/bootstrap/gregalectl
+          - artifact
+          - verify
+          - --env-file
+          - /etc/faas/storage.env
+          - --manifest-file
+          - /etc/faas/manifest.yaml
+          - --no-cache
+      register: faas_release_kernel_verify
+      changed_when: false
+
+    - name: Prewarm the verified release-pinned kernel in the node cache
+      ansible.builtin.command:
+        argv:
+          - /var/lib/faas/bootstrap/gregalectl
+          - artifact
+          - verify
+          - --env-file
+          - /etc/faas/storage.env
+          - --manifest-file
+          - /etc/faas/manifest.yaml
+      register: faas_release_kernel_prewarm
+      changed_when: false
+
 - import_playbook: bootstrap.yml
 
 - name: Verify the signed release before promoting its operator CLI

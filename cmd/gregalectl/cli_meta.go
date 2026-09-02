@@ -65,6 +65,7 @@ type cliFlag struct {
 //   - node-key        (init | rotate | status)
 //   - backup          (init | unseal-rclone | unseal-archive-creds)
 //   - secrets         (init | rotate | status | stamp)
+//   - artifact        (publish | verify)
 //   - compute-nodes   (add | list | show | drain | drain-status | activate | force-drain)
 //   - deploy          (join-node | add-node)
 //   - obs             (health)
@@ -80,6 +81,32 @@ type cliFlag struct {
 // boundary — adding a customer command to gregalectl or an operator
 // command to gregale fails CI immediately.
 var cliCommands = []cliCommand{
+	{
+		Name:    dispatchArtifact,
+		DocSlug: "artifact",
+		Short:   "Publish or verify release-pinned shared artifacts",
+		Subcommands: []cliSub{
+			{
+				Name:  "publish",
+				Short: "Publish the release-pinned kernel to the configured storage backend",
+				Flags: []cliFlag{
+					{Name: "env-file", Short: "storage.env path (required)"},
+					{Name: "manifest-file", Short: "production manifest path (required)"},
+					{Name: "file", Short: "release vmlinux path (required for publish)"},
+					{Name: "no-cache", Short: "bypass the local read-through cache"},
+				},
+			},
+			{
+				Name:  "verify",
+				Short: "Verify the release-pinned kernel exists with the anchored digest",
+				Flags: []cliFlag{
+					{Name: "env-file", Short: "storage.env path (required)"},
+					{Name: "manifest-file", Short: "production manifest path (required)"},
+					{Name: "no-cache", Short: "bypass the local read-through cache"},
+				},
+			},
+		},
+	},
 	{
 		Name:    "backup",
 		DocSlug: "backup",
