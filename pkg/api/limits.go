@@ -2987,7 +2987,9 @@ const (
 
 	// Gateway wake admission defaults are plan policy, kept here with the
 	// rest of the platform's quotas so gateway and scheduler-facing code do
-	// not grow separate copies of customer limits.
+	// not grow separate copies of customer limits. Priority is intentionally
+	// equal across plans; plan-aware priority would let sustained paid
+	// traffic starve other customers.
 	GatewayWakeAdmissionFreeMaxWaiters  = 4
 	GatewayWakeAdmissionHobbyMaxWaiters = 16
 	GatewayWakeAdmissionProMaxWaiters   = 64
@@ -2995,9 +2997,9 @@ const (
 	GatewayWakeAdmissionFreeMaxWait     = 10 * time.Second
 	GatewayWakeAdmissionPaidMaxWait     = 30 * time.Second
 	GatewayWakeAdmissionFreePriority    = 1
-	GatewayWakeAdmissionHobbyPriority   = 2
-	GatewayWakeAdmissionProPriority     = 3
-	GatewayWakeAdmissionScalePriority   = 4
+	GatewayWakeAdmissionHobbyPriority   = 1
+	GatewayWakeAdmissionProPriority     = 1
+	GatewayWakeAdmissionScalePriority   = 1
 
 	// MirrorMaxLifetimeSeconds (issue #72 / ADR-125) is the hard
 	// upper bound on how long a single mirror goroutine can run.

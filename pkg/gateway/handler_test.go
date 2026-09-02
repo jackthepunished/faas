@@ -77,6 +77,32 @@ type fakeBackend struct {
 	pickCalls atomic.Int32
 }
 
+// reconcileBackend exposes the optional live-target reconciliation seam
+// without changing fakeBackend itself. The blocking hook lets the test keep
+// the first cold-wake leader in reconciliation while a follower joins the
+// WakeGate.
+type reconcileBackend struct {
+	*fakeBackend
+	reconcileCalls   atomic.Int32
+	reconcileStart   chan struct{}
+	reconcileRelease chan struct{}
+}
+
+func (b *reconcileBackend) ReconcileLiveTargets(context.Context, string) error {
+	b.reconcileCalls.Add(1)
+	if b.reconcileStart != nil {
+		select {
+		case <-b.reconcileStart:
+		default:
+			close(b.reconcileStart)
+		}
+	}
+	if b.reconcileRelease != nil {
+		<-b.reconcileRelease
+	}
+	return nil
+}
+
 // AddTarget seeds a Target into the per-app cache without going through
 // Admit (issue #168). Used by tests that simulate a pre-warmed fleet or
 // simulate eviction.
@@ -209,6 +235,47 @@ func newTestHandler(t *testing.T) (*Handler, *fakeBackend, *httptest.Server) {
 	// Quiet logger: tests don't need slog output; the metrics assertion is the
 	// real check. Production uses slog.Default() via NewHandler.
 	return NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil))), b, upstream
+}
+
+func TestColdStartReconcilesOnlyThroughWakeLeader(t *testing.T) {
+	t.Parallel()
+	b := &reconcileBackend{
+		fakeBackend: &fakeBackend{
+			app: App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanFree},
+		},
+		reconcileStart:   make(chan struct{}),
+		reconcileRelease: make(chan struct{}),
+	}
+	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	results := make(chan error, 2)
+	go func() {
+		_, _, _, err := h.coldStart(context.Background(), "app-1", "acct-1", "", 1, api.PlanFree)
+		results <- err
+	}()
+	<-b.reconcileStart
+	go func() {
+		_, _, _, err := h.coldStart(context.Background(), "app-1", "acct-1", "", 1, api.PlanFree)
+		results <- err
+	}()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && h.gate.InflightWaiters("app-1") < 2 {
+		time.Sleep(time.Millisecond)
+	}
+	if got := h.gate.InflightWaiters("app-1"); got < 2 {
+		t.Fatalf("wake gate waiters = %d, want at least 2", got)
+	}
+	close(b.reconcileRelease)
+	for i := 0; i < 2; i++ {
+		if err := <-results; err != nil {
+			t.Fatalf("coldStart result %d: %v", i, err)
+		}
+	}
+	if got := b.reconcileCalls.Load(); got != 1 {
+		t.Fatalf("reconcile calls = %d, want 1 leader call", got)
+	}
+	if got := atomic.LoadInt32(&b.admits); got != 1 {
+		t.Fatalf("admit calls = %d, want 1 coalesced wake", got)
+	}
 }
 
 // setLegacyHot is the test helper that flips the fake backend into the
