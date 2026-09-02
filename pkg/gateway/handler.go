@@ -5162,13 +5162,13 @@ haveApp:
 	// request" which is the standard X-RateLimit-Remaining contract.
 	h.writeAppRateLimitHeaders(w, app.ID, app.Plan)
 
+	burstDone := h.burstPressure.begin(app.ID)
+	defer burstDone()
+	limits, _ := api.LimitsFor(app.Plan)
 	// Per-app fan-out admission (issue #168). The WakeGate's
 	// shouldWake predicate runs HealthyCount against the plan's
 	// effective max_concurrency, so a burst of N requests admits up to
 	// N instances before short-circuiting.
-	burstDone := h.burstPressure.begin(app.ID)
-	defer burstDone()
-	limits, _ := api.LimitsFor(app.Plan)
 	//nolint:contextcheck // request ctx at handler boundary.
 	cold, wakeID, wakeMethod, err := h.ensureCapacity(r.Context(), app.ID, app.AccountID, app.Scope, limits.MaxConcurrency, app.Plan)
 	if err != nil {
@@ -6508,15 +6508,10 @@ func (s *statusRecorder) finalFlush() {
 func (h *Handler) ensureCapacity(ctx context.Context, appID, accountID, scope string, maxConcurrency int, plan api.Plan) (cold bool, wakeID string, method WakeMethod, err error) {
 	// HealthyCount is intentionally process-local for the hot path, but an
 	// empty process-local cache is not authoritative in a multi-node fleet.
-	// Reconcile before entering the cold path so a VM admitted by another
-	// gateway, cron/floor worker, or before a gateway restart is reused.
-	if h.backend.HealthyCount(appID) == 0 {
-		if reconciler, ok := h.backend.(liveTargetReconciler); ok {
-			if reconcileErr := reconciler.ReconcileLiveTargets(ctx, appID); reconcileErr != nil && h.log != nil {
-				h.log.Warn("gateway: live target reconciliation failed", "app_id", appID, "err", reconcileErr)
-			}
-		}
-	}
+	// The empty-cache reconciliation now runs inside coldStart's WakeGate
+	// leader callback. That makes the whole cache-repair → wake decision one
+	// single-flight operation instead of letting every request in a burst enter
+	// the reconciliation path before the gate coalesces them.
 	if h.backend.HealthyCount(appID) > 0 {
 		return false, "", WakeMethodUnspecified, nil
 	}
@@ -6546,6 +6541,19 @@ func (h *Handler) coldStart(ctx context.Context, appID, accountID, scope string,
 			return h.backend.HealthyCount(appID) == 0
 		},
 		func(ctx context.Context) error {
+			// Only the WakeGate leader reaches this callback. Repair a
+			// process-local cache miss before spending a scheduler RPC on a
+			// new wake. A peer wake, cron/floor worker, or pre-restart live
+			// instance is therefore reused by all followers.
+			if reconciler, ok := h.backend.(liveTargetReconciler); ok {
+				if reconcileErr := reconciler.ReconcileLiveTargets(ctx, appID); reconcileErr != nil {
+					if h.log != nil {
+						h.log.Warn("gateway: live target reconciliation failed", "app_id", appID, "err", reconcileErr)
+					}
+				} else if h.backend.HealthyCount(appID) > 0 {
+					return nil
+				}
+			}
 			admit := func(admitCtx context.Context) error {
 				if ensurer, ok := h.backend.(warmEnsurer); ok && scope == "" {
 					id, m, atCapacity, e := ensurer.EnsureWarm(admitCtx, appID, scope, sched.TriggerGateway)
