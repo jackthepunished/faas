@@ -154,18 +154,19 @@ type Provider interface {
 	//      handler can dispatch on. Today the handler returns
 	//      502 for any non-nil error; the refinement is a follow-up.
 	//
-	// apid's handler is the only caller (cmd/apid/handlers_admin_credits.go).
-	// The webhook (charge.refunded) is observational and routes
+	// apid's operator route is the caller
+	// (cmd/apid/handlers_admin_refunds.go). The webhook (charge.refunded or
+	// the provider-equivalent refund event) is observational and routes
 	// through VerifyWebhook → EventRefundProcessed, NOT through this
 	// method.
 	Refund(ctx context.Context, chargeID string, amountCents int64) (*RefundResult, error)
 
 	// RetryLatestCharge materializes a new charge attempt against
-	// the account's saved card (issue #242; closes the lie at
-	// pkg/mail/account.go:107,150 that promises `faas billing retry`
-	// which didn't exist). Returns the new attempt's id + the
-	// provider's reference id; the apid handler echoes them in
-	// BillingRetryResponse.
+	// the account's saved card where the provider exposes that operation
+	// (issue #242). Returns the new attempt's id + the provider's reference
+	// id; the apid handler echoes them in BillingRetryResponse. Providers
+	// without a direct retry surface return ErrNotImplemented and apid
+	// directs the customer to the billing portal.
 	//
 	//   - Stripe: walks the customer's open invoices in reverse
 	//     chronological order and calls Invoices.Pay on the latest

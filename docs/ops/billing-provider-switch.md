@@ -72,6 +72,12 @@ wrong fixed price, wrong meter, or meter-credit benefit prevents startup.
 - Polar does not expose a direct saved-card retry operation. `faas billing
   retry` returns an unsupported result with the portal fallback; the customer
   must update the payment method in the portal.
+- Operator refunds use `POST /v1/admin/accounts/{id}/refunds`. The route
+  requires the local invoice UUID, a positive EUR-cent amount, a reason, and
+  an explicit `Idempotency-Key`; it binds the Polar order to the target
+  account before calling Polar and requires the admin scope plus the operator
+  email allowlist. The Polar provider's idempotency key is the recovery path
+  when the response to a money-moving request is ambiguous.
 
 ## Operator checks
 

@@ -95,3 +95,18 @@ type BillingPaddleOveragePreflightResponse struct {
 	PendingRows    int64 `json:"pending_rows"`
 	CompletedRows  int64 `json:"completed_rows"`
 }
+
+// AdminRefundResponse is the wire result of an operator-initiated refund.
+// The account and local invoice identifiers are echoed so an automation can
+// correlate the provider refund with the Gregale record without re-reading
+// the request body.
+type AdminRefundResponse struct {
+	AccountID        string `json:"account_id"`
+	InvoiceID        string `json:"invoice_id"`
+	Provider         string `json:"provider"`
+	ProviderRefundID string `json:"provider_refund_id"`
+	ChargeID         string `json:"charge_id"`
+	AmountCents      int64  `json:"amount_cents"`
+	Currency         string `json:"currency"`
+	Status           string `json:"status"`
+}

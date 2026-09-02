@@ -1726,6 +1726,12 @@ func (s *server) handler() http.Handler {
 	// would otherwise be able to issue credits.
 	mux.HandleFunc("POST /v1/admin/accounts/{id}/credits",
 		s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.idempotent(s.issueCredit))))
+	// Operator refund surface. Refunds move money, so unlike credit issuance
+	// this route also requires the standard MFA gate. The handler applies the
+	// FAAS_ADMIN_EMAILS allowlist and binds the Polar order to the target
+	// account through the local invoice projection before calling the provider.
+	mux.HandleFunc("POST /v1/admin/accounts/{id}/refunds",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.refundAccount))))
 
 	// PR-D / ADR-012 §7 amendment: per-tenant GitHub App webhook
 	// secret rotation. Same two-layer gate as issueCredit (scope +

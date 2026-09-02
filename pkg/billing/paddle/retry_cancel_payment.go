@@ -204,7 +204,11 @@ func (p *Provider) Refund(ctx context.Context, transactionID string, amountCents
 	if amountCents <= 0 {
 		return nil, errors.New("paddle: refund amount must be positive cents")
 	}
-	ctx = paddle.ContextWithTransitID(ctx, fmt.Sprintf("faas-refund-%s-%d", transactionID, amountCents))
+	idem := fmt.Sprintf("faas-refund-%s-%d", transactionID, amountCents)
+	if key, ok := billing.IdempotencyKeyFromContext(ctx); ok {
+		idem = key
+	}
+	ctx = paddle.ContextWithTransitID(ctx, idem)
 	txn, err := p.client.GetTransaction(ctx, &paddle.GetTransactionRequest{TransactionID: transactionID})
 	if err != nil {
 		return nil, fmt.Errorf("paddle: get transaction for refund %s: %w", transactionID, err)

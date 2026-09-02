@@ -3169,6 +3169,39 @@ func (c *Client) IssueAccountCredit(ctx context.Context, accountID, idemKey stri
 	return out, c.doReq(c.http, req, &out)
 }
 
+// RefundAccount issues an operator-initiated refund for a local invoice via
+// POST /v1/admin/accounts/{id}/refunds. The server resolves the provider order
+// from invoiceID and verifies that it belongs to accountID before moving money.
+//
+// idemKey is forwarded to the provider's native idempotency mechanism. Pass a
+// stable key when retrying an ambiguous request; an empty key is auto-generated
+// for one-shot SDK calls.
+func (c *Client) RefundAccount(ctx context.Context, accountID, invoiceID, idemKey string, amountCents int64, reason string) (AdminRefundResponse, error) {
+	if idemKey == "" {
+		idemKey = newUUIDv4()
+	}
+	body, err := json.Marshal(map[string]any{
+		"invoice_id":   invoiceID,
+		"amount_cents": amountCents,
+		"reason":       reason,
+	})
+	if err != nil {
+		return AdminRefundResponse{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST",
+		c.baseURL+"/v1/admin/accounts/"+accountID+"/refunds", bytes.NewReader(body))
+	if err != nil {
+		return AdminRefundResponse{}, err
+	}
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	req.Header.Set("Idempotency-Key", idemKey)
+	req.Header.Set("Content-Type", "application/json")
+	var out AdminRefundResponse
+	return out, c.doReq(c.http, req, &out)
+}
+
 // ConsumeInvoiceCredits drains the account's active credits FIFO
 // against an invoice's overage (issue #279 PR-C). Triggered by the
 // operator at month-rollover today; the same reducer will be called

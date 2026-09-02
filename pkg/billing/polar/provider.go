@@ -587,7 +587,11 @@ func (p *Provider) Refund(ctx context.Context, chargeID string, amountCents int6
 		"amount":   amountCents,
 	}
 	var refund refundResponse
-	if err := p.doJSON(ctx, http.MethodPost, "/v1/refunds", body, &refund, fmt.Sprintf("faas-refund-%s-%d", chargeID, amountCents)); err != nil {
+	idem := fmt.Sprintf("faas-refund-%s-%d", chargeID, amountCents)
+	if key, ok := billing.IdempotencyKeyFromContext(ctx); ok {
+		idem = key
+	}
+	if err := p.doJSON(ctx, http.MethodPost, "/v1/refunds", body, &refund, idem); err != nil {
 		return nil, fmt.Errorf("polar: create refund order=%s: %w", chargeID, err)
 	}
 	if refund.ID == "" {

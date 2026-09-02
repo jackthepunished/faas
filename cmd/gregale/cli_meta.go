@@ -157,11 +157,16 @@ var cliCommands = []cliCommand{
 	{
 		Name:    "admin",
 		DocSlug: "admin",
-		Short:   "Operator-only billing ops (admin credit --reason <text> <uuid> <cents>)",
+		Short:   "Operator-only billing ops (admin credit|refund|consume-credits)",
 		Subcommands: []cliSub{
 			{Name: "credit", Short: "Issue a billing credit", Flags: []cliFlag{
 				{Name: "reason", Short: "credit reason text", Req: true, Value: "text"},
 			}},
+			{Name: "refund", Short: "Refund a paid Polar invoice", Flags: []cliFlag{
+				{Name: "reason", Short: "refund reason text", Req: true, Value: "text"},
+				{Name: "idempotency-key", Short: "stable provider retry key", Value: "key"},
+			}},
+			{Name: "consume-credits", Short: "Consume credits against an invoice"},
 		},
 		Positionals: []string{"<uuid>", "<cents>"},
 	},
@@ -235,8 +240,8 @@ var cliCommands = []cliCommand{
 		// Mirrors every case in cmdBilling (commands_billing.go); the
 		// manifest had listed `portal` alone for eight real verbs.
 		Subcommands: []cliSub{
-			{Name: "portal", Short: "Open the Stripe billing portal"},
-			{Name: "retry", Short: "Retry the latest failed invoice payment"},
+			{Name: "portal", Short: "Open the active billing provider's portal"},
+			{Name: "retry", Short: "Retry failed payment when supported; Polar uses the portal"},
 			{Name: "cancel", Short: "Cancel the subscription at period end"},
 			{Name: "payment-method", Short: "Show the card on file"},
 			{Name: "status", Short: "Show subscription status"},

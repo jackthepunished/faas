@@ -26,7 +26,7 @@ Usage:
 
 Commands:
   account      Manage the local account (account export|delete|restore|status|dpa|slo)
-  admin        Operator-only billing ops (admin credit --reason <text> <uuid> <cents>)
+  admin        Operator-only billing ops (admin credit|refund|consume-credits)
   alerts       Per-app alert rules (alerts list|add|info|update|rm|rotate-secret --app <slug>)
   audit-events Audit-log query (audit-events list|get <id>)
   apps         List your apps
