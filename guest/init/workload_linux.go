@@ -334,11 +334,10 @@ func runWorkloads(mainManifest api.AppManifest, roster workloadRoster, secrets, 
 // the merged env).
 func newSupervisorForMain(spec workloadSpec, manifest api.AppManifest, secrets, apiEnv map[string]string, log *slog.Logger) *Supervisor {
 	supRef := &Supervisor{Max: MaxRestarts}
-	supRef.Start = func() error { return runAppWithEnv(manifest, secrets, apiEnv, supRef) }
+	supRef.Start = func() error { return runAppWithRAM(manifest, secrets, apiEnv, supRef, spec.RamMB) }
 	supRef.OnCrash = func(attempt int, err error) {
 		fmt.Fprintf(os.Stderr, "guest-init: main crashed (restart %d/%d): %v\n", attempt, MaxRestarts, err)
 	}
-	_ = spec // reserved for PR-C per-workload policy; ignored today
 	return supRef
 }
 
@@ -413,16 +412,12 @@ func runSidecar(spec workloadSpec, secrets, apiEnv map[string]string, sup *Super
 	// memory.max BEFORE Start so the kernel sees the
 	// cap on the very first page fault. The leaf is
 	// derived from (type, name) via cgroupSafeName; an
-	// empty safe name (path separator in the name)
-	// skips the partition — the workload runs under
-	// the parent scope, which still has the host-side
-	// cap.
-	leaf := leafDir(spec.Type, spec.Name)
-	if leaf != "" {
-		if perr := partitionInto(leaf, spec.RamMB); perr != nil {
-			slog.Default().Warn("cgroup partition into leaf failed",
-				"leaf", leaf, "name", spec.Name, "err", perr)
-		}
+	// invalid safe name or failed write aborts the
+	// workload before exec; otherwise it could run
+	// without its per-workload cap.
+	leaf, cgroupErr := prepareWorkloadCgroup(spec.Type, spec.Name, spec.RamMB, slog.Default())
+	if cgroupErr != nil {
+		return fmt.Errorf("prepare sidecar workload cgroup %q: %w", spec.Name, cgroupErr)
 	}
 	// Sidecar env can layer on top of the customer's baked
 	// env (imaged wrote the per-sidecar env into the ext4 at

@@ -101,6 +101,10 @@ func run(ctx context.Context, log *slog.Logger) error {
 	return runWithDeps(ctx, log, defaultDeps())
 }
 
+func builderNotificationChannels() []string {
+	return []string{db.NotifyBuildQueued, db.NotifyBuildChanged}
+}
+
 func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// DEPLOY-1 / ADR-075 capdecl gate. builderd is unprivileged —
 	// no Allow, no Deny. The build queue consumer, the vmmd
@@ -209,9 +213,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// (Cache.Sweep is pure filesystem, no shared state with Builderd).
 	cache := builderdpkg.NewCache(cfg.CacheDir)
 
-	notifCh, err := db.SubscribeWithReconnect(ctx, pool, []string{
-		db.NotifyBuildQueued,
-	}, log)
+	notifCh, err := db.SubscribeWithReconnect(ctx, pool, builderNotificationChannels(), log)
 	if err != nil {
 		return err
 	}
