@@ -11,11 +11,9 @@ Restart=on-failure
 RestartSec=2s
 
 Slice=faas-cp.slice
-# Aligned with the ansible/systemd copies (2026-09-03). 256M was below
-# vmmd's observed working set under load — it reached 2.1 GB RSS during a
-# sustained burst — so the old value would have OOM-killed it far sooner.
-# See deploy/ansible/roles/vmmd_service/files/faas-vmmd.service for the
-# full rationale.
+# Aligned with pkg/daemonunitspec/vmmd.go (2026-09-03). 256M sat below
+# vmmd's observed working set — it reached 2.1 GB RSS under load — so the
+# old value would have OOM-killed it far sooner.
 MemoryHigh=512M
 MemoryMax=1G
 
