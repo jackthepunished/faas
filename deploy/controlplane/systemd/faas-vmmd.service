@@ -15,6 +15,28 @@ Restart=on-failure
 RestartSec=2s
 RestartCountExport=SYSTEMD_RESTARTS_ON_FAILURE
 Slice=faas-cp.slice
+# vmmd was the only faas daemon without a memory cap (the other eight
+# gated units all carry MemoryMax). The cap was dropped when Delegate=yes
+# was added, apparently out of concern it would also bound the delegated
+# children — it does not: vmmd's own cgroup holds exactly one process, and
+# firecracker VMs live under faas-tenant.slice/<plan>/<uuid>, a sibling
+# tree the jailer creates with its own memory.max = plan + 8 MB.
+#
+# Without a cap vmmd could consume the whole 3 GB faas-cp.slice. On
+# 2026-09-03 it reached 2.1 GB RSS under sustained load and the SLICE
+# OOM-killed it, taking the node out of rotation (schedd's watchdog then
+# marked the compute_node inactive, and nothing brings it back — see
+# docs/runbooks/).
+#
+# MemoryHigh is the load-bearing half: it applies reclaim pressure and
+# throttles the cgroup instead of killing it, so a slow leak degrades
+# rather than dropping the node. MemoryMax is the backstop that contains
+# the blast radius to vmmd alone, leaving the rest of the slice for
+# gatewayd-internal. Steady-state RSS is ~20-50 MB, so 512M/1G is
+# 10-25x headroom; these are containment bounds, not a fix for the
+# growth itself, which is still undiagnosed.
+MemoryHigh=512M
+MemoryMax=1G
 Delegate=yes
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 EnvironmentFile=-/etc/faas/compute-db.env
