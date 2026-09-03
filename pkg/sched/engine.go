@@ -2169,12 +2169,18 @@ func (e *Engine) admitAndDispatchWithOptions(ctx context.Context, appID, deploym
 		e.rollbackAdmittedInstance(ctx, ins.ID, appID, "wake_sealed_env_invalid")
 		return WakeResult{}, fmt.Errorf("sched: wake: load sealed env: %w", err)
 	}
+	sidecars, err := e.sidecarsForDeployment(ctx, dep)
+	if err != nil {
+		e.rollbackAdmittedInstance(ctx, ins.ID, appID, "wake_sidecars_invalid")
+		return WakeResult{}, fmt.Errorf("sched: wake: load sidecars: %w", err)
+	}
 	spec := AppSpec{
 		BaseKey: baseKey(app.Runtime), LayerKey: layerKey(dep.RootfsKey, dep.ID),
 		VCPUCount: int32(limits.VCPU), MemSizeMiB: int32(app.RAMMB),
 		EgressMbit: int32(limits.EgressMbit),
 		Plan:       acct.Plan, AccountID: acct.ID,
 		SealedEnv: sealedEnv,
+		Sidecars:  sidecars,
 		// Issue #395 / ADR-045: plaintext api_env layer mirrors the
 		// sealed secrets surface but stores non-sensitive runtime
 		// config. Precedence at the guest layer is "secrets >
@@ -3719,6 +3725,10 @@ func (e *Engine) BuildAppSpecForMigration(ctx context.Context, instanceID string
 	if err != nil {
 		return AppSpec{}, fmt.Errorf("sched: build app spec: sealed env: %w", err)
 	}
+	sidecars, err := e.sidecarsForDeployment(ctx, dep)
+	if err != nil {
+		return AppSpec{}, fmt.Errorf("sched: build app spec: sidecars: %w", err)
+	}
 	return AppSpec{
 		BaseKey:    baseKey(app.Runtime),
 		LayerKey:   layerKey(dep.RootfsKey, dep.ID),
@@ -3728,6 +3738,7 @@ func (e *Engine) BuildAppSpecForMigration(ctx context.Context, instanceID string
 		Plan:       acct.Plan,
 		AccountID:  acct.ID,
 		SealedEnv:  sealedEnv,
+		Sidecars:   sidecars,
 		// ADR-045: api_env plaintext layer; the loadAPIEnv
 		// helper already fail-softs on a lookup error and logs
 		// Warn (engine.go:2382-2396). A hiccup here ships an
@@ -4174,12 +4185,18 @@ func (e *Engine) Prime(ctx context.Context, appID, deploymentID string) error {
 		e.rollbackAdmittedInstance(ctx, ins.ID, appID, "prime_sealed_env_invalid")
 		return fmt.Errorf("sched: prime: load sealed env: %w", err)
 	}
+	sidecars, err := e.sidecarsForDeployment(ctx, dep)
+	if err != nil {
+		e.rollbackAdmittedInstance(ctx, ins.ID, appID, "prime_sidecars_invalid")
+		return fmt.Errorf("sched: prime: load sidecars: %w", err)
+	}
 	spec := AppSpec{
 		BaseKey: baseKey(app.Runtime), LayerKey: layerKey(dep.RootfsKey, dep.ID),
 		VCPUCount: int32(limits.VCPU), MemSizeMiB: int32(app.RAMMB),
 		EgressMbit: int32(limits.EgressMbit),
 		Plan:       acct.Plan, AccountID: acct.ID,
 		SealedEnv: sealedEnv,
+		Sidecars:  sidecars,
 		// Issue #395 / ADR-045: plaintext api_env layer mirrors the
 		// sealed secrets surface but stores non-sensitive runtime
 		// config. Precedence at the guest layer is "secrets >

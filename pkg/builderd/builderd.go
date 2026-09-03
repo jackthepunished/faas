@@ -305,6 +305,28 @@ func (b *Builderd) ProcessNext(ctx context.Context) (BuildResult, error) {
 	return b.processClaimedBuild(ctx, build)
 }
 
+// stopIfBuildCancelled re-reads the build row at the points where the
+// orchestrator could otherwise create a side effect after a user cancel.
+// The VM cancel notification normally tears the VM down, but the row is the
+// source of truth and a destroy/completion race can still return a successful
+// outcome. In that case do not publish the artifact, stamp the deployment, or
+// emit snapshot_boot for a deployment the user has already cancelled.
+func (b *Builderd) stopIfBuildCancelled(ctx context.Context, buildID string) bool {
+	current, err := b.store.BuildByID(ctx, buildID)
+	if err != nil {
+		// A transient lookup failure should not turn a running build into a
+		// false cancellation. The normal terminal CAS and reaper remain the
+		// fallback authorities if the database is unavailable.
+		b.log.Warn("builderd: cancellation check failed", "build", buildID, "err", err)
+		return false
+	}
+	if current.Status != state.BuildCancelled {
+		return false
+	}
+	b.emitBuildLog(ctx, buildID, "build cancelled — stopping\n")
+	return true
+}
+
 // processClaimedBuild runs the canonical pipeline for a build that
 // has already been CAS-claimed (via ClaimQueuedBuild or
 // ClaimNextQueuedBuild). Both ProcessOne (LISTEN-driven) and
@@ -328,6 +350,9 @@ func (b *Builderd) processClaimedBuild(ctx context.Context, build state.Build) (
 	acct, acctErr := b.store.AccountByID(ctx, app.AccountID)
 	if acctErr != nil {
 		return BuildResult{}, fmt.Errorf("builderd: load account: %w", acctErr)
+	}
+	if b.stopIfBuildCancelled(ctx, build.ID) {
+		return BuildResult{}, nil
 	}
 
 	// B2.2 (issue #196): record the claim so the next
@@ -397,6 +422,9 @@ func (b *Builderd) processClaimedBuild(ctx context.Context, build state.Build) (
 			return BuildResult{}, err
 		}
 	}
+	if b.stopIfBuildCancelled(ctx, build.ID) {
+		return BuildResult{}, nil
+	}
 
 	fw, ver, err := b.detector.DetectWithVersion(dep.SourcePath)
 	if err != nil {
@@ -427,7 +455,13 @@ func (b *Builderd) processClaimedBuild(ctx context.Context, build state.Build) (
 		b.markFailed(ctx, dep.ID, build.ID, state.FailureInfra, "source hash: "+err.Error(), buildStart)
 		return BuildResult{}, err
 	}
+	if b.stopIfBuildCancelled(ctx, build.ID) {
+		return BuildResult{}, nil
+	}
 	if cached, ok := b.cache.LookupWithBase(srcHash, fw, acct.Plan, runtimeBaseRef); ok {
+		if b.stopIfBuildCancelled(ctx, build.ID) {
+			return BuildResult{}, nil
+		}
 		// Cache hit is one of the two real "build started" sites
 		// (the other is the spawn path below). Observe the
 		// queue-wait here so a no-slot requeue on a sibling row
@@ -484,6 +518,9 @@ func (b *Builderd) processClaimedBuild(ctx context.Context, build state.Build) (
 	}
 	defer releaseSlot()
 	b.emitBuildLog(ctx, build.ID, fmt.Sprintf("allocated builder slot (%s)\n", slot.Label))
+	if b.stopIfBuildCancelled(ctx, build.ID) {
+		return BuildResult{}, nil
+	}
 
 	// Past the slot decision — this is one of the two real "build
 	// started" sites (the other is the cache hit path above).
@@ -540,6 +577,9 @@ func (b *Builderd) processClaimedBuild(ctx context.Context, build state.Build) (
 		b.markFailed(ctx, dep.ID, build.ID, fc, "vm wait: "+err.Error(), buildStart)
 		return BuildResult{}, err
 	}
+	if b.stopIfBuildCancelled(ctx, build.ID) {
+		return BuildResult{}, nil
+	}
 	if out.ExitCode != 0 {
 		// Prefer the failure class the guest-init captured in build-done.json
 		// (one of: "FailureUserError", "FailureInfra", "FailureOOM",
@@ -593,6 +633,7 @@ func (b *Builderd) processClaimedBuild(ctx context.Context, build state.Build) (
 		b.markFailed(ctx, dep.ID, build.ID, state.FailureInfra, "stat produced layer: "+statErr.Error(), buildStart)
 		return BuildResult{}, statErr
 	}
+	artifactBytes := st.Size()
 	lim, known := api.LimitsFor(acct.Plan)
 	if !known {
 		b.markFailed(ctx, dep.ID, build.ID, state.FailureInfra, "unknown plan: "+string(acct.Plan), buildStart)
@@ -603,9 +644,12 @@ func (b *Builderd) processClaimedBuild(ctx context.Context, build state.Build) (
 		b.markFailed(ctx, dep.ID, build.ID, state.FailureUserError, msg, buildStart)
 		return BuildResult{}, errors.New("builderd: " + msg)
 	}
+	if b.stopIfBuildCancelled(ctx, build.ID) {
+		return BuildResult{}, nil
+	}
 
 	// Stamp the cache so the next build of the same source is a hit.
-	if err := b.cache.StoreWithBase(srcHash, fw, acct.Plan, runtimeBaseRef, out.OCIImage, out.LogTailBytes); err != nil {
+	if err := b.cache.StoreWithBase(srcHash, fw, acct.Plan, runtimeBaseRef, out.OCIImage, artifactBytes); err != nil {
 		b.log.Warn("builderd: cache store failed (continuing)", "err", err)
 	}
 	// Stamp the produced layer path onto the deployment row. imaged will
@@ -613,7 +657,7 @@ func (b *Builderd) processClaimedBuild(ctx context.Context, build state.Build) (
 	// a per-app ext4 (drive1), and re-emit NotifySnapshotPrime for schedd
 	// to cold-boot + snapshot. Splitting the channel prevents schedd from
 	// trying to mount the OCI tarball as a virtio-blk drive (it would 400).
-	if err := b.store.SetDeploymentRootfs(ctx, dep.ID, out.OCIImage, sched.AppLayerKey(app.Slug, dep.ID), out.LogTailBytes); err != nil {
+	if err := b.store.SetDeploymentRootfs(ctx, dep.ID, out.OCIImage, sched.AppLayerKey(app.Slug, dep.ID), artifactBytes); err != nil {
 		b.markFailed(ctx, dep.ID, build.ID, state.FailureInfra, "set rootfs: "+err.Error(), buildStart)
 		return BuildResult{}, err
 	}
@@ -628,7 +672,7 @@ func (b *Builderd) processClaimedBuild(ctx context.Context, build state.Build) (
 	// (Phase 3 populator fills them in).
 	b.recordProvenance(ctx, build, dep, app, acct, srcHash, false, ver)
 	b.markSucceeded(ctx, build.ID, "ok", buildStart)
-	return BuildResult{BuildID: build.ID, LayerPath: out.OCIImage, LayerBytes: out.LogTailBytes}, nil
+	return BuildResult{BuildID: build.ID, LayerPath: out.OCIImage, LayerBytes: artifactBytes}, nil
 }
 
 // snapshotBootPayload identifies the compute node that produced the local

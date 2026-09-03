@@ -1995,25 +1995,25 @@ func (h *Handler) buildSidecarLayers(ctx context.Context, app state.App, dep sta
 			_ = h.transition(ctx, dep.ID, state.DeployFailed, "sidecar storage init: "+err.Error())
 			return findings, fmt.Errorf("imaged: sidecar storage init: %w", err)
 		}
-		// rootfs.Builder.Build input. The sidecar's
-		// `ram_mb` is the memory.max the sidecar cgroup gets
-		// carved (PR-B step 6 wires that on the host side via
-		// writeWorkloadCgroup). The Manifest's entrypoint is a
-		// placeholder — guest-init reads the per-workload
-		// workload.json (issue #463 / ADR-069 §Sidecar staging)
-		// for the sidecar's argv/env/port at boot time, not
-		// the rootfs-baked app.json. The placeholder exists
-		// because pkg/api.AppManifest.Validate rejects an
-		// empty entrypoint; using a constant argv keeps the
-		// build happy without baking a customer-visible Cmd
-		// into the ext4.
+		// Build the sidecar's effective runtime contract into its
+		// immutable layer. The wake wire carries scheduling metadata
+		// only; command and per-sidecar env must be available before
+		// guest-init starts, including on a cold boot where there is
+		// no opportunity for a late host-side write.
+		workloadManifest, err := h.sidecarWorkloadManifest(sc, pulled.Config)
+		if err != nil {
+			_ = h.transition(ctx, dep.ID, state.DeployFailed, fmt.Sprintf("sidecar %q manifest: %s", sc.Name, err.Error()))
+			return findings, fmt.Errorf("imaged: sidecar %q manifest: %w", sc.Name, err)
+		}
 		result, err := h.builder.Build(ctx, rootfs.BuildInput{
-			Layers:        layersAsReaders(pulled.Layers),
-			Manifest:      api.SidecarBuildManifest(),
-			GuestInitPath: h.guestInitPath,
-			Plan:          acct.Plan,
-			Storage:       be,
-			StorageKey:    layerKey,
+			Layers:           layersAsReaders(pulled.Layers),
+			Manifest:         api.SidecarBuildManifest(),
+			WorkloadName:     sc.Name,
+			WorkloadManifest: &workloadManifest,
+			GuestInitPath:    h.guestInitPath,
+			Plan:             acct.Plan,
+			Storage:          be,
+			StorageKey:       layerKey,
 		})
 		if err != nil {
 			_ = h.transition(ctx, dep.ID, state.DeployFailed, fmt.Sprintf("sidecar %q build: %s", sc.Name, err.Error()))
@@ -2055,6 +2055,47 @@ func (h *Handler) buildSidecarLayers(ctx context.Context, app state.App, dep sta
 			"layers", len(pulled.Layers))
 	}
 	return findings, nil
+}
+
+// sidecarWorkloadManifest projects the OCI image config plus the deployment's
+// command/port overrides into the contract guest-init consumes. Entrypoint
+// follows OCI semantics: a supplied sidecar Cmd replaces the image Cmd while
+// retaining the image Entrypoint. Sidecar env remains sealed in the deployment
+// record and is opened by vmmd only for the per-instance writable layer at
+// wake; it is never persisted in the shared immutable sidecar image.
+func (h *Handler) sidecarWorkloadManifest(sc api.Sidecar, cfg oci.ImageConfig) (api.AppManifest, error) {
+	entrypoint := append([]string(nil), cfg.Entrypoint...)
+	cmd := append([]string(nil), cfg.Cmd...)
+	if len(sc.Cmd) > 0 {
+		cmd = append([]string(nil), sc.Cmd...)
+	}
+	if len(entrypoint) == 0 {
+		entrypoint = cmd
+		cmd = nil
+	}
+	if len(entrypoint) == 0 && len(cmd) == 0 {
+		// Preserve the established sidecar image convention for old
+		// images that rely on the injected start.sh. New images should
+		// declare an OCI Entrypoint/Cmd; the fallback remains useful for
+		// the existing sidecar fixtures and operator-built images.
+		entrypoint = []string{"/usr/local/bin/start.sh"}
+	}
+
+	manifest, err := oci.ManifestFromConfig(oci.Config{
+		Env:              cloneEnvMap(cfg.Env),
+		Entrypoint:       entrypoint,
+		Cmd:              cmd,
+		WorkingDir:       cfg.WorkingDir,
+		User:             cfg.User,
+		Healthcheck:      cfg.Healthcheck,
+		StopSignal:       cfg.StopSignal,
+		StopGracePeriodS: cfg.StopGracePeriodS,
+	})
+	if err != nil {
+		return api.AppManifest{}, err
+	}
+	manifest.Port = sc.Port
+	return manifest, nil
 }
 
 // buildFunctionLayer assembles a function deploy's app-layer ext4:

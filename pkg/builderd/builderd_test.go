@@ -48,6 +48,7 @@ type fakeVM struct {
 	out        BuildOutcome
 	spawnErr   error
 	waitErr    error
+	waitHook   func()
 	spawnCalls int
 	waitCalls  int
 	handle     BuildHandle
@@ -63,6 +64,9 @@ func (f *fakeVM) Spawn(_ context.Context, _ VMRequest) (BuildHandle, error) {
 
 func (f *fakeVM) WaitForCompletion(_ context.Context, _ BuildHandle) (BuildOutcome, error) {
 	f.waitCalls++
+	if f.waitHook != nil {
+		f.waitHook()
+	}
 	return f.out, f.waitErr
 }
 
@@ -250,8 +254,9 @@ func TestProcessOne_VMSpawnSucceedsAndStamps(t *testing.T) {
 		t.Errorf("VM spawn was called %d times, want 1", fvm.spawnCalls)
 	}
 	dep, _ := store.DeploymentByID(context.Background(), depID)
-	if dep.RootfsBytes != 14 {
-		t.Errorf("rootfs_bytes = %d, want 14", dep.RootfsBytes)
+	wantArtifactBytes := int64(len("produced layer"))
+	if dep.RootfsBytes != wantArtifactBytes {
+		t.Errorf("rootfs_bytes = %d, want artifact size %d", dep.RootfsBytes, wantArtifactBytes)
 	}
 	build, _ := store.BuildByID(context.Background(), buildID)
 	if build.Status != state.BuildSucceeded {
@@ -261,6 +266,61 @@ func TestProcessOne_VMSpawnSucceedsAndStamps(t *testing.T) {
 	hash, _ := hashFile(srcTar)
 	if _, ok := c.LookupWithBase(hash, FrameworkNode, api.PlanPro, imaged.BaseRefMinimal); !ok {
 		t.Error("expected cache populated after successful build")
+	}
+}
+
+func TestProcessOne_CancelledCompletionDoesNotPublishArtifact(t *testing.T) {
+	store := state.NewMemStore()
+	src := filepath.Join(t.TempDir(), "src.tar.gz")
+	makeTarballWithName(t, src, []string{"package.json", "index.js"})
+	buildID, depID, _ := seedDeployment(t, store, src)
+
+	layerPath := filepath.Join(t.TempDir(), "produced.ext4")
+	if err := os.WriteFile(layerPath, []byte("should not publish"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fvm := &fakeVM{
+		out: BuildOutcome{OCIImage: layerPath, ExitCode: 0},
+		// Simulate a cancel racing with vmmd.Destroy returning a successful
+		// outcome. The build row must win over the stale completion.
+		waitHook: func() {
+			if err := store.MarkBuildCancelled(context.Background(), buildID, depID, true, time.Now()); err != nil {
+				t.Fatalf("MarkBuildCancelled: %v", err)
+			}
+		},
+	}
+	notif := &fakeNotifier{}
+	cache := NewCache(t.TempDir())
+	b := New(store, notif, fvm, cache, NewDetector(), nil, Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	if _, err := b.ProcessOne(context.Background(), buildID); err != nil {
+		t.Fatalf("ProcessOne: %v", err)
+	}
+	build, err := store.BuildByID(context.Background(), buildID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if build.Status != state.BuildCancelled {
+		t.Fatalf("build status = %s, want cancelled", build.Status)
+	}
+	dep, err := store.DeploymentByID(context.Background(), depID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dep.RootfsPath != "" || dep.RootfsBytes != 0 {
+		t.Fatalf("cancelled build published rootfs: path=%q bytes=%d", dep.RootfsPath, dep.RootfsBytes)
+	}
+	for _, call := range notif.calls {
+		if call.channel == db.NotifySnapshotBoot {
+			t.Fatal("cancelled build emitted snapshot_boot")
+		}
+	}
+	hash, err := hashFile(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := cache.LookupWithBase(hash, FrameworkNode, api.PlanPro, imaged.BaseRefMinimal); ok {
+		t.Fatal("cancelled build populated the cache")
 	}
 }
 

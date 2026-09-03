@@ -12,6 +12,14 @@ import (
 // where guest-init reads it at boot (spec §4.6, §4.8).
 const AppManifestPath = "/etc/faas/app.json"
 
+// SidecarWorkloadManifestPath is the directory where imaged stores the
+// effective runtime contract for each sidecar. The sidecar name is appended
+// as one validated path component and the file name is workload.json. Keeping
+// the image contract in the sidecar layer makes it available on every cold
+// boot and restore without sending plaintext customer command or environment
+// data over the wake wire.
+const SidecarWorkloadManifestPath = "/etc/faas/workloads"
+
 // Defaults for the guest runtime contract (spec §4.8, §4.9).
 const (
 	DefaultAppPort = 8080  // the :8080 contract
@@ -425,22 +433,19 @@ func ReadManifest(r io.Reader) (AppManifest, error) {
 	return m, nil
 }
 
-// SidecarBuildManifest returns a placeholder AppManifest imaged
-// bakes into a sidecar's drive1 (issue #463 / ADR-069 / PR-B).
+// SidecarBuildManifest returns a compatibility placeholder AppManifest that
+// imaged bakes into a sidecar layer (issue #463 / ADR-069 / PR-B).
 //
 // The placeholder exists because pkg/api.AppManifest.Validate
 // rejects an empty entrypoint, and rootfs.Builder.Build calls
 // Validate on its way through. Sidecars do not have a customer
-// entrypoint — guest-init reads the per-workload workload.json
-// (one per drive, written by vmmd at boot per
-// pkg/fcvm/vmm.go::StageSecretsEnv generalization) to discover
-// argv/env/port for each sidecar at runtime. The placeholder is
-// therefore never executed: guest-init's per-workload supervisor
-// execs the sidecar argv from workload.json, not the rootfs-
-// baked app.json. The string "/bin/sidecar-placeholder" is a
-// stable marker an operator can grep for if the placeholder
-// ever surfaces in a crash log (it should not — guest-init
-// reads workload.json exclusively for sidecars).
+// entrypoint — guest-init reads the name-scoped workload.json
+// baked into the sidecar layer to discover argv/env/port at
+// runtime. The placeholder is therefore never executed:
+// guest-init's per-workload supervisor execs the effective argv
+// from that workload.json, not this compatibility app.json. The
+// string "/bin/sidecar-placeholder" is a stable marker an operator
+// can grep for if it ever surfaces in a crash log (it should not).
 func SidecarBuildManifest() AppManifest {
 	return AppManifest{
 		Entrypoint: []string{"/bin/sidecar-placeholder"},

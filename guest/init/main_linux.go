@@ -257,7 +257,7 @@ func boot() error {
 	// literal would trip Go's "undefined: sup" before the
 	// assignment. The wiring below is the canonical fix.
 	supRef := &Supervisor{Max: MaxRestarts}
-	supRef.Start = func() error { return runAppWithEnv(manifest, secrets, apiEnv, supRef) }
+	supRef.Start = func() error { return runAppWithEnv(manifest, secrets, apiEnv, supRef, 0) }
 	supRef.OnCrash = func(attempt int, err error) {
 		fmt.Fprintf(os.Stderr, "guest-init: app crashed (restart %d/%d): %v\n", attempt, MaxRestarts, err)
 	}
@@ -385,7 +385,9 @@ func runAppWithRAM(m api.AppManifest, secrets, apiEnv map[string]string, sup *Su
 	}
 	// Place the forked child into the leaf. Same race
 	// posture as runSidecar — see placeIntoLeaf's doc.
-	placeIntoLeaf(mainLeaf, cmd.Process.Pid, slog.Default())
+	if mainLeaf != "" {
+		placeIntoLeaf(mainLeaf, cmd.Process.Pid, slog.Default())
+	}
 	// Cluster C / ADR-121: spawn the per-workload cgroup.events
 	// oom_kill listener (guest/init/cgroup_partition_linux.go::
 	// WatchOOM) for the duration of the main workload's lifetime.
@@ -396,20 +398,11 @@ func runAppWithRAM(m api.AppManifest, secrets, apiEnv map[string]string, sup *Su
 	// classification surface (classify(exitCode=137) →
 	// FailureOOM) and does not need this listener.
 	//
-	// planMB: we can't read the customer's deployment row from
-	// guest-init (the manifest doesn't carry the plan cap and
-	// vmmd doesn't currently inject one). The listener
-	// re-reads the leaf's memory.max on the kill event and
-	// falls back to 0 if the env is missing — the whycopy
-	// Observed closure degrades to the static prose when
-	// planMB=0, which is still a stamp (just less actionable
-	// than the templated text). A future PR wires a VMM cmd-
-	// line / env injection that surfaces the plan cap.
 	if mainLeaf != "" {
 		oomCtx, oomCancel := context.WithCancel(context.Background())
 		go func() {
 			defer oomCancel()
-			werr := WatchOOM(oomCtx, mainLeaf, 0, /* planMB — re-read on kill */
+			werr := WatchOOM(oomCtx, mainLeaf, ramMB,
 				func(peakMB, pMB int) {
 					if eerr := EmitWorkloadOOM(oomCtx, peakMB, pMB); eerr != nil {
 						slog.Default().Warn("EmitWorkloadOOM failed",
@@ -1608,9 +1601,10 @@ func mountBasics() error {
 // (vdc), drive3 (vdd), ... are sidecar drives mounted read-only as
 // additional overlay lowers. The single writable upper stays on drive1
 // (ADR-069 §"no shared writable layer between workloads"). The merged
-// root's precedence is base → main → sidecar-0 → sidecar-1 → … so a
-// workload's /etc/faas/workload.json (per-drive stamp) is visible from
-// the merged root even though the base ships none.
+// root's precedence is base → main → sidecar-0 → sidecar-1 → … so the
+// deployment roster on the main upper and each sidecar's name-scoped
+// runtime manifest are visible from the merged root even though the
+// base ships none.
 //
 // The legacy 2-drive path (no sidecars) is preserved as the default
 // branch: assembleOverlay does NOT touch /proc/partitions or the
