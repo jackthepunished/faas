@@ -53,12 +53,11 @@ func TestInjectWorkloadManifest_WritesNameScopedContract(t *testing.T) {
 	}
 
 	path := filepath.Join(staging, "etc", "faas", "workloads", "metrics", "workload.json")
-	f, err := os.Open(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("workload manifest not at expected path %q: %v", path, err)
 	}
-	got, err := api.ReadManifest(f)
-	_ = f.Close()
+	got, err := api.ReadManifest(bytes.NewReader(data))
 	if err != nil {
 		t.Fatalf("ReadManifest: %v", err)
 	}

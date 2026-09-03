@@ -57,6 +57,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -160,12 +161,11 @@ func loadSidecarManifest(name string) (api.AppManifest, error) {
 		return api.AppManifest{}, fmt.Errorf("sidecar workload: invalid name %q", name)
 	}
 	path := filepath.Join(api.SidecarWorkloadManifestPath, name, "workload.json")
-	f, err := os.Open(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return api.AppManifest{}, err
 	}
-	defer func() { _ = f.Close() }()
-	return api.ReadManifest(f)
+	return api.ReadManifest(bytes.NewReader(data))
 }
 
 // loadSidecarEnv reads the deployment-specific env overrides staged by vmmd
