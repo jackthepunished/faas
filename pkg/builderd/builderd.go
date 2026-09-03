@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -139,12 +140,18 @@ type Builderd struct {
 	// fixtures can leave it empty; recordProvenance stamps empty
 	// which pgstore's NULLIF / nullString roundtrip permits.
 	builderNodeID string
-	// slotDecide is the slot-allocation hook. Production wires
-	// b.slotDecide = DecideSlot in New; tests inject a closure to
+	// slotDecide is the slot-allocation hook. Production leaves it nil
+	// so acquireSlot uses DecideSlot; tests inject a closure to
 	// exercise the no-slot requeue path without standing up a full
 	// ResidencyProbe rig. nil falls back to DecideSlot(b.resid, …)
 	// inside processClaimedBuild.
 	slotDecide func(ResidencyProbe, int) SlotDecision
+	// slotMu and activeSlots enforce the process-wide 1 guaranteed +
+	// 1 opportunistic builder budget. DecideSlot only evaluates tenant
+	// residency; it cannot account for another build racing through the
+	// LISTEN path or the durable worker.
+	slotMu      sync.Mutex
+	activeSlots int
 	// sourceStorage is the optional remote source handoff used by split-box
 	// deployments. Local/single-box deployments leave it nil and continue to
 	// read the source spool directly.
@@ -457,12 +464,8 @@ func (b *Builderd) processClaimedBuild(ctx context.Context, build state.Build) (
 	}
 
 	// Slot allocation (CLAUDE.md: builds never outrank tenant wakes).
-	decider := b.slotDecide
-	if decider == nil {
-		decider = DecideSlot
-	}
-	slot := decider(b.resid, api.RAMAdmissionCeilingMB)
-	if !slot.Allowed {
+	slot, releaseSlot, acquired := b.acquireSlot()
+	if !acquired {
 		// Requeue the row (NOT markFailed) so a later tick / notify
 		// can re-attempt it. RequeueBuild clears started_at but
 		// preserves enqueued_at so the FIFO position survives a
@@ -479,6 +482,7 @@ func (b *Builderd) processClaimedBuild(ctx context.Context, build state.Build) (
 		b.emitBuildLog(ctx, build.ID, fmt.Sprintf("no slot (%s) — requeued\n", slot.Reason))
 		return BuildResult{}, ErrNoSlot
 	}
+	defer releaseSlot()
 	b.emitBuildLog(ctx, build.ID, fmt.Sprintf("allocated builder slot (%s)\n", slot.Label))
 
 	// Past the slot decision — this is one of the two real "build

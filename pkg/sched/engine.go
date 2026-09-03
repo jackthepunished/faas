@@ -2014,27 +2014,6 @@ func (e *Engine) admitAndDispatchWithOptions(ctx context.Context, appID, deploym
 		release()
 		return WakeResult{}, err // *api.Problem from chooser
 	}
-	// Sticky-warm record: stamp the chosen node so the NEXT wake
-	// for this app picks it back up. Recorded after a successful
-	// admit only — a rejection doesn't "warm" anything. Per-app
-	// lock is held here so a concurrent burst for the same app
-	// sees a coherent (RecordWake, hint) sequence.
-	//
-	// Push-side fanout (ADR-025 axis 4): if the new entry actually
-	// changed appID's warm node, broadcast a WarmHintEvent to every
-	// gatewayd-internal subscribed via Engine.StreamWarmHints. Same per-app
-	// lock guards the cache write + the emit so the gRPC stream
-	// observes writes in the same order the cache does. nil
-	// broadcaster is a no-op (the test-only path that constructs
-	// Engine without NewEngine's eager init).
-	_, changed := e.warmAffinity.RecordWakeIfChanged(appID, placement.NodeID)
-	if changed && e.warmBroadcaster != nil {
-		e.warmBroadcaster.emit(WarmHintEvent{
-			AppID:     appID,
-			NodeID:    placement.NodeID,
-			WrittenAt: time.Now(),
-		})
-	}
 	if mode == "" {
 		mode = string(state.InstanceModeNormal)
 	}
@@ -2089,6 +2068,27 @@ func (e *Engine) admitAndDispatchWithOptions(ctx context.Context, appID, deploym
 		e.transitionWithKind(ctx, ins.ID, appID, state.StateFailed, "wake_boot_error", "admit_denied")
 		release()
 		return WakeResult{}, err // *api.Problem
+	}
+
+	// Sticky-warm record: stamp the chosen node so the NEXT wake
+	// for this app picks it back up. This happens only after the
+	// instance row exists and the ledger has admitted it; a placement
+	// rejection must not leave a false warm hint behind.
+	//
+	// Push-side fanout (ADR-025 axis 4): if the new entry actually
+	// changed appID's warm node, broadcast a WarmHintEvent to every
+	// gatewayd-internal subscribed via Engine.StreamWarmHints. Same
+	// per-app lock guards the cache write + the emit so the gRPC stream
+	// observes writes in the same order the cache does. nil
+	// broadcaster is a no-op (the test-only path that constructs
+	// Engine without NewEngine's eager init).
+	_, changed := e.warmAffinity.RecordWakeIfChanged(appID, placement.NodeID)
+	if changed && e.warmBroadcaster != nil {
+		e.warmBroadcaster.emit(WarmHintEvent{
+			AppID:     appID,
+			NodeID:    placement.NodeID,
+			WrittenAt: time.Now(),
+		})
 	}
 
 	// AppSpec is built under the lock and treated as immutable below.
