@@ -324,7 +324,7 @@ func TestBuildArgv(t *testing.T) {
 			fw:   api.FrameworkDockerfile,
 			want: []string{
 				"/usr/local/bin/buildctl", "--addr", "unix:///run/buildkit/buildkitd.sock", "build",
-				"--frontend", "dockerfile",
+				"--frontend", "dockerfile.v0",
 				"--local", "context=" + workdir,
 				"--local", "dockerfile=" + workdir,
 				"--output", "type=oci,dest=" + outdir + "/image.tar",

@@ -257,7 +257,7 @@ func boot() error {
 	// literal would trip Go's "undefined: sup" before the
 	// assignment. The wiring below is the canonical fix.
 	supRef := &Supervisor{Max: MaxRestarts}
-	supRef.Start = func() error { return runAppWithEnv(manifest, secrets, apiEnv, supRef, 0) }
+	supRef.Start = func() error { return runAppWithEnv(manifest, secrets, apiEnv, supRef) }
 	supRef.OnCrash = func(attempt int, err error) {
 		fmt.Fprintf(os.Stderr, "guest-init: app crashed (restart %d/%d): %v\n", attempt, MaxRestarts, err)
 	}
@@ -1226,7 +1226,7 @@ func buildArgv(m api.BuildManifest) []string {
 	case api.FrameworkDockerfile:
 		return []string{
 			"/usr/local/bin/buildctl", "--addr", "unix:///run/buildkit/buildkitd.sock", "build",
-			"--frontend", "dockerfile",
+			"--frontend", "dockerfile.v0",
 			"--local", "context=" + m.Workdir,
 			"--local", "dockerfile=" + m.Workdir,
 			"--output", "type=oci,dest=" + m.OutDir + "/image.tar",

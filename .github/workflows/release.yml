@@ -428,7 +428,7 @@ jobs:
           for item in "${RUNTIME_IMAGES[@]}"; do
             read -r key image <<< "$item"
             ref="ghcr.io/poyrazk/${image}:sha-${RUNTIME_SOURCE_SHA}"
-            digest="$(DOCKER_CONFIG="$CONFIG_DIR" crane digest "$ref" 2>/dev/null || true)"
+            digest="$(DOCKER_CONFIG="$CONFIG_DIR" crane digest --platform linux/amd64 "$ref" 2>/dev/null || true)"
             [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
               echo "::error::runtime image $ref has no immutable digest" >&2
               exit 1
