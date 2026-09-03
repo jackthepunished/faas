@@ -198,13 +198,15 @@ func TestClientAdmitInstance_AdmitsNewInstance(t *testing.T) {
 
 type burstContinuationEngine struct {
 	fakeEngine
-	mu    sync.Mutex
-	flags []bool
+	mu              sync.Mutex
+	flags           []bool
+	placementSpread []bool
 }
 
 func (e *burstContinuationEngine) AdmitInstance(ctx context.Context, appID, deploymentID, scope, trigger string) (sched.WakeResult, error) {
 	e.mu.Lock()
 	e.flags = append(e.flags, sched.IsBurstContinuation(ctx))
+	e.placementSpread = append(e.placementSpread, sched.IsBurstPlacementSpread(ctx))
 	e.mu.Unlock()
 	return e.fakeEngine.AdmitInstance(ctx, appID, deploymentID, scope, trigger)
 }
@@ -249,6 +251,17 @@ func TestClientAdmitInstancesCarriesContinuationMarker(t *testing.T) {
 	}
 	if continuations != 3 {
 		t.Fatalf("continuation calls = %d, want 3", continuations)
+	}
+	if len(eng.placementSpread) != 4 {
+		t.Fatalf("placement marker calls = %d, want 4", len(eng.placementSpread))
+	}
+	if eng.placementSpread[0] {
+		t.Error("first admission unexpectedly carried placement-spread marker")
+	}
+	for i, spread := range eng.placementSpread[1:] {
+		if !spread {
+			t.Errorf("continuation #%d missing placement-spread marker", i+1)
+		}
 	}
 }
 

@@ -1452,8 +1452,18 @@ func (e *Engine) AdmitInstance(ctx context.Context, appID, deploymentID, scope, 
 // marker after its first admission has passed every ordinary gate.
 type scaleOutBurstContinuationKey struct{}
 
+// burstPlacementSpreadKey marks sibling admissions that belong to one
+// gateway burst. The first admission keeps the warm-affinity hint so it can
+// reuse local snapshot/page-cache state; siblings must be allowed to choose
+// the least-loaded compute node instead of repeatedly pinning to that hint.
+type burstPlacementSpreadKey struct{}
+
 func withScaleOutBurstContinuation(ctx context.Context) context.Context {
-	return context.WithValue(ctx, scaleOutBurstContinuationKey{}, true)
+	ctx = context.WithValue(ctx, scaleOutBurstContinuationKey{}, true)
+	// The existing gRPC BurstContinuation bit is the transport boundary for
+	// sibling admissions. Carry placement spread with the same marker so a
+	// remote schedd does not silently reintroduce warm-node pinning.
+	return context.WithValue(ctx, burstPlacementSpreadKey{}, true)
 }
 
 // WithBurstContinuation marks a schedd admission as a continuation of a
@@ -1477,6 +1487,28 @@ func IsBurstContinuation(ctx context.Context) bool {
 func isScaleOutBurstContinuation(ctx context.Context) bool {
 	value, _ := ctx.Value(scaleOutBurstContinuationKey{}).(bool)
 	return value
+}
+
+// WithBurstPlacementSpread marks a bounded burst continuation so placement
+// ignores sticky warm affinity for that admission. The marker does not bypass
+// any capacity, quota, or scheduler gate. WithBurstContinuation also carries
+// this marker so the existing gRPC continuation bit preserves the behavior
+// across the gateway→schedd process boundary.
+func WithBurstPlacementSpread(ctx context.Context) context.Context {
+	return context.WithValue(ctx, burstPlacementSpreadKey{}, true)
+}
+
+func isBurstPlacementSpread(ctx context.Context) bool {
+	value, _ := ctx.Value(burstPlacementSpreadKey{}).(bool)
+	return value
+}
+
+// IsBurstPlacementSpread reports whether a scheduler admission is a sibling
+// of a bounded gateway burst. It is exposed for gRPC adapters and boundary
+// tests; the marker only changes warm-affinity preference, never capacity
+// enforcement.
+func IsBurstPlacementSpread(ctx context.Context) bool {
+	return isBurstPlacementSpread(ctx)
 }
 
 // AdmitInstances admits a bounded desired-capacity burst for one app. The
@@ -1513,7 +1545,7 @@ func (e *Engine) AdmitInstances(ctx context.Context, appID, scope, trigger strin
 		mu       sync.Mutex
 		wg       sync.WaitGroup
 		firstErr error
-		burstCtx = withScaleOutBurstContinuation(ctx)
+		burstCtx = WithBurstPlacementSpread(withScaleOutBurstContinuation(ctx))
 	)
 	for i := 1; i < count; i++ {
 		wg.Add(1)
@@ -1923,7 +1955,10 @@ func (e *Engine) admitAndDispatchWithOptions(ctx context.Context, appID, deploym
 	// least-loaded when the preferred node is saturated. ADR-005
 	// (cold boot must always work) is preserved: an empty hint
 	// behaves identically to a fresh install.
-	warmHint, _ := e.warmAffinity.LastWarmNode(appID)
+	var warmHint string
+	if !isBurstPlacementSpread(ctx) {
+		warmHint, _ = e.warmAffinity.LastWarmNode(appID)
+	}
 	var snapshotNodes []string
 	if haveSnap {
 		if replicas, ok := e.store.(state.SnapshotReplicaStore); ok {

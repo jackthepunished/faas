@@ -327,6 +327,9 @@ func fwdStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 
 	stream, err := cli.ForwardHTTPStream(ctx)
 	if err != nil {
+		if handleForwardRequestCancellation(w, r, true) {
+			return
+		}
 		if st, ok := status.FromError(err); ok && st.Code() == codes.Unavailable {
 			markStaleTarget(r.Context())
 		}
@@ -375,6 +378,9 @@ func fwdStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 	if err := stream.Send(&vmmdpb.ForwardHTTPStreamRequest{
 		Frame: &vmmdpb.ForwardHTTPStreamRequest_Init{Init: init},
 	}); err != nil {
+		if handleForwardRequestCancellation(w, r, true) {
+			return
+		}
 		if st, ok := status.FromError(err); ok && st.Code() == codes.Unavailable {
 			markStaleTarget(r.Context())
 		}
@@ -443,6 +449,9 @@ func fwdStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 			select {
 			case <-bodyErrCh:
 			default:
+			}
+			if handleForwardRequestCancellation(w, r, !wroteHeader) {
+				return
 			}
 			if st, ok := status.FromError(err); ok && st.Code() == codes.Unavailable {
 				markStaleTarget(r.Context())
