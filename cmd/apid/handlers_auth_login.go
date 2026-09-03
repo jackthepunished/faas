@@ -468,7 +468,7 @@ func (s *server) postSetPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit.Emit(r.Context(), "account.password_set", &acct.ID, map[string]any{
-		"proof":        proof,
+		"proof":    proof,
 		"replaced": replacing,
 	})
 	http.Redirect(w, r, "/dashboard/account/", http.StatusFound)
