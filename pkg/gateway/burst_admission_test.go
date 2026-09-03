@@ -61,6 +61,22 @@ func (b *burstTestBackend) AdmitBurst(_ context.Context, _ string, _ string, _ s
 	return count, nil
 }
 
+type blockingBurstBackend struct {
+	*burstTestBackend
+	started chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingBurstBackend) AdmitBurst(ctx context.Context, appID, scope, trigger string, maxConcurrency, count int) (int, error) {
+	close(b.started)
+	select {
+	case <-b.release:
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+	return b.burstTestBackend.AdmitBurst(ctx, appID, scope, trigger, maxConcurrency, count)
+}
+
 type burstSchedulerFake struct {
 	calls int
 }
@@ -130,6 +146,48 @@ func TestMaybeBurstCapacityStartsOneDeduplicatedWorker(t *testing.T) {
 	}
 	if got := b.HealthyCount("app-1"); got != 2 {
 		t.Fatalf("healthy targets after burst = %d, want 2", got)
+	}
+}
+
+func TestMaybeBurstCapacityWaitsForReadyTarget(t *testing.T) {
+	b := &blockingBurstBackend{
+		burstTestBackend: &burstTestBackend{
+			fakeBackend: &fakeBackend{app: App{ID: "app-1", Plan: api.PlanScale}},
+			admitted:    make(chan int, 1),
+		},
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	b.AddTarget(Target{NodeID: "node-1", InstanceID: "warm-1"})
+	h := NewHandlerWith(b, NewMetrics(), nil)
+	state := h.burstPressure.state("app-1")
+	state.inflight.Store(81)
+	defer state.inflight.Store(0)
+
+	result := make(chan error, 1)
+	go func() {
+		result <- h.maybeBurstCapacity(context.Background(), b.app, 20, 80)
+	}()
+
+	select {
+	case <-b.started:
+	case <-time.After(time.Second):
+		t.Fatal("burst admission worker did not start")
+	}
+	select {
+	case err := <-result:
+		t.Fatalf("maybeBurstCapacity returned before target readiness: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	close(b.release)
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("maybeBurstCapacity: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("maybeBurstCapacity did not return after target became ready")
 	}
 }
 

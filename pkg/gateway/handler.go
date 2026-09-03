@@ -5227,13 +5227,20 @@ haveApp:
 		// or by the leader's admission.
 		pick = h.backend.Pick(app.ID)
 	}
-	// The first request above guarantees one routable target. Use the
-	// request pressure accumulated by the whole burst to start bounded
-	// background admissions for the remaining desired capacity. This is
-	// intentionally detached from the current request's cancellation so
-	// a client disconnect cannot abandon a capacity reservation already
-	// handed to the scheduler.
-	h.maybeBurstCapacity(r.Context(), app, limits.MaxConcurrency, limits.ConcurrencyPerVMBound)
+	// The first request above guarantees one routable target. Reconcile the
+	// request pressure accumulated by the whole burst before forwarding so
+	// requests do not all pile onto that first target while sibling VMs are
+	// still restoring. The admission worker is detached internally, but this
+	// request remains cancellable by its own budget.
+	if burstErr := h.maybeBurstCapacity(r.Context(), app, limits.MaxConcurrency, limits.ConcurrencyPerVMBound); burstErr != nil {
+		// A burst that cannot become routable within the request budget is
+		// a controlled timeout, not an upstream 502. Client disconnects
+		// remain silent; genuine admission failures use the normal
+		// capacity problem response.
+		writeBurstCapacityError(w, r, burstErr)
+		h.observe(r, rec.status, app.ID, string(app.Plan), cold, Target{})
+		return
+	}
 
 	// Wake-fan-out (issue #556 / PR-C): when Pick landed on a
 	// cold bucket in a multi-deployment app, signal the handler

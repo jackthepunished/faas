@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,8 +30,20 @@ type burstPressure struct {
 
 type burstPressureState struct {
 	inflight atomic.Int64
-	worker   atomic.Bool
+	mu       sync.Mutex
+	worker   *burstGeneration
 }
+
+// burstGeneration represents one bounded capacity reconciliation. Keeping
+// the result on the generation (rather than on burstPressureState) prevents a
+// waiter from observing the result of a newer worker that started just after
+// the one it joined completed.
+type burstGeneration struct {
+	done chan struct{}
+	err  error
+}
+
+var errBurstCapacityStalled = errors.New("gateway: burst capacity admission made no progress")
 
 func (p *burstPressure) state(appID string) *burstPressureState {
 	if p == nil || appID == "" {
@@ -66,72 +79,114 @@ func desiredBurstInstances(inflight int64, perVM, maxInstances int) int {
 	return int(desired)
 }
 
-// maybeBurstCapacity starts one detached worker per app. The worker keeps
-// reconciling desired capacity while the burst is present, admitting at most
-// ScaleUpMaxBurstPerTick instances per scheduler round. This gives the public
-// request path an immediate signal without creating one scheduler request per
-// incoming HTTP request.
-func (h *Handler) maybeBurstCapacity(ctx context.Context, app App, maxInstances, perVM int) {
+// maybeBurstCapacity reconciles desired capacity before the request is
+// forwarded. There is still only one detached admission worker per app, but
+// callers join its generation and wait until enough routable targets exist.
+// This is the important distinction between a burst signal and burst
+// admission: a request must not consume its entire wall-clock budget while
+// extra capacity is merely being created in the background.
+func (h *Handler) maybeBurstCapacity(ctx context.Context, app App, maxInstances, perVM int) error {
 	if h == nil || h.backend == nil || h.burstPressure == nil || app.ID == "" || maxInstances <= 0 || perVM <= 0 {
-		return
+		return nil
 	}
 	admitter, ok := h.backend.(burstCapacityAdmitter)
 	if !ok {
-		return
+		return nil
 	}
 	state := h.burstPressure.state(app.ID)
 	if state == nil {
-		return
+		return nil
 	}
-	inflight := state.inflight.Load()
-	healthy := h.backend.HealthyCount(app.ID)
-	desired := desiredBurstInstances(inflight, perVM, maxInstances)
-	if desired <= healthy || !state.worker.CompareAndSwap(false, true) {
-		return
+	for {
+		inflight := state.inflight.Load()
+		healthy := h.backend.HealthyCount(app.ID)
+		desired := desiredBurstInstances(inflight, perVM, maxInstances)
+		if desired <= healthy {
+			return nil
+		}
+
+		state.mu.Lock()
+		generation := state.worker
+		if generation == nil {
+			generation = &burstGeneration{done: make(chan struct{})}
+			state.worker = generation
+			go h.runBurstCapacity(ctx, app, maxInstances, perVM, state, generation, admitter)
+		}
+		state.mu.Unlock()
+
+		select {
+		case <-generation.done:
+			if generation.err != nil {
+				return generation.err
+			}
+			// The worker may have observed a lower demand after some
+			// callers completed. Re-read pressure before forwarding.
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
+}
 
-	go func() {
-		defer state.worker.Store(false)
-		lifecycleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), admissionLifecycleTimeout)
-		defer cancel()
+func (h *Handler) runBurstCapacity(ctx context.Context, app App, maxInstances, perVM int, state *burstPressureState, generation *burstGeneration, admitter burstCapacityAdmitter) {
+	lifecycleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), admissionLifecycleTimeout)
+	defer cancel()
 
-		for lifecycleCtx.Err() == nil {
-			inflight := state.inflight.Load()
-			healthy := h.backend.HealthyCount(app.ID)
-			desired := desiredBurstInstances(inflight, perVM, maxInstances)
-			if desired <= healthy {
-				return
+	var workerErr error
+	for lifecycleCtx.Err() == nil {
+		inflight := state.inflight.Load()
+		healthy := h.backend.HealthyCount(app.ID)
+		desired := desiredBurstInstances(inflight, perVM, maxInstances)
+		if desired <= healthy {
+			break
+		}
+		count := desired - healthy
+		if count > api.ScaleUpMaxBurstPerTick {
+			count = api.ScaleUpMaxBurstPerTick
+		}
+		policy := WakeAdmissionPolicyForPlan(app.Plan)
+		var admitted int
+		var err error
+		var queued bool
+		var wait time.Duration
+		admit := func(admitCtx context.Context) error {
+			var admitErr error
+			admitted, admitErr = admitter.AdmitBurst(admitCtx, app.ID, app.Scope, sched.TriggerGateway, maxInstances, count)
+			return admitErr
+		}
+		if h.admissionQueue != nil {
+			queued, wait, err = h.admissionQueue.Do(lifecycleCtx, app.ID, string(app.Plan), policy, admit)
+			if h.metrics != nil {
+				h.metrics.ObserveWakeAdmission(string(app.Plan), err, queued, wait)
 			}
-			count := desired - healthy
-			if count > api.ScaleUpMaxBurstPerTick {
-				count = api.ScaleUpMaxBurstPerTick
-			}
-			policy := WakeAdmissionPolicyForPlan(app.Plan)
-			var admitted int
-			var err error
-			var queued bool
-			var wait time.Duration
-			admit := func(admitCtx context.Context) error {
-				var admitErr error
-				admitted, admitErr = admitter.AdmitBurst(admitCtx, app.ID, app.Scope, sched.TriggerGateway, maxInstances, count)
-				return admitErr
-			}
-			if h.admissionQueue != nil {
-				queued, wait, err = h.admissionQueue.Do(lifecycleCtx, app.ID, string(app.Plan), policy, admit)
-				if h.metrics != nil {
-					h.metrics.ObserveWakeAdmission(string(app.Plan), err, queued, wait)
-				}
-			} else {
-				err = admit(lifecycleCtx)
-			}
-			if err != nil && h.log != nil {
+		} else {
+			err = admit(lifecycleCtx)
+		}
+		if err != nil {
+			workerErr = err
+			if h.log != nil {
 				h.log.Warn("gateway: burst admission failed", "app_id", app.ID, "requested", count, "admitted", admitted, "err", err)
 			}
-			if admitted == 0 {
-				return
-			}
+			break
 		}
-	}()
+		if admitted == 0 || h.backend.HealthyCount(app.ID) <= healthy {
+			workerErr = errBurstCapacityStalled
+			if h.log != nil {
+				h.log.Warn("gateway: burst admission made no progress", "app_id", app.ID, "requested", count, "admitted", admitted)
+			}
+			break
+		}
+	}
+	if workerErr == nil && lifecycleCtx.Err() != nil {
+		workerErr = lifecycleCtx.Err()
+	}
+
+	state.mu.Lock()
+	generation.err = workerErr
+	if state.worker == generation {
+		state.worker = nil
+	}
+	close(generation.done)
+	state.mu.Unlock()
 }
 
 // AdmitBurst runs a bounded set of scheduler admissions concurrently. The
