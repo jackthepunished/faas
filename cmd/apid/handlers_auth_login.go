@@ -509,9 +509,12 @@ func (s *server) setPasswordProof(w http.ResponseWriter, r *http.Request, acct s
 		if has && !ts.IsZero() {
 			reason = "expired"
 		}
+		// Path and method are the mount's constants, not read off the
+		// request: the row is identical, and nothing request-derived
+		// flows into the audit payload.
 		s.audit.Emit(r.Context(), "auth.step_up_required", &acct.ID, map[string]any{
-			"path":    r.URL.Path,
-			"method":  r.Method,
+			"path":    setPasswordPath,
+			"method":  http.MethodPost,
 			"reason":  reason,
 			"ttl_sec": int(setPasswordStepUpTTL.Seconds()),
 		})
