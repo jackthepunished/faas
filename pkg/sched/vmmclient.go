@@ -344,6 +344,11 @@ type AppSpec struct {
 	SealedEnv       []fcvm.SealedEnvEntry
 	APIEnv          []fcvm.APIEnvEntry // issue #395 / ADR-045: plaintext per-app env
 	EgressAllowlist []string           // ADR-031 + ADR-032; v4 or v6 CIDRs; empty = no allowlist rule. The renderer partitions by family.
+	// Sidecars carries the deployment's immutable sidecar layer handles and
+	// per-workload policy. Image defaults and command metadata are baked into
+	// each sidecar layer; sealed deployment env overrides travel separately in
+	// the sidecar spec and are opened only by vmmd into the instance upper.
+	Sidecars []fcvm.WorkloadSpec
 	// Port (issue #460 / ADR-053 §Decision 1, PR-C) is the per-deployment
 	// override port the customer's app binds inside the guest. 0 = legacy
 	// 8080 (netns.AppPort default at the vmmd wire boundary). The host's
@@ -948,6 +953,27 @@ func (a AppSpec) toProto() *vmmdpb.AppSpec {
 			Value: e.Value,
 		})
 	}
+	sidecars := make([]*vmmdpb.SidecarSpec, 0, len(a.Sidecars))
+	for _, sc := range a.Sidecars {
+		sealedSidecarEnv := make([]*vmmdpb.SealedSecret, 0, len(sc.SealedEnv))
+		for _, entry := range sc.SealedEnv {
+			sealedSidecarEnv = append(sealedSidecarEnv, &vmmdpb.SealedSecret{
+				Key:        entry.Key,
+				Ciphertext: entry.Ciphertext,
+			})
+		}
+		sidecars = append(sidecars, &vmmdpb.SidecarSpec{
+			Name:       sc.Name,
+			Type:       sc.Type,
+			Image:      sc.Image,
+			RamMb:      int32(sc.RamMB),
+			Port:       uint32(sc.Port),
+			Essential:  sc.Essential,
+			StorageKey: sc.StorageKey,
+			DriveSlot:  sc.DriveID,
+			SealedEnv:  sealedSidecarEnv,
+		})
+	}
 	return &vmmdpb.AppSpec{
 		BaseKey:         a.BaseKey,
 		LayerKey:        a.LayerKey,
@@ -956,6 +982,7 @@ func (a AppSpec) toProto() *vmmdpb.AppSpec {
 		EgressMbit:      a.EgressMbit,
 		SealedEnv:       sealed,
 		ApiEnv:          apiEnv,
+		Sidecars:        sidecars,
 		EgressAllowlist: a.EgressAllowlist,
 		Port:            uint32(a.Port),
 		// Issue #460 / ADR-053, ADR-057 / PR-D: per-deployment

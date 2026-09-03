@@ -170,6 +170,11 @@ type fakeVMM struct {
 	// but per-call (one entry per workload, not aggregated).
 	stagedWorkloads  []stagedWorkload
 	stageWorkloadErr error
+	// Issue #463 / ADR-069: per-sidecar deployment env overrides staged on
+	// the writable main layer. Mirrors stagedWorkloads but records the JSON
+	// payload after Manager.Wake has unsealed it.
+	stagedWorkloadEnvs  []stagedWorkloadEnv
+	stageWorkloadEnvErr error
 	// Issue #463 / ADR-069 / PR-B: deployment-level roster at
 	// /etc/faas/workloads.json on drive1. Mirrors stagedWorkloads
 	// but the arg shape is (main, sidecars[]) — a single call
@@ -246,6 +251,12 @@ type stagedWorkload struct {
 	instance string
 	driveIdx int
 	spec     WorkloadSpec
+}
+
+type stagedWorkloadEnv struct {
+	instance     string
+	workloadName string
+	blob         []byte
 }
 
 func (v *fakeVMM) Boot(_ context.Context, l Lease, _ VMConfig, _ string) error {
@@ -629,6 +640,20 @@ func (v *fakeVMM) StageAPIEnv(instance string, jsonBlob []byte) error {
 	})
 	v.mu.Unlock()
 	return v.stageAPIEnvErr
+}
+
+// StageWorkloadEnv is the fakeVMM stub for per-sidecar env staging. The
+// production VMM writes this JSON to the main workload's instance-scoped
+// upper; the fake records the already-unsealed payload for contract tests.
+func (v *fakeVMM) StageWorkloadEnv(instance, workloadName string, jsonBlob []byte) error {
+	v.mu.Lock()
+	v.stagedWorkloadEnvs = append(v.stagedWorkloadEnvs, stagedWorkloadEnv{
+		instance:     instance,
+		workloadName: workloadName,
+		blob:         append([]byte(nil), jsonBlob...),
+	})
+	v.mu.Unlock()
+	return v.stageWorkloadEnvErr
 }
 
 // StageWorkloadManifest is the fakeVMM stub for the per-workload

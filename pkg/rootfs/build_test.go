@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -41,6 +42,34 @@ func TestInjectManifest_WritesCanonicalJSON(t *testing.T) {
 	}
 	if !bytes.Contains(b, []byte("8080")) {
 		t.Errorf("manifest content missing Port: %s", b)
+	}
+}
+
+func TestInjectWorkloadManifest_WritesNameScopedContract(t *testing.T) {
+	staging := t.TempDir()
+	want := api.AppManifest{Entrypoint: []string{"/bin/metrics"}, Port: 9090}
+	if err := InjectWorkloadManifest(staging, "metrics", want); err != nil {
+		t.Fatalf("InjectWorkloadManifest: %v", err)
+	}
+
+	path := filepath.Join(staging, "etc", "faas", "workloads", "metrics", "workload.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("workload manifest not at expected path %q: %v", path, err)
+	}
+	got, err := api.ReadManifest(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("ReadManifest: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("manifest = %#v, want %#v", got, want)
+	}
+}
+
+func TestInjectWorkloadManifest_RejectsPathTraversal(t *testing.T) {
+	err := InjectWorkloadManifest(t.TempDir(), "../escape", api.AppManifest{Entrypoint: []string{"/bin/metrics"}})
+	if err == nil || !strings.Contains(err.Error(), "invalid workload manifest name") {
+		t.Fatalf("error = %v, want invalid workload manifest name", err)
 	}
 }
 

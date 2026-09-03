@@ -441,13 +441,13 @@ func (v *JailerVMM) BootColdBoot(ctx context.Context, l Lease, spec ColdBootSpec
 	// (pre-PR-D default). Non-empty → waitReady does HTTP GET
 	// <HealthcheckPath> against <HostIP>:8080 and accepts 2xx as ready.
 	if spec.SkipReady {
-		return v.bootNoWait(ctx, l, BuildColdBootConfig(spec, l.Slot))
+		return v.bootNoWait(ctx, l, BuildColdBootConfig(spec, l.Slot), spec.Workloads, spec.SecretsEnvJSON, spec.APIEnvJSON)
 	}
-	return v.Boot(ctx, l, BuildColdBootConfig(spec, l.Slot), spec.HealthcheckPath)
+	return v.boot(ctx, l, BuildColdBootConfig(spec, l.Slot), false, spec.HealthcheckPath, spec.Workloads, spec.SecretsEnvJSON, spec.APIEnvJSON)
 }
 
-func (v *JailerVMM) bootNoWait(ctx context.Context, l Lease, cfg VMConfig) error {
-	return v.boot(ctx, l, cfg, true, "")
+func (v *JailerVMM) bootNoWait(ctx context.Context, l Lease, cfg VMConfig, workloads []WorkloadSpec, secretsEnvJSON, apiEnvJSON []byte) error {
+	return v.boot(ctx, l, cfg, true, "", workloads, secretsEnvJSON, apiEnvJSON)
 }
 
 // Boot provisions the chroot, starts the jailed firecracker with a full config,
@@ -468,10 +468,10 @@ func (v *JailerVMM) bootNoWait(ctx context.Context, l Lease, cfg VMConfig) error
 // Move 4 (issue #254): registerRing is called BEFORE startJailer so
 // cmd.Stdout can be wired to the ring's writer in startJailer.
 func (v *JailerVMM) Boot(ctx context.Context, l Lease, cfg VMConfig, healthcheckPath string) (err error) {
-	return v.boot(ctx, l, cfg, false, healthcheckPath)
+	return v.boot(ctx, l, cfg, false, healthcheckPath, nil, nil, nil)
 }
 
-func (v *JailerVMM) boot(ctx context.Context, l Lease, cfg VMConfig, skipReady bool, healthcheckPath string) (err error) {
+func (v *JailerVMM) boot(ctx context.Context, l Lease, cfg VMConfig, skipReady bool, healthcheckPath string, workloads []WorkloadSpec, secretsEnvJSON, apiEnvJSON []byte) (err error) {
 	root, err := v.mkChroot(l.Instance)
 	if err != nil {
 		return err
@@ -486,6 +486,9 @@ func (v *JailerVMM) boot(ctx context.Context, l Lease, cfg VMConfig, skipReady b
 	jailed, err := v.provision(root, cfg, l.UID, l.GID, l.Instance)
 	if err != nil {
 		return fmt.Errorf("vmm: provision chroot: %w", err)
+	}
+	if err := v.stagePreBootFiles(l.Instance, workloads, secretsEnvJSON, apiEnvJSON); err != nil {
+		return fmt.Errorf("vmm: stage pre-boot workload state: %w", err)
 	}
 	cfgBytes, err := json.Marshal(jailed)
 	if err != nil {
@@ -510,6 +513,11 @@ func (v *JailerVMM) boot(ctx context.Context, l Lease, cfg VMConfig, skipReady b
 	if err = v.bindTunDeviceInJailer(root, l.Instance, l.UID, l.GID); err != nil {
 		return err
 	}
+	if l.IsBuilder || l.Plan.Valid() {
+		if err = v.applyPreBootCgroupFence(l, workloads); err != nil {
+			return fmt.Errorf("vmm: apply pre-boot cgroup fence: %w", err)
+		}
+	}
 	if err = writeConfigFIFO(ctx, cfgPath, cfgBytes); err != nil {
 		return fmt.Errorf("vmm: write config: %w", err)
 	}
@@ -520,6 +528,87 @@ func (v *JailerVMM) boot(ctx context.Context, l Lease, cfg VMConfig, skipReady b
 	if !skipReady {
 		if err = v.waitReady(ctx, l, healthcheckPath); err != nil {
 			return fmt.Errorf("vmm: readiness: %w", err)
+		}
+	}
+	return nil
+}
+
+// preparesWakeStateBeforeBoot is an internal marker used by Manager.Wake.
+// JailerVMM stages all runtime files while the Firecracker config FIFO is
+// still closed, so Manager must not repeat the writes after readiness. Test
+// VMMs do not implement this marker and retain the older observable staging
+// hooks.
+func (v *JailerVMM) preparesWakeStateBeforeBoot() bool { return true }
+
+// stagePreBootFiles writes every file guest-init needs before the VM can run.
+// The main drive is available after provision; the Firecracker process has not
+// received its config yet, so this is the last safe point for secrets, API env,
+// per-sidecar env overrides, and the sidecar roster.
+func (v *JailerVMM) stagePreBootFiles(instance string, workloads []WorkloadSpec, secretsEnvJSON, apiEnvJSON []byte) error {
+	if len(secretsEnvJSON) > 0 {
+		if err := v.StageSecretsEnv(instance, secretsEnvJSON); err != nil {
+			return fmt.Errorf("stage secrets.env: %w", err)
+		}
+	}
+	if len(apiEnvJSON) > 0 {
+		if err := v.StageAPIEnv(instance, apiEnvJSON); err != nil {
+			return fmt.Errorf("stage env.json: %w", err)
+		}
+	}
+	if len(workloads) > 1 {
+		// Sidecar drives are deliberately read-only. Image defaults and the
+		// effective command are baked into their immutable manifests, while
+		// deployment-specific env overrides are written to the instance's
+		// writable main upper before guest-init can execute them.
+		for _, workload := range workloads[1:] {
+			if len(workload.preparedEnvJSON) == 0 {
+				continue
+			}
+			if err := v.StageWorkloadEnv(instance, workload.Name, workload.preparedEnvJSON); err != nil {
+				return fmt.Errorf("stage workload %s env: %w", workload.Name, err)
+			}
+		}
+		if err := v.StageWorkloadManifest(instance, -1, workloads[0]); err != nil {
+			return fmt.Errorf("stage main workload manifest: %w", err)
+		}
+		if err := v.StageWorkloadRoster(instance, workloads[0], workloads[1:]); err != nil {
+			return fmt.Errorf("stage workload roster: %w", err)
+		}
+	}
+	return nil
+}
+
+// applyPreBootCgroupFence installs the host-side memory/CPU fence after
+// jailer has created the instance scope but before the config FIFO releases
+// Firecracker. A missing or unwritable fence is fatal: allowing an uncapped
+// VM to continue would turn a provisioning error into a resource-isolation
+// bypass.
+func (v *JailerVMM) applyPreBootCgroupFence(l Lease, workloads []WorkloadSpec) error {
+	if l.IsBuilder {
+		if err := writeBuildCgroup(l.Instance, l.MemoryMaxMiB); err != nil {
+			return err
+		}
+		return nil
+	}
+	if err := writePlanCgroup(l.Instance, l.Plan, l.MemoryMaxMiB); err != nil {
+		return err
+	}
+	if len(workloads) <= 1 {
+		return nil
+	}
+	parentScope := filepath.Join(cgroupRoot, ParentCgroupFor(l.Plan), PerInstanceScope(l.Instance))
+	if err := writeWorkloadCgroup(parentScope, WorkloadNameMain, l.MemoryMaxMiB); err != nil {
+		return err
+	}
+	for _, workload := range workloads[1:] {
+		// RamMB=0 means inherit the parent plan cap; no child leaf is
+		// needed and treating zero as 1 MiB would make the workload
+		// unusable.
+		if workload.RamMB == 0 {
+			continue
+		}
+		if err := writeWorkloadCgroup(parentScope, workload.Name, workload.RamMB); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -688,6 +777,9 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 		}
 	}
 	tStageDrives := time.Now()
+	if err := v.stagePreBootFiles(l.Instance, spec.Workloads, spec.SecretsEnvJSON, spec.APIEnvJSON); err != nil {
+		return fmt.Errorf("vmm: stage pre-boot workload state: %w", err)
+	}
 
 	// Snapshot files are read-only inputs shared across the N instances a single
 	// snapshot may restore (invariant §6.2-5): hardlink them in and widen for read
@@ -725,6 +817,11 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 	tStartJailer := time.Now()
 	if err = v.bindTunDeviceInJailer(root, l.Instance, l.UID, l.GID); err != nil {
 		return err
+	}
+	if l.IsBuilder || l.Plan.Valid() {
+		if err = v.applyPreBootCgroupFence(l, spec.Workloads); err != nil {
+			return fmt.Errorf("vmm: apply pre-boot cgroup fence: %w", err)
+		}
 	}
 	tBindTun := time.Now()
 	body := map[string]any{
@@ -1811,13 +1908,11 @@ func sidecarDriveImageName(idx int) string {
 // main workload's drive carries the same file at the same path so
 // guest-init can read all workloads uniformly; the main workload
 // invariant makes the manifest's type="main" / name="main" entries
-// redundant but stable. Image-side sealed env / plaintext env
-// continue to live at the older /etc/faas/secrets.env and
-// /etc/faas/env.json paths on drive1 (the main workload's drive)
-// — sidecar env is baked into the sidecar's ext4 at build time
-// by imaged (per PR-A's `app_secrets` + `app_envs` flow); the
-// wake-time env wire stays flat (no per-workload entries) so the
-// vmmd proto surface is unchanged.
+// redundant but stable. Main secrets/API env continue to live at the
+// older /etc/faas/secrets.env and /etc/faas/env.json paths on drive1.
+// Sidecar image defaults and command metadata are baked into each
+// immutable sidecar layer; deployment-specific overrides are staged by
+// vmmd under /etc/faas/workloads/<name>/env.json in the writable main upper.
 const workloadManifestPath = "upper/etc/faas/workload.json"
 
 // secretsEnvPath is the in-guest location guest-init reads after pivot_root
@@ -1916,15 +2011,68 @@ func (v *JailerVMM) StageAPIEnv(instance string, jsonBlob []byte) error {
 	return nil
 }
 
-// StageWorkloadManifest (issue #463 / ADR-069 / PR-B) writes the
-// per-workload manifest at /etc/faas/workload.json on a sidecar's
-// drive. The manifest is the contract guest-init's supervisor reads
-// to fork/exec the workload, so it MUST land on every workload's
-// drive before the VM cold-boots. The main workload's drive also
-// gets the manifest stamped — guest-init reads all workloads
-// uniformly — but the main workload's manifest is the trivial
-// convenience case (cmd/port are the customer's app spec; named
-// fields are the customer's pinned values from the apps row).
+// workloadEnvPath is the per-sidecar override file written to the main
+// workload's writable upper. The sidecar image's immutable workload.json
+// remains in its own read-only lower and supplies the image defaults.
+const workloadEnvPath = "upper/etc/faas/workloads"
+
+// StageWorkloadEnv writes one sidecar's already-unsealed env overrides to the
+// main workload's writable layer. The file is instance-scoped and is staged
+// before Firecracker receives its config, so plaintext never lands in the
+// shared sidecar image or reaches guest-init through the wake wire.
+func (v *JailerVMM) StageWorkloadEnv(instance, workloadName string, jsonBlob []byte) error {
+	if len(jsonBlob) == 0 {
+		return nil
+	}
+	if !validWorkloadName(workloadName) {
+		return fmt.Errorf("invalid workload name %q", workloadName)
+	}
+	drive1, err := v.resolveDriveImage(instance)
+	if err != nil {
+		return err
+	}
+	mp, err := os.MkdirTemp("", "faas-vmm-workload-env-")
+	if err != nil {
+		return fmt.Errorf("mkdir mountpoint: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(mp) }()
+	if out, err := exec.Command("mount", "-o", "loop,rw", drive1, mp).CombinedOutput(); err != nil {
+		return fmt.Errorf("mount loop: %w (%s)", err, bytes.TrimSpace(out))
+	}
+	defer func() { _ = exec.Command("umount", mp).Run() }()
+
+	target := filepath.Join(mp, workloadEnvPath, workloadName, "env.json")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return fmt.Errorf("mkdir workload env: %w", err)
+	}
+	if err := os.WriteFile(target, jsonBlob, 0o400); err != nil {
+		return fmt.Errorf("write workload env: %w", err)
+	}
+	return nil
+}
+
+func validWorkloadName(name string) bool {
+	if name == "" || len(name) > 63 || filepath.Base(name) != name {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' {
+			return false
+		}
+		if i == 0 && ((c < 'a' || c > 'z') && (c < '0' || c > '9')) {
+			return false
+		}
+	}
+	return true
+}
+
+// StageWorkloadManifest (issue #463 / ADR-069 / PR-B) is the
+// compatibility helper for writing /etc/faas/workload.json on a
+// workload drive. New sidecar layers carry their effective runtime
+// contract at /etc/faas/workloads/<name>/workload.json during the
+// image build; the wake-time helper remains for the main workload
+// and older sidecar layers.
 //
 // driveIdx is the 0-based sidecar index (0 for the first sidecar,
 // 1 for the second, etc.) — the same index BuildColdBootConfig
@@ -1934,7 +2082,7 @@ func (v *JailerVMM) StageAPIEnv(instance string, jsonBlob []byte) error {
 //
 // The drive is loopback-mounted rw, the file is written with mode
 // 0o400 (read-only for the in-guest workloads), and umount runs in
-// a defer. We capture the manifest's command list and port verbatim
+// a defer. The compatibility manifest captures command and port
 // from the WorkloadSpec that schedd sent on the wake wire; vmmd
 // trusts the wire as it trusts every other wake-field (the gRPC
 // server runs on a unix socket reachable only by the faas group;
@@ -2194,11 +2342,13 @@ func (v *JailerVMM) StageWorkloadRoster(instance string, main WorkloadSpec, side
 	}
 	for _, sc := range sidecars {
 		roster.Sidecars = append(roster.Sidecars, workloadManifest{
-			Name:      sc.Name,
-			Type:      sc.Type,
-			RamMB:     sc.RamMB,
-			Port:      sc.Port,
-			Essential: sc.Essential,
+			Name:       sc.Name,
+			Type:       sc.Type,
+			RamMB:      sc.RamMB,
+			Port:       sc.Port,
+			Essential:  sc.Essential,
+			Cmd:        sc.Cmd,
+			Entrypoint: sc.Entrypoint,
 		})
 	}
 	blob, err := json.Marshal(roster)

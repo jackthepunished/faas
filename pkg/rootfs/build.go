@@ -94,6 +94,13 @@ type BuildInput struct {
 	Layers []io.Reader
 	// Manifest is the /etc/faas/app.json contract to inject.
 	Manifest api.AppManifest
+	// WorkloadName and WorkloadManifest optionally add a workload-specific
+	// contract under /etc/faas/workloads/<name>/workload.json. This is used
+	// for sidecar images: their effective OCI entrypoint and image-default
+	// environment travel with the immutable sidecar layer; deployment overrides
+	// remain sealed until vmmd opens them for an instance.
+	WorkloadName     string
+	WorkloadManifest *api.AppManifest
 	// GuestInitPath is the guest-init binary injected as /sbin/init.
 	GuestInitPath string
 	// Plan sets the app-layer cap.
@@ -247,6 +254,17 @@ func (b *Builder) Build(ctx context.Context, in BuildInput) (BuildResult, error)
 	}
 	if err := InjectManifest(staging, in.Manifest); err != nil {
 		return BuildResult{}, err
+	}
+	if in.WorkloadManifest != nil {
+		if in.WorkloadName == "" {
+			return BuildResult{}, errors.New("rootfs: workload manifest requires a workload name")
+		}
+		if err := in.WorkloadManifest.ValidatePlan(in.Plan); err != nil {
+			return BuildResult{}, fmt.Errorf("rootfs: workload manifest: %w", err)
+		}
+		if err := InjectWorkloadManifest(staging, in.WorkloadName, *in.WorkloadManifest); err != nil {
+			return BuildResult{}, err
+		}
 	}
 
 	stats, err := InspectStaging(staging)
@@ -482,6 +500,49 @@ func InjectManifest(staging string, m api.AppManifest) error {
 	}
 	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
 		return fmt.Errorf("rootfs: write manifest: %w", err)
+	}
+	return nil
+}
+
+// InjectWorkloadManifest writes the effective runtime contract for one
+// workload into its immutable layer. The name is validated before it is used
+// in a filesystem path so a malformed wire value cannot escape the staging
+// tree. The guest reads this file after overlay assembly and uses it only for
+// the matching sidecar; the deployment roster remains the source of memory,
+// port, and essential-policy metadata.
+func InjectWorkloadManifest(staging, workloadName string, m api.AppManifest) error {
+	if err := validateWorkloadManifestName(workloadName); err != nil {
+		return err
+	}
+	if err := m.Validate(); err != nil {
+		return fmt.Errorf("rootfs: workload manifest: %w", err)
+	}
+	path := filepath.Join(staging, filepath.FromSlash(strings.TrimPrefix(api.SidecarWorkloadManifestPath, "/")), workloadName, "workload.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("rootfs: workload manifest dir: %w", err)
+	}
+	var buf bytes.Buffer
+	if err := api.WriteManifest(&buf, m); err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+		return fmt.Errorf("rootfs: write workload manifest: %w", err)
+	}
+	return nil
+}
+
+func validateWorkloadManifestName(name string) error {
+	if name == "" || name == "." || name == ".." || filepath.Base(name) != name || len(name) > 63 {
+		return fmt.Errorf("rootfs: invalid workload manifest name %q", name)
+	}
+	for _, r := range name {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' {
+			return fmt.Errorf("rootfs: invalid workload manifest name %q", name)
+		}
+	}
+	first := name[0]
+	if (first < 'a' || first > 'z') && (first < '0' || first > '9') {
+		return fmt.Errorf("rootfs: invalid workload manifest name %q", name)
 	}
 	return nil
 }

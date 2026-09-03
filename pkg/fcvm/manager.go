@@ -173,6 +173,12 @@ type VMM interface {
 	// different path and the payload is plaintext-by-contract (no
 	// unseal step).
 	StageAPIEnv(instance string, jsonBlob []byte) error
+	// StageWorkloadEnv writes the already-unsealed env overrides for one
+	// sidecar under /etc/faas/workloads/<name>/env.json on the main workload's
+	// writable layer. Implementations MUST treat an empty jsonBlob as a no-op.
+	// The caller has already validated the name and opened the sealed values;
+	// this method must run before guest-init can execute the workload.
+	StageWorkloadEnv(instance, workloadName string, jsonBlob []byte) error
 	// StageWorkloadManifest (issue #463 / ADR-069 / PR-B) writes
 	// /etc/faas/workload.json on a workload's drive so guest-init
 	// can fork/exec the workload under the right supervisor. Pass
@@ -2337,6 +2343,92 @@ func jsonMarshalEnvelope(e secretbox.Envelope) ([]byte, error) {
 	return json.Marshal(e)
 }
 
+// prepareWakeFiles resolves the two runtime environment files before the VMM
+// starts. JailerVMM stages the returned bytes while Firecracker's config FIFO
+// is still closed; keeping the preparation here preserves the Manager as the
+// only secret-unseal boundary without allowing guest-init to race a late
+// loopback write.
+func (m *Manager) prepareWakeFiles(req WakeRequest) (secretsJSON, apiJSON []byte, err error) {
+	if len(req.SealedEnvEntries) > 0 {
+		merged, openErr := m.openSealedEnvEntries(req.SealedEnvEntries)
+		if openErr != nil {
+			return nil, nil, openErr
+		}
+		secretsJSON, err = jsonMarshalEnvelope(merged)
+		if err != nil {
+			return nil, nil, fmt.Errorf("marshal envelope: %w", err)
+		}
+	}
+
+	if len(req.APIEnvEntries) > 0 {
+		merged := make(map[string]string, len(req.APIEnvEntries))
+		for _, entry := range req.APIEnvEntries {
+			merged[entry.Key] = entry.Value
+		}
+		apiJSON, err = json.Marshal(merged)
+		if err != nil {
+			return nil, nil, fmt.Errorf("marshal api env: %w", err)
+		}
+	}
+	return secretsJSON, apiJSON, nil
+}
+
+func (m *Manager) openSealedEnvEntries(entries []SealedEnvEntry) (secretbox.Envelope, error) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	if len(m.hostIdentities) == 0 {
+		return nil, ErrNoHostKey
+	}
+	merged := secretbox.Envelope{}
+	for _, entry := range entries {
+		inner, err := secretbox.OpenMulti(m.hostIdentities, entry.Ciphertext)
+		if err != nil {
+			return nil, fmt.Errorf("open sealed env[%s]: %w", logsanitize.Field(entry.Key), err)
+		}
+		for key, value := range inner {
+			merged[key] = value
+		}
+	}
+	return merged, nil
+}
+
+// prepareSidecarEnvFiles opens the per-value SealBytes payloads persisted by
+// apid and keeps the resulting plaintext only in the wake request until the
+// concrete VMM writes it to that instance's writable main layer. Unlike the
+// shared sidecar image, that layer is already deployment/instance scoped.
+func (m *Manager) prepareSidecarEnvFiles(req *WakeRequest) error {
+	for i := range req.Sidecars {
+		entries := req.Sidecars[i].SealedEnv
+		if len(entries) == 0 {
+			continue
+		}
+		if len(m.hostIdentities) == 0 {
+			return ErrNoHostKey
+		}
+		merged := make(map[string]string, len(entries))
+		for _, entry := range entries {
+			namespace, plaintext, err := secretbox.OpenBytesMulti(m.hostIdentities, entry.Ciphertext)
+			if err != nil {
+				return fmt.Errorf("open sidecar env[%s]: %w", logsanitize.Field(entry.Key), err)
+			}
+			if namespace != "sidecar_env" {
+				return fmt.Errorf("sidecar env[%s] has namespace %q, want sidecar_env", logsanitize.Field(entry.Key), namespace)
+			}
+			merged[entry.Key] = string(plaintext)
+		}
+		blob, err := json.Marshal(merged)
+		if err != nil {
+			return fmt.Errorf("marshal sidecar env: %w", err)
+		}
+		req.Sidecars[i].preparedEnvJSON = blob
+		// Do not carry ciphertext any farther than the Manager's unseal
+		// boundary; the VMM only needs the per-instance plaintext bytes.
+		req.Sidecars[i].SealedEnv = nil
+	}
+	return nil
+}
+
 // stageSecretsEnv delegates to the VMM's loopback-mount write. The Manager
 // holds no mount logic of its own — the VMM owns the chroot root + instance
 // layout (JailerVMM) or, in tests, a stub that writes the file directly.
@@ -2351,6 +2443,14 @@ func (m *Manager) stageSecretsEnv(instance string, jsonBlob []byte) error {
 // > os.environ". See VMM.StageAPIEnv for the file-write implementation.
 func (m *Manager) stageAPIEnv(instance string, jsonBlob []byte) error {
 	return m.vmm.StageAPIEnv(instance, jsonBlob)
+}
+
+func (m *Manager) preparesWakeStateBeforeBoot() bool {
+	type preBootStatePreparer interface {
+		preparesWakeStateBeforeBoot() bool
+	}
+	preparer, ok := m.vmm.(preBootStatePreparer)
+	return ok && preparer.preparesWakeStateBeforeBoot()
 }
 
 // WakeRequest brings an app up for a request or cron (spec §6.1). If Snapshot is
@@ -2462,6 +2562,12 @@ type WakeRequest struct {
 	// env.json file written (manifest env still flows in via
 	// /etc/faas/app.json, the legacy path).
 	APIEnvEntries []APIEnvEntry
+	// preparedSecretsEnvJSON and preparedAPIEnvJSON are internal-only
+	// handoff fields. Wake fills them before calling bringUp so a concrete
+	// JailerVMM can stage both files before releasing Firecracker's config
+	// FIFO. They are deliberately unexported and never cross the gRPC wire.
+	preparedSecretsEnvJSON []byte
+	preparedAPIEnvJSON     []byte
 	// EgressAllowlist (ADR-031, tier-2 of the network roadmap): per-app
 	// outbound IPv4 allowlist. Each entry is a CIDR string (e.g.
 	// "1.2.3.0/24"); empty slice = current behaviour (no allowlist rule
@@ -2868,6 +2974,19 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 		err = fmt.Errorf("wake %s: invalid plan %q (issue #301 / ADR-043)", req.Instance, req.Plan)
 		return nil, err
 	}
+	// Prepare runtime files before any VMM boot path. The concrete JailerVMM
+	// stages these bytes before releasing Firecracker's config FIFO; test VMMs
+	// without the pre-boot marker keep the legacy post-ready staging hooks
+	// below for compatibility.
+	req.preparedSecretsEnvJSON, req.preparedAPIEnvJSON, err = m.prepareWakeFiles(req)
+	if err != nil {
+		err = fmt.Errorf("wake %s: prepare runtime env: %w", req.Instance, err)
+		return nil, err
+	}
+	if err = m.prepareSidecarEnvFiles(&req); err != nil {
+		err = fmt.Errorf("wake %s: prepare sidecar env: %w", req.Instance, err)
+		return nil, err
+	}
 	// Spec §7 conntrack cap (ADR-018 deferral). Platform-wide constant;
 	// not propagated through vmmd gRPC because every instance sees the
 	// same value (the failure mode is host-table exhaustion, shared).
@@ -3037,70 +3156,27 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 		return nil, err
 	}
 
-	// G2: stage sealed env → unseal each entry → merge into envelope →
-	// loopback-mounted write → umount. The Manager is the unseal point
-	// (holds host.age). We refuse the request if any sealed blob was
-	// supplied without a key configured — silent drop would mean plaintext
-	// ciphertext never reaches the guest and the caller's "wake succeeded"
-	// hides a missing secret.
-	if len(req.SealedEnvEntries) > 0 {
-		if len(m.hostIdentities) == 0 {
-			return nil, fmt.Errorf("wake %s: %w", req.Instance, ErrNoHostKey)
-		}
-		// We loop-and-merge rather than unseal-into-buf because each entry
-		// is a sealed full envelope (per-key rows). That's the natural shape
-		// coming from apid's per-row upserts. OpenMulti is the
-		// rotation-aware entry point: during the 30-day overlap window
-		// (issue #316 / ADR-057) m.hostIdentities holds [current, previous]
-		// and age.Decrypt natively tries both. Single-identity pre- and
-		// post-overlap states use the 1-element slice.
-		merged := secretbox.Envelope{}
-		for _, e := range req.SealedEnvEntries {
-			inner, err := secretbox.OpenMulti(m.hostIdentities, e.Ciphertext)
-			if err != nil {
-				return nil, fmt.Errorf("wake %s: open sealed env[%s]: %w",
-					req.Instance, logsanitize.Field(e.Key), err)
-			}
-			for k, v := range inner {
-				// Last write wins on key collision. apid upserts on a single
-				// row at a time, so collisions can only happen across wake
-				// scheduling — meaning a stale row got in; the newer one is
-				// the truth.
-				merged[k] = v
+	// Test VMMs retain the legacy observable staging hooks. Production
+	// JailerVMM receives the prepared bytes through the boot spec and writes
+	// them before Firecracker can execute guest-init.
+	if !m.preparesWakeStateBeforeBoot() {
+		if len(req.preparedSecretsEnvJSON) > 0 {
+			if err := m.stageSecretsEnv(req.Instance, req.preparedSecretsEnvJSON); err != nil {
+				return nil, fmt.Errorf("wake %s: stage secrets.env: %w", req.Instance, err)
 			}
 		}
-		// Re-marshal as canonical JSON so guest-init reads the same envelope
-		// shape secretbox.Open returns. The plaintext never escapes into any
-		// log line — only the size and key count are observable above.
-		blob, err := jsonMarshalEnvelope(merged)
-		if err != nil {
-			return nil, fmt.Errorf("wake %s: marshal envelope: %w", req.Instance, err)
+		if len(req.preparedAPIEnvJSON) > 0 {
+			if err := m.stageAPIEnv(req.Instance, req.preparedAPIEnvJSON); err != nil {
+				return nil, fmt.Errorf("wake %s: stage api env: %w", req.Instance, err)
+			}
 		}
-		if err := m.stageSecretsEnv(req.Instance, blob); err != nil {
-			return nil, fmt.Errorf("wake %s: stage secrets.env: %w", req.Instance, err)
-		}
-	}
-
-	// Issue #395 / ADR-045: stage plaintext api_env → JSON-encode the
-	// merged map → loopback-mounted write → umount. Mirrors the
-	// sealed-secrets block above but skips the unseal step entirely.
-	// Sorted-by-key write so the wire is deterministic (handy for
-	// future redaction / diff tooling). No host key needed — values
-	// are plaintext by contract.
-	if len(req.APIEnvEntries) > 0 {
-		merged := map[string]string{}
-		for _, e := range req.APIEnvEntries {
-			merged[e.Key] = e.Value
-		}
-		// Marshal deterministically (encoding/json already sorts map
-		// keys alphabetically) so re-reads on the guest side produce
-		// the same bytes regardless of input ordering.
-		blob, err := json.Marshal(merged)
-		if err != nil {
-			return nil, fmt.Errorf("wake %s: marshal api env: %w", req.Instance, err)
-		}
-		if err := m.stageAPIEnv(req.Instance, blob); err != nil {
-			return nil, fmt.Errorf("wake %s: stage api env: %w", req.Instance, err)
+		for _, sc := range req.Sidecars {
+			if len(sc.preparedEnvJSON) == 0 {
+				continue
+			}
+			if err := m.vmm.StageWorkloadEnv(req.Instance, sc.Name, sc.preparedEnvJSON); err != nil {
+				return nil, fmt.Errorf("wake %s: stage sidecar %s env: %w", req.Instance, sc.Name, err)
+			}
 		}
 	}
 
@@ -3122,7 +3198,7 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 	// index 0 in the sidecar slice = "layer-sidecar-0" in the
 	// FC config. The in-chroot basename is the constant
 	// sidecarDriveImageName(0) = "sidecar-0.ext4".
-	if len(req.Sidecars) > 0 {
+	if len(req.Sidecars) > 0 && !m.preparesWakeStateBeforeBoot() {
 		// Main workload manifest on drive1.
 		if err := m.vmm.StageWorkloadManifest(req.Instance, -1, WorkloadSpec{
 			Name:      WorkloadNameMain,
@@ -3169,71 +3245,76 @@ func (m *Manager) Wake(ctx context.Context, req WakeRequest) (_ *Instance, err e
 	// so snapshot-restore Wake does not need a reset. Failure routes
 	// through the deferred cleanup path — the VM is already up, but
 	// teardown kills it and releases the lease.
-	if lease.IsBuilder {
-		err = writeBuildCgroup(req.Instance, req.MemSizeMiB)
-	} else {
-		err = writePlanCgroup(req.Instance, req.Plan, req.MemSizeMiB)
-	}
-	if err != nil {
-		// Cgroup setup is a mandatory isolation boundary. The VM is already
-		// up, but returning the error routes through Wake's deferred cleanup
-		// so the instance cannot become reachable without its memory and CPU
-		// fences. Local environments that cannot provide cgroup v2 must use
-		// the existing fake VMM/unit-test path rather than weakening this
-		// production invariant.
-		// Issue #1059 / ADR-127: closed-reason counter. Hardcoded
-		// reason="cgroup_fail" per ADR §3 — the wrap already names
-		// the surface, and the §11 invariant "cgroups v2 with
-		// memory.max = plan + 8 MB" makes any sustained
-		// cgroup_fail rate an operator action item. nil-safe.
-		if m.wakeFailureMetrics != nil {
-			m.wakeFailureMetrics.WakeFailure("", req.AppID, WakeReasonCgroupFail).Inc()
-		}
-		return nil, fmt.Errorf("wake %s: cgroup fence: %w", req.Instance, err)
-	}
-
-	// Issue #463 / ADR-069 / PR-B: per-workload cgroup scopes. The
-	// parent scope (writePlanCgroup above) holds the plan ceiling; we
-	// carve one child scope per workload with memory.max = workload's
-	// ram_mb. The host-side firecracker process stays in the parent
-	// scope (jailer's --cgroup arg); the child scopes are defense-in-
-	// depth leaves that the kernel cascade-removes when vmm.Kill
-	// removes the parent. The PRIMARY OOM isolation happens inside
-	// the guest (guest-init's per-workload cgroup partition); this
-	// host-side layer is a second line of defense for the host's
-	// firecracker process and a per-workload memory.failcnt triage
-	// signal. Same "warn + continue" posture as writePlanCgroup
-	// because the VM is already up and leaking a host-side cap is
-	// strictly better than failing the wake.
-	if len(req.Sidecars) > 0 {
-		parentCgroup := ParentCgroupFor(req.Plan)
+	if !m.preparesWakeStateBeforeBoot() {
 		if lease.IsBuilder {
-			parentCgroup = BuilderCgroupParent
+			err = writeBuildCgroup(req.Instance, req.MemSizeMiB)
+		} else {
+			err = writePlanCgroup(req.Instance, req.Plan, req.MemSizeMiB)
 		}
-		parentScope := filepath.Join(cgroupRoot, parentCgroup, PerInstanceScope(req.Instance))
-		// Main workload: matches the per-instance memory.max (the
-		// customer pays for the plan RAM, not the +8 MB overhead).
-		// The +8 MB lives on the parent scope and is shared across
-		// all workload children.
-		if wErr := writeWorkloadCgroup(parentScope, WorkloadNameMain, req.MemSizeMiB); wErr != nil {
-			m.log.Warn("cgroup fence: writeWorkloadCgroup main failed, continuing",
-				"instance", req.Instance, "err", wErr)
-			// Issue #1059 / ADR-127: hardcoded reason="cgroup_fail"
-			// on the per-workload cgroup warn-and-continue paths.
-			// Same posture as writePlanCgroup above — leaks the
-			// warn-and-continue through the metric so the
-			// operator-facing surface can spot the sustained case
-			// without grepping slog.
+		if err != nil {
+			// Cgroup setup is a mandatory isolation boundary. The VM is already
+			// up, but returning the error routes through Wake's deferred cleanup
+			// so the instance cannot become reachable without its memory and CPU
+			// fences. Local environments that cannot provide cgroup v2 must use
+			// the existing fake VMM/unit-test path rather than weakening this
+			// production invariant.
+			// Issue #1059 / ADR-127: closed-reason counter. Hardcoded
+			// reason="cgroup_fail" per ADR §3 — the wrap already names
+			// the surface, and the §11 invariant "cgroups v2 with
+			// memory.max = plan + 8 MB" makes any sustained
+			// cgroup_fail rate an operator action item. nil-safe.
 			if m.wakeFailureMetrics != nil {
 				m.wakeFailureMetrics.WakeFailure("", req.AppID, WakeReasonCgroupFail).Inc()
 			}
+			return nil, fmt.Errorf("wake %s: cgroup fence: %w", req.Instance, err)
 		}
-		for _, sc := range req.Sidecars {
-			if wErr := writeWorkloadCgroup(parentScope, sc.Name, sc.RamMB); wErr != nil {
-				m.log.Warn("cgroup fence: writeWorkloadCgroup sidecar failed, continuing",
-					"instance", req.Instance, "sidecar", sc.Name, "err", wErr)
+
+		// Issue #463 / ADR-069 / PR-B: per-workload cgroup scopes. The
+		// parent scope (writePlanCgroup above) holds the plan ceiling; we
+		// carve one child scope per workload with memory.max = workload's
+		// ram_mb. The host-side firecracker process stays in the parent
+		// scope (jailer's --cgroup arg); the child scopes are defense-in-
+		// depth leaves that the kernel cascade-removes when vmm.Kill
+		// removes the parent. The PRIMARY OOM isolation happens inside
+		// the guest (guest-init's per-workload cgroup partition); this
+		// host-side layer is a second line of defense for the host's
+		// firecracker process and a per-workload memory.failcnt triage
+		// signal. Same "warn + continue" posture as writePlanCgroup
+		// because the VM is already up and leaking a host-side cap is
+		// strictly better than failing the wake.
+		if len(req.Sidecars) > 0 {
+			parentCgroup := ParentCgroupFor(req.Plan)
+			if lease.IsBuilder {
+				parentCgroup = BuilderCgroupParent
+			}
+			parentScope := filepath.Join(cgroupRoot, parentCgroup, PerInstanceScope(req.Instance))
+			// Main workload: matches the per-instance memory.max (the
+			// customer pays for the plan RAM, not the +8 MB overhead).
+			// The +8 MB lives on the parent scope and is shared across
+			// all workload children.
+			if wErr := writeWorkloadCgroup(parentScope, WorkloadNameMain, req.MemSizeMiB); wErr != nil {
+				m.log.Warn("cgroup fence: writeWorkloadCgroup main failed, continuing",
+					"instance", req.Instance, "err", wErr)
+				// Issue #1059 / ADR-127: hardcoded reason="cgroup_fail"
+				// on the per-workload cgroup warn-and-continue paths.
+				// Same posture as writePlanCgroup above — leaks the
+				// warn-and-continue through the metric so the
+				// operator-facing surface can spot the sustained case
+				// without grepping slog.
 				if m.wakeFailureMetrics != nil {
 					m.wakeFailureMetrics.WakeFailure("", req.AppID, WakeReasonCgroupFail).Inc()
+				}
+			}
+			for _, sc := range req.Sidecars {
+				if sc.RamMB == 0 {
+					continue
+				}
+				if wErr := writeWorkloadCgroup(parentScope, sc.Name, sc.RamMB); wErr != nil {
+					m.log.Warn("cgroup fence: writeWorkloadCgroup sidecar failed, continuing",
+						"instance", req.Instance, "sidecar", sc.Name, "err", wErr)
+					if m.wakeFailureMetrics != nil {
+						m.wakeFailureMetrics.WakeFailure("", req.AppID, WakeReasonCgroupFail).Inc()
+					}
 				}
 			}
 		}
@@ -3421,7 +3502,9 @@ func (m *Manager) bringUp(ctx context.Context, lease Lease, nc netns.Config, req
 			// path. Non-empty → Restore stages one extra drive
 			// per entry (read-only for sidecars, read-write for
 			// the main workload's drive1). Additive per ADR-016.
-			Workloads: buildWorkloadsForRestore(req),
+			Workloads:      buildWorkloadsForRestore(req),
+			SecretsEnvJSON: req.preparedSecretsEnvJSON,
+			APIEnvJSON:     req.preparedAPIEnvJSON,
 		}
 		// ADR-098 C11: stamp the RestoreMs (issue #470 / PR #543).
 		// vmm.Restore wraps /snapshot/load + waitReady for the
@@ -3503,7 +3586,9 @@ func (m *Manager) bringUp(ctx context.Context, lease Lease, nc netns.Config, req
 		// (main + sidecars). buildWorkloadsForColdBoot emits an
 		// empty slice on the legacy single-workload path so
 		// BootColdBoot falls through to the LayerKey branch.
-		Workloads: buildWorkloadsForColdBoot(req),
+		Workloads:      buildWorkloadsForColdBoot(req),
+		SecretsEnvJSON: req.preparedSecretsEnvJSON,
+		APIEnvJSON:     req.preparedAPIEnvJSON,
 	}
 	if err := m.vmm.BootColdBoot(ctx, lease, spec); err != nil {
 		// Issue #1059 / ADR-127: terminal cold-boot failure
@@ -4985,13 +5070,18 @@ func buildWorkloadsForColdBoot(req WakeRequest) []WorkloadSpec {
 			continue
 		}
 		out = append(out, WorkloadSpec{
-			Name:       sc.Name,
-			Type:       sc.Type,
-			StorageKey: sc.StorageKey,
-			DriveID:    sc.DriveID, // imaged populated this on the wire
-			RamMB:      sc.RamMB,
-			Port:       sc.Port,
-			Essential:  sc.Essential,
+			Name:            sc.Name,
+			Type:            sc.Type,
+			Image:           sc.Image,
+			StorageKey:      sc.StorageKey,
+			DriveID:         sc.DriveID, // imaged populated this on the wire
+			RamMB:           sc.RamMB,
+			Port:            sc.Port,
+			Essential:       sc.Essential,
+			Cmd:             append([]string(nil), sc.Cmd...),
+			Entrypoint:      append([]string(nil), sc.Entrypoint...),
+			SealedEnv:       append([]SealedEnvEntry(nil), sc.SealedEnv...),
+			preparedEnvJSON: append([]byte(nil), sc.preparedEnvJSON...),
 		})
 	}
 	return out
