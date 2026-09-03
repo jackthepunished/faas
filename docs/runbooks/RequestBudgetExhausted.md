@@ -27,12 +27,26 @@ The budget is sourced from:
      the documented customer-facing surface.
   2. `Plan.RequestBudgetMs` — per-plan default fallback. Zero =
      fall back to `RequestBudgetDefault` (3 s).
-  3. `RequestBudgetDefault` (3 s gatewayd-public / 5 s apid) — the
-     last-resort fallback when neither rule nor per-plan override
-     is set.
+  3. `RequestBudgetDefault` (3 s) — the last-resort fallback when
+     neither rule nor per-plan override is set.
 
 Per-app overrides win over per-plan defaults; per-plan defaults
 win over the platform default.
+
+**Where the budget is stamped matters** (ADR-093 amendment,
+2026-09-03). `gatewayd-public` stamps only `RequestBudgetMax` (30 s)
+as a liveness backstop — it cannot resolve the app, so it cannot see
+a `kind=budget` rule. The authoritative budget is stamped one hop
+later by `gatewayd-internal`'s `applyEdgeRuleBudget`, which is where
+`budget_stamped` is logged and where the rule actually applies.
+
+Before that amendment `gatewayd-public` stamped 3 s, and because
+`reqbudget` derives a *child* budget from the parent's remaining
+time, a `kind=budget` rule could only ever tighten the budget, never
+widen it. If you are debugging a deployment that predates the
+amendment, a rule that appears applied (`source:rule` in
+`budget_stamped`) but has no effect on observed latency is that bug,
+not a rule problem.
 
 ## Symptom
 
