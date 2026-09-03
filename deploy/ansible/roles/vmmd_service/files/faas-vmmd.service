@@ -30,6 +30,15 @@ RestartSec=2s
 RestartCountExport=SYSTEMD_RESTARTS_ON_FAILURE
 
 Slice=faas-cp.slice
+# Keep in sync with pkg/daemonunitspec/vmmd.go — this role is NOT a
+# deployctl generate target (see defaultTargets in cmd/deployctl/main.go),
+# so the drift gate does not cover it. Full rationale lives in the spec;
+# short version: vmmd was the only gated daemon with no memory bound,
+# Delegate=yes does not put the microVMs in its cgroup (they live under
+# faas-tenant.slice), and an unbounded vmmd OOM-killed the shared 3 G
+# faas-cp.slice on 2026-09-03 and took the node out of rotation.
+MemoryHigh=512M
+MemoryMax=1G
 Delegate=yes
 
 AmbientCapabilities=CAP_NET_BIND_SERVICE
