@@ -450,7 +450,7 @@ func (s *server) postSetPassword(w http.ResponseWriter, r *http.Request) {
 		api.WriteProblem(w, api.ErrPasswordTooWeak(err.Error()))
 		return
 	}
-	proof, hadPassword, ok := s.setPasswordProof(w, r, acct)
+	proof, replacing, ok := s.setPasswordProof(w, r, acct)
 	if !ok {
 		return
 	}
@@ -469,7 +469,7 @@ func (s *server) postSetPassword(w http.ResponseWriter, r *http.Request) {
 	}
 	s.audit.Emit(r.Context(), "account.password_set", &acct.ID, map[string]any{
 		"proof":        proof,
-		"had_password": hadPassword,
+		"replaced": replacing,
 	})
 	http.Redirect(w, r, "/dashboard/account/", http.StatusFound)
 }
@@ -483,9 +483,9 @@ const setPasswordStepUpTTL = 5 * time.Minute
 // postSetPassword). Returns the proof name for the audit row and
 // whether a password already existed. On refusal it has written the
 // problem and returns ok=false.
-func (s *server) setPasswordProof(w http.ResponseWriter, r *http.Request, acct state.Account) (proof string, hadPassword bool, ok bool) {
+func (s *server) setPasswordProof(w http.ResponseWriter, r *http.Request, acct state.Account) (proof string, replacing bool, ok bool) {
 	hash, err := s.store.AccountPasswordByAccountID(r.Context(), acct.ID)
-	hadPassword = err == nil
+	replacing = err == nil
 	if err != nil && !errors.Is(err, state.ErrNotFound) {
 		s.log.Error("set_password.lookup", "err", err)
 		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
@@ -495,7 +495,7 @@ func (s *server) setPasswordProof(w http.ResponseWriter, r *http.Request, acct s
 
 	ts, has := authmw.StepUpFrom(r)
 	if has && !ts.IsZero() && time.Since(ts) <= setPasswordStepUpTTL {
-		return "step_up", hadPassword, true
+		return "step_up", replacing, true
 	}
 
 	// An enrolled second factor outranks the knowledge factor: a phished
@@ -519,10 +519,10 @@ func (s *server) setPasswordProof(w http.ResponseWriter, r *http.Request, acct s
 			"ttl_sec": int(setPasswordStepUpTTL.Seconds()),
 		})
 		api.WriteProblem(w, api.ErrStepUpRequired())
-		return "", hadPassword, false
+		return "", replacing, false
 	}
 
-	if hadPassword {
+	if replacing {
 		current := r.FormValue("current_password")
 		matched, verr := auth.Verify(hash, current)
 		if verr != nil {
