@@ -1,7 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -361,5 +365,175 @@ func TestSetPassword_WeakPasswordStillRefusedAfterProof(t *testing.T) {
 	}
 	if !storedPasswordVerifies(t, store, id, seededPassword) {
 		t.Fatal("the seeded password was replaced by a weak one")
+	}
+}
+
+// --- Coverage for the refusal and failure branches ----------------------
+
+// newSetPasswordServer is newAuthedDashboardServerFull with a caller-
+// supplied store, so a test can wrap the MemStore and fail one method.
+func newSetPasswordServer(t *testing.T, store state.Store, accountID string) (http.Handler, *http.Cookie, *session.Manager) {
+	t.Helper()
+	mgr, err := session.NewEphemeralManager(sessionCookieLifetime)
+	if err != nil {
+		t.Fatalf("session manager: %v", err)
+	}
+	cookie, err := mgr.Issue(accountID)
+	if err != nil {
+		t.Fatalf("issue session: %v", err)
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := newServerWithDeps(store, log, "gregale.dev", noopNotifier{}, "", noopMailer{}, stubGithubdClient{}, mgr, nil, 15*60_000_000_000, "")
+	return srv.handler(), &http.Cookie{Name: sessionCookie, Value: cookie}, mgr
+}
+
+// failingPasswordStore fails the password read or write on demand;
+// everything else is the real MemStore.
+type failingPasswordStore struct {
+	*state.MemStore
+	failRead  bool
+	failWrite bool
+}
+
+var errStoreDown = errors.New("store: simulated failure")
+
+func (f *failingPasswordStore) AccountPasswordByAccountID(ctx context.Context, id string) (string, error) {
+	if f.failRead {
+		return "", errStoreDown
+	}
+	return f.MemStore.AccountPasswordByAccountID(ctx, id)
+}
+
+func (f *failingPasswordStore) SetAccountPassword(ctx context.Context, id, phc string) error {
+	if f.failWrite {
+		return errStoreDown
+	}
+	return f.MemStore.SetAccountPassword(ctx, id, phc)
+}
+
+func TestSetPassword_MalformedFormBodyIsRefused(t *testing.T) {
+	h, sid, _, _ := newAuthedDashboardServerFull(t)
+	rec := httptest.NewRecorder()
+	// "%zz" is not valid percent-encoding, so ParseForm fails before
+	// anything else runs.
+	r := httptest.NewRequest(http.MethodPost, "/dashboard/account/set-password",
+		strings.NewReader("password=%zz"))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.AddCookie(sid)
+	h.ServeHTTP(rec, r)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code = %d, want 400\nbody = %s", rec.Code, rec.Body.String())
+	}
+	if code := problemCode(t, rec); code != api.CodeValidation {
+		t.Errorf("code = %q, want %q", code, api.CodeValidation)
+	}
+}
+
+// A stamp older than the window is reported as "expired", not
+// "missing" — the split ADR-077's audit queries depend on.
+func TestSetPassword_StaleStepUpIsAuditedAsExpired(t *testing.T) {
+	h, _, store, mgr := newAuthedDashboardServerFull(t)
+	id := accountID(t, store, "alice@example.com")
+	if err := store.MarkMFAEnrolled(t.Context(), id); err != nil {
+		t.Fatalf("MarkMFAEnrolled: %v", err)
+	}
+	sidValue := "stale-stepped-up-sid"
+	if _, err := store.CreateSession(t.Context(), sidValue, id, "192.0.2.10", "stale-ua"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	stale, err := mgr.IssueWithSessionAndBindingHashAndStepUp(sidValue, id, "", time.Now().Add(-10*time.Minute), false)
+	if err != nil {
+		t.Fatalf("issue stale cookie: %v", err)
+	}
+	sid := &http.Cookie{Name: sessionCookie, Value: stale}
+
+	rec := postSetPasswordForm(t, h, sid, mgr, id, url.Values{"password": {chosenPassword}})
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("code = %d, want 403\nbody = %s", rec.Code, rec.Body.String())
+	}
+	events, err := store.ListEvents(t.Context(), id, 20)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	var reason string
+	for _, ev := range events {
+		if ev.Kind != "auth.step_up_required" {
+			continue
+		}
+		var data struct {
+			Reason string `json:"reason"`
+		}
+		if err := json.Unmarshal(ev.Data, &data); err != nil {
+			t.Fatalf("event data: %v", err)
+		}
+		reason = data.Reason
+	}
+	if reason != "expired" {
+		t.Fatalf("audit reason = %q, want %q", reason, "expired")
+	}
+}
+
+// A stored hash that Verify cannot parse is a data problem, logged
+// server-side; the caller still gets the same 401 as a wrong guess.
+func TestSetPassword_MalformedStoredHashIsRefused(t *testing.T) {
+	h, sid, store, mgr := newAuthedDashboardServerFull(t)
+	id := accountID(t, store, "alice@example.com")
+	if err := store.SetAccountPassword(t.Context(), id, "not-a-phc-string"); err != nil {
+		t.Fatalf("seed malformed hash: %v", err)
+	}
+
+	rec := postSetPasswordForm(t, h, sid, mgr, id, url.Values{
+		"password":         {chosenPassword},
+		"current_password": {seededPassword},
+	})
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("code = %d, want 401\nbody = %s", rec.Code, rec.Body.String())
+	}
+	if code := problemCode(t, rec); code != api.CodeInvalidCredentials {
+		t.Errorf("code = %q, want %q", code, api.CodeInvalidCredentials)
+	}
+	if phc, _ := store.AccountPasswordByAccountID(t.Context(), id); phc != "not-a-phc-string" {
+		t.Fatal("the stored hash was replaced on a verify error")
+	}
+}
+
+func TestSetPassword_PasswordLookupFailureIs500(t *testing.T) {
+	inner := state.NewMemStore()
+	acct, err := inner.CreateAccount(t.Context(), "alice@example.com", "free")
+	if err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+	store := &failingPasswordStore{MemStore: inner, failRead: true}
+	h, sid, mgr := newSetPasswordServer(t, store, acct.ID)
+
+	rec := postSetPasswordForm(t, h, sid, mgr, acct.ID, url.Values{"password": {chosenPassword}})
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("code = %d, want 500\nbody = %s", rec.Code, rec.Body.String())
+	}
+	if _, err := inner.AccountPasswordByAccountID(t.Context(), acct.ID); err == nil {
+		t.Fatal("a password was stored although the lookup failed")
+	}
+}
+
+func TestSetPassword_PasswordWriteFailureIs500(t *testing.T) {
+	inner := state.NewMemStore()
+	acct, err := inner.CreateAccount(t.Context(), "alice@example.com", "free")
+	if err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+	store := &failingPasswordStore{MemStore: inner, failWrite: true}
+	h, sid, mgr := newSetPasswordServer(t, store, acct.ID)
+
+	rec := postSetPasswordForm(t, h, sid, mgr, acct.ID, url.Values{"password": {chosenPassword}})
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("code = %d, want 500\nbody = %s", rec.Code, rec.Body.String())
+	}
+	if _, err := inner.AccountPasswordByAccountID(t.Context(), acct.ID); err == nil {
+		t.Fatal("a password was stored although the write failed")
 	}
 }
