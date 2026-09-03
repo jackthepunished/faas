@@ -412,12 +412,12 @@ func (s *server) postReset(w http.ResponseWriter, r *http.Request) {
 //
 //  1. A fresh step-up stamp (≤ setPasswordStepUpTTL) is accepted as-is —
 //     unchanged for customers who verified TOTP moments ago.
-//  2. The account has a password → `current_password` is required and
+//  2. MFA enrolled → 403 step_up_required: the customer has a second
+//     factor and must use it, whether or not they also have a password.
+//  3. The account has a password → `current_password` is required and
 //     verified. Missing and wrong are the same 401 invalid_credentials
 //     (the caller already knows the account exists, so there is nothing
 //     to enumerate — the padding is for timing, not for presence).
-//  3. No password, MFA enrolled → 403 step_up_required: the customer
-//     has a factor and must use it.
 //  4. No password, no MFA → accepted. There is no factor to re-verify;
 //     the session is the only proof there is, and this opt-in is the
 //     reason the route exists. The audit row records `proof=session`.
@@ -441,13 +441,17 @@ func (s *server) postSetPassword(w http.ResponseWriter, r *http.Request) {
 			"Invalid CSRF token", "please reload the page and try again"))
 		return
 	}
-	proof, hadPassword, ok := s.setPasswordProof(w, r, acct)
-	if !ok {
-		return
-	}
+	// The length rule is free and inspects only the new password, so it
+	// runs before the proof: no DB read and no Argon2id verify for a
+	// request that was never going to be accepted (pkg/auth/password.go
+	// Validate). Nothing leaks — the caller is already the account.
 	plain := r.FormValue("password")
 	if err := auth.Validate(plain); err != nil {
 		api.WriteProblem(w, api.ErrPasswordTooWeak(err.Error()))
+		return
+	}
+	proof, hadPassword, ok := s.setPasswordProof(w, r, acct)
+	if !ok {
 		return
 	}
 	phc, err := auth.Encode(plain)
@@ -489,13 +493,41 @@ func (s *server) setPasswordProof(w http.ResponseWriter, r *http.Request, acct s
 		return "", false, false
 	}
 
-	if ts, has := authmw.StepUpFrom(r); has && !ts.IsZero() && time.Since(ts) <= setPasswordStepUpTTL {
+	ts, has := authmw.StepUpFrom(r)
+	if has && !ts.IsZero() && time.Since(ts) <= setPasswordStepUpTTL {
 		return "step_up", hadPassword, true
+	}
+
+	// An enrolled second factor outranks the knowledge factor: a phished
+	// password plus a stolen session must not be enough to rotate the
+	// password on an account that has TOTP. This keeps MFA customers on
+	// the ADR-077 tier regardless of whether they also have a password.
+	if acct.MFAEnrolled() {
+		// Same row RequireStepUpHandler emits, including its
+		// missing/expired split — ADR-077's queries filter on it.
+		reason := "missing"
+		if has && !ts.IsZero() {
+			reason = "expired"
+		}
+		s.audit.Emit(r.Context(), "auth.step_up_required", &acct.ID, map[string]any{
+			"path":    r.URL.Path,
+			"method":  r.Method,
+			"reason":  reason,
+			"ttl_sec": int(setPasswordStepUpTTL.Seconds()),
+		})
+		api.WriteProblem(w, api.ErrStepUpRequired())
+		return "", hadPassword, false
 	}
 
 	if hadPassword {
 		current := r.FormValue("current_password")
 		matched, verr := auth.Verify(hash, current)
+		if verr != nil {
+			// A malformed stored hash is a data problem, not a wrong
+			// guess; Verify's contract is that it must be surfaced.
+			// Still 401 to the caller — nothing else is safe to say.
+			s.log.Error("set_password.verify", "account_id", acct.ID, "err", verr)
+		}
 		if verr != nil || !matched {
 			s.audit.Emit(r.Context(), "account.password_set_denied", &acct.ID, map[string]any{
 				"reason": "current_password",
@@ -504,17 +536,6 @@ func (s *server) setPasswordProof(w http.ResponseWriter, r *http.Request, acct s
 			return "", true, false
 		}
 		return "current_password", true, true
-	}
-
-	if acct.MFAEnrolled() {
-		s.audit.Emit(r.Context(), "auth.step_up_required", &acct.ID, map[string]any{
-			"path":    r.URL.Path,
-			"method":  r.Method,
-			"reason":  "missing",
-			"ttl_sec": int(setPasswordStepUpTTL.Seconds()),
-		})
-		api.WriteProblem(w, api.ErrStepUpRequired())
-		return "", false, false
 	}
 
 	return "session", false, true

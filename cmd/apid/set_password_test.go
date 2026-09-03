@@ -244,6 +244,33 @@ func TestSetPassword_HasPassword_FreshStepUpStandsInForCurrentPassword(t *testin
 	}
 }
 
+// The second factor outranks the knowledge factor: with TOTP enrolled,
+// the right current_password is not enough — otherwise a phished
+// password plus a stolen session could rotate it.
+func TestSetPassword_HasPasswordWithMFA_RequiresStepUpDespiteCurrentPassword(t *testing.T) {
+	h, sid, store, mgr := newAuthedDashboardServerFull(t)
+	id := accountID(t, store, "alice@example.com")
+	seedPassword(t, store, id)
+	if err := store.MarkMFAEnrolled(t.Context(), id); err != nil {
+		t.Fatalf("MarkMFAEnrolled: %v", err)
+	}
+
+	rec := postSetPasswordForm(t, h, sid, mgr, id, url.Values{
+		"password":         {chosenPassword},
+		"current_password": {seededPassword},
+	})
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("code = %d, want 403\nbody = %s", rec.Code, rec.Body.String())
+	}
+	if code := problemCode(t, rec); code != api.CodeStepUpRequired {
+		t.Errorf("code = %q, want %q", code, api.CodeStepUpRequired)
+	}
+	if !storedPasswordVerifies(t, store, id, seededPassword) {
+		t.Fatal("the seeded password was replaced without a step-up")
+	}
+}
+
 func TestSetPassword_OAuthOnlyWithMFA_RequiresStepUp(t *testing.T) {
 	h, sid, store, mgr := newAuthedDashboardServerFull(t)
 	id := accountID(t, store, "alice@example.com")
@@ -261,6 +288,28 @@ func TestSetPassword_OAuthOnlyWithMFA_RequiresStepUp(t *testing.T) {
 	}
 	if _, err := store.AccountPasswordByAccountID(t.Context(), id); err == nil {
 		t.Fatal("a password was stored without a step-up")
+	}
+}
+
+// The length rule is free and inspects only the new password, so it runs
+// before the proof — no DB read and no Argon2id verify for a request
+// that was never going to be accepted. Observable: a short password
+// answers 400 even when current_password is wrong.
+func TestSetPassword_LengthRuleRunsBeforeProof(t *testing.T) {
+	h, sid, store, mgr := newAuthedDashboardServerFull(t)
+	id := accountID(t, store, "alice@example.com")
+	seedPassword(t, store, id)
+
+	rec := postSetPasswordForm(t, h, sid, mgr, id, url.Values{
+		"password":         {"short"},
+		"current_password": {"not-the-seeded-password"},
+	})
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code = %d, want 400\nbody = %s", rec.Code, rec.Body.String())
+	}
+	if code := problemCode(t, rec); code != api.CodePasswordTooWeak {
+		t.Errorf("code = %q, want %q", code, api.CodePasswordTooWeak)
 	}
 }
 

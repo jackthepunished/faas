@@ -46,12 +46,22 @@ match:
 | Account state | Session state | Outcome | Audit `proof` |
 |---|---|---|---|
 | any | step-up stamp ≤ 5 min | accept | `step_up` |
-| has password | no fresh stamp | require `current_password`; `auth.Verify` against the stored PHC; missing or wrong → 401 `invalid_credentials` | `current_password` |
-| no password, MFA enrolled | no fresh stamp | 403 `step_up_required` (same problem and audit row the ADR-077 gate emitted) | — |
+| MFA enrolled (with or without a password) | no fresh stamp | 403 `step_up_required` (same problem and audit row the ADR-077 gate emitted, including its `missing`/`expired` split) | — |
+| has password, no MFA | no fresh stamp | require `current_password`; `auth.Verify` against the stored PHC; missing or wrong → 401 `invalid_credentials` | `current_password` |
 | no password, no MFA | any | accept | `session` |
 
 The 5-minute TTL is `setPasswordStepUpTTL`, the same window every
 other ADR-077 route uses.
+
+The second factor outranks the knowledge factor on purpose. An
+MFA-enrolled customer who also has a password stays on the ADR-077
+tier: a phished password plus a stolen session is not enough to rotate
+the password. (`/v1/account/mfa/disable` does accept the password
+alone, but that is a recovery path for a lost authenticator, not a
+precedent for routine changes.) The length rule on the new password
+runs before any of this — it is free and inspects only the new value,
+so a request that could never be accepted costs no DB read and no
+Argon2id.
 
 Missing and wrong `current_password` are deliberately the same 401.
 The caller is already authenticated as the account, so there is
@@ -122,6 +132,13 @@ after a valid proof.
   with an API key). Same diagnosis, same shape of fix — deliberately
   not folded into this PR so each route's threat model gets its own
   read; needs its own ADR or an amendment here.
+- **Sessions survive a password change.** Neither this route nor
+  `/auth/reset` revokes other sessions after `SetAccountPassword`, and
+  there is no credential epoch on the session envelope — so a session
+  an attacker already holds outlives the rotation that was meant to
+  evict them. Fix belongs to both paths at once (revoke all but the
+  current session, or stamp an epoch that `sessionAuth` compares);
+  separate PR.
 - `GET /v1/account` → `has_password: bool`, so the console can render
   the "current password" step only when it applies.
 - Console (`faas-web`): insert that step ahead of the choose/confirm

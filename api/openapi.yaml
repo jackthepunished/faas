@@ -1588,11 +1588,12 @@ paths:
 
         - A step-up verified within the last 5 minutes
           (`POST /v1/account/mfa/verify`) is accepted as-is.
+        - Otherwise, if the account has MFA enrolled, 403
+          `step_up_required` — verify TOTP first, whether or not the
+          account also has a password.
         - Otherwise, if the account already has a password,
           `current_password` is required and verified. Missing and
           wrong both answer 401 `invalid_credentials`.
-        - Otherwise, if the account has MFA enrolled, 403
-          `step_up_required` — verify TOTP first.
         - Otherwise (OAuth-only, no MFA) the request is accepted; the
           session is the only proof the account has.
       parameters:
@@ -1627,8 +1628,8 @@ paths:
               schema: { $ref: '#/components/schemas/Problem' }
         '403':
           description: |
-            The account has MFA enrolled and no password; a fresh
-            step-up is required first (`step_up_required`).
+            The account has MFA enrolled and the session carries no
+            step-up from the last 5 minutes (`step_up_required`).
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
