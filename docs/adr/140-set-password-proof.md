@@ -74,18 +74,35 @@ The mount in `cmd/apid/server.go` drops `requireStepUpHandler`; the
 handler emits the identical `auth.step_up_required` audit row on the
 MFA-enrolled branch so ADR-077's downstream queries keep working.
 
+### CSRF
+
+The route is a form POST authenticated by the `faas_sid` cookie, which
+is `SameSite=Lax`. Customer functions are served from
+`*.apps.gregale.dev`, which is *same-site* with `api.gregale.dev`, so a
+form auto-submitted by a customer-hosted page still carries the
+victim's session cookie. The blanket step-up gate incidentally blocked
+that; the `session` row above would not. So every branch — including
+the ones that go on to verify `current_password` or a step-up — first
+requires a purpose-bound `csrf_token` (`middleware.VerifyAuthenticated`,
+action `set_password`), minted by `GET /v1/auth/csrf?action=set_password`
+and double-submitted with the `faas_csrf` cookie. Missing or mismatched
+is 400 `validation_failed`, the same answer `dashboardDelete` gives.
+`set_password` joins the closed `csrfActions` allowlist.
+
 ## Wire
 
 `SetPasswordRequest` (form-encoded):
 
 ```
 password          string  required, 12–256 chars
+csrf_token        string  required; from GET /v1/auth/csrf?action=set_password
 current_password  string  optional; required by the "has password" row
 ```
 
 Responses: `302` → `/dashboard/account/` on success; `400`
-`password_too_weak`; `401` `invalid_credentials` (also the no-session
-answer); `403` `step_up_required`.
+`validation_failed` (CSRF) or `password_too_weak`; `401`
+`invalid_credentials` (also the no-session answer); `403`
+`step_up_required`.
 
 ## Tests
 
@@ -98,6 +115,13 @@ after a valid proof.
 
 ## Follow-ups
 
+- **Sibling mounts.** `POST /dashboard/account/delete` and
+  `POST /dashboard/raise-overage-cap` sit behind the same
+  `requireStepUpHandler(5m)` mount and lock out no-MFA customers from
+  the dashboard in the same way (the `/v1` equivalents remain reachable
+  with an API key). Same diagnosis, same shape of fix — deliberately
+  not folded into this PR so each route's threat model gets its own
+  read; needs its own ADR or an amendment here.
 - `GET /v1/account` → `has_password: bool`, so the console can render
   the "current password" step only when it applies.
 - Console (`faas-web`): insert that step ahead of the choose/confirm

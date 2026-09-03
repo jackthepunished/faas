@@ -1372,7 +1372,7 @@ paths:
           required: true
           schema:
             type: string
-            enum: [auth.logout, auth.session.revoke, auth.sessions.revoke_all, mfa_confirm, mfa_recover, mfa_disable]
+            enum: [auth.logout, auth.session.revoke, auth.sessions.revoke_all, mfa_confirm, mfa_recover, mfa_disable, set_password]
           description: Exact mutation action the token will authorize.
       responses:
         '200':
@@ -1577,6 +1577,13 @@ paths:
         it. The same Argon2id path as `/auth/reset`, anchored to the
         session's account rather than a reset token.
 
+        The form must carry a `csrf_token` minted by
+        `GET /v1/auth/csrf?action=set_password` (double-submit with
+        the `faas_csrf` cookie); a missing or mismatched token is 400
+        `validation_failed`. The route is a same-site form POST, so
+        `SameSite=Lax` alone does not protect it from a customer app
+        hosted under `*.apps.gregale.dev`.
+
         Proof of presence (ADR-140), decided by what the account has:
 
         - A step-up verified within the last 5 minutes
@@ -1603,7 +1610,10 @@ paths:
             Location:
               schema: { type: string, example: "/dashboard/account/" }
         '400':
-          description: Chosen password is too weak (≥12 chars required).
+          description: |
+            Chosen password is too weak (`password_too_weak`, ≥12
+            chars required), or the `csrf_token` is missing or does
+            not match the `faas_csrf` cookie (`validation_failed`).
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -11233,9 +11243,14 @@ components:
     SetPasswordRequest:
       description: "New password for the authenticated account. Lets OAuth-only customers opt into password login, and customers who already have a password replace it."
       type: object
-      required: [password]
+      required: [password, csrf_token]
       properties:
         password: { type: string, minLength: 12, maxLength: 256 }
+        csrf_token:
+          type: string
+          description: |
+            Double-submit token from `GET /v1/auth/csrf?action=set_password`;
+            must equal the `faas_csrf` cookie that call set.
         current_password:
           type: string
           description: |
