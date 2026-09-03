@@ -84,6 +84,15 @@ The mount in `cmd/apid/server.go` drops `requireStepUpHandler`; the
 handler emits the identical `auth.step_up_required` audit row on the
 MFA-enrolled branch so ADR-077's downstream queries keep working.
 
+### Rate limit
+
+`current_password` is a credential check, so the route is mounted
+through `dashboardAuthChain` and shares the dashboard's per-IP failure
+bucket with `/login` (§11: 10 failures per minute per IP, counting the
+401s). Without it a stolen session would be a free oracle for guessing
+the password. The ADR-077 mount had no limiter because it accepted no
+credential.
+
 ### CSRF
 
 The route is a form POST authenticated by the `faas_sid` cookie, which
@@ -112,7 +121,7 @@ current_password  string  optional; required by the "has password" row
 Responses: `302` → `/dashboard/account/` on success; `400`
 `validation_failed` (CSRF) or `password_too_weak`; `401`
 `invalid_credentials` (also the no-session answer); `403`
-`step_up_required`.
+`step_up_required`; `429` after ten 401s from one IP in a minute.
 
 ## Tests
 

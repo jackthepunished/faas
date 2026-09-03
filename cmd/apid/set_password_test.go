@@ -313,6 +313,36 @@ func TestSetPassword_LengthRuleRunsBeforeProof(t *testing.T) {
 	}
 }
 
+// current_password is a credential check, so it sits in the same
+// per-IP failure bucket as /login (§11: 10 failures/min/IP). A stolen
+// session must not be a free oracle for guessing the password.
+func TestSetPassword_WrongCurrentPasswordIsRateLimited(t *testing.T) {
+	h, sid, store, mgr := newAuthedDashboardServerFull(t)
+	id := accountID(t, store, "alice@example.com")
+	seedPassword(t, store, id)
+
+	form := url.Values{
+		"password":         {chosenPassword},
+		"current_password": {"not-the-seeded-password"},
+	}
+	var last *httptest.ResponseRecorder
+	for i := 0; i < 12; i++ {
+		last = postSetPasswordForm(t, h, sid, mgr, id, form)
+		if last.Code == http.StatusTooManyRequests {
+			break
+		}
+		if last.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: code = %d, want 401 or 429\nbody = %s", i+1, last.Code, last.Body.String())
+		}
+	}
+	if last.Code != http.StatusTooManyRequests {
+		t.Fatalf("12 wrong guesses never tripped the limiter; last code = %d", last.Code)
+	}
+	if !storedPasswordVerifies(t, store, id, seededPassword) {
+		t.Fatal("the seeded password was replaced during a guessing run")
+	}
+}
+
 func TestSetPassword_WeakPasswordStillRefusedAfterProof(t *testing.T) {
 	h, sid, store, mgr := newAuthedDashboardServerFull(t)
 	id := accountID(t, store, "alice@example.com")

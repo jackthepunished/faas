@@ -1633,6 +1633,7 @@ paths:
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
 
   # ─── Apps ─────────────────────────────────────────────────────────────────
 
