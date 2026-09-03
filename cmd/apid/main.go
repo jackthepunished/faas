@@ -757,6 +757,18 @@ func run(ctx context.Context, log *slog.Logger) error {
 				}
 			}()
 		}
+		// Public-release hardening: pg_notify is only the wakeup for
+		// imaged signature audits. The durable outbox replay loop
+		// recovers rows missed during a LISTEN reconnect or an apid
+		// restart, and also drains rows when the notification subscriber
+		// is unavailable.
+		if _, ok := srv.store.(state.AuditEventOutboxStore); ok {
+			go func() {
+				if err := runAuditOutbox(ctx, srv.store, log, srv.eventsPlatform); err != nil && ctx.Err() == nil {
+					log.Error("audit: durable outbox exited", "err", err)
+				}
+			}()
+		}
 		// ADR-126 / issue #975 item #2: bridge the two pg_notify
 		// channels that mutate the `?source=auto` cache inputs
 		// (NotifyAppOpenAPIDocChanged + NotifyEdgeRuleChanged)
