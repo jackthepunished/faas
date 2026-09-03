@@ -1142,10 +1142,10 @@ func prepareRailpackConfig(m api.BuildManifest) (func() error, error) {
 		return nil, fmt.Errorf("parse %s deploy.base: %w", path, err)
 	}
 	base["image"] = m.RuntimeBaseRef
-	// Alpine runner bases cannot execute Railpack's default apt install
-	// phase. Preserve an explicit customer list, but make the platform
-	// default empty for the two musl runtime rows.
-	if isAlpineRuntime(m.Runtime) {
+	// Alpine runner bases and base-minimal cannot execute Railpack's default
+	// apt install phase. Preserve an explicit customer list, but make the
+	// platform default empty for musl runtimes and minimal scratch bases.
+	if isAlpineRuntime(m.Runtime) || m.Runtime == "" || strings.Contains(m.RuntimeBaseRef, "base-minimal") {
 		if _, ok := deploy["aptPackages"]; !ok {
 			deploy["aptPackages"] = []any{}
 		}

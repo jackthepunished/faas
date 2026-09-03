@@ -451,6 +451,34 @@ func TestPrepareRailpackConfig_CreatesAndRemovesPlatformConfig(t *testing.T) {
 	}
 }
 
+func TestPrepareRailpackConfig_MinimalBaseDefaultsAptPackagesEmpty(t *testing.T) {
+	workdir := t.TempDir()
+	restore, err := prepareRailpackConfig(api.BuildManifest{
+		Framework:      api.FrameworkAuto,
+		Runtime:        "",
+		RuntimeBaseRef: "ghcr.io/poyrazk/base-minimal@sha256:" + strings.Repeat("c", 64),
+		Workdir:        workdir,
+	})
+	if err != nil {
+		t.Fatalf("prepareRailpackConfig: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(workdir, "railpack.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var config map[string]any
+	if err := json.Unmarshal(data, &config); err != nil {
+		t.Fatal(err)
+	}
+	deploy := config["deploy"].(map[string]any)
+	if got := deploy["aptPackages"].([]any); len(got) != 0 {
+		t.Fatalf("default minimal base aptPackages = %v, want empty", got)
+	}
+	if err := restore(); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+}
+
 func equalSlice(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
