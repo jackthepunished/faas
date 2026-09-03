@@ -2175,10 +2175,16 @@ func (s *server) handler() http.Handler {
 		CountStatuses: []int{middleware.CountEveryAttempt, http.StatusGone},
 	}, http.HandlerFunc(s.postReset)))
 	// POST /dashboard/account/set-password is the authed opt-in for
-	// OAuth-only customers. Behind sessionAuth so the call is anchored
-	// to a known account. NOT behind the auth-bucket — the call only
-	// succeeds when the customer already holds a session.
-	mux.Handle("POST /dashboard/account/set-password", s.dashboardChain(s.sessionAuth(s.requireStepUpHandler(5*time.Minute)(http.HandlerFunc(s.postSetPassword)))))
+	// OAuth-only customers and the change-password path for everyone
+	// else. Behind sessionAuth so the call is anchored to a known
+	// account. NOT behind the auth-bucket — the call only succeeds
+	// when the customer already holds a session. NOT behind
+	// requireStepUpHandler either (ADR-140): the only writer of a
+	// step-up stamp is TOTP verify, so a blanket gate locked out the
+	// OAuth-only, no-MFA customers the route exists for. The handler
+	// picks the proof itself — fresh step-up, current_password, or a
+	// 403 step_up_required when the account has MFA and nothing else.
+	mux.Handle("POST /dashboard/account/set-password", s.dashboardChain(s.sessionAuth(http.HandlerFunc(s.postSetPassword))))
 	mux.Handle("GET /auth/verify", s.dashboardAuthChain(middleware.AuthLimitConfig{
 		// /auth/verify 401s on unknown tokens AND 410s on consumed tokens;
 		// count both so an attacker can't cycle through one-time tokens

@@ -1570,11 +1570,24 @@ paths:
     post:
       tags: [auth]
       operationId: setPassword
-      summary: Set a password on the authenticated account.
+      summary: Set or replace the password on the authenticated account.
       description: |
         Authenticated. Lets OAuth-only customers opt into password
-        login. The same Argon2id path as `/auth/reset`, anchored
-        to the session's account rather than a reset token.
+        login and lets customers who already have a password replace
+        it. The same Argon2id path as `/auth/reset`, anchored to the
+        session's account rather than a reset token.
+
+        Proof of presence (ADR-140), decided by what the account has:
+
+        - A step-up verified within the last 5 minutes
+          (`POST /v1/account/mfa/verify`) is accepted as-is.
+        - Otherwise, if the account already has a password,
+          `current_password` is required and verified. Missing and
+          wrong both answer 401 `invalid_credentials`.
+        - Otherwise, if the account has MFA enrolled, 403
+          `step_up_required` — verify TOTP first.
+        - Otherwise (OAuth-only, no MFA) the request is accepted; the
+          session is the only proof the account has.
       parameters:
         - $ref: '#/components/parameters/CookieSession'
       requestBody:
@@ -1594,7 +1607,21 @@ paths:
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
+        '401':
+          description: |
+            No session, or the account has a password and
+            `current_password` is missing or wrong
+            (`invalid_credentials`).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '403':
+          description: |
+            The account has MFA enrolled and no password; a fresh
+            step-up is required first (`step_up_required`).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
 
   # ─── Apps ─────────────────────────────────────────────────────────────────
 
@@ -11204,11 +11231,17 @@ components:
         new_password: { type: string, minLength: 12, maxLength: 256 }
 
     SetPasswordRequest:
-      description: "New password for the authenticated account. Lets OAuth-only customers opt into password login."
+      description: "New password for the authenticated account. Lets OAuth-only customers opt into password login, and customers who already have a password replace it."
       type: object
       required: [password]
       properties:
         password: { type: string, minLength: 12, maxLength: 256 }
+        current_password:
+          type: string
+          description: |
+            Required when the account already has a password and the
+            session carries no step-up from the last 5 minutes
+            (ADR-140). Ignored for OAuth-only accounts.
 
     # ─── GitHub install bind picker (PR-B) ──────────────────────────────
 

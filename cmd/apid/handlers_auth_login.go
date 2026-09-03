@@ -40,6 +40,7 @@ import (
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/auth"
+	authmw "github.com/onebox-faas/faas/pkg/auth/middleware"
 	"github.com/onebox-faas/faas/pkg/dashboard"
 	"github.com/onebox-faas/faas/pkg/httpsec"
 	"github.com/onebox-faas/faas/pkg/middleware"
@@ -402,9 +403,24 @@ func (s *server) postReset(w http.ResponseWriter, r *http.Request) {
 
 // postSetPassword is the authenticated POST /dashboard/account/set-password.
 // Behind sessionAuth; lets OAuth-only customers opt into password
-// login. The same Argon2id Encode + SetAccountPassword path as
-// reset, but anchored to the session's account rather than a reset
-// token.
+// login and lets customers who already have one replace it. The same
+// Argon2id Encode + SetAccountPassword path as reset, but anchored to
+// the session's account rather than a reset token.
+//
+// ADR-140: the proof of presence is chosen by what the account has,
+// in this order, instead of a blanket TOTP step-up on the mount:
+//
+//  1. A fresh step-up stamp (≤ setPasswordStepUpTTL) is accepted as-is —
+//     unchanged for customers who verified TOTP moments ago.
+//  2. The account has a password → `current_password` is required and
+//     verified. Missing and wrong are the same 401 invalid_credentials
+//     (the caller already knows the account exists, so there is nothing
+//     to enumerate — the padding is for timing, not for presence).
+//  3. No password, MFA enrolled → 403 step_up_required: the customer
+//     has a factor and must use it.
+//  4. No password, no MFA → accepted. There is no factor to re-verify;
+//     the session is the only proof there is, and this opt-in is the
+//     reason the route exists. The audit row records `proof=session`.
 func (s *server) postSetPassword(w http.ResponseWriter, r *http.Request) {
 	acct, ok := AccountFrom(r.Context())
 	if !ok {
@@ -413,6 +429,10 @@ func (s *server) postSetPassword(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := r.ParseForm(); err != nil {
 		api.WriteProblem(w, api.ErrValidation("could not parse form body"))
+		return
+	}
+	proof, hadPassword, ok := s.setPasswordProof(w, r, acct)
+	if !ok {
 		return
 	}
 	plain := r.FormValue("password")
@@ -433,7 +453,61 @@ func (s *server) postSetPassword(w http.ResponseWriter, r *http.Request) {
 			"internal_error", "Internal Error", "failed to set password"))
 		return
 	}
+	s.audit.Emit(r.Context(), "account.password_set", &acct.ID, map[string]any{
+		"proof":        proof,
+		"had_password": hadPassword,
+	})
 	http.Redirect(w, r, "/dashboard/account/", http.StatusFound)
+}
+
+// setPasswordStepUpTTL is the same 5-minute window ADR-077 uses on
+// every other sensitive-op route.
+const setPasswordStepUpTTL = 5 * time.Minute
+
+// setPasswordProof decides whether the caller has shown enough to
+// replace or set the account's password (ADR-140, matrix on
+// postSetPassword). Returns the proof name for the audit row and
+// whether a password already existed. On refusal it has written the
+// problem and returns ok=false.
+func (s *server) setPasswordProof(w http.ResponseWriter, r *http.Request, acct state.Account) (proof string, hadPassword bool, ok bool) {
+	hash, err := s.store.AccountPasswordByAccountID(r.Context(), acct.ID)
+	hadPassword = err == nil
+	if err != nil && !errors.Is(err, state.ErrNotFound) {
+		s.log.Error("set_password.lookup", "err", err)
+		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError,
+			"internal_error", "Internal Error", "failed to read password"))
+		return "", false, false
+	}
+
+	if ts, has := authmw.StepUpFrom(r); has && !ts.IsZero() && time.Since(ts) <= setPasswordStepUpTTL {
+		return "step_up", hadPassword, true
+	}
+
+	if hadPassword {
+		current := r.FormValue("current_password")
+		matched, verr := auth.Verify(hash, current)
+		if verr != nil || !matched {
+			s.audit.Emit(r.Context(), "account.password_set_denied", &acct.ID, map[string]any{
+				"reason": "current_password",
+			})
+			api.WriteProblem(w, api.ErrInvalidCredentials())
+			return "", true, false
+		}
+		return "current_password", true, true
+	}
+
+	if acct.MFAEnrolled() {
+		s.audit.Emit(r.Context(), "auth.step_up_required", &acct.ID, map[string]any{
+			"path":    r.URL.Path,
+			"method":  r.Method,
+			"reason":  "missing",
+			"ttl_sec": int(setPasswordStepUpTTL.Seconds()),
+		})
+		api.WriteProblem(w, api.ErrStepUpRequired())
+		return "", false, false
+	}
+
+	return "session", false, true
 }
 
 // decodeEmailPasswordRequest pulls email + password out of either a
