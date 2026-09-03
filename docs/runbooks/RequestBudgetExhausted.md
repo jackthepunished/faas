@@ -83,6 +83,17 @@ Two options:
      `kind=budget` with `action.budget.budget_ms` set to the desired
      wall-clock ceiling. The rule must beat the per-plan default —
      match by `(hostname, path, method)` to scope narrowly.
+
+     ```
+     gregale edge-rules create --app <slug> --kind budget \
+       --match-host <app>.gregale.dev --match-path /slow-route \
+       --budget-ms 15000
+     ```
+
+     Add `--budget-allow-override-header` to let callers tune the
+     budget per request; it defaults to `x-faas-budget-ms`. Note that
+     the override header is inert until a `kind=budget` rule matches
+     the request — there is no rule-free way to widen the budget.
   2. **Per-plan default**: bump `plans.request_budget_ms` for the
      affected plan. Only do this when the spike is fleet-wide, not
      per-app.
