@@ -175,6 +175,26 @@ func TestSetPassword_OAuthOnlyNoMFA_SetsWithoutStepUp(t *testing.T) {
 	}
 }
 
+func TestSetPassword_ExplicitMFARequired_RequiresEnrollment(t *testing.T) {
+	h, sid, store, mgr := newAuthedDashboardServerFull(t)
+	id := accountID(t, store, "alice@example.com")
+	if _, err := store.SetMFARequired(t.Context(), id, true); err != nil {
+		t.Fatalf("SetMFARequired: %v", err)
+	}
+
+	rec := postSetPasswordForm(t, h, sid, mgr, id, url.Values{"password": {chosenPassword}})
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("code = %d, want 403\nbody = %s", rec.Code, rec.Body.String())
+	}
+	if code := problemCode(t, rec); code != api.CodeMFARequired {
+		t.Errorf("code = %q, want %q", code, api.CodeMFARequired)
+	}
+	if _, err := store.AccountPasswordByAccountID(t.Context(), id); err == nil {
+		t.Fatal("a password was stored while explicit MFA policy was pending")
+	}
+}
+
 func TestSetPassword_HasPassword_RequiresCurrentPassword(t *testing.T) {
 	h, sid, store, mgr := newAuthedDashboardServerFull(t)
 	id := accountID(t, store, "alice@example.com")

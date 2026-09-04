@@ -412,13 +412,15 @@ func (s *server) postReset(w http.ResponseWriter, r *http.Request) {
 //
 //  1. A fresh step-up stamp (≤ setPasswordStepUpTTL) is accepted as-is —
 //     unchanged for customers who verified TOTP moments ago.
-//  2. MFA enrolled → 403 step_up_required: the customer has a second
+//  2. MFARequired with no enrollment → 403 mfa_required: an explicit
+//     account policy is pending completion.
+//  3. MFA enrolled → 403 step_up_required: the customer has a second
 //     factor and must use it, whether or not they also have a password.
-//  3. The account has a password → `current_password` is required and
+//  4. The account has a password → `current_password` is required and
 //     verified. Missing and wrong are the same 401 invalid_credentials
 //     (the caller already knows the account exists, so there is nothing
 //     to enumerate — the padding is for timing, not for presence).
-//  4. No password, no MFA → accepted. There is no factor to re-verify;
+//  5. No password, no MFA → accepted. There is no factor to re-verify;
 //     the session is the only proof there is, and this opt-in is the
 //     reason the route exists. The audit row records `proof=session`.
 func (s *server) postSetPassword(w http.ResponseWriter, r *http.Request) {
@@ -496,6 +498,22 @@ func (s *server) setPasswordProof(w http.ResponseWriter, r *http.Request, acct s
 	ts, has := authmw.StepUpFrom(r)
 	if has && !ts.IsZero() && time.Since(ts) <= setPasswordStepUpTTL {
 		return "step_up", replacing, true
+	}
+
+	// MFA is opt-in for ordinary accounts: an account that has neither
+	// enrolled nor been explicitly armed remains eligible for the
+	// OAuth-only/session proof below. Preserve the separate
+	// MFARequired policy hook, though; a pending enrollment policy must
+	// not be bypassed merely because this dashboard route uses the
+	// proof-selection handler instead of RequireMFA.
+	if acct.MFARequired && !acct.MFAEnrolled() {
+		s.audit.Emit(r.Context(), "auth.mfa_gate_hit", &acct.ID, map[string]any{
+			"path":   setPasswordPath,
+			"method": http.MethodPost,
+		})
+		api.WriteProblem(w, api.NewProblem(http.StatusForbidden, api.CodeMFARequired,
+			"MFA required", "complete /v1/account/mfa/enroll or /v1/account/mfa/confirm to access this route"))
+		return "", replacing, false
 	}
 
 	// An enrolled second factor outranks the knowledge factor: a phished

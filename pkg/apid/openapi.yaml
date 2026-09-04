@@ -1588,6 +1588,10 @@ paths:
 
         - A step-up verified within the last 5 minutes
           (`POST /v1/account/mfa/verify`) is accepted as-is.
+        - Otherwise, if an explicit `mfa_required` policy is armed
+          while the account has not enrolled, 403 `mfa_required`.
+          This is a policy hook; MFA remains opt-in for ordinary
+          accounts.
         - Otherwise, if the account has MFA enrolled, 403
           `step_up_required` — verify TOTP first, whether or not the
           account also has a password.
@@ -1629,7 +1633,9 @@ paths:
         '403':
           description: |
             The account has MFA enrolled and the session carries no
-            step-up from the last 5 minutes (`step_up_required`).
+            step-up from the last 5 minutes (`step_up_required`), or
+            an explicit `mfa_required` policy is pending enrollment
+            (`mfa_required`). MFA is opt-in for ordinary accounts.
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }

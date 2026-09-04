@@ -2181,8 +2181,9 @@ func (s *server) handler() http.Handler {
 	// writer of a step-up stamp is TOTP verify, so a blanket gate
 	// locked out the OAuth-only, no-MFA customers the route exists
 	// for. The handler picks the proof itself — fresh step-up,
-	// current_password, or a 403 step_up_required when the account
-	// has MFA. Because current_password is a credential check, the
+	// current_password, or a 403 when an explicit MFA policy is
+	// pending or the account has enrolled MFA. Because
+	// current_password is a credential check, the
 	// route shares the dashboard's per-IP failure bucket with /login
 	// (§11: 10/min/IP, counting the 401s) so a stolen session is not
 	// a free oracle for guessing the password.

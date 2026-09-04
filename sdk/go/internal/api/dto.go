@@ -554,7 +554,8 @@ type PasswordResetConfirm struct {
 // reset-confirm NewPassword field — the handler runs auth
 // (sessionAuth) before encoding, so this is an authenticated surface.
 type SetPasswordRequest struct {
-	Password string `json:"password"`
+	Password  string `json:"password"`
+	CSRFToken string `json:"csrf_token"`
 	// CurrentPassword is required when the account already has a
 	// password and the session carries no fresh step-up (ADR-140).
 	// Ignored for OAuth-only accounts, which have nothing to verify.

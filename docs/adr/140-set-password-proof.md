@@ -2,7 +2,7 @@
 
 - **Status:** proposed
 - **Date:** 2026-09-03
-- **Decision:** The set-password handler chooses its own proof of presence from what the account has — a fresh step-up, the current password, or (for an OAuth-only account with no MFA) the session itself — instead of sitting behind the blanket `requireStepUpHandler(5m)` mount from ADR-077.
+- **Decision:** The set-password handler chooses its own proof of presence from what the account has — a fresh step-up, an explicit pending MFA policy, the current password, or (for an OAuth-only account with no MFA) the session itself — instead of sitting behind the blanket `requireStepUpHandler(5m)` mount from ADR-077. MFA remains opt-in for ordinary accounts.
 - **Why:** The only writer of a step-up stamp is `POST /v1/account/mfa/verify`, so the blanket gate meant an OAuth-only customer without MFA — the customer the route exists for — could never set a password (403 `step_up_required` on every attempt). At the same time, a customer who *had* a password and *had* stepped up could replace it without re-proving anything; the knowledge factor was never consulted.
 - **Consequences:** `SetPasswordRequest` gains an optional `current_password`. Two new audit kinds: `account.password_set` (with `proof` ∈ {`step_up`, `current_password`, `session`} and `replaced`, true when an existing password was overwritten) and `account.password_set_denied`. The ADR-077 routes table row for this path is superseded by this ADR. The console gets a "current password" step in a follow-up, ideally with a `has_password` field on `GET /v1/account` so it can decide up front.
 - **Rejected alternatives:** (a) keep the blanket step-up and require every customer to enrol MFA before setting a password — makes the OAuth opt-in unusable for the majority; (b) drop the gate and verify nothing — reopens "stolen browser sets a password" for every account; (c) re-run the OAuth consent as the proof for OAuth-only accounts — no server surface for it today, and the consent redirect cannot be completed from a fetch.
@@ -46,6 +46,7 @@ match:
 | Account state | Session state | Outcome | Audit `proof` |
 |---|---|---|---|
 | any | step-up stamp ≤ 5 min | accept | `step_up` |
+| `MFARequired=true`, not enrolled | no fresh stamp | 403 `mfa_required`; complete enrollment | — |
 | MFA enrolled (with or without a password) | no fresh stamp | 403 `step_up_required` (same problem and audit row the ADR-077 gate emitted, including its `missing`/`expired` split) | — |
 | has password, no MFA | no fresh stamp | require `current_password`; `auth.Verify` against the stored PHC; missing or wrong → 401 `invalid_credentials` | `current_password` |
 | no password, no MFA | any | accept | `session` |
@@ -121,14 +122,16 @@ current_password  string  optional; required by the "has password" row
 Responses: `302` → `/dashboard/account/` on success; `400`
 `validation_failed` (CSRF) or `password_too_weak`; `401`
 `invalid_credentials` (also the no-session answer); `403`
-`step_up_required`; `429` after ten 401s from one IP in a minute.
+`step_up_required` for enrolled MFA or `mfa_required` for an explicit
+pending policy; `429` after ten 401s from one IP in a minute.
 
 ## Tests
 
 `cmd/apid/set_password_test.go` pins the full matrix: OAuth-only
-no-MFA accepts without a stamp; has-password refuses a missing and a
-wrong `current_password` (401, stored hash untouched) and accepts the
-right one; a fresh stamp stands in for `current_password`; MFA-enrolled
+no-MFA accepts without a stamp; an explicit pending MFA policy gets
+403 without enrollment; has-password refuses a missing and a wrong
+`current_password` (401, stored hash untouched) and accepts the right
+one; a fresh stamp stands in for `current_password`; MFA-enrolled
 without a password or a stamp gets 403; the length rule still applies
 after a valid proof.
 
