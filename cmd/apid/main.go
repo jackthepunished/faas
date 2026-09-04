@@ -757,6 +757,18 @@ func run(ctx context.Context, log *slog.Logger) error {
 				}
 			}()
 		}
+		// Public-release hardening: pg_notify is only the wakeup for
+		// imaged signature audits. The durable outbox replay loop
+		// recovers rows missed during a LISTEN reconnect or an apid
+		// restart, and also drains rows when the notification subscriber
+		// is unavailable.
+		if _, ok := srv.store.(state.AuditEventOutboxStore); ok {
+			go func() {
+				if err := runAuditOutbox(ctx, srv.store, log, srv.eventsPlatform); err != nil && ctx.Err() == nil {
+					log.Error("audit: durable outbox exited", "err", err)
+				}
+			}()
+		}
 		// ADR-126 / issue #975 item #2: bridge the two pg_notify
 		// channels that mutate the `?source=auto` cache inputs
 		// (NotifyAppOpenAPIDocChanged + NotifyEdgeRuleChanged)
@@ -1227,14 +1239,11 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// deploy, and never interpolate untrusted input.
 	srv.WithBillingPortalURL(deps.getenv("FAAS_BILLING_PORTAL_URL"))
 
-	// Billing provider dispatch (ADR-025 / PR #3 / ADR-032 v2).
-	// FAAS_BILLING_PROVIDER defaults to "paddle" (the v2 production
-	// provider) when unset — the loader constructs a *paddle.Provider
-	// and runs EnsurePlanProducts so the catalog is populated before
-	// the first /v1/webhooks/paddle POST can land. When unset, the
-	// daemon fatals at boot if FAAS_PADDLE_API_KEY is missing
-	// (NewProvider returns ErrNoAPIKey on empty key — see PR #962
-	// CRIT-2 fix). The legacy "stripe" opt-in still returns
+	// Billing provider dispatch (ADR-025 / public-release billing).
+	// FAAS_BILLING_PROVIDER defaults to "polar" when unset — the loader
+	// constructs a *polar.Provider and requires the configured catalog
+	// and meter to pass preflight before the daemon accepts billing traffic.
+	// The legacy "stripe" opt-in still returns
 	// (nil, "stripe", nil) so the changePlan 402 path falls back to
 	// the FAAS_BILLING_PORTAL_URL template above (the pre-PR-#3
 	// behaviour stays bit-for-bit unchanged).
@@ -1596,6 +1605,19 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		}
 	} else {
 		log.Info("background re-seal disabled; set FAAS_REKEY_ENABLED=true to opt in (see docs/ops/host-age-rotation.md)")
+	}
+
+	// A single reconnecting LISTEN session fans invocation_done events out
+	// to all synchronous requests. If the optimization cannot start, keep
+	// the legacy per-request listener path so a transient database/listener
+	// issue does not prevent apid from serving traffic.
+	if deps.pool != nil {
+		completion := newInvocationCompletionWaiter(deps.pool, log)
+		if err := completion.Start(ctx); err != nil {
+			log.Warn("invocation completion fan-out unavailable; using per-request LISTEN fallback", "err", err)
+		} else {
+			srv.WithInvocationCompletionWaiter(completion)
+		}
 	}
 
 	// Optional pre-listen hook (DNS poller in production; nil in tests).

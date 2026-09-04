@@ -205,6 +205,10 @@ type Server struct {
 	// codes.Unavailable, except for the idempotent
 	// Phase 4 / 5 ack paths which succeed.
 	migrations *migrationTracker
+	// streamBridges owns the reusable v2 bridge process and H2C transport for
+	// each live instance. It is lazy so tests and legacy/v1 traffic pay no
+	// startup cost until the optimized path is actually used.
+	streamBridges *streamBridgeManager
 }
 
 // New wires the server. ops may be nil (noop metrics), log may be nil
@@ -251,7 +255,7 @@ func NewWithCPUAndNetAndActivity(vmm VmmdAPI, ops *wire.OpsMetrics, fcVer string
 		// never exported. Tests that don't assert metrics use this path.
 		ops = wire.NewOpsMetrics("vmmd_test")
 	}
-	return &Server{vmm: vmm, ops: ops, fcVer: fcVer, log: log, cpuCache: cpu, netCache: net, activity: act, migrations: newMigrationTracker()}
+	return &Server{vmm: vmm, ops: ops, fcVer: fcVer, log: log, cpuCache: cpu, netCache: net, activity: act, migrations: newMigrationTracker(), streamBridges: newStreamBridgeManager(log)}
 }
 
 // WithEvents (issue #517 / PR-C / ADR-064) wires the wake-timeline
@@ -391,6 +395,16 @@ func (s *Server) incWakeFailure(_ context.Context, reason string) {
 // Register binds s to a gRPC server.
 func (s *Server) Register(g *grpc.Server) {
 	vmmdpb.RegisterVmmdServer(g, s)
+}
+
+// Close releases reusable bridge processes and their unix-socket transports.
+// vmmd calls this during graceful shutdown; keeping it explicit also makes
+// the child lifecycle testable without relying on parent-death signals.
+func (s *Server) Close(ctx context.Context) error {
+	if s == nil || s.streamBridges == nil {
+		return nil
+	}
+	return s.streamBridges.close(ctx)
 }
 
 // CreateFromSnapshot wires the snapshot-restore path. Falls back to cold
@@ -902,6 +916,13 @@ func buildInstanceStatsRow(
 		}
 		if lastAt, ok := activityCache.LastAt(instance); ok {
 			row.LastRequestAt = timestamppb.New(lastAt)
+		}
+		if total, ok := activityCache.Total(instance); ok {
+			// The activity tracker is the source of truth for the
+			// topology-independent scale signal. Keep it optional so
+			// older/non-production test constructors retain the
+			// pre-tracker wire shape.
+			row.RequestCountTotal = wrapperspb.Int64(int64(total))
 		}
 	}
 	return row

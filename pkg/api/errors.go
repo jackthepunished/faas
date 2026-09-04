@@ -2122,15 +2122,10 @@ func ErrStepUpRequired() *Problem {
 		"step-up MFA required for this action: complete /v1/account/mfa/verify to refresh")
 }
 
-// ErrBillingNotImplemented is returned by an apid handler that
-// invoked a billing.Provider method the selected provider (per
-// FAAS_BILLING_PROVIDER) does not support (issue #279: Paddle's
-// Refund). The 501 surfaces the seam so an operator picking the
-// billing backend knows up front which surface areas it disables;
-// today no apid handler invokes Provider.Refund — refunds are
-// Stripe-webhook-observational only — so this helper exists for
-// the future operator-initiated refund path. callers branch on
-// errors.Is(err, billing.ErrNotImplemented) and route here.
+// ErrBillingNotImplemented is returned by an apid handler when the selected
+// provider (per FAAS_BILLING_PROVIDER) does not support the requested billing
+// surface. The 501 makes provider capability gaps explicit to operators;
+// callers branch on errors.Is(err, billing.ErrNotImplemented) and route here.
 func ErrBillingNotImplemented(detail string) *Problem {
 	return NewProblem(http.StatusNotImplemented, CodeBillingNotImplemented,
 		"Billing provider does not support this surface", detail).

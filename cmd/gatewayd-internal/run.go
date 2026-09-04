@@ -365,6 +365,21 @@ func (a *synthAdapter) Invoke(ctx context.Context, appID string, inv state.Invoc
 	return a.invoke(ctx, appID, inv)
 }
 
+// InvokeWithTarget is the pre-woken synthetic invocation path. Schedd owns
+// admission, so gatewayd-internal must not resolve the app and issue another
+// Wake RPC for the same invocation. The target is forwarded directly to the
+// existing node-client path, so the handler needs no second app lookup.
+func (a *synthAdapter) InvokeWithTarget(ctx context.Context, appID string, inv state.Invocation, target gateway.Target) (state.Invocation, error) {
+	if target.InstanceID == "" || target.NodeID == "" {
+		return inv, fmt.Errorf("gateway synth: pre-woken target is incomplete")
+	}
+	if a.forward == nil {
+		return inv, fmt.Errorf("gateway synth: invocation forwarder is not wired")
+	}
+	inv.InstanceID = target.InstanceID
+	return a.forwardInvocation(ctx, target, inv)
+}
+
 // forwardInvocation delivers a synthetic invocation through the same
 // per-node vmmd bridge as an ordinary HTTP request and copies the response
 // body into Invocation.Result. The scheduler persists that result when it

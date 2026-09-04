@@ -6,7 +6,7 @@
 # Keep it tiny: it is the lower layer of every overlay and any bloat here is paid
 # once on disk but affects boot for every app. No package manager, no shell tools
 # beyond busybox.
-FROM debian:12-slim@sha256:362e64223cc0da95422b3b13c045186fc0a81250e765d31c025fbddf257f6143 AS build
+FROM debian:12-slim@sha256:5ae3c39ebd15e229dcedd5cee596b2497182493d41ff162e824ba13fc1b2b867 AS build
 # Issue #197 B3.5 (extension): base-minimal shares the same `debian:12-slim`
 # digest as builder-base; the lock entry covers both. The `scratch` FROM
 # below is the empty canonical image (no upstream repo) and is exempt

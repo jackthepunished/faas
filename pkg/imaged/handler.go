@@ -408,15 +408,72 @@ func (h *Handler) verifyImageSignature(ctx context.Context, app state.App, dep s
 // + data.ref + data.signer). signer is empty on missing/invalid.
 //
 // imaged-side audit events travel via pg_notify('audit_event') —
-// pkg/audit (apid-side) subscribes and writes the rows. This keeps
-// the audit write surface single-sourced (apid) while letting imaged
-// surface operator-visible events.
+// pkg/audit (apid-side) subscribes and writes the rows. The durable
+// outbox is the recovery path when that notification is missed; the
+// notification remains the low-latency fast path.
+type signatureAuditPayload struct {
+	OutboxID     int64  `json:"outbox_id,omitempty"`
+	Kind         string `json:"kind"`
+	AppID        string `json:"app_id"`
+	DeploymentID string `json:"deployment_id"`
+	Ref          string `json:"ref"`
+	Signer       string `json:"signer"`
+}
+
+type signatureAuditData struct {
+	AppID        string `json:"app_id"`
+	DeploymentID string `json:"deployment_id"`
+	Ref          string `json:"ref"`
+	Signer       string `json:"signer"`
+}
+
 func (h *Handler) emitSignatureAudit(ctx context.Context, kind string, app state.App, dep state.Deployment, ref, signer string) {
 	h.log.Warn(kind, "app", app.Slug, "deployment", dep.ID, "ref", ref, "signer", signer)
+	base := signatureAuditPayload{
+		Kind:         kind,
+		AppID:        app.ID,
+		DeploymentID: dep.ID,
+		Ref:          ref,
+		Signer:       signer,
+	}
+	data, err := json.Marshal(signatureAuditData{
+		AppID:        app.ID,
+		DeploymentID: dep.ID,
+		Ref:          ref,
+		Signer:       signer,
+	})
+	if err != nil {
+		h.log.Error("imaged: marshal signature audit", "kind", kind, "deployment", dep.ID, "err", err)
+		return
+	}
+	if outbox, ok := h.store.(state.AuditEventOutboxStore); ok {
+		dedupeKey := "imaged.signature." + kind + "." + dep.ID
+		if dep.ID == "" {
+			dedupeKey = "imaged.signature." + kind + "." + app.ID + "." + ref
+		}
+		// "apid" preserves the existing events.actor attribution: apid
+		// remains the audit writer even though imaged owns the observation.
+		outboxID, enqueueErr := outbox.EnqueueAuditEvent(ctx, "apid", kind, &app.ID, data, dedupeKey)
+		if enqueueErr == nil {
+			base.OutboxID = outboxID
+			payload, marshalErr := json.Marshal(base)
+			if marshalErr != nil {
+				// base only contains scalar fields, so this is a
+				// programmer error; the durable row is still safe
+				// for the apid replay loop.
+				h.log.Error("imaged: marshal signature audit notification", "kind", kind, "deployment", dep.ID, "err", marshalErr)
+				return
+			}
+			if h.notif != nil {
+				_ = h.notif.Notify(ctx, "audit_event", string(payload))
+			}
+			return
+		}
+		h.log.Warn("imaged: enqueue durable signature audit failed; using notification fallback",
+			"kind", kind, "deployment", dep.ID, "err", enqueueErr)
+	}
 	if h.notif != nil {
-		payload := fmt.Sprintf(`{"kind":%q,"app_id":%q,"deployment_id":%q,"ref":%q,"signer":%q}`,
-			kind, app.ID, dep.ID, ref, signer)
-		_ = h.notif.Notify(ctx, "audit_event", payload)
+		_ = h.notif.Notify(ctx, "audit_event", string(data))
 	}
 }
 
@@ -1238,11 +1295,11 @@ func (h *Handler) HandleNotification(ctx context.Context, n db.Notification) {
 			h.log.Warn("imaged: trusted_signer_changed refresh failed", "err", err)
 		}
 	case "audit_event":
-		// imaged-side audit emits (app.signature_missing /
-		// app.signature_invalid) are routed via pg_notify and
-		// eventually written by apid-side pkg/audit. The Loop in
-		// pkg/loop subscribes; this arm is a no-op so the typed
-		// payload reaches pkg/audit unchanged.
+		// audit_event is an imaged → apid handoff. New producers
+		// persist it in audit_event_outbox and apid consumes the
+		// notification; this imaged-side subscription is retained
+		// for channel compatibility and intentionally does not
+		// re-process the event.
 	}
 }
 
@@ -1938,25 +1995,25 @@ func (h *Handler) buildSidecarLayers(ctx context.Context, app state.App, dep sta
 			_ = h.transition(ctx, dep.ID, state.DeployFailed, "sidecar storage init: "+err.Error())
 			return findings, fmt.Errorf("imaged: sidecar storage init: %w", err)
 		}
-		// rootfs.Builder.Build input. The sidecar's
-		// `ram_mb` is the memory.max the sidecar cgroup gets
-		// carved (PR-B step 6 wires that on the host side via
-		// writeWorkloadCgroup). The Manifest's entrypoint is a
-		// placeholder — guest-init reads the per-workload
-		// workload.json (issue #463 / ADR-069 §Sidecar staging)
-		// for the sidecar's argv/env/port at boot time, not
-		// the rootfs-baked app.json. The placeholder exists
-		// because pkg/api.AppManifest.Validate rejects an
-		// empty entrypoint; using a constant argv keeps the
-		// build happy without baking a customer-visible Cmd
-		// into the ext4.
+		// Build the sidecar's effective runtime contract into its
+		// immutable layer. The wake wire carries scheduling metadata
+		// only; command and per-sidecar env must be available before
+		// guest-init starts, including on a cold boot where there is
+		// no opportunity for a late host-side write.
+		workloadManifest, err := h.sidecarWorkloadManifest(sc, pulled.Config)
+		if err != nil {
+			_ = h.transition(ctx, dep.ID, state.DeployFailed, fmt.Sprintf("sidecar %q manifest: %s", sc.Name, err.Error()))
+			return findings, fmt.Errorf("imaged: sidecar %q manifest: %w", sc.Name, err)
+		}
 		result, err := h.builder.Build(ctx, rootfs.BuildInput{
-			Layers:        layersAsReaders(pulled.Layers),
-			Manifest:      api.SidecarBuildManifest(),
-			GuestInitPath: h.guestInitPath,
-			Plan:          acct.Plan,
-			Storage:       be,
-			StorageKey:    layerKey,
+			Layers:           layersAsReaders(pulled.Layers),
+			Manifest:         api.SidecarBuildManifest(),
+			WorkloadName:     sc.Name,
+			WorkloadManifest: &workloadManifest,
+			GuestInitPath:    h.guestInitPath,
+			Plan:             acct.Plan,
+			Storage:          be,
+			StorageKey:       layerKey,
 		})
 		if err != nil {
 			_ = h.transition(ctx, dep.ID, state.DeployFailed, fmt.Sprintf("sidecar %q build: %s", sc.Name, err.Error()))
@@ -1998,6 +2055,47 @@ func (h *Handler) buildSidecarLayers(ctx context.Context, app state.App, dep sta
 			"layers", len(pulled.Layers))
 	}
 	return findings, nil
+}
+
+// sidecarWorkloadManifest projects the OCI image config plus the deployment's
+// command/port overrides into the contract guest-init consumes. Entrypoint
+// follows OCI semantics: a supplied sidecar Cmd replaces the image Cmd while
+// retaining the image Entrypoint. Sidecar env remains sealed in the deployment
+// record and is opened by vmmd only for the per-instance writable layer at
+// wake; it is never persisted in the shared immutable sidecar image.
+func (h *Handler) sidecarWorkloadManifest(sc api.Sidecar, cfg oci.ImageConfig) (api.AppManifest, error) {
+	entrypoint := append([]string(nil), cfg.Entrypoint...)
+	cmd := append([]string(nil), cfg.Cmd...)
+	if len(sc.Cmd) > 0 {
+		cmd = append([]string(nil), sc.Cmd...)
+	}
+	if len(entrypoint) == 0 {
+		entrypoint = cmd
+		cmd = nil
+	}
+	if len(entrypoint) == 0 && len(cmd) == 0 {
+		// Preserve the established sidecar image convention for old
+		// images that rely on the injected start.sh. New images should
+		// declare an OCI Entrypoint/Cmd; the fallback remains useful for
+		// the existing sidecar fixtures and operator-built images.
+		entrypoint = []string{"/usr/local/bin/start.sh"}
+	}
+
+	manifest, err := oci.ManifestFromConfig(oci.Config{
+		Env:              cloneEnvMap(cfg.Env),
+		Entrypoint:       entrypoint,
+		Cmd:              cmd,
+		WorkingDir:       cfg.WorkingDir,
+		User:             cfg.User,
+		Healthcheck:      cfg.Healthcheck,
+		StopSignal:       cfg.StopSignal,
+		StopGracePeriodS: cfg.StopGracePeriodS,
+	})
+	if err != nil {
+		return api.AppManifest{}, err
+	}
+	manifest.Port = sc.Port
+	return manifest, nil
 }
 
 // buildFunctionLayer assembles a function deploy's app-layer ext4:
@@ -2830,12 +2928,11 @@ func (h *Handler) aboveBaseLayers(ctx context.Context, mp oci.ManifestPuller,
 	}
 	baseRef := h.deployBaseRefOverride
 	if baseRef == "" {
-		// Per-runtime env var (FAAS_DEPLOY_BASE_REF_<RUNTIME>) takes
-		// precedence over the legacy single-string global
-		// FAAS_DEPLOY_BASE_REF (wired at cmd/imaged/main.go:255).
-		// Matches the posture of EnsureBases (startup auto-stage):
-		// per-runtime is the canonical operator surface, the single
-		// global is the test-harness / legacy knob. Unknown runtimes
+		// Per-runtime env var (FAAS_DEPLOY_BASE_REF_<RUNTIME>) is the
+		// production contract. The retired single-string global
+		// FAAS_DEPLOY_BASE_REF is rejected by cmd/imaged/main.go.
+		// Matches the posture of EnsureBases (startup auto-stage).
+		// Unknown runtimes
 		// fall through to baseRefFor's default (BaseRefMinimal for
 		// the "" / customer-uploaded-image case). Same
 		// digest-pin validation as the row-level override gate.

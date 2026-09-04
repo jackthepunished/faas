@@ -76,6 +76,38 @@ func TestReader_ReplaceSnapshotForInstance(t *testing.T) {
 	}
 }
 
+func TestReader_RequestsPerSecondAggregatesAndResetsSafely(t *testing.T) {
+	r := NewReader()
+	base := time.Unix(1_700_000_000, 0)
+	r.Replace([]InstanceStat{
+		{AppID: "app1", InstanceID: "i-1", SampledAt: base, RequestCountTotal: 100, RequestCountValid: true},
+		{AppID: "app1", InstanceID: "i-2", SampledAt: base, RequestCountTotal: 40, RequestCountValid: true},
+	})
+	if _, ok := r.RequestsPerSecond("app1"); ok {
+		t.Fatal("RequestsPerSecond returned a signal for a first sample")
+	}
+
+	r.Replace([]InstanceStat{
+		{AppID: "app1", InstanceID: "i-1", SampledAt: base.Add(time.Second), RequestCountTotal: 130, RequestCountValid: true},
+		{AppID: "app1", InstanceID: "i-2", SampledAt: base.Add(time.Second), RequestCountTotal: 50, RequestCountValid: true},
+	})
+	got, ok := r.RequestsPerSecond("app1")
+	if !ok || got != 40 {
+		t.Fatalf("RequestsPerSecond(app1) = (%v, %v), want (40, true)", got, ok)
+	}
+
+	// A vmmd restart / instance recreation resets its cumulative counter.
+	// That sample establishes a new baseline and must not create a burst.
+	r.Replace([]InstanceStat{
+		{AppID: "app1", InstanceID: "i-1", SampledAt: base.Add(2 * time.Second), RequestCountTotal: 2, RequestCountValid: true},
+		{AppID: "app1", InstanceID: "i-2", SampledAt: base.Add(2 * time.Second), RequestCountTotal: 60, RequestCountValid: true},
+	})
+	got, ok = r.RequestsPerSecond("app1")
+	if !ok || got != 10 {
+		t.Fatalf("RequestsPerSecond(app1) after one counter reset = (%v, %v), want (10, true)", got, ok)
+	}
+}
+
 func TestReader_DeterministicOrdering(t *testing.T) {
 	r := NewReader()
 	now := time.Now()

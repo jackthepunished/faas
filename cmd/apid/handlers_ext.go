@@ -3153,11 +3153,70 @@ func (s *server) changePlan(w http.ResponseWriter, r *http.Request, acct state.A
 		api.WriteProblem(w, prob)
 		return
 	}
+	// A downgrade is a provider-side subscription mutation, not a local
+	// entitlement mutation. Applying it locally first can leave a customer on
+	// Free while Polar continues charging the previous paid subscription. The
+	// provider webhook is the only source of truth for the eventual local plan.
+	if acct.Plan != plan {
+		prob := &api.Problem{
+			Status: http.StatusPaymentRequired,
+			Code:   api.CodePayment,
+			Title:  "Billing confirmation required",
+			Detail: "plan downgrades must be scheduled with the billing provider; the current plan remains active until provider confirmation",
+		}
+		if s.billingProvider == nil || acct.StripeSubscriptionItem == "" {
+			prob.BillingPortalURL = s.billingPortalURLForProvider(r.Context(), acct)
+			api.WriteProblem(w, prob)
+			return
+		}
+		changer, ok := s.billingProvider.(billing.SubscriptionPlanChangeProvider)
+		if !ok {
+			prob.Detail = "this billing provider does not support API plan downgrades; use the billing portal; the current plan remains active until provider confirmation"
+			prob.BillingPortalURL = s.billingPortalURLForProvider(r.Context(), acct)
+			api.WriteProblem(w, prob)
+			return
+		}
+		effectiveAt, err := changer.ChangeSubscriptionPlan(r.Context(), acct, plan)
+		if err != nil {
+			s.log.Error("schedule plan change failed",
+				"account", acct.ID,
+				"from", logsanitize.Field(string(acct.Plan)),
+				"to", logsanitize.Field(string(plan)),
+				"err", err)
+			if errors.Is(err, billing.ErrAlreadyCancelled) {
+				api.WriteProblem(w, api.NewProblem(http.StatusConflict,
+					api.CodeConflict, "billing subscription unavailable",
+					"the billing subscription is no longer active; refresh billing and try again"))
+				return
+			}
+			api.WriteProblem(w, api.NewProblem(http.StatusBadGateway,
+				"billing_plan_change_failed", "billing plan change failed",
+				"the provider could not schedule this plan change; the current plan remains active"))
+			return
+		}
+		updated, err := s.store.AccountByID(r.Context(), acct.ID)
+		if err != nil {
+			updated = acct
+		}
+		status := "pending_provider_confirmation"
+		response := s.accountResponse(r.Context(), updated, r)
+		response.PlanChangeStatus = status
+		response.RequestedPlan = string(plan)
+		if !effectiveAt.IsZero() {
+			response.EffectiveAt = &effectiveAt
+		}
+		writeJSON(w, http.StatusAccepted, response)
+		return
+	}
 	if err := s.store.UpdateAccountPlan(r.Context(), acct.ID, plan); err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not update plan"))
 		return
 	}
-	updated, _ := s.store.AccountByID(r.Context(), acct.ID)
+	updated, err := s.store.AccountByID(r.Context(), acct.ID)
+	if err != nil {
+		updated = acct
+		updated.Plan = plan
+	}
 	// CodeQL go/log-injection (CWE-117): plan was enum-validated against
 	// the 4 Plan constants (free|hobby|pro|scale) by plan.Valid() in this
 	// handler — a bad value is rejected with 400 before reaching here,
@@ -3173,9 +3232,7 @@ func (s *server) changePlan(w http.ResponseWriter, r *http.Request, acct state.A
 		"from": string(acct.Plan),
 		"to":   string(plan),
 	})
-	writeJSON(w, http.StatusOK, api.AccountResponse{
-		ID: updated.ID, Email: updated.Email, Plan: string(updated.Plan), Status: string(updated.Status),
-	})
+	writeJSON(w, http.StatusOK, s.accountResponse(r.Context(), updated, r))
 }
 
 // --- spend cap raise (issue #561) --------------------------------------------
@@ -3216,9 +3273,7 @@ func (s *server) raiseOverageCap(w http.ResponseWriter, r *http.Request, acct st
 		api.WriteProblem(w, api.ErrInternal("could not update overage cap"))
 		return
 	}
-	writeJSON(w, http.StatusOK, api.AccountResponse{
-		ID: updated.ID, Email: updated.Email, Plan: string(updated.Plan), Status: string(updated.Status),
-	})
+	writeJSON(w, http.StatusOK, s.accountResponse(r.Context(), updated, r))
 }
 
 // raiseOverageCapSvc is the shared validation-free mutation body used
@@ -3400,8 +3455,9 @@ func (s *server) billingWebhookTolerance() time.Duration {
 // 200'd). Returns 400 on bad payload / bad signature. Unknown event
 // types return 200 so Paddle stops retrying.
 func (s *server) paddleWebhook(w http.ResponseWriter, r *http.Request) {
-	if s.billingProvider == nil {
+	if s.billingProvider == nil || providerName(s.billingProvider) != "paddle" {
 		s.log.Error("paddle_webhook.no_provider",
+			"provider", providerName(s.billingProvider),
 			"err", "FAAS_BILLING_PROVIDER != paddle; refusing to process events")
 		api.WriteProblem(w, api.NewProblem(http.StatusServiceUnavailable, api.CodeCapacity,
 			"paddle webhook not configured",
@@ -3507,11 +3563,12 @@ func (s *server) paddleWebhook(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleBillingEvent is the provider-neutral dunning state machine.
-// Both stripeWebhook and paddleWebhook call it after their per-provider
-// VerifyWebhook succeeds and the account is resolved. The four
+// Stripe, Paddle, and Polar webhook handlers call it after their
+// per-provider verification succeeds and the account is resolved. The four
 // transitions (active / past_due / suspended / plan-change) and the
 // associated dunning emails are the same for both providers — only
-// the event source differs.
+// the event source differs. Polar selects the async-mail variant so
+// provider acknowledgement is not held up by the mail transport.
 //
 // ev.Type is the normalized billing.EventType. Stripe-shaped event
 // strings ("invoice.payment_failed" etc.) are mapped to the normalized
@@ -3546,6 +3603,52 @@ func (s *server) persistBillingInvoice(ctx context.Context, provider string, acc
 }
 
 func (s *server) handleBillingEvent(ctx context.Context, ev billing.Event, acct state.Account) error {
+	return s.handleBillingEventWithOptions(ctx, ev, acct, false)
+}
+
+// handlePolarBillingEvent applies the same entitlement state machine as the
+// legacy provider paths, but keeps best-effort email delivery off Polar's
+// webhook acknowledgement path. Polar retries slow deliveries, so the
+// provider-facing handler must finish after durable state has been written,
+// not after an SMTP/API call completes.
+func (s *server) handlePolarBillingEvent(ctx context.Context, ev billing.Event, acct state.Account) error {
+	return s.handleBillingEventWithOptions(ctx, ev, acct, true)
+}
+
+// sendBillingTransitionMail keeps delivery errors observable without making
+// them part of the billing state transition. Polar callers set async=true so
+// a slow mail transport cannot consume the webhook provider's acknowledgement
+// budget. Legacy callers stay synchronous for compatibility with their
+// existing delivery semantics and tests.
+//
+//nolint:contextcheck // Polar mail deliberately outlives the acknowledged webhook request.
+func (s *server) sendBillingTransitionMail(ctx context.Context, acct state.Account, subject, body string, async bool, operation string) {
+	if s.mailer == nil {
+		return
+	}
+	send := func(mailCtx context.Context) {
+		if err := s.mailer.Send(mailCtx, Message{
+			To: []string{acct.Email}, Subject: subject, TextBody: body,
+		}); err != nil {
+			s.log.Warn("apid: billing transition mail",
+				"operation", operation, "account", acct.ID, "err", err)
+		}
+	}
+	if !async {
+		send(ctx)
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	mailCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	go func() {
+		defer cancel()
+		send(mailCtx)
+	}()
+}
+
+func (s *server) handleBillingEventWithOptions(ctx context.Context, ev billing.Event, acct state.Account, asyncBillingMail bool) error {
 	switch ev.Type {
 	case billing.EventSubscriptionCreated:
 		// The shared column retains its historical Stripe name, but for
@@ -3598,12 +3701,7 @@ func (s *server) handleBillingEvent(ctx context.Context, ev billing.Event, acct 
 			// past_due), which routes through the if branch above
 			// and skips the mail.
 			subject, body := mail.PaymentFailedBody(acct.Email, time.Now().UTC())
-			if err := s.mailer.Send(ctx, Message{
-				To: []string{acct.Email}, Subject: subject, TextBody: body,
-			}); err != nil {
-				s.log.Warn("apid: payment_failed mail",
-					"account", acct.ID, "err", err)
-			}
+			s.sendBillingTransitionMail(ctx, acct, subject, body, asyncBillingMail, "payment_failed")
 		}
 	case billing.EventSubscriptionPastDue:
 		// PR-P3: Paddle's `subscription.past_due` event lands here.
@@ -3662,12 +3760,7 @@ func (s *server) handleBillingEvent(ctx context.Context, ev billing.Event, acct 
 				// past_due → active transition, never on a no-op
 				// redelivery.
 				subject, body := mail.AccountRestoredBody(acct.Email, time.Now().UTC())
-				if err := s.mailer.Send(ctx, Message{
-					To: []string{acct.Email}, Subject: subject, TextBody: body,
-				}); err != nil {
-					s.log.Warn("apid: payment_succeeded mail",
-						"account", acct.ID, "err", err)
-				}
+				s.sendBillingTransitionMail(ctx, acct, subject, body, asyncBillingMail, "payment_succeeded")
 			}
 		}
 		// Clear the dedupe stamp on every payment_succeeded, not just
@@ -3691,18 +3784,17 @@ func (s *server) handleBillingEvent(ctx context.Context, ev billing.Event, acct 
 		}
 	case billing.EventRefundProcessed:
 		// Issue #279: a refund was issued against one of the account's
-		// charges (Stripe: charge.refunded). The provider-initiated
-		// refund path runs through Provider.Refund (POST /v1/admin/
-		// accounts/{id}/credits), not this webhook — the webhook is
-		// the asynchronous confirmation that Stripe accepted the
-		// refund. We emit an audit row so an operator can correlate
-		// the audit log with the Stripe dashboard.
+		// charges. The operator-initiated path runs through Provider.Refund
+		// (POST /v1/admin/accounts/{id}/refunds), not this webhook — the
+		// webhook is the asynchronous confirmation that the provider accepted
+		// the refund. We emit an audit row so an operator can correlate the
+		// audit log with the provider dashboard.
 		//
-		// Idempotent: a redelivered charge.refunded hits the same
+		// Idempotent: a redelivered refund event hits the same
 		// case and emits another audit row; auditors expect this
 		// (it's a real "event happened" — the second delivery is a
 		// different event in time). The dedupe happens upstream
-		// (Stripe's webhook delivery has its own retry semantics).
+		// (the ingress dedupe has provider-specific retry semantics).
 		s.audit.Emit(ctx, "refund.processed", &acct.ID, map[string]any{
 			"actor":              acct.ID,
 			"actor_email":        acct.Email,

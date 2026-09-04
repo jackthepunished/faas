@@ -13,10 +13,12 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"math/big"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -56,6 +58,8 @@ type Provider struct {
 	dedupe        usageDedupe
 	webhookTol    time.Duration
 	now           func() time.Time
+	catalogMu     sync.RWMutex
+	lastSyncAt    time.Time
 }
 
 var _ billing.Provider = (*Provider)(nil)
@@ -149,6 +153,14 @@ func (p *Provider) Capabilities() billing.CapabilitySet {
 	return caps
 }
 
+// UsageMode tells meterd to remove Gregale's included calendar-month quota
+// before sending a Polar event. Polar's native credits reset on a customer's
+// subscription cycle, while Gregale's plan contract resets on the UTC
+// calendar month; using local net overage keeps both sides on the same period.
+func (p *Provider) UsageMode() billing.UsageMode {
+	return billing.UsageModeOverage
+}
+
 // ClassifyPushError satisfies billing.Classifier while keeping Polar's
 // provider-specific error taxonomy in errors.go.
 func (p *Provider) ClassifyPushError(err error) string {
@@ -171,9 +183,19 @@ func (p *Provider) EnsurePlanProducts(ctx context.Context) error {
 	if strings.TrimSpace(p.usageEvent) == "" {
 		return errors.New("polar: usage event name is empty")
 	}
+	if strings.TrimSpace(p.meterID) == "" {
+		return errors.New("polar: meter id missing; configure FAAS_POLAR_METER_ID")
+	}
 	if err := p.validateCatalog(ctx); err != nil {
 		return err
 	}
+	p.catalogMu.Lock()
+	stamp := time.Now().UTC()
+	if p.now != nil {
+		stamp = p.now().UTC()
+	}
+	p.lastSyncAt = stamp
+	p.catalogMu.Unlock()
 	return nil
 }
 
@@ -181,32 +203,137 @@ func (p *Provider) EnsurePlanProducts(ctx context.Context) error {
 // exist in the selected Polar environment. The provider intentionally does
 // not create or mutate catalog resources, but accepting a typo here would
 // otherwise defer a broken deployment to the first customer checkout.
+type catalogProduct struct {
+	ID                     string           `json:"id"`
+	RecurringInterval      string           `json:"recurring_interval"`
+	RecurringIntervalCount int              `json:"recurring_interval_count"`
+	IsRecurring            bool             `json:"is_recurring"`
+	IsArchived             bool             `json:"is_archived"`
+	Prices                 []catalogPrice   `json:"prices"`
+	Benefits               []catalogBenefit `json:"benefits"`
+}
+
+type catalogPrice struct {
+	AmountType    string `json:"amount_type"`
+	PriceCurrency string `json:"price_currency"`
+	PriceAmount   int64  `json:"price_amount"`
+	UnitAmount    string `json:"unit_amount"`
+	MeterID       string `json:"meter_id"`
+	IsArchived    bool   `json:"is_archived"`
+	CapAmount     *int64 `json:"cap_amount"`
+}
+
+type catalogBenefit struct {
+	Type      string `json:"type"`
+	IsDeleted bool   `json:"is_deleted"`
+}
+
+type catalogMeter struct {
+	ID          string             `json:"id"`
+	Unit        string             `json:"unit"`
+	ArchivedAt  *time.Time         `json:"archived_at"`
+	Filter      catalogFilter      `json:"filter"`
+	Aggregation catalogAggregation `json:"aggregation"`
+}
+
+type catalogFilter struct {
+	Conjunction string            `json:"conjunction"`
+	Clauses     []json.RawMessage `json:"clauses"`
+}
+
+type catalogAggregation struct {
+	Func     string `json:"func"`
+	Property string `json:"property"`
+}
+
 func (p *Provider) validateCatalog(ctx context.Context) error {
 	for plan, productID := range p.products {
-		var product struct {
-			ID string `json:"id"`
-		}
+		var product catalogProduct
 		path := "/v1/products/" + url.PathEscape(productID)
 		if err := p.doJSON(ctx, http.MethodGet, path, nil, &product, ""); err != nil {
 			return fmt.Errorf("polar: validate %s product %q: %w", plan, productID, err)
 		}
-		if product.ID != "" && product.ID != productID {
+		if product.ID == "" {
+			return fmt.Errorf("polar: validate %s product %q returned empty id", plan, productID)
+		}
+		if product.ID != productID {
 			return fmt.Errorf("polar: validate %s product %q returned mismatched id %q", plan, productID, product.ID)
 		}
+		if product.IsArchived || !product.IsRecurring || product.RecurringInterval != "month" || product.RecurringIntervalCount != 1 {
+			return fmt.Errorf("polar: validate %s product %q requires an active monthly recurring product", plan, productID)
+		}
+
+		fixed, metered := 0, 0
+		expectedFixedCents := billing.PlanMonthlyMillicents(plan) / api.MillicentsPerCent
+		for _, price := range product.Prices {
+			if price.IsArchived {
+				continue
+			}
+			switch price.AmountType {
+			case "fixed":
+				fixed++
+				if price.PriceCurrency != "eur" || price.PriceAmount != expectedFixedCents {
+					return fmt.Errorf("polar: validate %s product %q fixed price must be EUR %d cents", plan, productID, expectedFixedCents)
+				}
+			case "metered_unit":
+				metered++
+				if price.PriceCurrency != "eur" || price.MeterID != p.meterID || !decimalEquals(price.UnitAmount, billing.PlanOverageMillicentsPerGBHour()/api.MillicentsPerCent) {
+					return fmt.Errorf("polar: validate %s product %q metered price must be EUR 1 cent per unit on meter %q", plan, productID, p.meterID)
+				}
+				if price.CapAmount != nil {
+					return fmt.Errorf("polar: validate %s product %q metered price must not have a cap", plan, productID)
+				}
+			default:
+				return fmt.Errorf("polar: validate %s product %q has unsupported active price type %q", plan, productID, price.AmountType)
+			}
+		}
+		if fixed != 1 || metered != 1 {
+			return fmt.Errorf("polar: validate %s product %q requires exactly one active fixed price and one active metered price", plan, productID)
+		}
+		for _, benefit := range product.Benefits {
+			if !benefit.IsDeleted && benefit.Type == "meter_credit" {
+				return fmt.Errorf("polar: validate %s product %q must not attach meter credits; Gregale sends net calendar-month overage", plan, productID)
+			}
+		}
 	}
-	if strings.TrimSpace(p.meterID) != "" {
-		var meter struct {
-			ID string `json:"id"`
-		}
-		path := "/v1/meters/" + url.PathEscape(p.meterID)
-		if err := p.doJSON(ctx, http.MethodGet, path, nil, &meter, ""); err != nil {
-			return fmt.Errorf("polar: validate meter %q: %w", p.meterID, err)
-		}
-		if meter.ID != "" && meter.ID != p.meterID {
-			return fmt.Errorf("polar: validate meter %q returned mismatched id %q", p.meterID, meter.ID)
-		}
+	var meter catalogMeter
+	path := "/v1/meters/" + url.PathEscape(p.meterID)
+	if err := p.doJSON(ctx, http.MethodGet, path, nil, &meter, ""); err != nil {
+		return fmt.Errorf("polar: validate meter %q: %w", p.meterID, err)
+	}
+	if meter.ID != p.meterID {
+		return fmt.Errorf("polar: validate meter %q returned mismatched id %q", p.meterID, meter.ID)
+	}
+	if meter.ArchivedAt != nil || meter.Unit != "scalar" || meter.Aggregation.Func != "sum" || meter.Aggregation.Property != "gb_ram_hours" {
+		return fmt.Errorf("polar: validate meter %q must be an active scalar sum of gb_ram_hours", p.meterID)
+	}
+	if !filterHasEventClause(meter.Filter, p.usageEvent) {
+		return fmt.Errorf("polar: validate meter %q must filter event name %q", p.meterID, p.usageEvent)
 	}
 	return nil
+}
+
+func decimalEquals(value string, want int64) bool {
+	ratio, ok := new(big.Rat).SetString(strings.TrimSpace(value))
+	return ok && ratio.Cmp(big.NewRat(want, 1)) == 0
+}
+
+func filterHasEventClause(filter catalogFilter, eventName string) bool {
+	for _, raw := range filter.Clauses {
+		var clause struct {
+			Property string `json:"property"`
+			Operator string `json:"operator"`
+			Value    any    `json:"value"`
+		}
+		if json.Unmarshal(raw, &clause) == nil && clause.Property == "name" && clause.Operator == "eq" && clause.Value == eventName {
+			return true
+		}
+		var nested catalogFilter
+		if json.Unmarshal(raw, &nested) == nil && filterHasEventClause(nested, eventName) {
+			return true
+		}
+	}
+	return false
 }
 
 type customerResponse struct {
@@ -276,8 +403,10 @@ type ingestResponse struct {
 }
 
 // PushUsageRecord sends one immutable Polar event for the meterd window.
-// Polar meters sum metadata.gb_ram_hours, while mb_seconds remains in the
-// event for exact local reconciliation and operator auditability.
+// For the production pusher, mbSeconds is already the net calendar-month
+// overage selected by the UsageMode contract. Polar meters sum
+// metadata.gb_ram_hours, while mb_seconds remains in the event for exact
+// local reconciliation and operator auditability.
 func (p *Provider) PushUsageRecord(ctx context.Context, acct state.Account, hour time.Time, mbSeconds int64) error {
 	if mbSeconds < 0 {
 		return fmt.Errorf("polar: %w (account=%s)", ErrNegativeMBSeconds, acct.ID)
@@ -403,8 +532,9 @@ type quantitiesResponse struct {
 
 // ReconcileUsage reads the configured Polar meter's total for the account and
 // converts the gb_ram_hours meter quantity back to the exact local
-// mb_seconds unit used by the drift detector. Polar's API exposes quantities
-// as a number, so the conversion rounds only at the final integer boundary.
+// overage-mb_seconds unit used by the drift detector. Polar's API exposes
+// quantities as a number, so the conversion rounds only at the final integer
+// boundary.
 func (p *Provider) ReconcileUsage(ctx context.Context, acct state.Account, start, end time.Time) (int64, error) {
 	if strings.TrimSpace(p.meterID) == "" {
 		return 0, billing.ErrNotImplemented
@@ -457,7 +587,11 @@ func (p *Provider) Refund(ctx context.Context, chargeID string, amountCents int6
 		"amount":   amountCents,
 	}
 	var refund refundResponse
-	if err := p.doJSON(ctx, http.MethodPost, "/v1/refunds", body, &refund, fmt.Sprintf("faas-refund-%s-%d", chargeID, amountCents)); err != nil {
+	idem := fmt.Sprintf("faas-refund-%s-%d", chargeID, amountCents)
+	if key, ok := billing.IdempotencyKeyFromContext(ctx); ok {
+		idem = key
+	}
+	if err := p.doJSON(ctx, http.MethodPost, "/v1/refunds", body, &refund, idem); err != nil {
 		return nil, fmt.Errorf("polar: create refund order=%s: %w", chargeID, err)
 	}
 	if refund.ID == "" {
@@ -508,6 +642,52 @@ type subscriptionResponse struct {
 	ID                string    `json:"id"`
 	CurrentPeriodEnd  time.Time `json:"current_period_end"`
 	CancelAtPeriodEnd bool      `json:"cancel_at_period_end"`
+	PendingUpdate     *struct {
+		AppliesAt time.Time `json:"applies_at"`
+	} `json:"pending_update"`
+}
+
+// ChangeSubscriptionPlan schedules an existing Polar subscription for the
+// requested plan. Paid-to-paid changes use Polar's next_period proration
+// mode, which creates a pending update instead of charging or changing the
+// entitlement in the middle of the current period. Free is represented by a
+// period-end cancellation because Gregale does not maintain a free Polar
+// product.
+//
+// The caller intentionally waits for subscription.updated/revoked before
+// changing the local account plan. This prevents a successful provider API
+// response followed by a lost webhook from granting the wrong entitlement.
+func (p *Provider) ChangeSubscriptionPlan(ctx context.Context, acct state.Account, targetPlan api.Plan) (time.Time, error) {
+	if acct.StripeSubscriptionItem == "" {
+		return time.Time{}, fmt.Errorf("polar: change subscription account=%s: %w", acct.ID, billing.ErrAlreadyCancelled)
+	}
+	if targetPlan == api.PlanFree {
+		return p.CancelAtPeriodEnd(ctx, acct)
+	}
+	if !targetPlan.IsPaid() {
+		return time.Time{}, fmt.Errorf("polar: invalid target plan=%q", targetPlan)
+	}
+	productID := strings.TrimSpace(p.products[targetPlan])
+	if productID == "" {
+		return time.Time{}, fmt.Errorf("polar: product id missing for plan=%s", targetPlan)
+	}
+	body := map[string]any{
+		"product_id":         productID,
+		"proration_behavior": "next_period",
+	}
+	var sub subscriptionResponse
+	path := "/v1/subscriptions/" + url.PathEscape(acct.StripeSubscriptionItem)
+	idem := fmt.Sprintf("faas-plan-change-%s-%s", acct.ID, targetPlan)
+	if err := p.doJSON(ctx, http.MethodPatch, path, body, &sub, idem); err != nil {
+		return time.Time{}, fmt.Errorf("polar: change subscription account=%s target=%s: %w", acct.ID, targetPlan, err)
+	}
+	if sub.PendingUpdate != nil && !sub.PendingUpdate.AppliesAt.IsZero() {
+		return sub.PendingUpdate.AppliesAt, nil
+	}
+	if !sub.CurrentPeriodEnd.IsZero() {
+		return sub.CurrentPeriodEnd, nil
+	}
+	return time.Time{}, fmt.Errorf("polar: change subscription account=%s returned no effective date", acct.ID)
 }
 
 // CancelAtPeriodEnd calls Polar's documented PATCH subscription operation.

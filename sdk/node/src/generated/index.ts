@@ -17,6 +17,7 @@ export type { AccountResponse } from './models/AccountResponse.js';
 export type { AccountSLOResponse } from './models/AccountSLOResponse.js';
 export type { AddTenantHostnameRequest } from './models/AddTenantHostnameRequest.js';
 export type { AddTrustedSignerRequest } from './models/AddTrustedSignerRequest.js';
+export type { AdminRefundResponse } from './models/AdminRefundResponse.js';
 export type { AdminSetGithubWebhookSecretRequest } from './models/AdminSetGithubWebhookSecretRequest.js';
 export type { AdminSetGithubWebhookSecretResponse } from './models/AdminSetGithubWebhookSecretResponse.js';
 export type { AlertDeliveryResponse } from './models/AlertDeliveryResponse.js';

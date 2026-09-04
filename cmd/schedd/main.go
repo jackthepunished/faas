@@ -728,7 +728,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// + reaper tickers in loop.Run are gated on jobsDispatched;
 	// the engine methods stay wired so a missed tick in one
 	// window drains on the next).
-	jobsDispatched := os.Getenv("FAAS_JOBS_DISPATCH") != ""
+	jobsDispatched := jobsDispatchEnabled(os.Getenv("FAAS_JOBS_DISPATCH"))
 	if jobsDispatched {
 		log.Info("schedd jobs dispatch enabled — clustering flag FAAS_JOBS_DISPATCH=1 set")
 	} else {
@@ -1246,14 +1246,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		hb.Interval = deps.heartbeatInterval
 	}
 	// PR-A observability slice (issue #170): per-{app,node} instance
-	// stats poller. Builds a Reader (the canonical seam #171 reaper
-	// and #169 scale-up will read from), wires the Poller with the
+	// stats poller. Builds a Reader (the canonical seam for per-instance
+	// policy consumers; #169 scale-up reads from it), wires the Poller with the
 	// same deps.dialVMM the heartbeat uses (so dial churn is bounded
 	// by the dialer — same pattern PR #120 established), and
-	// attaches it via WithInstanceStats. The Reader is intentionally
-	// NOT threaded to the reaper or any policy consumer today —
-	// that's #171 / #169's job. PR-A keeps the reader as the only
-	// public surface.
+	// attaches it via WithInstanceStats. The same Reader is passed to
+	// the reactive scale-up trigger below; its cumulative activity
+	// counter is the provider-independent RPS fallback when the
+	// optional gateway metrics endpoint is unavailable.
 	reader := instancestats.NewReader()
 	statsPoller := instancestats.NewPoller(
 		store,
@@ -1290,9 +1290,10 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// cfg.ScaleUpInterval (default 1s); admits another instance
 	// when measured per-instance RPS or CPU exceeds the target
 	// and headroom is available. The trigger is nil-safe on every
-	// dep; an empty GatewayMetricsURL disables the RPS path (and
-	// the trigger still fires on CPU when PR #205's
-	// instancestats.Reader is wired). The engine adapter converts
+	// dep; an empty GatewayMetricsURL disables only the optional
+	// gateway scrape. The VMMD activity-counter signal from the
+	// instancestats.Reader remains available for split-box and
+	// bare-metal deployments. The engine adapter converts
 	// sched.WakeResult → scaleup.AdmitResult (a small subset —
 	// the trigger only inspects AtCapacity).
 	//
@@ -1425,8 +1426,9 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		engine.ReconcileDeadNodeInstances,
 		time.Duration(dnrInterval)*time.Second,
 		log))
-	// Issue #171: share a single HTTPPromScraper between the RPS
-	// scale-up trigger and the aggressive-reaper signal mirror.
+	// Issue #171: share a single HTTPPromScraper between the gateway
+	// scrape path for the RPS scale-up trigger and the aggressive-
+	// reaper signal mirror.
 	// The concurrent_requests and CPU triggers do not depend on the
 	// optional gateway metrics endpoint, so an empty metrics URL must
 	// not disable those workers.
@@ -1734,6 +1736,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// goroutine added a 7th long-term subscriber that tipped
 	// pool.MaxConns=16 over the edge and starved the async-invoke
 	// drain's BeginTx under e2e query bursts.
+	drainDispatchConcurrency := sched.DefaultDrainDispatchConcurrency
+	if v := strings.TrimSpace(os.Getenv("FAAS_SCHEDD_INVOCATION_DISPATCH_CONCURRENCY")); v != "" {
+		n, parseErr := strconv.Atoi(v)
+		if parseErr != nil || n < 1 {
+			return fmt.Errorf("FAAS_SCHEDD_INVOCATION_DISPATCH_CONCURRENCY must be a positive integer: %q", v)
+		}
+		drainDispatchConcurrency = n
+	}
 
 	// Move 1 drain: a second goroutine inside schedd that drains the
 	// unified invocations table on a 1s safety tick + invocation_due
@@ -1754,7 +1764,8 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			drain := sched.NewDrain(engine.Store(), engine,
 				sched.WithDrainGatewaySynth(synth),
 				sched.WithDrainNotifier(engine.Notifier()),
-				sched.WithDrainLogger(log))
+				sched.WithDrainLogger(log),
+				sched.WithDrainDispatchConcurrency(drainDispatchConcurrency))
 			notifC, subErr := db.SubscribeWithReconnect(ctx, pool,
 				[]string{db.NotifyInvocationDue}, log)
 			if subErr != nil {
@@ -1836,6 +1847,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	}
 	_ = lis.Close()
 	return nil
+}
+
+// jobsDispatchEnabled is intentionally an exact opt-in. Treating any
+// non-empty value (including "0" or "false") as enabled makes a templated
+// production environment unexpectedly activate an incomplete jobs path.
+func jobsDispatchEnabled(value string) bool {
+	return strings.TrimSpace(value) == "1"
 }
 
 // subscribeWithReconnect drains a pg_notify-style feed via the

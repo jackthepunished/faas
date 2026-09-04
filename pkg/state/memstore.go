@@ -79,6 +79,21 @@ type paddleOverageClaimState struct {
 	mbSecondsSum int64
 }
 
+// auditEventOutboxRow is the in-memory mirror of audit_event_outbox. The
+// public queue item intentionally omits mutable claim metadata; keeping that
+// metadata private prevents callers from treating a stale claim as authority.
+type auditEventOutboxRow struct {
+	AuditEventOutbox
+	state       string
+	availableAt time.Time
+	claimedBy   string
+	claimedAt   time.Time
+	leaseUntil  time.Time
+	deliveredAt time.Time
+	createdAt   time.Time
+	lastError   string
+}
+
 // MemStore is an in-memory Store for tests and local development. It is safe for
 // concurrent use and enforces the same uniqueness constraints as the schema
 // (unique email, unique slug, unique key hash) so tests exercise real error
@@ -352,6 +367,12 @@ type MemStore struct {
 	// fan-out. Legacy snapshots without an entry remain globally eligible.
 	snapshotOrigins map[string]snapshotOriginRow
 	events          []Event
+	// auditOutbox mirrors audit_event_outbox. It is separate from the
+	// events slice because delivery claims need leases and retry state,
+	// while the resulting audit event remains append-only.
+	auditOutbox       map[int64]auditEventOutboxRow
+	auditOutboxByKey  map[string]int64
+	nextAuditOutboxID int64
 	// auditLog (issue #755 / PR-6) is the in-memory mirror of the
 	// pgstore.audit_log table. Append-only by spec — MemStore has no
 	// UpdateAuditLog / DeleteAuditLog pair. The DeleteAccount path
@@ -754,6 +775,9 @@ func NewMemStore() *MemStore {
 		snapshotReplicas:        map[snapshotReplicaKey]snapshotReplicaRow{},
 		snapshotOrigins:         map[string]snapshotOriginRow{},
 		events:                  []Event{},
+		auditOutbox:             map[int64]auditEventOutboxRow{},
+		auditOutboxByKey:        map[string]int64{},
+		nextAuditOutboxID:       1,
 		usage:                   []usageMinute{},
 		usageByMonth:            []Usage{},
 		idem:                    map[string]idemEntry{},
@@ -8124,6 +8148,42 @@ func (m *MemStore) CreateInstanceWithMode(_ context.Context, appID, deploymentID
 	return ins, nil
 }
 
+// CreateJobInstance mirrors the PostgreSQL job-task insert. Job instances
+// have no app or deployment row: the job definition owns the OCI image and
+// the run/task coordinates live on the job task row.
+func (m *MemStore) CreateJobInstance(_ context.Context, instanceID, jobID, runID string, taskIndex int, state string, ramMB int, nodeID, wakeID string) (Instance, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.jobs[jobID]; !ok {
+		return Instance{}, ErrNotFound
+	}
+	if instanceID == "" {
+		instanceID = newID()
+	}
+	if _, exists := m.instances[instanceID]; exists {
+		return Instance{}, ErrConflict
+	}
+	ins := Instance{
+		ID:           instanceID,
+		State:        state,
+		RAMMB:        ramMB,
+		NodeID:       nodeID,
+		StartedAt:    time.Now(),
+		Mode:         string(InstanceModeJob),
+		Kind:         "job_task",
+		JobID:        jobID,
+		JobRunID:     runID,
+		JobTaskIndex: taskIndex,
+	}
+	if wakeID != "" {
+		ins.WakeID = wakeID
+	} else {
+		ins.WakeID = uuid.NewString()
+	}
+	m.instances[ins.ID] = ins
+	return ins, nil
+}
+
 // StampAppScaleOut (PR-C, issue #462) records the apps
 // LastScaleOutAt timestamp. The MemStore mirrors the PG contract
 // (PgStore.StampAppScaleOut): a single UPDATE; no row existence
@@ -10992,9 +11052,9 @@ func (m *MemStore) LoadAllOverageCapCents(_ context.Context) (map[string]int64, 
 }
 
 // CurrentMonthOverageCents sums the account's usage_minutes.mb_seconds
-// from the UTC month start and converts to integer cents. Formula:
-// 1 GB-h = 3600 GB-seconds; at €0.01/GB-h → 1 GB-h = 100 cents.
-// Integer math only — never float on money (CLAUDE.md).
+// from the UTC month start, removes the account plan's included calendar-
+// month allowance, and converts the remainder to integer cents. Integer
+// math only — never float on money (CLAUDE.md).
 //
 // Mirrors pgstore.CurrentMonthOverageCents: the scan is O(rows-in-month)
 // which on a one-box is bounded. The `now` argument is the caller's
@@ -11004,6 +11064,10 @@ func (m *MemStore) CurrentMonthOverageCents(_ context.Context, accountID string)
 	defer m.mu.Unlock()
 	now := m.clock()
 	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	var plan api.Plan
+	if acct, ok := m.accounts[accountID]; ok {
+		plan = acct.Plan
+	}
 	var mbSeconds int64
 	for _, u := range m.usage {
 		if u.AccountID != accountID {
@@ -11014,7 +11078,7 @@ func (m *MemStore) CurrentMonthOverageCents(_ context.Context, accountID string)
 		}
 		mbSeconds += u.MBSeconds
 	}
-	return mbSeconds * 100 / 3600, nil
+	return api.OverageCentsForMBSeconds(plan, mbSeconds), nil
 }
 
 // UpdateAccountOverageCapCents writes accounts.overage_cap_cents for

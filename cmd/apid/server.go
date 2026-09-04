@@ -48,6 +48,10 @@ type server struct {
 	// response. The public edge at this origin forwards /cli-auth to apid.
 	cliAuthURLBase string
 	notif          Notifier
+	// invocationCompletion multiplexes the durable invocation_done
+	// notification stream for synchronous invoke waiters. Nil keeps the
+	// legacy per-request LISTEN path for tests and degraded boot.
+	invocationCompletion *invocationCompletionWaiter
 	// stripeWebhookSecret is the endpoint signing secret Stripe uses
 	// for the v1 HMAC. Empty disables signature verification (dev mode).
 	stripeWebhookSecret string
@@ -602,6 +606,15 @@ func (s *server) WithGatewaydControlURL(url string) *server {
 	return s
 }
 
+// WithInvocationCompletionWaiter attaches the process-wide completion
+// fan-out used by synchronous invocation handlers. The setter preserves the
+// existing server construction seams while allowing production boot to make
+// the optimization optional and fail-safe.
+func (s *server) WithInvocationCompletionWaiter(w *invocationCompletionWaiter) *server {
+	s.invocationCompletion = w
+	return s
+}
+
 // WithSpecCache attaches the in-process LRU backing the
 // ?source=auto OpenAPI generation (ADR-126 / issue #975
 // item #2). Production wires a *openapidiff.SpecCache from
@@ -1037,6 +1050,10 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("GET /v1/auth/csrf", s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.issueCSRFToken))))
 
 	// Apps.
+	// Issue #1219: Prometheus refreshes compute gateway targets from the
+	// active control-plane registry. This internal route is loopback-only;
+	// gatewayd-internal rejects the same path before its public /v1 proxy.
+	mux.HandleFunc("GET /v1/internal/metrics/targets", s.computeMetricsDiscovery)
 	mux.HandleFunc("GET /v1/apps", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listApps))))
 	mux.HandleFunc("POST /v1/apps", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createApp)))))
 	mux.HandleFunc("GET /v1/apps/{slug}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getApp))))
@@ -1709,6 +1726,12 @@ func (s *server) handler() http.Handler {
 	// would otherwise be able to issue credits.
 	mux.HandleFunc("POST /v1/admin/accounts/{id}/credits",
 		s.authLimited(s.requireScope(api.ScopesAdminOnly...)(s.idempotent(s.issueCredit))))
+	// Operator refund surface. Refunds move money, so unlike credit issuance
+	// this route also requires the standard MFA gate. The handler applies the
+	// FAAS_ADMIN_EMAILS allowlist and binds the Polar order to the target
+	// account through the local invoice projection before calling the provider.
+	mux.HandleFunc("POST /v1/admin/accounts/{id}/refunds",
+		s.authLimited(s.requireMFA(s.requireScope(api.ScopesAdminOnly...)(s.refundAccount))))
 
 	// PR-D / ADR-012 §7 amendment: per-tenant GitHub App webhook
 	// secret rotation. Same two-layer gate as issueCredit (scope +

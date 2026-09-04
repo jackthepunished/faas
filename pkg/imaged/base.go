@@ -21,6 +21,11 @@ import (
 // TOML) so the box can roll a base image ahead of pinned refs and have imaged
 // track it without a code change.
 const (
+	// testDeployBaseRefEnv is intentionally separate from the production
+	// per-runtime knobs. It is only forwarded by the hermetic e2e harness so
+	// tests can point both builderd and imaged at a local registry.
+	testDeployBaseRefEnv = "FAAS_TEST_DEPLOY_BASE_REF"
+
 	BaseRefNode22      = "ghcr.io/poyrazk/runner-node22:latest"
 	BaseRefPython312   = "ghcr.io/poyrazk/runner-python312:latest"
 	BaseRefGo124       = "ghcr.io/poyrazk/runner-go124:latest"
@@ -271,6 +276,15 @@ func resolveDeployBaseRef(runtime string, envLookup func(string) string) (string
 	if envLookup == nil {
 		envLookup = os.Getenv
 	}
+	if legacy := strings.TrimSpace(envLookup("FAAS_DEPLOY_BASE_REF")); legacy != "" {
+		return "", fmt.Errorf("imaged: FAAS_DEPLOY_BASE_REF is retired; set the runtime-specific FAAS_DEPLOY_BASE_REF_<RUNTIME> instead")
+	}
+	if testRef := strings.TrimSpace(envLookup(testDeployBaseRefEnv)); testRef != "" {
+		if node := strings.TrimSpace(envLookup("FAAS_NODE_NAME")); node != "" {
+			return "", fmt.Errorf("imaged: %s is test-only and cannot be set on named node %q", testDeployBaseRefEnv, node)
+		}
+		return testRef, nil
+	}
 	for _, row := range DefaultRuntimeBaseRefs {
 		if row.Runtime != runtime {
 			continue
@@ -305,7 +319,22 @@ func resolveDeployBaseRef(runtime string, envLookup func(string) string) (string
 	return ref, nil
 }
 
+// ResolveDeployBaseRef exposes the canonical runtime-to-base resolver to the
+// source builder. Keeping builderd and imaged on this one mapping is
+// important: the OCI image produced by Railpack must begin with the same
+// immutable base whose layers imaged removes before adding the app layer.
+// The envLookup seam is retained for deterministic unit tests.
+func ResolveDeployBaseRef(runtime string, envLookup func(string) string) (string, error) {
+	return resolveDeployBaseRef(runtime, envLookup)
+}
+
 func requireProductionBaseDigest(envKey, ref string, envLookup func(string) string) error {
+	if strings.TrimSpace(envLookup(testDeployBaseRefEnv)) != "" {
+		if node := strings.TrimSpace(envLookup("FAAS_NODE_NAME")); node != "" {
+			return fmt.Errorf("imaged: %s is test-only and cannot be set on named node %q", testDeployBaseRefEnv, node)
+		}
+		return nil
+	}
 	if strings.TrimSpace(envLookup("FAAS_NODE_NAME")) == "" {
 		return nil
 	}

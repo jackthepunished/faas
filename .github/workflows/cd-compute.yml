@@ -445,6 +445,26 @@ jobs:
             }
           done
 
+      - name: Require fleet runner disk headroom
+        run: |
+          set -euo pipefail
+          # The bootstrap CLI verifies a signed release in a private temp
+          # directory and the join artifact keeps a second copy. Fail early
+          # with an actionable diagnostic instead of allowing a mid-join
+          # "no space left on device" failure.
+          minimum_free_kb=$((5 * 1024 * 1024))
+          free_kb="$(df -Pk "$RUNNER_TEMP" | awk 'NR == 2 { print $4 }')"
+          [[ "$free_kb" =~ ^[0-9]+$ ]] || {
+            echo "::error::could not determine free space on fleet runner" >&2
+            exit 1
+          }
+          if (( free_kb < minimum_free_kb )); then
+            echo "::error::fleet runner has only ${free_kb} KiB free; at least ${minimum_free_kb} KiB is required" >&2
+            echo "::error::prune old /opt/faas/releases entries or repair runner retention before retrying" >&2
+            exit 1
+          fi
+          df -h "$RUNNER_TEMP"
+
       - name: Install pinned cosign verifier
         run: |
           set -euo pipefail
@@ -495,7 +515,7 @@ jobs:
               -o "$RELEASE_ROOT/$asset" "$asset_url"
           }
           for asset in release.tar.gz release.cosign.bundle release.sbom.json \
-            release-manifest.json production-manifest.yaml SHA256SUMS; do
+            release-manifest.json production-manifest.yaml runtime-bases.env SHA256SUMS; do
             download_asset "$asset"
           done
           (
@@ -541,9 +561,17 @@ jobs:
           for asset in release.tar.gz release.cosign.bundle release.sbom.json production-manifest.yaml; do
             install -m 0644 "$RELEASE_ROOT/$asset" "$ARTIFACT_DIR/$asset"
           done
+          # This file is a release contract, not a secret, but keep the
+          # controller-side copy private because it is immediately staged as
+          # root:root 0600 on the adopted host.
+          install -m 0600 "$RELEASE_ROOT/runtime-bases.env" "$ARTIFACT_DIR/runtime-bases.env"
           tar --extract --gzip --file "$RELEASE_ROOT/release.tar.gz" \
             --to-stdout gregalectl > "$ARTIFACT_DIR/gregalectl-linux-amd64"
           chmod 0755 "$ARTIFACT_DIR/gregalectl-linux-amd64"
+          tar --extract --gzip --file "$RELEASE_ROOT/release.tar.gz" \
+            --to-stdout vmlinux > "$ARTIFACT_DIR/vmlinux"
+          test -s "$ARTIFACT_DIR/vmlinux"
+          chmod 0644 "$ARTIFACT_DIR/vmlinux"
           install -m 0755 "$RUNNER_TEMP/release-tools/cosign" "$ARTIFACT_DIR/cosign-linux-amd64"
 
           umask 077
@@ -630,7 +658,27 @@ jobs:
           fi
           echo "ARTIFACT_DIR=$ARTIFACT_DIR" >> "$GITHUB_ENV"
 
+      - name: Publish the release-pinned kernel to shared storage
+        env:
+          # Publishing uses the exact storage.env contract that is staged on
+          # the node. `--no-cache` keeps the trusted runner from treating its
+          # local filesystem as a second artifact source.
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          "$ARTIFACT_DIR/gregalectl-linux-amd64" artifact publish \
+            --env-file "$ARTIFACT_DIR/storage.env" \
+            --manifest-file "$ARTIFACT_DIR/production-manifest.yaml" \
+            --file "$ARTIFACT_DIR/vmlinux" \
+            --no-cache \
+            --json
+
       - name: Verify runner prerequisites and adopt the compute host
+        env:
+          # Keep Go/CLI temporary files inside the runner-owned scratch area
+          # so the final cleanup step can reclaim them after an interrupted
+          # join.
+          TMPDIR: ${{ runner.temp }}
         run: |
           set -euo pipefail
           # The supplied deployment key/user are the fleet operator identity,
@@ -698,3 +746,17 @@ jobs:
           set -euo pipefail
           echo "release=${RELEASE_ID:-unknown} node=$NODE ssh_host=$SSH_HOST"
           echo "The join command is the readiness/activation gate; inspect its JSON result above."
+
+      - name: Clean compute rollout scratch
+        if: always()
+        run: |
+          set +e
+          rm -rf -- \
+            "$RUNNER_TEMP/gregale-compute-release" \
+            "$RUNNER_TEMP/gregale-compute-join" \
+            "$RUNNER_TEMP/compute-pki.tar.gz" \
+            "$RUNNER_TEMP/compute-pki-extracted" \
+            "$RUNNER_TEMP/release-tools"
+          find "$RUNNER_TEMP" -maxdepth 1 -mindepth 1 -type d \
+            \( -name 'gregalectl-release-bootstrap-*' -o -name 'release-cosign-*' -o -name 'release-tarball-*' \) \
+            -mmin +10 -exec rm -rf -- {} +

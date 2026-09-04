@@ -43,6 +43,12 @@ type fakeVMM struct {
 	forceColdFallback   bool // CreateFromSnapshot reports a cold-boot fallback (ADR-005)
 	wakeErr             error
 	snapErr             error
+	// snapDeadline / snapHasDeadline capture the ctx deadline seen by
+	// PauseAndSnapshot. The RPC shipped with NO deadline and wedged the
+	// scheduler for 10+ minutes in production (2026-09-03); these let a
+	// test assert the deadline exists without waiting SnapshotTimeout.
+	snapDeadline    time.Time
+	snapHasDeadline bool
 	// warmSnapErr (issue #470 / PR A / ADR-055): injectable WarmSnapshot
 	// failure. Distinct from snapErr so the warm-capture failure test
 	// can simulate "vmmd's PauseAndSnapshot succeeded but WarmSnapshot
@@ -177,6 +183,9 @@ func (f *fakeVMM) CreateFromSnapshot(ctx context.Context, _, instance string, ap
 }
 
 func (f *fakeVMM) PauseAndSnapshot(ctx context.Context, _, _, _, _, _ string) (SnapshotBytes, error) {
+	f.mu.Lock()
+	f.snapDeadline, f.snapHasDeadline = ctx.Deadline()
+	f.mu.Unlock()
 	if d := f.sleepFor; d > 0 {
 		select {
 		case <-time.After(d):
@@ -932,6 +941,43 @@ func TestAdmitAndDispatch_MinFloorAlready_StaysPlanLimitConcur(t *testing.T) {
 	}
 	if got := p.HasHeader("Retry-After"); len(got) != 0 {
 		t.Errorf("Retry-After = %v, want nil (Retry-After is for cooldown_held, not min_floor)", got)
+	}
+}
+
+// TestAdmitInstanceForDeployment_DispatchesBoot pins the floor-trigger
+// contract: an explicit deployment admission must run the same vmmd and
+// Phase-4 commit path as a request-driven wake. The old helper only inserted
+// a COLD_BOOTING row and reserved ledger capacity, which left floor-created
+// instances to time out in the watchdog.
+func TestAdmitInstanceForDeployment_DispatchesBoot(t *testing.T) {
+	store := state.NewMemStore()
+	_, app, dep := seedApp(t, store, api.PlanPro, 128, 5)
+	vmm := &fakeVMM{}
+	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+
+	res, err := e.AdmitInstanceForDeployment(context.Background(), app.ID, dep.ID, "", TriggerFloorDep)
+	if err != nil {
+		t.Fatalf("AdmitInstanceForDeployment: %v", err)
+	}
+	if res.InstanceID == "" {
+		t.Fatal("AdmitInstanceForDeployment returned an empty instance id")
+	}
+	ins, err := store.InstanceByID(context.Background(), res.InstanceID)
+	if err != nil {
+		t.Fatalf("InstanceByID: %v", err)
+	}
+	if ins.State != string(state.StateRunning) {
+		t.Fatalf("instance state = %q, want %q", ins.State, state.StateRunning)
+	}
+
+	vmm.mu.Lock()
+	coldBoots, restores := vmm.coldBoots, vmm.restores
+	vmm.mu.Unlock()
+	if coldBoots != 1 || restores != 0 {
+		t.Fatalf("coldBoots=%d restores=%d, want 1/0", coldBoots, restores)
+	}
+	if got := e.Ledger().Concurrency(app.ID); got != 1 {
+		t.Fatalf("ledger concurrency = %d, want 1", got)
 	}
 }
 
@@ -1763,7 +1809,8 @@ func TestEngineWake_AdmissionDeniedReturnsProblem(t *testing.T) {
 	store := state.NewMemStore()
 	_, app, _ := seedApp(t, store, api.PlanFree, 128, 1)
 	vmm := &fakeVMM{}
-	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+	warm := NewWarmAffinity(0)
+	e := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0").WithWarmAffinity(warm)
 
 	// Fill the ledger to the ceiling so the wake is refused for
 	// capacity. PR #113 moved the resident counter to a per-node
@@ -1812,6 +1859,9 @@ func TestEngineWake_AdmissionDeniedReturnsProblem(t *testing.T) {
 	rows, _ := store.ListInstancesForApp(context.Background(), app.ID)
 	if len(rows) != 1 || rows[0].State != string(state.StateFailed) {
 		t.Errorf("rows = %+v, want one failed row", rows)
+	}
+	if _, ok := warm.LastWarmNode(app.ID); ok {
+		t.Fatal("capacity-denied wake must not leave a warm placement hint")
 	}
 }
 

@@ -537,12 +537,18 @@ message SidecarSpec {
   // jail chroot (e.g. "layer-sidecar-1"). Mirrors
   // pkg/fcvm.DriveSidecarPrefix + index.
   string drive_slot = 8;
+  // sealed_env carries the per-sidecar ciphertext values from the
+  // deployment record. vmmd opens them only into the per-instance
+  // writable main layer before boot; plaintext never enters the wire
+  // or the shared immutable sidecar image.
+  repeated SealedSecret sealed_env = 9;
 }
 
-// SealedSecret is one (key, ciphertext) pair from app_secrets. The key is
-// the env-var name; the ciphertext is sealed by apid via filippo.io/age
-// under the host X25519 recipient. vmmd merges all entries into the
-// single envelope file written to drive1.
+// SealedSecret is one (key, ciphertext) pair from an app or sidecar env
+// store. The key is the env-var name; the ciphertext is sealed by apid via
+// filippo.io/age under the host X25519 recipient. vmmd opens the entries only
+// at wake time and writes the resulting plaintext to the appropriate
+// instance-scoped file.
 message SealedSecret {
   string key        = 1;
   bytes  ciphertext = 2;
@@ -929,6 +935,12 @@ message InstanceStats {
   // table. Zero is a real idle value; the enclosing Stats response is
   // additive so older schedd peers can ignore this field.
   int64 open_conns = 11;
+  // Cumulative ForwardHTTP requests observed by vmmd for this instance.
+  // Wrapper semantics match the other optional counters: absent means the
+  // activity tracker has not seen the instance yet, while zero is a real
+  // value after the first observation. Schedd uses the deltas between Stats
+  // samples as a topology-independent RPS signal for reactive scale-up.
+  google.protobuf.Int64Value request_count_total = 12;
 }
 
 // PingRequest is intentionally empty. Ping is a liveness probe; the

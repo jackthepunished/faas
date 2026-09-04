@@ -843,7 +843,16 @@ func (h *Handler) EnsureBases(ctx context.Context, arch string, refs []RuntimeBa
 	}
 	for _, row := range refs {
 		ref := row.Ref
-		if v := strings.TrimSpace(envLookup(row.EnvOverride)); v != "" {
+		if testRef := strings.TrimSpace(envLookup(testDeployBaseRefEnv)); testRef != "" {
+			if node := strings.TrimSpace(envLookup("FAAS_NODE_NAME")); node != "" {
+				return nil, fmt.Errorf("imaged: %s is test-only and cannot be set on named node %q", testDeployBaseRefEnv, node)
+			}
+			// The e2e-only override intentionally applies to the whole
+			// runtime matrix: the fake registry publishes one fixture ref
+			// for every runtime-shaped request. Production never receives
+			// this variable and therefore remains per-runtime and pinned.
+			ref = testRef
+		} else if v := strings.TrimSpace(envLookup(row.EnvOverride)); v != "" {
 			// Operator wants this runtime pinned. Reject tag-only
 			// overrides before any byte is pulled — a deploy keyed
 			// to a today-stable digest would silently resolve to
@@ -1020,6 +1029,12 @@ func (h *Handler) EnsureRuntimeBase(ctx context.Context, runtime, arch string, e
 func resolveParentRef(parentRef string, envOverrideByRef map[string]string, envLookup func(string) string) (string, error) {
 	if parentRef == "" {
 		return "", nil
+	}
+	if testRef := strings.TrimSpace(envLookup(testDeployBaseRefEnv)); testRef != "" {
+		if node := strings.TrimSpace(envLookup("FAAS_NODE_NAME")); node != "" {
+			return "", fmt.Errorf("imaged: %s is test-only and cannot be set on named node %q", testDeployBaseRefEnv, node)
+		}
+		return testRef, nil
 	}
 	parentEnv, ok := envOverrideByRef[parentRef]
 	if !ok {

@@ -13,6 +13,7 @@ export type { AccountResponse } from './AccountResponse.js';
 export type { AccountSLOResponse } from './AccountSLOResponse.js';
 export type { AddTenantHostnameRequest } from './AddTenantHostnameRequest.js';
 export type { AddTrustedSignerRequest } from './AddTrustedSignerRequest.js';
+export type { AdminRefundResponse } from './AdminRefundResponse.js';
 export type { AdminSetGithubWebhookSecretRequest } from './AdminSetGithubWebhookSecretRequest.js';
 export type { AdminSetGithubWebhookSecretResponse } from './AdminSetGithubWebhookSecretResponse.js';
 export type { AlertDeliveryResponse } from './AlertDeliveryResponse.js';

@@ -509,6 +509,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/AccountResponse'
                 example: {"id":"0123456789abcdef0123456789abcdef","email":"ops@example.com","plan":"hobby","status":"active","limits":{"plan":"hobby","ram_mb":256,"max_concurrency":2,"deployed_apps":3,"included_gb_hours":50,"app_layer_max_mb":512},"usage_gb_hours":1.234,"app_count":3,"github_install_id":null}
+        '202':
+          description: The provider accepted a deferred plan change; the current local entitlement remains active until the provider webhook confirms it.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountResponse'
         '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '402': { $ref: '#/components/responses/PaymentRequired' }
@@ -9514,6 +9520,74 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  # ─── Operator Polar refunds (issue #279) ───────────────────────────────
+  # Money-moving route. MFA is enforced for session principals, while the
+  # admin scope + FAAS_ADMIN_EMAILS allowlist protect operator API keys.
+  # The explicit idempotency key is forwarded to Polar, so a retry after an
+  # ambiguous response does not create a second refund.
+  /v1/admin/accounts/{id}/refunds:
+    post:
+      tags: [admin]
+      operationId: refundAccountInvoice
+      summary: Refund a paid Polar invoice (admin-only).
+      description: |
+        `invoice_id` must identify a local Gregale invoice belonging to the
+        target account. The current public-release implementation supports
+        Polar order IDs and integer EUR cents. `Idempotency-Key` is required
+        and is sent to the provider unchanged (up to 255 characters).
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+          description: Account UUID whose paid invoice will be refunded.
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 255 }
+          description: Stable key for this refund operation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [invoice_id, amount_cents, reason]
+              properties:
+                invoice_id:   { type: string, format: uuid, description: 'Local Gregale invoice UUID.' }
+                amount_cents: { type: integer, format: int64, minimum: 1, description: 'Refund amount in EUR cents.' }
+                reason:       { type: string, minLength: 3, maxLength: 500, description: 'Reason recorded with the money-moving operation.' }
+      responses:
+        '200':
+          description: Refund accepted by the provider.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminRefundResponse' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: 'code: admin_required or mfa_required — operator scope, email allowlist, and MFA gates apply.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Invoice is not refundable or has no paid amount/provider identity.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '501':
+          description: The selected billing provider does not expose this refund surface.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '502':
+          description: Provider rejected the refund or returned an incomplete response.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
   # ─── Per-tenant GitHub webhook secret rotation (PR-D) ────────────────
   # Sets the per-tenant override of the platform-wide
   # FAAS_GITHUB_WEBHOOK_SECRET so a leaked tenant secret can rotate
@@ -11321,6 +11395,9 @@ components:
         usage_gb_hours: { type: number }
         app_count: { type: integer }
         github_install_id: { type: [string, "null"] }
+        plan_change_status: { type: string }
+        requested_plan: { type: string, enum: [free, hobby, pro, scale] }
+        effective_at: { type: string, format: date-time }
 
     AccountLimits:
       description: "Plan-driven quota and resource caps: max RAM per app, concurrent wakes, total deployed apps, included GB-hours, and max app-layer bytes per build."
@@ -13329,35 +13406,33 @@ components:
 
     BillingCatalogEntry:
       description: |
-        One row in the Paddle price + product catalog (PR-P3).
+        One row in the provider price + product catalog (PR-P3).
         Plan values are the billable api.Plan constants
         ("hobby", "pro", "scale") — PlanFree is intentionally
         absent because it carries no recurring line item.
-        Handle is the Paddle-side id (pri_… for monthly / overage,
-        pro_… for product). SyncedAt is RFC 3339 UTC from the
-        catalog's lastSyncAt.
+        Handle is the provider-side product or price ID. SyncedAt is
+        RFC 3339 UTC from the catalog's last successful preflight.
       type: object
       required: [plan, kind, handle, synced_at]
       properties:
         plan:     { type: string, enum: [hobby, pro, scale] }
         kind:     { type: string, enum: [monthly, overage, product] }
-        handle:   { type: string, description: 'Paddle price (pri_…) or product (pro_…) ID.' }
+        handle:   { type: string, description: 'Provider price or product ID.' }
         synced_at: { type: string, format: date-time }
 
     BillingCatalogResponse:
       description: |
         Wire shape for GET / POST / DELETE
-        /v1/admin/billing-paddle-catalog (PR-P3). Provider is
-        the active billing provider's name (paddle / stripe);
-        on a Stripe deployment the handler 501s before
-        serializing this struct. SyncedAt is the timestamp of
-        the most recent successful EnsurePlanProducts call;
-        empty string when no hydration has yet completed
-        (POST and DELETE both reset it).
+        /v1/admin/billing-paddle-catalog compatibility endpoints
+        (PR-P3). Provider is the active billing provider's name
+        (polar / paddle); providers without a catalog surface
+        return 501. SyncedAt is the timestamp of the most recent
+        successful catalog preflight; empty when no hydration has
+        completed.
       type: object
       required: [provider, synced_at, entries]
       properties:
-        provider:  { type: string, description: 'Active provider name (paddle / stripe).' }
+        provider:  { type: string, description: 'Active provider name (polar / paddle).' }
         synced_at: { type: string, description: 'RFC 3339 last-sync timestamp; empty string when never synced.' }
         entries:
           type: array
@@ -13534,6 +13609,23 @@ components:
         reason:         { type: string, minLength: 3, maxLength: 500 }
         created_at:     { type: string, format: date-time }
         expires_at:     { type: [string, "null"], format: date-time }
+
+    AdminRefundResponse:
+      description: |
+        Result of an operator-initiated Polar refund. The local invoice and
+        provider refund identifiers are both returned for reconciliation.
+        Amounts are integer EUR cents.
+      type: object
+      required: [account_id, invoice_id, provider, provider_refund_id, charge_id, amount_cents, currency, status]
+      properties:
+        account_id:        { type: string, format: uuid }
+        invoice_id:        { type: string, format: uuid }
+        provider:          { type: string, enum: [polar] }
+        provider_refund_id: { type: string }
+        charge_id:         { type: string, description: 'Polar order ID used by the refund.' }
+        amount_cents:      { type: integer, format: int64, minimum: 1 }
+        currency:          { type: string, example: eur }
+        status:             { type: string, description: 'Provider refund status.' }
 
     AdminSetGithubWebhookSecretResponse:
       description: |

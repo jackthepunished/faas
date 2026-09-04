@@ -456,22 +456,20 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 		log.Info("imaged: function runner wired", "runtime", kw.runtime, "path", p)
 	}
 
-	// FAAS_DEPLOY_BASE_REF overrides the per-runtime base ref used by
-	// aboveBaseLayers at deploy time. Operator overrides must be
-	// digest-pinned (ADR-021 D4): a tag reference like `:latest` would
-	// resolve to whatever the registry serves TODAY, not when a deploy
-	// was first queued — and a per-app build that pins against today's
-	// `latest` would suddenly change what /srv/fc/base/<runtime>.ext4
-	// contains on the next imaged restart, invalidating the per-app
-	// diff_ids above. Refusing bare tags here makes the override an
-	// explicit, reproducible operator choice.
+	// Production base selection is per-runtime and comes from the
+	// FAAS_DEPLOY_BASE_REF_<RUNTIME> environment contract. The old global
+	// FAAS_DEPLOY_BASE_REF could make builderd and imaged select different
+	// layers, so fail closed if it is still present. Only the e2e harness may
+	// use the explicitly test-only global redirect to a local registry.
 	if dbr := os.Getenv("FAAS_DEPLOY_BASE_REF"); dbr != "" {
-		ref, err := oci.ParseReference(dbr)
-		if err != nil || ref.Digest == "" {
-			return fmt.Errorf("imaged: FAAS_DEPLOY_BASE_REF %q must be a digest-pinned reference (e.g. registry.gregale.dev/img@sha256:...)", dbr)
+		return fmt.Errorf("imaged: FAAS_DEPLOY_BASE_REF is retired; set FAAS_DEPLOY_BASE_REF_<RUNTIME> instead")
+	}
+	if dbr := os.Getenv("FAAS_TEST_DEPLOY_BASE_REF"); dbr != "" {
+		if node := strings.TrimSpace(os.Getenv("FAAS_NODE_NAME")); node != "" {
+			return fmt.Errorf("imaged: FAAS_TEST_DEPLOY_BASE_REF is test-only and cannot be set on named node %q", node)
 		}
 		h.WithDeployBaseRef(dbr)
-		log.Info("imaged: deploy base ref override", "ref", dbr)
+		log.Info("imaged: test deploy base ref override", "ref", dbr)
 	}
 
 	// F1 + F2: stage the builder-base ext4 on startup, then hand off to the

@@ -768,6 +768,11 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		WithSlowSubscriberCallback(func() {
 			ops.IncLogDropped("slow_subscriber")
 		})
+	// Activity tracker (PR-B, issue #462): per-instance in-flight
+	// ForwardHTTP request counter. It is shared by the gRPC server's
+	// stats surface and the liveness loop so load-correlated probe misses
+	// can receive the bounded infrastructure grace (issue #1267).
+	activityTracker := activity.NewWithDefaults()
 	mgr := fcvm.NewManager(
 		wire.ExecRunner{},
 		jailer,
@@ -815,7 +820,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		},
 	).WithLivenessProbeStarter(func(ctx context.Context, instance string, slot int, deploymentID string, cfg fcvm.LivenessProbeConfig) context.CancelFunc {
 		return startLivenessLoopHelper(ctx, mgr, log, instance, slot, deploymentID, cfg,
-			jailer.VsockUDSSocketPath(instance))
+			jailer.VsockUDSSocketPath(instance), activityTracker)
 	})
 	mgr.SetHostIdentities(hostIdentities)
 	// issue #299: wire the artifact backend the Manager uses to
@@ -852,6 +857,52 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		"cap", cfg.ParentMountCap,
 		"max_age", cfg.ParentMountMaxAge.String(),
 		"sweep_interval", cfg.ParentSweepInterval.String())
+
+	// Reap microVMs orphaned by a previous vmmd. Firecracker children
+	// do not die with vmmd (they are jailed into faas-tenant.slice, a
+	// sibling cgroup), but the live-instance map that makes them
+	// reachable is in-memory — so after a restart they burn tenant RAM
+	// while nothing can route to them. Measured on a production node
+	// on 2026-09-04: 23 such VMs, oldest 3.7 days, 5.3 GB.
+	//
+	// Gated on durable state, never on "vmmd restarted". On that same
+	// node 2 of the 25 running VMs were instances schedd still
+	// considered live (one RUNNING and serving, one mid-SNAPSHOTTING);
+	// an ungated sweep would have killed a customer's VM. A nil store
+	// (default-local / tests) means there is no durable view to gate
+	// on, so the sweep is skipped entirely rather than run blind.
+	if store != nil {
+		rep, err := fcvm.ReapOrphanedJails(ctx, fcvm.ReapOptions{
+			JailRoot: jailer.JailRoot(),
+			Runner:   wire.ExecRunner{},
+			Log:      log,
+			IsLive: func(ctx context.Context, instanceID string) (bool, error) {
+				ins, err := store.InstanceByID(ctx, instanceID)
+				if err != nil {
+					// A row that is genuinely gone is not live;
+					// anything else is unknown and must not
+					// authorise a kill.
+					if errors.Is(err, state.ErrNotFound) {
+						return false, nil
+					}
+					return false, err
+				}
+				// state.IsLive is the documented single source of
+				// truth for the live set, so a future state added
+				// there is honoured here without a second edit.
+				return state.IsLive(ins.State), nil
+			},
+		})
+		if err != nil {
+			log.Warn("vmmd: orphan reap failed", "err", err)
+		} else if rep.Scanned > 0 {
+			log.Info("vmmd: orphan reap complete",
+				"scanned", rep.Scanned, "reaped", rep.Reaped,
+				"skipped_live", rep.SkippedLive,
+				"skipped_young", rep.SkippedYoung,
+				"skipped_unknown", rep.SkippedUnknown)
+		}
+	}
 
 	// Orphan sweep — schedule via a context-bound goroutine that
 	// exits cleanly on ctx.Done. Mirrors the schedd watchdog tick
@@ -1097,13 +1148,6 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// nil to vmmdgrpc.NewWithCPUAndNet and skip the sample
 	// loop entirely.
 	netCache := netstats.NewWithDefaults()
-	// Activity tracker (PR-B, issue #462): per-instance in-flight
-	// ForwardHTTP request counter, fed by vmmdgrpc.ForwardHTTP's
-	// Begin/End defer pair (forward.go) and consumed by
-	// vmmdgrpc.Server.Stats as the inflight_requests and
-	// last_request_at wire fields. PR-C reads them via
-	// instancestats.Reader.MaxInflightForApp.
-	activityTracker := activity.NewWithDefaults()
 	gsrv := grpc.NewServer(append(
 		wire.ServerCredsOrEmpty(serverTLS),
 		wire.TraceServerOptions()...,
@@ -1120,6 +1164,11 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		impl.WithEvents(events.NewPlatform("vmmd", store, log, ops, nil))
 	}
 	impl.Register(gsrv)
+	defer func() {
+		if err := impl.Close(context.WithoutCancel(ctx)); err != nil {
+			log.Warn("vmmd: stream bridge cleanup during shutdown failed", "err", err)
+		}
+	}()
 
 	// Optional /metrics endpoint.
 	var httpSrv *http.Server

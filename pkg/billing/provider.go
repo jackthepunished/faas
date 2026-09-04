@@ -9,11 +9,11 @@
 // implementations today:
 //
 //   - pkg/billing/stripe — extracted from the original pkg/stripex package.
-//     Default provider when FAAS_BILLING_PROVIDER is empty.
-//   - pkg/billing/paddle — Paddle Billing v2 (current API). Opt-in via
-//     FAAS_BILLING_PROVIDER=paddle.
+//     Legacy opt-in via FAAS_BILLING_PROVIDER=stripe.
+//   - pkg/billing/paddle — Paddle Billing v2 (current API). Explicit opt-in
+//     via FAAS_BILLING_PROVIDER=paddle.
 //   - pkg/billing/polar — Polar MoR REST API + event-based usage billing.
-//     Opt-in via FAAS_BILLING_PROVIDER=polar.
+//     Public-release default and explicit option via FAAS_BILLING_PROVIDER=polar.
 //
 // Provider-specific behaviour stays inside each implementation; the rest
 // of the codebase (apid, meterd, the dunning state machine, the email
@@ -116,8 +116,10 @@ type Provider interface {
 	// FAAS_RECONCILE_INTERVAL and asks each implementation how
 	// many mb_seconds it has actually pushed for the given hour
 	// window. The reconciler compares that sum against the local
-	// `usage_minutes` total and exposes the diff as Prometheus
-	// gauges + the BillingDrift alert.
+	// provider quantity and exposes the diff as Prometheus gauges +
+	// the BillingDrift alert. Providers implementing
+	// UsageModeProvider may use net calendar-month overage instead of
+	// raw local usage.
 	//
 	// Read-only against the provider — implementations MUST NOT
 	// mutate customer / subscription state from this call.
@@ -133,7 +135,8 @@ type Provider interface {
 	// implementation returns ErrNotImplemented until the upstream
 	// adds one. Polar: the configured meter quantities endpoint is
 	// summed when FAAS_POLAR_METER_ID is set; without a meter ID it
-	// returns ErrNotImplemented.
+	// returns ErrNotImplemented for direct callers (startup validation
+	// rejects that configuration).
 	ReconcileUsage(ctx context.Context, acct state.Account, start, end time.Time) (pushedMBSeconds int64, err error)
 
 	// Refund issues an operator-initiated refund against a charge
@@ -151,18 +154,19 @@ type Provider interface {
 	//      handler can dispatch on. Today the handler returns
 	//      502 for any non-nil error; the refinement is a follow-up.
 	//
-	// apid's handler is the only caller (cmd/apid/handlers_admin_credits.go).
-	// The webhook (charge.refunded) is observational and routes
+	// apid's operator route is the caller
+	// (cmd/apid/handlers_admin_refunds.go). The webhook (charge.refunded or
+	// the provider-equivalent refund event) is observational and routes
 	// through VerifyWebhook → EventRefundProcessed, NOT through this
 	// method.
 	Refund(ctx context.Context, chargeID string, amountCents int64) (*RefundResult, error)
 
 	// RetryLatestCharge materializes a new charge attempt against
-	// the account's saved card (issue #242; closes the lie at
-	// pkg/mail/account.go:107,150 that promises `faas billing retry`
-	// which didn't exist). Returns the new attempt's id + the
-	// provider's reference id; the apid handler echoes them in
-	// BillingRetryResponse.
+	// the account's saved card where the provider exposes that operation
+	// (issue #242). Returns the new attempt's id + the provider's reference
+	// id; the apid handler echoes them in BillingRetryResponse. Providers
+	// without a direct retry surface return ErrNotImplemented and apid
+	// directs the customer to the billing portal.
 	//
 	//   - Stripe: walks the customer's open invoices in reverse
 	//     chronological order and calls Invoices.Pay on the latest
@@ -221,6 +225,27 @@ type Provider interface {
 	PaymentMethodSummary(ctx context.Context, acct state.Account) (PaymentMethod, error)
 }
 
+// UsageModeProvider is an optional provider contract for usage semantics.
+// Providers that return UsageModeOverage receive only the portion above
+// Gregale's included calendar-month quota. Providers without this optional
+// surface retain the historical raw-usage contract.
+type UsageModeProvider interface {
+	UsageMode() UsageMode
+}
+
+// UsageMode describes the quantity passed to PushUsageRecord and returned by
+// ReconcileUsage.
+type UsageMode string
+
+const (
+	// UsageModeRaw is the legacy provider contract: the quantity is all local
+	// usage in the requested window.
+	UsageModeRaw UsageMode = "raw"
+	// UsageModeOverage is the calendar-month net-overage contract. The
+	// included plan allowance is removed locally before provider ingestion.
+	UsageModeOverage UsageMode = "overage"
+)
+
 // CustomerPortalProvider is an optional provider surface for creating a
 // short-lived, customer-authenticated billing portal session. Providers that
 // do not expose a session API can continue using the operator-configured
@@ -229,11 +254,37 @@ type CustomerPortalProvider interface {
 	CreateCustomerPortalSession(ctx context.Context, acct state.Account, returnURL string) (portalURL string, err error)
 }
 
+// SubscriptionPlanChangeProvider is an optional provider surface for
+// scheduling a change to an existing subscription. The caller must not
+// change the local entitlement before the provider confirms the new product
+// through a webhook. Providers that do not expose subscription product
+// changes leave customers on the hosted billing portal path.
+//
+// targetPlan == api.PlanFree means cancel the subscription at period end;
+// paid-to-paid changes should use the provider's non-prorating or
+// next-period semantics unless the provider explicitly documents otherwise.
+type SubscriptionPlanChangeProvider interface {
+	ChangeSubscriptionPlan(ctx context.Context, acct state.Account, targetPlan api.Plan) (effectiveAt time.Time, err error)
+}
+
 // InvoicePDFRequester is an optional provider surface for requesting an
 // invoice PDF after a paid order. Providers whose invoices are generated
 // automatically need not implement it.
 type InvoicePDFRequester interface {
 	RequestInvoicePDF(ctx context.Context, providerInvoiceID string) error
+}
+
+// CatalogProvider is an optional operator surface for inspecting and
+// revalidating the active provider's configured product catalog. The API
+// endpoint retains its historical billing-paddle-catalog path for client
+// compatibility, but the response and this interface are provider-neutral.
+// Providers whose catalog is dashboard-owned may return ErrNotImplemented for
+// ResetBillingCatalog rather than pretending that a local reset deletes the
+// remote products.
+type CatalogProvider interface {
+	ListBillingCatalog(ctx context.Context) []api.BillingCatalogEntry
+	SyncBillingCatalog(ctx context.Context) ([]api.BillingCatalogEntry, error)
+	ResetBillingCatalog(ctx context.Context) error
 }
 
 // EventType is the provider-neutral "what happened" classifier apid

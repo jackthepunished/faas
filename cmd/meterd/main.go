@@ -732,7 +732,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		}
 		// Empty API key on a Stripe box is a soft-warn today
 		// (pushUsageRecordSDKSum returns an error per call, the loop
-		// logs and skips); with the Paddle provider, the API key must
+		// logs and skips); with Polar or Paddle, the API key must
 		// be set or the SDK refuses to initialize. Surface the provider
 		// name so an operator can match the warning to the right
 		// source.
@@ -996,12 +996,12 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// alongside the existing gauges without coupling — the two
 	// registries are merged at the /metrics scrape below. We hand
 	// it the same billing.Provider the pusher uses (no second SDK
-	// client load). provName defaults to "stripe" for the historical
-	// loader that returns an empty string; cmd/meterd/main.go:613
+	// client load). provName defaults to Polar for injected test or
+	// compatibility pushers that do not carry a provider name; cmd/meterd/main.go:613
 	// guarantees the pusher is loaded before we get here.
 	recRegistry := prometheus.NewRegistry()
 	if provName == "" {
-		provName = "stripe"
+		provName = provPolar
 	}
 	rec := reconciler.New(provName, store, pusher, log, recRegistry)
 	go rec.Loop(ctx, mc.ReconcileInterval)
@@ -1553,7 +1553,7 @@ func (a mailStoreCheckerAdapter) IsMailSuppressed(ctx context.Context, email str
 // fallback) — means a TOML-only deploy doesn't trigger a false-positive
 // warn on every boot.
 //
-// Post-PR-#962 (Paddle is the v2 default): an empty Paddle key is now
+// Post-public-release (Polar is the default): an empty provider key is now
 // a constructor error (NewProvider returns ErrNoAPIKey on empty /
 // whitespace-only keys — CRIT-2 fix), so the daemon refuses to start
 // rather than booting and warn-logging per tick. The Stripe branch

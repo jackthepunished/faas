@@ -3571,6 +3571,11 @@ type Store interface {
 	// (Engine.AdmitMirrorInstance) call this overload with
 	// an explicit mode value.
 	CreateInstanceWithMode(ctx context.Context, appID, deploymentID, state string, ramMB int, nodeID, wakeID, mode string) (Instance, error)
+	// CreateJobInstance creates the job-task shape required by the jobs
+	// schema: app_id and deployment_id are NULL, while job_id and kind are
+	// populated. Job definitions point at OCI images directly, so there is
+	// no deployment row to reuse for this instance.
+	CreateJobInstance(ctx context.Context, instanceID, jobID, runID string, taskIndex int, state string, ramMB int, nodeID, wakeID string) (Instance, error)
 	InstanceByID(ctx context.Context, id string) (Instance, error)
 	// ReadActiveInstanceForWakeID is the cluster-coord lookup
 	// primitive (multi-host safety cluster PR-5 / audit F4). When
@@ -4559,8 +4564,9 @@ type Store interface {
 	// against every other.
 	ConsumeAccountCredit(ctx context.Context, p ConsumeAccountCreditParams) (ConsumeAccountCreditResult, error)
 	// CurrentMonthOverageCents returns the account's derived overage
-	// in integer cents for the current UTC month. 1 GB-h = 100 cents
-	// at €0.01/GB-h (CLAUDE.md: integer cents only, never float).
+	// in integer cents for the current UTC month. The account plan's
+	// included calendar-month allowance is subtracted before the
+	// €0.01/GB-h conversion (CLAUDE.md: integer cents only, never float).
 	// meterd consults this on every quota tick to decide whether the
 	// overage row should be capped. The PgStore implementation sums
 	// usage_minutes.mb_seconds since the UTC month start and converts

@@ -119,16 +119,17 @@ func TestChangePlan_GateMatrix(t *testing.T) {
 			requestedPlan: api.PlanScale, wantStatus: 402, wantCode: api.CodePayment,
 			wantPortalURLSet: true, wantPlanAfter: api.PlanPro,
 		},
-		// Downgrades always pass.
+		// Downgrades are provider mutations too; the local entitlement stays
+		// unchanged until the provider confirms the scheduled change.
 		{
 			name: "pro→free_downgrade", startingPlan: api.PlanPro, stripeItem: "si_abc",
-			requestedPlan: api.PlanFree, wantStatus: 200, wantCode: "",
-			wantPlanAfter: api.PlanFree,
+			requestedPlan: api.PlanFree, wantStatus: 402, wantCode: api.CodePayment,
+			wantPortalURLSet: true, wantPlanAfter: api.PlanPro,
 		},
 		{
 			name: "scale→pro_downgrade", startingPlan: api.PlanScale, stripeItem: "si_abc",
-			requestedPlan: api.PlanPro, wantStatus: 200, wantCode: "",
-			wantPlanAfter: api.PlanPro,
+			requestedPlan: api.PlanPro, wantStatus: 402, wantCode: api.CodePayment,
+			wantPortalURLSet: true, wantPlanAfter: api.PlanScale,
 		},
 		// Idempotent same-tier: success, no gate.
 		{
@@ -210,6 +211,67 @@ func TestChangePlan_DoesNotEnableMFA(t *testing.T) {
 	}
 	if fresh.Plan != api.PlanHobby {
 		t.Fatalf("plan = %q, want hobby until provider confirms upgrade", fresh.Plan)
+	}
+}
+
+func TestChangePlan_DowngradeWaitsForProviderConfirmation(t *testing.T) {
+	e, srv := setupChangePlan(t, api.PlanPro, "sub_123")
+	effectiveAt := time.Date(2026, 9, 30, 0, 0, 0, 0, time.UTC)
+	fake := &fakeBillingProvider{planChangeEffective: effectiveAt}
+	srv.WithBillingProvider(fake)
+
+	rec := e.do(t, "PATCH", "/v1/account/plan",
+		map[string]string{"plan": string(api.PlanHobby)}, nil)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202\nbody = %s", rec.Code, rec.Body)
+	}
+	if fake.planChangeCalls != 1 || fake.planChangeTarget != api.PlanHobby {
+		t.Fatalf("provider plan change = (%d, %q), want (1, hobby)", fake.planChangeCalls, fake.planChangeTarget)
+	}
+	var response api.AccountResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("response is not AccountResponse: %v", err)
+	}
+	if response.Plan != string(api.PlanPro) {
+		t.Errorf("response plan = %q, want current plan %q", response.Plan, api.PlanPro)
+	}
+	if response.PlanChangeStatus != "pending_provider_confirmation" {
+		t.Errorf("plan_change_status = %q, want pending_provider_confirmation", response.PlanChangeStatus)
+	}
+	if response.RequestedPlan != string(api.PlanHobby) {
+		t.Errorf("requested_plan = %q, want hobby", response.RequestedPlan)
+	}
+	if response.EffectiveAt == nil || !response.EffectiveAt.Equal(effectiveAt) {
+		t.Errorf("effective_at = %v, want %v", response.EffectiveAt, effectiveAt)
+	}
+	updated, err := e.store.AccountByID(context.Background(), e.acct.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Plan != api.PlanPro {
+		t.Fatalf("stored plan = %q, want pro until provider confirmation", updated.Plan)
+	}
+}
+
+func TestChangePlan_DowngradeProviderFailureKeepsLocalPlan(t *testing.T) {
+	e, srv := setupChangePlan(t, api.PlanPro, "sub_123")
+	fake := &fakeBillingProvider{planChangeErr: errors.New("provider unavailable")}
+	srv.WithBillingProvider(fake)
+
+	rec := e.do(t, "PATCH", "/v1/account/plan",
+		map[string]string{"plan": string(api.PlanFree)}, nil)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502\nbody = %s", rec.Code, rec.Body)
+	}
+	if fake.planChangeCalls != 1 {
+		t.Fatalf("provider plan change calls = %d, want 1", fake.planChangeCalls)
+	}
+	updated, err := e.store.AccountByID(context.Background(), e.acct.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Plan != api.PlanPro {
+		t.Fatalf("stored plan = %q, want pro after provider failure", updated.Plan)
 	}
 }
 
@@ -337,6 +399,10 @@ type fakeBillingProvider struct {
 	checkoutURL         string
 	err                 error
 	calls               int
+	planChangeCalls     int
+	planChangeTarget    api.Plan
+	planChangeEffective time.Time
+	planChangeErr       error
 	customerCreateCalls int
 	customerCreateID    string
 	customerCreateErr   error
@@ -365,6 +431,12 @@ func (f *fakeBillingProvider) CreateUpgradeTransaction(_ context.Context, acct s
 		return "", "", f.err
 	}
 	return f.txnID, f.checkoutURL, nil
+}
+
+func (f *fakeBillingProvider) ChangeSubscriptionPlan(_ context.Context, _ state.Account, target api.Plan) (time.Time, error) {
+	f.planChangeCalls++
+	f.planChangeTarget = target
+	return f.planChangeEffective, f.planChangeErr
 }
 
 // Refund is the issue #279 billing.Provider seam. The changePlan

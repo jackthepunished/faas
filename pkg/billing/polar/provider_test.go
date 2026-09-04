@@ -46,8 +46,17 @@ func testConfig(baseURL string) Config {
 		ProProductID:     "pro-product",
 		ScaleProductID:   "scale-product",
 		UsageEventName:   "ram_usage",
+		MeterID:          "meter-1",
 		ToleranceSeconds: 300,
 	}
+}
+
+func catalogProductJSON(id string, fixedCents int64) string {
+	return `{"id":"` + id + `","recurring_interval":"month","recurring_interval_count":1,"is_recurring":true,"is_archived":false,"prices":[{"amount_type":"fixed","price_currency":"eur","price_amount":` + strconv.FormatInt(fixedCents, 10) + `,"is_archived":false},{"amount_type":"metered_unit","price_currency":"eur","unit_amount":"1","meter_id":"meter-1","cap_amount":null,"is_archived":false}],"benefits":[]}`
+}
+
+func catalogMeterJSON() string {
+	return `{"id":"meter-1","unit":"scalar","archived_at":null,"filter":{"conjunction":"and","clauses":[{"property":"name","operator":"eq","value":"ram_usage"}]},"aggregation":{"func":"sum","property":"gb_ram_hours"}}`
 }
 
 func TestNewProviderRequiresAccessToken(t *testing.T) {
@@ -71,13 +80,28 @@ func TestEnsurePlanProductsRequiresConfiguredIDs(t *testing.T) {
 func TestEnsurePlanProductsValidatesConfiguredCatalog(t *testing.T) {
 	var productRequests int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, "/v1/products/") {
+		if r.Method != http.MethodGet {
+			http.NotFound(w, r)
+			return
+		}
+		if r.URL.Path == "/v1/meters/meter-1" {
+			_, _ = io.WriteString(w, catalogMeterJSON())
+			return
+		}
+		if !strings.HasPrefix(r.URL.Path, "/v1/products/") {
 			http.NotFound(w, r)
 			return
 		}
 		productRequests++
 		id := strings.TrimPrefix(r.URL.Path, "/v1/products/")
-		_, _ = io.WriteString(w, `{"id":"`+id+`"}`)
+		fixed := int64(900)
+		switch id {
+		case "pro-product":
+			fixed = 2900
+		case "scale-product":
+			fixed = 9900
+		}
+		_, _ = io.WriteString(w, catalogProductJSON(id, fixed))
 	}))
 	defer server.Close()
 	p, err := NewProvider(testConfig(server.URL), nil)
@@ -89,6 +113,84 @@ func TestEnsurePlanProductsValidatesConfiguredCatalog(t *testing.T) {
 	}
 	if productRequests != 3 {
 		t.Fatalf("catalog product requests = %d, want 3", productRequests)
+	}
+	entries := p.ListBillingCatalog(context.Background())
+	if len(entries) != 3 {
+		t.Fatalf("Polar catalog entries = %d, want 3", len(entries))
+	}
+	for _, entry := range entries {
+		if entry.Kind != api.BillingCatalogKindProduct || entry.Handle == "" {
+			t.Errorf("catalog entry = %+v, want a product handle", entry)
+		}
+		if entry.SyncedAt.IsZero() {
+			t.Errorf("catalog entry %s has zero synced_at", entry.Plan)
+		}
+	}
+}
+
+func TestEnsurePlanProductsRejectsWrongPriceBeforeStartup(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/meters/meter-1" {
+			_, _ = io.WriteString(w, catalogMeterJSON())
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/v1/products/") {
+			id := strings.TrimPrefix(r.URL.Path, "/v1/products/")
+			_, _ = io.WriteString(w, catalogProductJSON(id, 1))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	p, err := NewProvider(testConfig(server.URL), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.EnsurePlanProducts(context.Background()); err == nil || !strings.Contains(err.Error(), "fixed price") {
+		t.Fatalf("EnsurePlanProducts error = %v, want fixed-price validation", err)
+	}
+}
+
+func TestEnsurePlanProductsRejectsPolarMeterCredits(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/meters/meter-1" {
+			_, _ = io.WriteString(w, catalogMeterJSON())
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/v1/products/") {
+			id := strings.TrimPrefix(r.URL.Path, "/v1/products/")
+			fixed := int64(900)
+			switch id {
+			case "pro-product":
+				fixed = 2900
+			case "scale-product":
+				fixed = 9900
+			}
+			product := strings.Replace(catalogProductJSON(id, fixed), `"benefits":[]`, `"benefits":[{"type":"meter_credit","is_deleted":false}]`, 1)
+			_, _ = io.WriteString(w, product)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	p, err := NewProvider(testConfig(server.URL), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.EnsurePlanProducts(context.Background()); err == nil || !strings.Contains(err.Error(), "meter credits") {
+		t.Fatalf("EnsurePlanProducts error = %v, want meter-credit validation", err)
+	}
+}
+
+func TestEnsurePlanProductsRequiresMeterID(t *testing.T) {
+	cfg := testConfig("http://example.test")
+	cfg.MeterID = ""
+	p, err := NewProvider(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.EnsurePlanProducts(context.Background()); err == nil || !strings.Contains(err.Error(), "FAAS_POLAR_METER_ID") {
+		t.Fatalf("EnsurePlanProducts error = %v, want meter-id validation", err)
 	}
 }
 
@@ -262,6 +364,44 @@ func TestCreateCustomerPortalSession(t *testing.T) {
 	}
 }
 
+func TestChangeSubscriptionPlanSchedulesNextPeriodUpdate(t *testing.T) {
+	var gotIdempotency string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPatch || r.URL.Path != "/v1/subscriptions/sub-1" {
+			http.NotFound(w, r)
+			return
+		}
+		gotIdempotency = r.Header.Get("Idempotency-Key")
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body["product_id"] != "pro-product" || body["proration_behavior"] != "next_period" {
+			t.Fatalf("subscription update body = %v", body)
+		}
+		_, _ = io.WriteString(w, `{"id":"sub-1","current_period_end":"2026-09-30T00:00:00Z","pending_update":{"applies_at":"2026-09-30T00:00:00Z"}}`)
+	}))
+	defer server.Close()
+
+	p, err := NewProvider(testConfig(server.URL), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	effectiveAt, err := p.ChangeSubscriptionPlan(context.Background(), state.Account{
+		ID: "acct-1", StripeSubscriptionItem: "sub-1",
+	}, api.PlanPro)
+	if err != nil {
+		t.Fatalf("ChangeSubscriptionPlan: %v", err)
+	}
+	want := time.Date(2026, 9, 30, 0, 0, 0, 0, time.UTC)
+	if !effectiveAt.Equal(want) {
+		t.Fatalf("effective_at = %v, want %v", effectiveAt, want)
+	}
+	if gotIdempotency != "faas-plan-change-acct-1-pro" {
+		t.Fatalf("idempotency key = %q", gotIdempotency)
+	}
+}
+
 func TestReconcileUsageReadsMeterTotal(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/v1/meters/meter-1/quantities" {
@@ -301,7 +441,9 @@ func TestReconcileUsageReadsMeterTotal(t *testing.T) {
 }
 
 func TestReconcileUsageWithoutMeterIsUnsupported(t *testing.T) {
-	p, err := NewProvider(testConfig("http://example.test"), nil)
+	cfg := testConfig("http://example.test")
+	cfg.MeterID = ""
+	p, err := NewProvider(cfg, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -510,5 +652,29 @@ func TestCancelAndRefund(t *testing.T) {
 	}
 	if len(paths) != 2 {
 		t.Fatalf("API paths = %v", paths)
+	}
+}
+
+func TestRefundUsesContextIdempotencyKey(t *testing.T) {
+	var got string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/refunds" {
+			http.NotFound(w, r)
+			return
+		}
+		got = r.Header.Get("Idempotency-Key")
+		_, _ = io.WriteString(w, `{"id":"refund-operator","amount":250,"currency":"eur","status":"pending"}`)
+	}))
+	defer server.Close()
+	p, err := NewProvider(testConfig(server.URL), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := billing.ContextWithIdempotencyKey(context.Background(), "operator-refund-42")
+	if _, err := p.Refund(ctx, "order-1", 250); err != nil {
+		t.Fatalf("Refund: %v", err)
+	}
+	if got != "operator-refund-42" {
+		t.Fatalf("refund idempotency key = %q, want operator-refund-42", got)
 	}
 }

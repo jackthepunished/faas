@@ -166,6 +166,42 @@ func TestPGBackend_FanOutAcrossMaxConcurrency(t *testing.T) {
 	}
 }
 
+// TestPGBackend_StaleTargetIsNotRehydrated pins the transport-failure fence.
+// The instance row may still be RUNNING while vmmd's liveness failure is
+// propagating through schedd; reconciliation must not put that same target
+// back into the picker during the recovery window.
+func TestPGBackend_StaleTargetIsNotRehydrated(t *testing.T) {
+	sched := gateway.NewFakeScheduler("node-shared")
+	b := gateway.NewPGBackend(&fakeRouter{byID: map[string]gateway.App{}}, sched, nil).
+		WithLiveTargetLoader(func(context.Context, string) ([]gateway.Target, error) {
+			return []gateway.Target{{InstanceID: "i-1", NodeID: "node-shared"}}, nil
+		})
+
+	if _, _, _, err := b.Admit(context.Background(), "app-1", "", "", "", 5); err != nil {
+		t.Fatalf("Admit: %v", err)
+	}
+	b.EvictInstance("app-1", "i-1")
+
+	if err := b.ReconcileLiveTargets(context.Background(), "app-1"); err != nil {
+		t.Fatalf("ReconcileLiveTargets: %v", err)
+	}
+	if got := b.HealthyCount("app-1"); got != 0 {
+		t.Fatalf("HealthyCount after stale reconciliation = %d, want 0", got)
+	}
+
+	// A fresh admission uses a new instance identity and must not be blocked
+	// by the old instance's quarantine.
+	if _, _, _, err := b.Admit(context.Background(), "app-1", "", "", "", 5); err != nil {
+		t.Fatalf("replacement Admit: %v", err)
+	}
+	if got := b.HealthyCount("app-1"); got != 1 {
+		t.Fatalf("HealthyCount after replacement = %d, want 1", got)
+	}
+	if pick := b.Pick("app-1"); !pick.OK || pick.Target.InstanceID != "i-2" {
+		t.Fatalf("replacement Pick = %+v, want i-2", pick)
+	}
+}
+
 // TestPGBackend_AdmitErrorDoesNotSeedTarget (issue #168) — a real
 // admission failure (e.g. RAM headroom surfaced as *api.Problem) must
 // not leak a partial target into the cache.
@@ -364,8 +400,20 @@ func TestPGBackend_AdmitRequestCancellationDoesNotCancelLifecycle(t *testing.T) 
 	case <-time.After(time.Second):
 		t.Fatal("admission lifecycle did not complete")
 	}
-	if got := b.HealthyCount("app-1"); got != 1 {
-		t.Fatalf("HealthyCount after detached admission = %d, want 1", got)
+	// blockingScheduler closes completed immediately before returning from
+	// AdmitInstance. The detached backend goroutine still has to receive that
+	// result and publish the target, so observing completed alone is not a
+	// synchronization point for the cache update.
+	deadline := time.NewTimer(time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer deadline.Stop()
+	defer ticker.Stop()
+	for b.HealthyCount("app-1") != 1 {
+		select {
+		case <-ticker.C:
+		case <-deadline.C:
+			t.Fatalf("HealthyCount after detached admission = %d, want 1", b.HealthyCount("app-1"))
+		}
 	}
 	if pick := b.Pick("app-1"); !pick.OK || pick.Target.InstanceID != "instance-after-timeout" {
 		t.Fatalf("Pick after detached admission = %+v, want instance-after-timeout", pick)
