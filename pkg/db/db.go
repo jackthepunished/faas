@@ -32,10 +32,10 @@ func Open(ctx context.Context, dsnOverride string) (*pgxpool.Pool, error) {
 }
 
 // DaemonMaxConnections is the direct-pool budget for each production daemon.
-// The normal public-beta topology (control plane plus one active compute node)
-// stays below 90 ordinary sessions. A second continuously active compute node
-// requires the PgBouncer connection-capacity gate documented in the Postgres
-// runbook.
+// The postgres_capacity Ansible role combines these per-process limits with
+// the complete compute_nodes inventory. It keeps the steady fleet below 75%
+// of ordinary PostgreSQL capacity and reserves one overlapping compute
+// generation plus operator headroom before node admission.
 var DaemonMaxConnections = map[string]int32{
 	"apid": 12,
 	// Each schedd owns eleven permanent LISTEN subscribers in production.

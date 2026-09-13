@@ -49,17 +49,24 @@ unbudgeted client that needs attribution before its pool can be corrected.
    evidence for the incident record.
 
 Do not increase `max_connections` as the first response. More backends raise
-PostgreSQL memory use and hide a pool-budget regression. Keep the normal
-public-beta topology (control plane plus one active compute node) at or below
-90 ordinary sessions. Do not activate the stopped standby node for continuous
-traffic with direct daemon pools: both schedd processes on that node require
-eleven permanent LISTEN sessions plus request headroom, so the complete fleet
-can exceed PostgreSQL's 97 ordinary-client slots. Before running both compute
-nodes continuously, introduce PgBouncer and repeat the API, wake, jobs,
-workflow, and rollout-overlap capacity suite.
+PostgreSQL memory use and hide a pool-budget regression. The public-beta
+configuration is the reviewed exception: `postgres_capacity` derives the
+postmaster ceiling from the complete compute inventory after the daemon pools
+have been explicitly bounded and attributed. It budgets 40 control-plane
+sessions, 34 sessions per compute node, one overlapping rollout node, operator
+headroom, and five superuser-reserved slots. It also refuses admission when
+the database host lacks RAM for the derived ceiling.
+
+The direct-pool model is validated through twelve compute nodes on an
+appropriately sized database host. Beyond that beta envelope, split permanent
+`LISTEN` sessions onto a direct DSN, route ordinary query pools through
+transaction-mode PgBouncer, and repeat the API, wake, jobs, workflow, and
+rollout-overlap capacity suite.
 
 ## Verify recovery
 
 The warning clears after utilization remains at or below 75%. Verify that new
-connections carry an application name and that a rollout overlap cannot push
-the exported count beyond the 90-session direct-pool ceiling.
+connections carry an application name, the exported ordinary capacity matches
+the inventory-derived ceiling, the steady fleet stays below 75% of ordinary
+capacity, and one overlapping compute generation still leaves the configured
+operator headroom.
