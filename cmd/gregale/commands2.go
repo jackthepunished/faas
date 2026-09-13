@@ -3520,6 +3520,13 @@ func renderUsageSummary(w io.Writer, s api.UsageSummaryResponse) {
 	// confusing the two.
 	_, _ = fmt.Fprintf(w, "  %-*s %.6f CPU-hours\n", labelWidth, "CPU usage:", s.UsedCPUHours)
 	_, _ = fmt.Fprintf(w, "  %-*s %.3f GB\n", labelWidth, "Egress:", s.UsedEgressGB)
+	if s.Executions != nil {
+		_, _ = fmt.Fprintf(w, "  %-*s %d runs (%d succeeded, %d failed, %d cancelled)\n",
+			labelWidth, "Executions:", s.Executions.Runs, s.Executions.Succeeded,
+			s.Executions.Failed, s.Executions.Cancelled)
+		_, _ = fmt.Fprintf(w, "  %-*s %d ms wall / %d ms CPU\n",
+			labelWidth, "Run compute:", s.Executions.WallTimeMS, s.Executions.CPUTimeMS)
+	}
 	if s.EgressBillingMode != "" {
 		_, _ = fmt.Fprintf(w, "  %-*s %s\n", labelWidth, "Egress mode:", s.EgressBillingMode)
 		_, _ = fmt.Fprintf(w, "  %-*s %s\n", labelWidth, "Egress from:", s.EgressBillingFrom)
@@ -4018,6 +4025,13 @@ func runLogs(ctx context.Context, slug, deployment string, filter api.LogFilter,
 			return 130
 		case e, ok := <-dec.Events():
 			if !ok {
+				// Decoder publishes the terminal error after it has
+				// queued every parsed event. Wait until Events closes
+				// before reading Errors so an EOF cannot win a select
+				// against a buffered `degraded` (or log) frame.
+				if streamErr := <-dec.Errors(); streamErr != nil && !errors.Is(streamErr, io.EOF) {
+					return printErr("Stream closed", streamErr)
+				}
 				if collector != nil {
 					collector.flush(os.Stdout)
 				}
@@ -4052,14 +4066,6 @@ func runLogs(ctx context.Context, slug, deployment string, filter api.LogFilter,
 					collector.observe(e.Data)
 				}
 			}
-		case err := <-dec.Errors():
-			if errors.Is(err, io.EOF) {
-				if collector != nil {
-					collector.flush(os.Stdout)
-				}
-				return 0
-			}
-			return printErr("Stream closed", err)
 		}
 	}
 }
