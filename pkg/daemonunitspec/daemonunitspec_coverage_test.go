@@ -166,6 +166,9 @@ func TestUnitApid_Shape(t *testing.T) {
 	if !hasOptionalLoadCredential(u, "faas_archive_creds", "/etc/faas/secrets/storage-box/archive-creds.json") {
 		t.Error("apid: missing optional faas_archive_creds LoadCredential")
 	}
+	if !hasReadWrite(u, "/srv/fc") {
+		t.Error("apid: missing artifact lifecycle access to /srv/fc")
+	}
 }
 
 func TestUnitSchedd_Shape(t *testing.T) {
@@ -243,6 +246,9 @@ func TestUnitGatewaydInternal_Shape(t *testing.T) {
 	if !hasOptionalLoadCredential(u, "faas_archive_creds", "/etc/faas/secrets/storage-box/archive-creds.json") {
 		t.Error("gatewayd-internal: missing optional faas_archive_creds LoadCredential")
 	}
+	if !hasReadWrite(u, "/var/lib/faas/egress-meter") {
+		t.Error("gatewayd-internal: missing durable egress metering access")
+	}
 }
 
 func TestUnitGatewaydPublic_Shape(t *testing.T) {
@@ -318,8 +324,8 @@ func TestUnitMeterd_Shape(t *testing.T) {
 	if !hasEnvironment(u, "FAAS_PROMETHEUS_URL", "http://127.0.0.1:9095") {
 		t.Error("meterd: missing local Prometheus endpoint for alert evaluation")
 	}
-	if !hasEnvironment(u, "FAAS_HOST_AGE_IDENTITY_PATH", "%d/faas_host_age_identity") {
-		t.Error("meterd: missing host age credential path for webhook secret decryption")
+	if !hasEnvironment(u, "FAAS_HOST_AGE_IDENTITY_PATH", "%d/faas_fleet_age_identity") {
+		t.Error("meterd: missing fleet age credential path for webhook secret decryption")
 	}
 	if !hasLoadCredential(u, "faas_host_age_identity", "/etc/faas/secrets/host.age") {
 		t.Error("meterd: missing current host age identity LoadCredential")

@@ -41,8 +41,14 @@ func TestHostJournalMetricsSample(t *testing.T) {
 			}
 			return []byte("persistent link failed\n\nnetworkctl list failed\n"), nil
 		case name == "du" && args[len(args)-1] == "/var/log/journal":
+			if got := strings.Join(args, " "); got != "-sB1 -- /var/log/journal" {
+				t.Errorf("du args = %q, want allocated-byte accounting", got)
+			}
 			return []byte("1048576\t/var/log/journal\n"), nil
 		case name == "du" && args[len(args)-1] == "/run/log/journal":
+			if got := strings.Join(args, " "); got != "-sB1 -- /run/log/journal" {
+				t.Errorf("du args = %q, want allocated-byte accounting", got)
+			}
 			return []byte("2048\t/run/log/journal\n"), nil
 		default:
 			return nil, errors.New("unexpected command")
@@ -215,6 +221,8 @@ func TestJournalPolicyHasFiniteBounds(t *testing.T) {
 		"faas_hardening_journal_system_max_use: 512M",
 		"faas_hardening_journal_runtime_max_use: 128M",
 		"faas_hardening_journal_max_retention: 7day",
+		"faas_hardening_rsyslog_max_file_size: 100M",
+		"faas_hardening_rsyslog_rotate: 7",
 	} {
 		if !strings.Contains(string(defaults), want) {
 			t.Errorf("journal defaults missing %q", want)
@@ -233,6 +241,24 @@ func TestJournalPolicyHasFiniteBounds(t *testing.T) {
 	} {
 		if !strings.Contains(string(template), directive) {
 			t.Errorf("journal template missing %q", directive)
+		}
+	}
+	rsyslogPolicy, err := os.ReadFile(filepath.Join("..", "..", "deploy", "ansible", "roles", "host_hardening", "templates", "rsyslog.logrotate.j2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, directive := range []string{"size {{ faas_hardening_rsyslog_max_file_size }}", "rotate {{ faas_hardening_rsyslog_rotate }}", "/usr/lib/rsyslog/rsyslog-rotate"} {
+		if !strings.Contains(string(rsyslogPolicy), directive) {
+			t.Errorf("rsyslog rotation policy missing %q", directive)
+		}
+	}
+	tasks, err := os.ReadFile(filepath.Join("..", "..", "deploy", "ansible", "roles", "host_hardening", "tasks", "main.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, guard := range []string{"disable the unwritable GCE console sink", "rsyslogd -N1", "reject active file sinks to the unwritable console"} {
+		if !strings.Contains(string(tasks), guard) {
+			t.Errorf("host-hardening readiness checks missing %q", guard)
 		}
 	}
 }

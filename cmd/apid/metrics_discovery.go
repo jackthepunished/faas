@@ -11,9 +11,24 @@ const (
 	vmmdMetricsDiscoveryPath     = "/v1/internal/metrics/vmmd-targets"
 	imagedMetricsDiscoveryPath   = "/v1/internal/metrics/imaged-targets"
 	builderdMetricsDiscoveryPath = "/v1/internal/metrics/builderd-targets"
+	nodeMetricsDiscoveryPath     = "/v1/internal/metrics/node-targets"
 	promtailMetricsDiscoveryPath = "/v1/internal/metrics/promtail-targets"
 	maxMetricsDiscoveryTargets   = 1000
 )
+
+// metricsDiscoveryHandler is mounted only on apid's loopback metrics server.
+// Keeping these paths out of handler() makes the isolation independent of
+// reverse-proxy path filters and trusted forwarding headers.
+func (s *server) metricsDiscoveryHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET "+computeMetricsDiscoveryPath, s.computeMetricsDiscovery)
+	mux.HandleFunc("GET "+vmmdMetricsDiscoveryPath, s.vmmdMetricsDiscovery)
+	mux.HandleFunc("GET "+imagedMetricsDiscoveryPath, s.imagedMetricsDiscovery)
+	mux.HandleFunc("GET "+builderdMetricsDiscoveryPath, s.builderdMetricsDiscovery)
+	mux.HandleFunc("GET "+nodeMetricsDiscoveryPath, s.nodeMetricsDiscovery)
+	mux.HandleFunc("GET "+promtailMetricsDiscoveryPath, s.promtailMetricsDiscovery)
+	return mux
+}
 
 // prometheusTargetGroup is the HTTP service-discovery wire shape described by
 // Prometheus. One group is emitted per compute node so a node replacement
@@ -44,6 +59,10 @@ func (s *server) imagedMetricsDiscovery(w http.ResponseWriter, r *http.Request) 
 
 func (s *server) builderdMetricsDiscovery(w http.ResponseWriter, r *http.Request) {
 	s.metricsDiscovery(w, r, "builderd", daemonMetricsTarget("9105"))
+}
+
+func (s *server) nodeMetricsDiscovery(w http.ResponseWriter, r *http.Request) {
+	s.metricsDiscovery(w, r, "node-compute", daemonMetricsTarget("9100"))
 }
 
 // promtailMetricsDiscovery serves the control-plane Prometheus HTTP-SD

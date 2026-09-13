@@ -1668,6 +1668,13 @@ func (c *Client) VerifyDomain(ctx context.Context, domain string) (CustomDomainR
 	return out, c.do(ctx, "POST", "/v1/domains/"+domain+"/verify", nil, &out)
 }
 
+// RetryDomainVerification re-arms a pending domain after its bounded polling
+// backoff or retry budget expires. The server returns 202 with no response
+// body; mutating-call idempotency is supplied by Client.do.
+func (c *Client) RetryDomainVerification(ctx context.Context, domain string) error {
+	return c.do(ctx, "POST", "/v1/domains/"+domain+"/retry", nil, nil)
+}
+
 // GetDomain (issue #961 / Mega-A PR-3) returns a domain's durable
 // row + the live cert chain (NotAfter, SANs). Backed by GET
 // /v1/domains/{domain}. The cert dial is on-demand; failures to
@@ -3401,23 +3408,19 @@ func (c *Client) GetAppThrottleSuggestionsOpts(ctx context.Context, slug, rng st
 }
 
 // GetAppRoutes returns the per-route label snapshot for the named
-// app (ADR-093). The bounded label set is served by the
-// gatewayd-internal control listener and reverse-proxied by apid;
+// app (ADR-093). Production returns the bounded union from every active
+// compute collector through the control-plane Prometheus aggregate;
 // each entry is "METHOD /raw/path" with overflow collapsed to
 // "__route_other__" when the per-app cap (50) is exceeded. Source
-// is "live" on success and "unavailable" when the control
-// listener dial failed — callers should render both branches the
-// same way (empty list, distinct chip).
+// is "live" for complete collection, "partial" when some collectors are
+// unavailable, and "unavailable" when the fleet bridge failed. Collector
+// counts distinguish those states from healthy no traffic.
 //
-// CapHit (ADR-093 Tier B item #1) is true iff the app's route
-// label set reached RouteMetricsPerAppCap (50) and additional
-// routes are collapsing into the reserved __route_other__ bucket.
-// When true, len(Routes) == 52 (50 real + reserved empty +
-// __route_other__). When false, the dashboard can render "you have
-// N admitted routes" without counting. CapHit is the zero value
+// CapHit (ADR-093 Tier B item #1) is true iff the fleet route union
+// reached RouteMetricsPerAppCap (50) or a collector emitted the
+// reserved __route_other__ bucket. CapHit is the zero value
 // (false) on the source: unavailable path — the cap state is
-// unknown when the gatewayd-internal dial fails, so the field is
-// not part of the unreliable wire.
+// unknown when collection fails.
 func (c *Client) GetAppRoutes(ctx context.Context, slug string) (AppRoutesResponse, error) {
 	var out AppRoutesResponse
 	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/routes", nil, &out)

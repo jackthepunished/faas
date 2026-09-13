@@ -83,6 +83,8 @@
     - role: nftables
     - role: overlay
     - role: node_exporter
+    - role: internal_pki_renewal
+    - role: canary_artifact_retention
     - role: alertmanager
     - role: prometheus
     - role: grafana
@@ -97,6 +99,7 @@
       when: faas_object_storage_gateway_managed | default(false) | bool
     - role: githubd_service
     - role: log_archive
+    - role: optional_credentials
     # Topology cleanup is safe during image seeding and must also remove
     # legacy one-box services left on an existing control-plane host.
     - role: role_convergence
@@ -135,6 +138,8 @@
     - role: nftables
     - role: overlay
     - role: node_exporter
+    - role: internal_pki_renewal
+    - role: canary_artifact_retention
     # Compute-only:
     - role: vmmd_service
     # M9: every compute node owns a node-local schedd for heartbeat and
@@ -146,6 +151,7 @@
     - role: builderd_service
     - role: compute_only_service
     - role: log_archive
+    - role: optional_credentials
     - role: role_convergence
     - role: fleet_verify
       # node_join imports this bootstrap before it installs the requested

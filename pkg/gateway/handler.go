@@ -495,6 +495,10 @@ type PublicAuthUnsealer interface {
 // last_request_at touches (spec §4.1) and to stamp x-faas-instance on
 // the request before proxying.
 type Target struct {
+	// AppID is authoritative admission/cache identity. Lifecycle telemetry
+	// must not depend on an optional request header, especially for cron and
+	// other synthetic invocations.
+	AppID      string
 	NodeID     string
 	InstanceID string
 	WakeID     string
@@ -5055,7 +5059,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		rid = newRequestID()
 	}
 	w.Header().Set("x-faas-request-id", rid)
+	// The response, scheduler RPC metadata, and first-byte event all consume
+	// this canonical header/context pair. Generated IDs used to exist only in
+	// the response and gateway-private context, leaving cold-wake timelines
+	// without the customer-visible correlation handle.
+	r.Header.Set("x-faas-request-id", rid)
 	r = r.WithContext(WithRequestID(r.Context(), rid)) //nolint:contextcheck // request ctx is the canonical inbound ctx at the HTTP handler boundary.
+	correlation, _ := wire.FromContext(r.Context())
+	correlation.RequestID = rid
+	r = r.WithContext(wire.WithContext(r.Context(), correlation))
 
 	host := hostname(r.Host)
 
@@ -5830,10 +5842,11 @@ haveApp:
 	if cold && wakeID != "" && target.WakeID != "" {
 		wakeID = target.WakeID
 	}
-	// The cached target retains the VM's original wake ID. Only this
-	// request's admission belongs in a wake timeline; warm traffic must not
-	// append synchronous wake events for the rest of the VM's lifetime.
-	target.WakeID = wakeID
+	// Consume the wake generation's first-byte metadata exactly once. This
+	// also covers the first warm-looking browser retry after a detached wake
+	// page: the cached target still carries the completed wake ID even though
+	// this retry did not perform admission itself.
+	r, target = h.armWakeFirstByte(r, app.ID, target, wakeID)
 
 	// Semantic bridge span. The request context is passed through the existing
 	// otelgrpc client instrumentation, so vmmd's forwarding server span and
@@ -7271,7 +7284,11 @@ func (h *Handler) coldStart(ctx context.Context, appID, accountID, scope string,
 		cold           bool
 		method         WakeMethod
 	)
-	h.beginWakePageCycle(appID)
+	acceptedAt := time.Now()
+	if requestAt, ok := StartTimeFromContext(ctx); ok {
+		acceptedAt = requestAt
+	}
+	h.beginWakePageCycle(appID, acceptedAt)
 	policy := WakeAdmissionPolicyForPlan(plan)
 	werr := h.gate.WaitWithPolicy(ctx, appID, accountID, policy,
 		func() bool {

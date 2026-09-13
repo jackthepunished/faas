@@ -24,6 +24,7 @@ def instance(name: str, service_account: str, *, running: bool = True) -> dict:
         "lastStopTimestamp": "2026-09-12T11:30:00Z",
         "metadata": {"items": []},
         "serviceAccounts": [{"email": service_account}],
+        "tags": {"items": []},
         "disks": [
             {
                 "boot": True,
@@ -44,6 +45,7 @@ def healthy_snapshot() -> dict:
     compute_sa = POLICY["compute"]["service_account"]
     backup_sa = POLICY["backup"]["writer_service_account"]
     control = instance(POLICY["control_plane"]["instance"], POLICY["control_plane"]["service_account"])
+    control["tags"]["items"].append(POLICY["access"]["origin_target_tag"])
     compute = instance("faas-compute-node-1", compute_sa)
     disks = []
     for vm in (control, compute):
@@ -59,6 +61,7 @@ def healthy_snapshot() -> dict:
         "active_accounts": [{"account": POLICY["operator_account"], "status": "ACTIVE"}],
         "project": {"projectId": project},
         "billing_project": {"billingEnabled": True, "billingAccountName": "billingAccounts/ABC"},
+        "control_plane_dev_only_env": [],
         "project_metadata": {
             "commonInstanceMetadata": {
                 "items": [
@@ -75,7 +78,21 @@ def healthy_snapshot() -> dict:
                 "direction": "INGRESS",
                 "sourceRanges": ["35.235.240.0/20"],
                 "allowed": [{"IPProtocol": "tcp", "ports": ["22"]}],
-            }
+            },
+            {
+                "name": POLICY["access"]["origin_firewall_rules"]["ipv4"],
+                "direction": "INGRESS",
+                "sourceRanges": sorted(AUDIT.pinned_cloudflare_ranges(AUDIT.CLOUDFLARE_V4)),
+                "targetTags": [POLICY["access"]["origin_target_tag"]],
+                "allowed": [{"IPProtocol": "tcp", "ports": ["80", "443"]}],
+            },
+            {
+                "name": POLICY["access"]["origin_firewall_rules"]["ipv6"],
+                "direction": "INGRESS",
+                "sourceRanges": sorted(AUDIT.pinned_cloudflare_ranges(AUDIT.CLOUDFLARE_V6)),
+                "targetTags": [POLICY["access"]["origin_target_tag"]],
+                "allowed": [{"IPProtocol": "tcp", "ports": ["80", "443"]}],
+            },
         ],
         "project_iam": {
             "bindings": [
@@ -135,6 +152,7 @@ class AuditTest(unittest.TestCase):
         compute = snap["instances"][1]
         control["deletionProtection"] = False
         control["disks"][0]["autoDelete"] = True
+        control["tags"]["items"] = []
         compute["serviceAccounts"] = [{"email": "811654175645-compute@developer.gserviceaccount.com"}]
         snap["project_metadata"]["commonInstanceMetadata"]["items"] = []
         snap["firewalls"] = [
@@ -165,6 +183,8 @@ class AuditTest(unittest.TestCase):
             "boot disk is configured to auto-delete",
             "metadata enable-oslogin is not TRUE",
             "default-allow-ssh exposes",
+            "missing origin target tag",
+            "origin firewall rule is missing",
             "roles/logging.logWriter missing",
             "backup bucket grants access to compute identity",
             "backup writer retains destructive roles/storage.objectAdmin",
@@ -190,6 +210,30 @@ class AuditTest(unittest.TestCase):
         joined = "\n".join(failures)
         self.assertIn("stopped for 60.0h", joined)
         self.assertIn("public-all exposes", joined)
+
+    def test_dev_only_control_plane_environment_fails_without_values(self) -> None:
+        snap = healthy_snapshot()
+        snap["control_plane_dev_only_env"] = ["FAAS_DEV_TOKEN", "FAAS_DEV"]
+        failures = AUDIT.audit(POLICY, snap)
+        joined = "\n".join(failures)
+        self.assertIn("FAAS_DEV, FAAS_DEV_TOKEN", joined)
+
+    def test_unreadable_control_plane_environment_fails_closed(self) -> None:
+        snap = healthy_snapshot()
+        snap["control_plane_dev_only_env"] = {"_error": "ssh unavailable"}
+        self.assertIn(
+            "control-plane dev-only environment cannot be audited: ssh unavailable",
+            AUDIT.audit(POLICY, snap),
+        )
+
+    def test_origin_rule_drift_and_public_bypass_fail(self) -> None:
+        snap = healthy_snapshot()
+        snap["firewalls"][1]["sourceRanges"] = ["0.0.0.0/0"]
+        snap["firewalls"][1]["targetTags"] = []
+        failures = "\n".join(AUDIT.audit(POLICY, snap))
+        self.assertIn("exposes the HTTP origin publicly", failures)
+        self.assertIn("does not match pinned Cloudflare ipv4 ranges", failures)
+        self.assertIn("is not limited to target tag", failures)
 
 
 if __name__ == "__main__":

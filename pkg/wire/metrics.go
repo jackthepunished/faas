@@ -1160,6 +1160,11 @@ type OpsMetrics struct {
 	// registered on every daemon registry for a stable scrape shape; only
 	// builderd records samples.
 	builderWarmRestoreTotal *prometheus.CounterVec
+	// buildExport* is builderd's bounded node-local OCI handoff telemetry.
+	// The outcome vocabulary is closed; bytes is the post-sweep disk usage.
+	buildExportCleanupTotal  *prometheus.CounterVec
+	buildExportCleanupErrors prometheus.Counter
+	buildExportBytes         prometheus.Gauge
 	// cpuStatsCollectDur: introduced for issue #279 / PR-B / ADR-039.
 	// Wall-clock duration of the CPU-rate-and-accumulator read path
 	// on the vmmd and schedd wires. Stored as prometheus.Histogram
@@ -1767,7 +1772,8 @@ type OpsMetrics struct {
 	// sit at zero. Closed set is the 15 phases from
 	// pkg/events/wake.go (extended by ADR-098 C11 to surface
 	// the three vmmd-side phase-decomposed wake timings).
-	wakePhaseEmitted *prometheus.CounterVec
+	wakePhaseEmitted    *prometheus.CounterVec
+	wakeIdentityInvalid *prometheus.CounterVec
 	// recoveryEventEmitted: Workstream B / issue #1184. Per-(kind,
 	// result) counter for pkg/events.Platform.EmitRecovery. kind is
 	// the substring after `node.` / `instance.` (e.g. "draining",
@@ -2659,6 +2665,21 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	for _, result := range []string{"hit", "miss", "stale"} {
 		builderWarmRestoreTotal.WithLabelValues(result)
 	}
+	buildExportCleanupTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_build_export_cleanup_total",
+		Help: "Build export directories removed by builderd, labelled by reason in {released,expired,pressure}. Released means imaged published the layer or the pipeline terminated; expired is the 24h recovery ceiling; pressure is an unowned legacy export reclaimed above the byte cap.",
+	}, []string{"reason"})
+	for _, reason := range []string{"released", "expired", "pressure"} {
+		buildExportCleanupTotal.WithLabelValues(reason)
+	}
+	buildExportCleanupErrors := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: prefix + "_build_export_cleanup_errors_total",
+		Help: "Build export inventory, durable-state lookup, lease, and removal errors. A sustained increase means the builder SSD cleanup bound is not being enforced.",
+	})
+	buildExportBytes := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: prefix + "_build_export_bytes",
+		Help: "Current bytes below the node-local builder export root after the latest startup or periodic sweep.",
+	})
 	buildQueueWait := prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name: prefix + "_build_queue_wait_seconds",
 		Help: "Seconds a build waited between enqueue (apid) and dequeue (builderd start), spec §12 target < 60 s, warn > 300 s (ADR-030).",
@@ -3322,6 +3343,10 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_wake_phase_emitted_total",
 		Help: "Count of wake-timeline events emitted via pkg/events.Platform, labelled by phase (the substring after `wake.`, e.g. `boot_started`, `readiness_200`, `proxy_first_byte`) and result ∈ {ok, failed} (issue #517 / PR-C, ADR-064). Single-registry: registered on every daemon; only schedd / vmmd / gatewayd-internal / builderd / apid increment via Platform.Emit. The closed 14-phase set is pre-instantiated at boot so the §12 wake-latency panel surfaces zero on an idle daemon.",
 	}, []string{"phase", "result"})
+	wakeIdentityInvalid := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_wake_identity_invalid_total",
+		Help: "Joinable wake lifecycle events rejected before persistence because a required authoritative app or node identity field was empty, labelled by phase and field.",
+	}, []string{"phase", "field"})
 	// vmmd already exports execution timings under wake_phase_duration_seconds.
 	// Event-store latency is a different family (and has different labels).
 	wakeEventDurationName := prefix + "_wake_phase_duration_seconds"
@@ -3356,7 +3381,9 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		ops, dur, watchdogKills, warmSnapshotErrors, warmupErrors, livenessRestarts, workloadOOMKills, serviceReplicaStatus, daemonRestartCount, daemonBuildInfo, daemonUptimeSeconds, daemonReady, daemonReadyReason, faasDeployVersion, bridgeFramingTotal, guestInitDuration, wakeSnapshotTier, executionActive, executionTotal, executionPhaseDuration, executionFailures, executionOutputBytes, executionSweeps, wakeFailure, wakeLatency, guestTailSeconds, guestTailFailedTotal, tailCapReached, evictedPriority, evictionFiredTotal, eventsWriteFail, auditWriteFail, cveCheckTotal, cvesOpenTotal,
 		writeRedirectTotal, writeRedirectLatency,
 		auditWriteDur, cronFireNowDispatchDur, accountOrgMismatch, requestFailures, requestTotal, stripePushDur, paddlePushDur, polarPushDur,
-		buildDur, buildQueueWait, buildCacheOutcome, builderWarmRestoreTotal, residentGBPerCustomer, billingCapExceededTotal,
+		buildDur, buildQueueWait, buildCacheOutcome, builderWarmRestoreTotal,
+		buildExportCleanupTotal, buildExportCleanupErrors, buildExportBytes,
+		residentGBPerCustomer, billingCapExceededTotal,
 		meterdFloorAppliedTotal, meteredMBSecondsTotal,
 		// ADR-123 alert-preset signal series — PR-A (3) + PR-B (2). Each
 		// backs one of the 8 alert_presets catalog rows. Without
@@ -3414,7 +3441,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		githubdPushSkippedTotal,
 		throttleSecondsTotal, throttleRatio,
 		egressSourceErrors,
-		wakePhaseEmitted, wakePhaseDur, recoveryEventEmitted,
+		wakePhaseEmitted, wakeIdentityInvalid, wakePhaseDur, recoveryEventEmitted,
 		// ADR-124 follow-up #2: plan_gate_rescued_by_exclude counter
 		// (12 pre-instantiated series). See planGateRescuedByExclude
 		// field declaration at line 292.
@@ -4349,6 +4376,9 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 			wakePhaseDur.WithLabelValues(phase, result)
 		}
 	}
+	for _, identity := range [][2]string{{"readiness_200", "node_id"}, {"proxy_first_byte", "app_id"}} {
+		wakeIdentityInvalid.WithLabelValues(identity[0], identity[1])
+	}
 	// Workstream B / issue #1184: pre-instantiate the closed
 	// 7-kind × 2-result label set for recoveryEventEmitted so the
 	// recovery-dashboard panel reads zero on an idle fleet rather
@@ -4708,6 +4738,9 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		buildQueueWait:                                        buildQueueWait,
 		buildCacheOutcome:                                     buildCacheOutcome,
 		builderWarmRestoreTotal:                               builderWarmRestoreTotal,
+		buildExportCleanupTotal:                               buildExportCleanupTotal,
+		buildExportCleanupErrors:                              buildExportCleanupErrors,
+		buildExportBytes:                                      buildExportBytes,
 		residentGBPerCustomer:                                 residentGBPerCustomer,
 		billingCapExceededTotal:                               billingCapExceededTotal,
 		meterdFloorAppliedTotal:                               meterdFloorAppliedTotal,
@@ -4778,6 +4811,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		githubdPathFilterTotal:                                githubdPathFilterTotal,
 		githubdPushSkippedTotal:                               githubdPushSkippedTotal,
 		wakePhaseEmitted:                                      wakePhaseEmitted,
+		wakeIdentityInvalid:                                   wakeIdentityInvalid,
 		wakePhaseDur:                                          wakePhaseDur,
 		recoveryEventEmitted:                                  recoveryEventEmitted,
 		esmPollsTotal:                                         esmPollsTotal,
@@ -6868,6 +6902,16 @@ func (m *OpsMetrics) WakePhaseEmitted(phase, result string) prometheus.Counter {
 	return m.wakePhaseEmitted.WithLabelValues(phase, result)
 }
 
+// WakeIdentityInvalid counts lifecycle events rejected for an empty
+// authoritative identity. It is separate from persistence failures so its
+// alert diagnoses producer contract regressions directly.
+func (m *OpsMetrics) WakeIdentityInvalid(phase, field string) prometheus.Counter {
+	if m == nil {
+		return nil
+	}
+	return m.wakeIdentityInvalid.WithLabelValues(phase, field)
+}
+
 // RecoveryEventEmitted returns the per-(kind, result) counter for
 // pkg/events.Platform.EmitRecovery (Workstream B / issue #1184,
 // ADR-137). kind is the substring after `node.` / `instance.`
@@ -6943,6 +6987,34 @@ func (m *OpsMetrics) ObserveBuilderWarmRestore(result string) {
 	case "hit", "miss", "stale":
 		m.builderWarmRestoreTotal.WithLabelValues(result).Inc()
 	}
+}
+
+// ObserveBuildExportCleanup adds removed directories to the closed reason
+// counter. Counts are batched by a sweep to avoid one metrics call per file.
+func (m *OpsMetrics) ObserveBuildExportCleanup(reason string, count int) {
+	if m == nil || m.buildExportCleanupTotal == nil || count <= 0 {
+		return
+	}
+	switch reason {
+	case "released", "expired", "pressure":
+		m.buildExportCleanupTotal.WithLabelValues(reason).Add(float64(count))
+	}
+}
+
+// ObserveBuildExportCleanupErrors records cleanup failures from one sweep.
+func (m *OpsMetrics) ObserveBuildExportCleanupErrors(count int) {
+	if m == nil || m.buildExportCleanupErrors == nil || count <= 0 {
+		return
+	}
+	m.buildExportCleanupErrors.Add(float64(count))
+}
+
+// SetBuildExportBytes publishes the post-sweep size of the export tree.
+func (m *OpsMetrics) SetBuildExportBytes(bytes int64) {
+	if m == nil || m.buildExportBytes == nil || bytes < 0 {
+		return
+	}
+	m.buildExportBytes.Set(float64(bytes))
 }
 
 // ObserveDeploymentCancelled (ADR-124) increments the

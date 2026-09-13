@@ -1191,6 +1191,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 					continue
 				}
 				targets = append(targets, gateway.Target{
+					AppID:        appID,
 					InstanceID:   instance.ID,
 					NodeID:       instance.NodeID,
 					WakeID:       instance.WakeID,
@@ -1335,6 +1336,9 @@ func run(ctx context.Context, log *slog.Logger) error {
 		// schedd can StampInstanceInvocation; without it the meter's
 		// per-instance count lands on 0.
 		invoke: func(ctx context.Context, appID string, inv state.Invocation) (state.Invocation, error) {
+			acceptedAt := time.Now()
+			ctx = gateway.WithStartTime(ctx, acceptedAt)
+			ctx = gateway.WithWakeTimelineStart(ctx, acceptedAt)
 			app, err := pgStore.AppByID(ctx, appID)
 			if err != nil {
 				return inv, fmt.Errorf("synth invoke resolve app %s: %w", appID, err)
@@ -1348,6 +1352,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 				return inv, fmt.Errorf("synth invoke wake %s: %w", appID, err)
 			}
 			target := gateway.Target{
+				AppID:        appID,
 				InstanceID:   instanceID,
 				NodeID:       nodeID,
 				DeploymentID: deploymentID,
@@ -1359,6 +1364,9 @@ func run(ctx context.Context, log *slog.Logger) error {
 			return synth.forwardInvocation(ctx, target, inv)
 		},
 		invokeWithStatus: func(ctx context.Context, appID string, inv state.Invocation) (state.Invocation, int, error) {
+			acceptedAt := time.Now()
+			ctx = gateway.WithStartTime(ctx, acceptedAt)
+			ctx = gateway.WithWakeTimelineStart(ctx, acceptedAt)
 			app, err := pgStore.AppByID(ctx, appID)
 			if err != nil {
 				return inv, 0, fmt.Errorf("synth invoke resolve app %s: %w", appID, err)
@@ -1371,7 +1379,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 			if err != nil {
 				return inv, 0, fmt.Errorf("synth invoke wake %s: %w", appID, err)
 			}
-			target := gateway.Target{InstanceID: instanceID, NodeID: nodeID, DeploymentID: deploymentID, WakeID: wakeID, Port: port}
+			target := gateway.Target{AppID: appID, InstanceID: instanceID, NodeID: nodeID, DeploymentID: deploymentID, WakeID: wakeID, Port: port}
 			backend.RecordTarget(appID, target)
 			inv.InstanceID = instanceID
 			return synth.forwardInvocationWithStatus(ctx, target, inv)
@@ -1722,7 +1730,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// the apid + meterd daemons load.
 	deps.publicAuthCache = gateway.NewPublicAuthCache()
 	if deps.hostKeyDir != "" {
-		if identities, loadErr := secretbox.LoadHostKeys(deps.hostKeyDir); loadErr != nil {
+		if identities, loadErr := secretbox.LoadFleetAndHostKeys(deps.hostKeyDir); loadErr != nil {
 			log.Warn("gatewayd-internal: LoadHostKeys (rotation overlap) failed; basic-auth will be unseal-disabled until next boot",
 				"dir", deps.hostKeyDir, "err", loadErr.Error())
 		} else {
@@ -2170,7 +2178,10 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	if !isUnixSocketPath(egressGRPCSocket) && deps.egressTLS == nil {
 		return fmt.Errorf("gatewayd: egress target %q is non-unix but egress_tls_* is empty (set egress_tls_cert_path / key_path / ca_path or point the target at a unix socket for single-box mode)", egressGRPCSocket)
 	}
-	egressGRPCSrv := egressgrpc.NewServer(egressSink, log)
+	egressGRPCSrv, err := egressgrpc.NewPersistentServer(egressSink, log, egressgrpc.DefaultPendingPath)
+	if err != nil {
+		return fmt.Errorf("gatewayd: open durable egress replay ledger: %w", err)
+	}
 	deps.egressGRPC = newEgressGRPCListener(egressGRPCSocket, deps.egressTLS, egressGRPCSrv, log)
 	// Best-effort start, mirroring the synth listener pattern
 	// (runWithDeps internal RPC). If the unix socket can't bind
@@ -2962,10 +2973,9 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		unifiedMux.Handle("POST /v1/invocations:dispatch_batch", deps.synth.Mux())
 		unifiedMux.Handle("/healthz", internalHealthRoute(deps.synth.Mux(), publicHandler))
 		// The compute data-plane listener is private: the generated nftables
-		// policy admits port 8080 only from the control plane. Expose the
-		// control metrics there so the control-plane Prometheus can scrape
-		// every compute node without a provider-specific IP, second Prometheus
-		// installation, or an unauthenticated 0.0.0.0:9090 control bind.
+		// policy admits port 8080 only from the control plane. Expose metrics at
+		// a private platform path so Prometheus can scrape every compute node
+		// without stealing a customer's ordinary /metrics application route.
 		// Do not install this route on the single-box/public role.
 		installComputeMetricsRoute(unifiedMux, cfg.Role, controlMux)
 		// Wrap with h2c so the in-process unix-socket hop negotiates
@@ -3376,16 +3386,18 @@ func serviceDiscoveryUpstreams() []string {
 	return upstreams
 }
 
-// installComputeMetricsRoute exposes only /metrics on a compute node's
+const computeMetricsPath = "/v1/internal/metrics"
+
+// installComputeMetricsRoute exposes only the private metrics path on a compute node's
 // private data-plane listener. The listener is admitted from the control
 // plane by the generated firewall; the single-box/public role never gets
-// this route, so an accidentally public application listener cannot expose
-// daemon metrics.
+// this route. The ordinary /metrics path remains customer-owned, including
+// when gatewayd-public forwards an app-host request over its private hop.
 func installComputeMetricsRoute(mux *http.ServeMux, boxRole role.Role, control http.Handler) {
 	if mux == nil || control == nil || boxRole != role.RoleComputeOnly {
 		return
 	}
-	mux.Handle("/metrics", control)
+	mux.Handle(computeMetricsPath, control)
 }
 
 // weightsStoreAdapter (issue #556 / PR-B) adapts pkg/state.PgStore to

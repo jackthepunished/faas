@@ -498,10 +498,9 @@ func fwdStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 			// gateway-fanout cache sets it from the
 			// AdmitInstanceResponse on the wake). requestID
 			// is the inbound x-faas-request-id minted by the
-			// gateway edge. latency_ms is the gap from the
-			// proxy start (stamped on the request context by
-			// the closure) to the first byte. nil opts out
-			// (pre-PR-C fixtures).
+			// gateway edge. latency_ms starts at request/wake
+			// acceptance; proxy_latency_ms keeps the final bridge
+			// hop separately. nil opts out (pre-PR-C fixtures).
 			//
 			// `evs` aliases the parameter so the package
 			// name `evts.ProxyFirstByte` is still reachable
@@ -510,13 +509,14 @@ func fwdStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 			if evs := events; evs != nil && t.WakeID != "" {
 				started := proxyStartFromContext(r.Context())
 				evs.EmitAsync(r.Context(), evts.ProxyFirstByte{
-					EmitAt:     time.Now().UTC(),
-					WakeID:     t.WakeID,
-					AppID:      r.Header.Get("x-faas-app"),
-					RequestID:  r.Header.Get("x-faas-request-id"),
-					InstanceID: t.InstanceID,
-					NodeID:     t.NodeID,
-					LatencyMs:  time.Since(started).Milliseconds(),
+					EmitAt:         time.Now().UTC(),
+					WakeID:         t.WakeID,
+					AppID:          t.AppID,
+					RequestID:      requestIDFrom(r),
+					InstanceID:     t.InstanceID,
+					NodeID:         t.NodeID,
+					LatencyMs:      time.Since(wakeTimelineStart(r)).Milliseconds(),
+					ProxyLatencyMs: time.Since(started).Milliseconds(),
 				})
 			}
 			continue
@@ -850,13 +850,14 @@ func rawStreamOnceWithEvents(w http.ResponseWriter, r *http.Request, cli vmmdpb.
 			if evs := events; evs != nil && t.WakeID != "" {
 				started := proxyStartFromContext(r.Context())
 				evs.EmitAsync(r.Context(), evts.ProxyFirstByte{
-					EmitAt:     time.Now().UTC(),
-					WakeID:     t.WakeID,
-					AppID:      r.Header.Get("x-faas-app"),
-					RequestID:  r.Header.Get("x-faas-request-id"),
-					InstanceID: t.InstanceID,
-					NodeID:     t.NodeID,
-					LatencyMs:  time.Since(started).Milliseconds(),
+					EmitAt:         time.Now().UTC(),
+					WakeID:         t.WakeID,
+					AppID:          t.AppID,
+					RequestID:      requestIDFrom(r),
+					InstanceID:     t.InstanceID,
+					NodeID:         t.NodeID,
+					LatencyMs:      time.Since(wakeTimelineStart(r)).Milliseconds(),
+					ProxyLatencyMs: time.Since(started).Milliseconds(),
 				})
 			}
 			// If the init carries an error string (the bridge

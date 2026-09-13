@@ -24,6 +24,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/apihostingreceipt"
 	"github.com/onebox-faas/faas/pkg/audit"
 	"github.com/onebox-faas/faas/pkg/buildcache"
+	"github.com/onebox-faas/faas/pkg/buildexport"
 	"github.com/onebox-faas/faas/pkg/cosign"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/fcvm"
@@ -269,7 +270,8 @@ type Handler struct {
 	// path apid loads for MFA unseal). Nil-safe: with no identity
 	// wired, the registry credential lookup is skipped and pulls
 	// stay anonymous (matches the Free plan / no-credential case).
-	secretboxIdentity *age.X25519Identity
+	secretboxIdentity   *age.X25519Identity
+	secretboxIdentities []*age.X25519Identity
 }
 
 // New returns a Handler. The OCI puller is injected so tests can substitute
@@ -774,6 +776,19 @@ func (h *Handler) WithVMMClient(c VMMClientIface) *Handler {
 // (handler_auth_test.go).
 func (h *Handler) WithSecretboxIdentity(ident *age.X25519Identity) *Handler {
 	h.secretboxIdentity = ident
+	if ident != nil {
+		h.secretboxIdentities = []*age.X25519Identity{ident}
+	}
+	return h
+}
+
+// WithSecretboxIdentities wires the fleet-first identity set while retaining
+// host identities for legacy ciphertext migration.
+func (h *Handler) WithSecretboxIdentities(identities []*age.X25519Identity) *Handler {
+	h.secretboxIdentities = identities
+	if len(identities) > 0 {
+		h.secretboxIdentity = identities[0]
+	}
 	return h
 }
 
@@ -1604,7 +1619,11 @@ func (h *Handler) resolveRegistryAuth(ctx context.Context, app state.App, host s
 	// app_secret namespace check). A namespace mismatch
 	// means the envelope was sealed for a different
 	// secretbox slot — refuse rather than passing through.
-	ns, plaintext, err := secretbox.OpenBytes(h.secretboxIdentity, cred.PasswordEncrypted)
+	identities := h.secretboxIdentities
+	if len(identities) == 0 && h.secretboxIdentity != nil {
+		identities = []*age.X25519Identity{h.secretboxIdentity}
+	}
+	ns, plaintext, err := secretbox.OpenBytesMulti(identities, cred.PasswordEncrypted)
 	if err != nil {
 		// Don't echo the unseal error verbatim — it can include
 		// corrupted-byte markers that aid an attacker probing the
@@ -2378,6 +2397,15 @@ func (h *Handler) buildFunctionLayer(ctx context.Context, app state.App, dep sta
 		_ = h.transition(ctx, dep.ID, state.DeployFailed, "build function layer: "+err.Error())
 		return fmt.Errorf("imaged: build function layer: %w", err)
 	}
+	// A function artifact without the runner digest cannot produce complete
+	// provenance. The production rootfs builder computes this from the exact
+	// bytes it injects; fail closed if a builder ever omits it.
+	if result.RunnerDigest == "" {
+		const msg = "function runner digest missing from rootfs build"
+		_ = h.transition(ctx, dep.ID, state.DeployFailed, msg)
+		return fmt.Errorf("imaged: %s", msg)
+	}
+	h.updateBuildProvenanceRunnerDigest(ctx, dep.ID, result.RunnerDigest)
 	h.updateBuildProvenanceSBOM(ctx, dep.ID, result.SBOMKey)
 	if err := h.store.SetDeploymentRootfs(ctx, dep.ID, h.appsRootPath(app.Slug, dep.ID), appsKey, result.ContentBytes); err != nil {
 		_ = h.transition(ctx, dep.ID, state.DeployFailed, "stamp rootfs: "+err.Error())
@@ -2891,6 +2919,28 @@ func (h *Handler) handleSnapshotBoot(ctx context.Context, p snapshotBootPayload)
 		h.log.Warn("imaged: snapshot_boot skipped — rootfs_path empty; waiting on builderd",
 			"deployment", p.DeploymentID)
 		return nil
+	}
+	// A builder export is a durable handoff until SetDeploymentRootfs stamps
+	// the final app layer. Hold a shared lease for the complete consume/publish
+	// attempt so builderd's exclusive cleanup lease cannot race an OCI read.
+	// ErrBusy is retryable: another imaged worker or a cleanup decision won the
+	// race, and the 2s durable recovery loop will re-read the authoritative row.
+	exportLease, isBuildExport, leaseErr := buildexport.AcquireArtifact(dep.RootfsPath)
+	if errors.Is(leaseErr, buildexport.ErrBusy) {
+		h.log.Info("imaged: snapshot_boot build export busy; deferring to recovery",
+			"deployment", dep.ID, "artifact", dep.RootfsPath)
+		return nil
+	}
+	if leaseErr != nil {
+		_ = h.markDeployFailed(ctx, dep.ID, leaseErr, "open builder export handoff")
+		return fmt.Errorf("imaged: acquire build export handoff: %w", leaseErr)
+	}
+	if isBuildExport {
+		defer func() {
+			if closeErr := exportLease.Close(); closeErr != nil {
+				h.log.Warn("imaged: release build export lease", "deployment", dep.ID, "err", closeErr)
+			}
+		}()
 	}
 	// Cache hits arrive through a deployment-specific hard link. Keep it for
 	// crash recovery while this handler runs, then remove it only after the
@@ -3657,6 +3707,37 @@ func (h *Handler) updateBuildProvenanceSBOM(ctx context.Context, deploymentID, s
 		// load-bearing artefact.
 		h.log.Warn("imaged: stamp sbom_storage_key",
 			"build", build.ID, "sbom_key", sbomKey, "err", err)
+	}
+}
+
+// updateBuildProvenanceRunnerDigest stamps the digest of the runner bytes
+// injected into a function artifact. The build row and provenance row are
+// created by builderd before imaged assembles the final layer, so this is a
+// post-build update. Image-only deployments have no build row and are
+// intentionally ignored.
+func (h *Handler) updateBuildProvenanceRunnerDigest(ctx context.Context, deploymentID, runnerDigest string) {
+	if deploymentID == "" || runnerDigest == "" {
+		return
+	}
+	runnerStore, ok := h.store.(state.BuildProvenanceRunnerDigestStore)
+	if !ok {
+		h.log.Warn("imaged: runner digest persistence unavailable", "deployment", deploymentID)
+		return
+	}
+	build, err := h.store.BuildByDeployment(ctx, deploymentID)
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			// Image-only deploy or pre-build state — no
+			// build_provenance row to stamp.
+			return
+		}
+		h.log.Warn("imaged: build_provenance lookup failed",
+			"deployment", deploymentID, "err", err)
+		return
+	}
+	if err := runnerStore.UpdateBuildProvenanceRunnerDigest(ctx, build.ID, runnerDigest); err != nil {
+		h.log.Warn("imaged: stamp runner_digest",
+			"build", build.ID, "runner_digest", runnerDigest, "err", err)
 	}
 }
 

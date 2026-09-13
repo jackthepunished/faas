@@ -19,6 +19,8 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_POLICY = ROOT / "deploy/gcp/public-beta-policy.json"
+CLOUDFLARE_V4 = ROOT / "deploy/ansible/roles/nftables/files/cloudflare-ips-v4.txt"
+CLOUDFLARE_V6 = ROOT / "deploy/ansible/roles/nftables/files/cloudflare-ips-v6.txt"
 
 
 def gcloud(*args: str, allow_error: bool = False) -> Any:
@@ -34,6 +36,28 @@ def gcloud(*args: str, allow_error: bool = False) -> Any:
         raise RuntimeError(f"{' '.join(command)} returned invalid JSON: {exc}") from exc
 
 
+def inspect_control_plane_dev_env(project: str, instance: dict[str, Any], forbidden: list[str]) -> Any:
+    """Return configured forbidden names from sealed.env without reading values."""
+    name = str(instance.get("name", ""))
+    zone = zone_name(str(instance.get("zone", "")))
+    if not name or not zone:
+        return {"_error": "control-plane instance or zone is unavailable"}
+    pattern = "|".join(forbidden)
+    remote = (
+        "sudo awk -F= '$1 ~ /^(" + pattern + ")$/ {print $1}' "
+        "/etc/faas/sealed.env | LC_ALL=C sort -u"
+    )
+    command = [
+        "gcloud", "compute", "ssh", name, "--zone", zone, "--project", project,
+        "--quiet", "--command", remote,
+    ]
+    proc = subprocess.run(command, text=True, capture_output=True, check=False)
+    if proc.returncode:
+        return {"_error": proc.stderr.strip() or f"exit {proc.returncode}"}
+    allowed = set(forbidden)
+    return sorted({line.strip() for line in proc.stdout.splitlines() if line.strip() in allowed})
+
+
 def collect(policy: dict[str, Any]) -> dict[str, Any]:
     project = policy["project_id"]
     bucket = policy["backup"]["bucket"]
@@ -42,13 +66,21 @@ def collect(policy: dict[str, Any]) -> dict[str, Any]:
     if isinstance(billing, dict):
         billing_account = str(billing.get("billingAccountName", "")).split("/")[-1]
 
+    instances = gcloud("compute", "instances", "list", "--project", project)
+    control = next(
+        (item for item in instances if item.get("name") == policy["control_plane"]["instance"]),
+        {},
+    )
     result = {
         "collected_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "active_accounts": gcloud("auth", "list", "--filter=status:ACTIVE"),
         "project": gcloud("projects", "describe", project),
         "billing_project": billing,
         "project_metadata": gcloud("compute", "project-info", "describe", "--project", project),
-        "instances": gcloud("compute", "instances", "list", "--project", project),
+        "instances": instances,
+        "control_plane_dev_only_env": inspect_control_plane_dev_env(
+            project, control, policy["access"]["forbidden_control_plane_env"]
+        ),
         "disks": gcloud("compute", "disks", "list", "--project", project),
         "firewalls": gcloud("compute", "firewall-rules", "list", "--project", project),
         "project_iam": gcloud("projects", "get-iam-policy", project),
@@ -120,6 +152,28 @@ def port_is_public(rule: dict[str, Any], forbidden: set[int]) -> bool:
     return False
 
 
+def rule_allows_ports(rule: dict[str, Any], required: set[int]) -> bool:
+    """Return true when one enabled ingress rule admits every required port."""
+    if rule.get("disabled") or rule.get("direction", "INGRESS") != "INGRESS":
+        return False
+    admitted: set[int] = set()
+    for allowed in rule.get("allowed", []):
+        if allowed.get("IPProtocol", allowed.get("ipProtocol", "")).lower() not in {"tcp", "all"}:
+            continue
+        ports = allowed.get("ports")
+        if not ports:
+            return True
+        for item in ports:
+            lo, _, hi = str(item).partition("-")
+            low, high = int(lo), int(hi or lo)
+            admitted.update(port for port in required if low <= port <= high)
+    return admitted == required
+
+
+def pinned_cloudflare_ranges(path: Path) -> set[str]:
+    return {line.strip() for line in path.read_text().splitlines() if line.strip()}
+
+
 def budget_destinations(budget: dict[str, Any]) -> list[str]:
     rule = budget.get("allUpdatesRule", {})
     out = list(rule.get("monitoringNotificationChannels", []))
@@ -142,6 +196,15 @@ def audit(policy: dict[str, Any], snap: dict[str, Any], now: dt.datetime | None 
         failures.append("gcloud returned a different project than the policy")
     if not snap.get("billing_project", {}).get("billingEnabled"):
         failures.append("project billing is disabled or cannot be read")
+
+    dev_env = snap.get("control_plane_dev_only_env", {})
+    if isinstance(dev_env, dict) and dev_env.get("_error"):
+        failures.append(f"control-plane dev-only environment cannot be audited: {dev_env['_error']}")
+    elif dev_env:
+        failures.append(
+            "control-plane sealed environment contains forbidden dev-only variables: "
+            + ", ".join(sorted(str(name) for name in dev_env))
+        )
 
     instances = {item.get("name"): item for item in snap.get("instances", [])}
     disks = {item.get("name"): item for item in snap.get("disks", [])}
@@ -176,7 +239,8 @@ def audit(policy: dict[str, Any], snap: dict[str, Any], now: dt.datetime | None 
             failures.append(f"{name}: service account is {accounts or 'missing'}, expected {expected_sa}")
 
     control = policy["control_plane"]
-    check_instance(instances.get(control["instance"]), control, "control-plane")
+    control_instance = instances.get(control["instance"])
+    check_instance(control_instance, control, "control-plane")
 
     compute_policy = policy["compute"]
     compute = [i for name, i in instances.items() if name.startswith(compute_policy["instance_prefix"])]
@@ -200,6 +264,31 @@ def audit(policy: dict[str, Any], snap: dict[str, Any], now: dt.datetime | None 
     for rule in snap.get("firewalls", []):
         if port_is_public(rule, forbidden):
             failures.append(f"firewall {rule.get('name', '<unnamed>')} exposes an administrative TCP port publicly")
+
+    origin_ports = set(policy["access"]["forbidden_direct_origin_tcp_ports"])
+    firewalls = {str(rule.get("name")): rule for rule in snap.get("firewalls", [])}
+    for rule in firewalls.values():
+        if port_is_public(rule, origin_ports):
+            failures.append(f"firewall {rule.get('name', '<unnamed>')} exposes the HTTP origin publicly")
+    origin_tag = policy["access"]["origin_target_tag"]
+    control_tags = set((control_instance or {}).get("tags", {}).get("items", []))
+    if origin_tag not in control_tags:
+        failures.append(f"{control['instance']}: missing origin target tag {origin_tag}")
+    expected_by_family = {
+        "ipv4": pinned_cloudflare_ranges(CLOUDFLARE_V4),
+        "ipv6": pinned_cloudflare_ranges(CLOUDFLARE_V6),
+    }
+    for family, name in policy["access"]["origin_firewall_rules"].items():
+        rule = firewalls.get(name)
+        if not rule:
+            failures.append(f"origin firewall rule is missing: {name}")
+            continue
+        if set(rule.get("sourceRanges", [])) != expected_by_family[family]:
+            failures.append(f"origin firewall {name} does not match pinned Cloudflare {family} ranges")
+        if origin_tag not in set(rule.get("targetTags", [])):
+            failures.append(f"origin firewall {name} is not limited to target tag {origin_tag}")
+        if not rule_allows_ports(rule, origin_ports):
+            failures.append(f"origin firewall {name} does not allow both TCP/80 and TCP/443")
 
     project_iam = snap.get("project_iam", {})
     compute_members = {f"serviceAccount:{i['serviceAccounts'][0]['email']}" for i in compute if i.get("serviceAccounts")}

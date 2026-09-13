@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/netip"
 	"sort"
@@ -242,7 +243,7 @@ func (s *PgStore) AccountByKeyHash(ctx context.Context, hash []byte) (Account, e
 func (s *PgStore) APIKeyByHash(ctx context.Context, hash []byte) (APIKey, error) {
 	row := s.pool.QueryRow(ctx,
 		`select id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
-		        coalesce(last_used_at, 'epoch'::timestamptz),
+		        last_used_at,
 		        expires_at, status, revoked_at, rotated_from_id,
 		        coalesce(host(created_ip),'') as created_ip, coalesce(created_ua,'') as created_ua, parent_key_id
 		 from api_keys where key_sha256 = $1`, hash)
@@ -1189,7 +1190,7 @@ func (s *PgStore) CreateAPIKey(ctx context.Context, accountID string, hash []byt
 		              and personal_org = true
 		            limit 1))
 		 returning id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
-		           coalesce(last_used_at, 'epoch'::timestamptz),
+		           last_used_at,
 		           expires_at, status, revoked_at, rotated_from_id,
 		           coalesce(host(created_ip),'') as created_ip, coalesce(created_ua,'') as created_ua, parent_key_id`,
 		accountID, hash, nullString(label), scopes)
@@ -1216,7 +1217,7 @@ func (s *PgStore) CreateAPIKeyWithExpiry(ctx context.Context, accountID string, 
 		              and personal_org = true
 		            limit 1))
 		 returning id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
-		           coalesce(last_used_at, 'epoch'::timestamptz),
+		           last_used_at,
 		           expires_at, status, revoked_at, rotated_from_id,
 		           coalesce(host(created_ip),'') as created_ip, coalesce(created_ua,'') as created_ua, parent_key_id`,
 		accountID, hash, nullString(label), scopes, nullableTimestamptzPtr(expiresAt))
@@ -1238,7 +1239,7 @@ func (s *PgStore) CreateAPIKeyWithExpiryAndProvenance(ctx context.Context, accou
 		            limit 1),
 		         $6, $7, $8)
 		 returning id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
-		           coalesce(last_used_at, 'epoch'::timestamptz),
+		           last_used_at,
 		           expires_at, status, revoked_at, rotated_from_id,
 		           coalesce(host(created_ip),'') as created_ip, coalesce(created_ua,'') as created_ua, parent_key_id`,
 		accountID, hash, nullString(label), scopes, nullableTimestamptzPtr(expiresAt),
@@ -1268,7 +1269,7 @@ func (s *PgStore) DeleteAPIKeyReturning(ctx context.Context, accountID, keyID st
 	row := s.pool.QueryRow(ctx,
 		`delete from api_keys where id = $1 and account_id = $2
 		 returning id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
-		           coalesce(last_used_at, 'epoch'::timestamptz),
+		           last_used_at,
 		           expires_at, status, revoked_at, rotated_from_id,
 		           coalesce(host(created_ip),'') as created_ip, coalesce(created_ua,'') as created_ua, parent_key_id`,
 		keyID, accountID)
@@ -1278,7 +1279,7 @@ func (s *PgStore) DeleteAPIKeyReturning(ctx context.Context, accountID, keyID st
 func (s *PgStore) ListAPIKeys(ctx context.Context, accountID string) ([]APIKey, error) {
 	rows, err := s.pool.Query(ctx,
 		`select id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
-		        coalesce(last_used_at, 'epoch'::timestamptz),
+		        last_used_at,
 		        expires_at, status, revoked_at, rotated_from_id,
 		        coalesce(host(created_ip),'') as created_ip, coalesce(created_ua,'') as created_ua, parent_key_id
 		 from api_keys where account_id = $1 order by created_at desc`,
@@ -1309,7 +1310,7 @@ func (s *PgStore) ListAPIKeys(ctx context.Context, accountID string) ([]APIKey, 
 func (s *PgStore) GetAPIKey(ctx context.Context, accountID, keyID string) (APIKey, error) {
 	return scanAPIKey(s.pool.QueryRow(ctx,
 		`select id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
-		        coalesce(last_used_at, 'epoch'::timestamptz),
+		        last_used_at,
 		        expires_at, status, revoked_at, rotated_from_id,
 		        coalesce(host(created_ip),'') as created_ip, coalesce(created_ua,'') as created_ua, parent_key_id
 		   from api_keys where account_id = $1 and id = $2`,
@@ -1354,7 +1355,7 @@ func (s *PgStore) MarkAPIKeyRevoked(ctx context.Context, accountID, keyID string
 		        revoked_at = coalesce(revoked_at, now())
 		  where id = $1 and account_id = $2
 		  returning id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
-		            coalesce(last_used_at, 'epoch'::timestamptz),
+		            last_used_at,
 		            expires_at, status, revoked_at, rotated_from_id,
 		            coalesce(host(created_ip),'') as created_ip, coalesce(created_ua,'') as created_ua, parent_key_id`,
 		keyID, accountID)
@@ -1419,7 +1420,7 @@ func (s *PgStore) RotateAPIKey(ctx context.Context, accountID, oldKeyID string, 
 	// projection is consistent with the lock above.
 	old, err := scanAPIKeyRow(ctx, tx,
 		`select id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
-		        coalesce(last_used_at, 'epoch'::timestamptz),
+		        last_used_at,
 		        expires_at, status, revoked_at, rotated_from_id,
 		        coalesce(host(created_ip),'') as created_ip, coalesce(created_ua,'') as created_ua, parent_key_id
 		   from api_keys where id = $1`, oldKeyID)
@@ -1443,7 +1444,7 @@ func (s *PgStore) RotateAPIKey(ctx context.Context, accountID, oldKeyID string, 
 		`insert into api_keys (account_id, key_sha256, label, scopes, status, rotated_from_id, org_id)
 		 values ($1, $2, $3, $4, 'active', $5, $6)
 		 returning id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
-		           coalesce(last_used_at, 'epoch'::timestamptz),
+		           last_used_at,
 		           expires_at, status, revoked_at, rotated_from_id,
 		           coalesce(host(created_ip),'') as created_ip, coalesce(created_ua,'') as created_ua, parent_key_id`,
 		accountID, newHash, newLabel, old.Scopes, oldKeyID, old.OrgID)
@@ -1463,7 +1464,7 @@ func (s *PgStore) RotateAPIKey(ctx context.Context, accountID, oldKeyID string, 
 			        revoked_at = coalesce(revoked_at, now())
 			  where id = $1
 			  returning id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
-			            coalesce(last_used_at, 'epoch'::timestamptz),
+			            last_used_at,
 			            expires_at, status, revoked_at, rotated_from_id,
 		            coalesce(host(created_ip),'') as created_ip, coalesce(created_ua,'') as created_ua, parent_key_id`,
 			oldKeyID)
@@ -1477,7 +1478,7 @@ func (s *PgStore) RotateAPIKey(ctx context.Context, accountID, oldKeyID string, 
 			        expires_at = now() + ($1)::interval
 			  where id = $2
 			  returning id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
-			            coalesce(last_used_at, 'epoch'::timestamptz),
+			            last_used_at,
 			            expires_at, status, revoked_at, rotated_from_id,
 		            coalesce(host(created_ip),'') as created_ip, coalesce(created_ua,'') as created_ua, parent_key_id`,
 			graceWindow.String(), oldKeyID)
@@ -1579,7 +1580,7 @@ func (s *PgStore) CreateOrgAPIKey(ctx context.Context, orgID, accountID string, 
 		`insert into api_keys (account_id, key_sha256, label, scopes, expires_at, org_id)
 		 values ($1, $2, $3, $4, $5, $6)
 		 returning id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
-		           coalesce(last_used_at, 'epoch'::timestamptz),
+		           last_used_at,
 		           expires_at, status, revoked_at, rotated_from_id,
 		           coalesce(host(created_ip),'') as created_ip, coalesce(created_ua,'') as created_ua, parent_key_id`,
 		accountID, hash, nullString(label), scopes, nullableTimestamptzPtr(expiresAt), orgID)
@@ -1597,7 +1598,7 @@ func (s *PgStore) CreateOrgAPIKeyWithProvenance(ctx context.Context, orgID, acco
 		`insert into api_keys (account_id, key_sha256, label, scopes, expires_at, org_id, created_ip, created_ua, parent_key_id)
 		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		 returning id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
-		           coalesce(last_used_at, 'epoch'::timestamptz),
+		           last_used_at,
 		           expires_at, status, revoked_at, rotated_from_id,
 		           coalesce(host(created_ip),'') as created_ip, coalesce(created_ua,'') as created_ua, parent_key_id`,
 		accountID, hash, nullString(label), scopes, nullableTimestamptzPtr(expiresAt), orgID,
@@ -1613,7 +1614,7 @@ func (s *PgStore) CreateOrgAPIKeyWithProvenance(ctx context.Context, orgID, acco
 func (s *PgStore) ListOrgAPIKeys(ctx context.Context, orgID string) ([]APIKey, error) {
 	rows, err := s.pool.Query(ctx,
 		`select id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
-		        coalesce(last_used_at, 'epoch'::timestamptz),
+		        last_used_at,
 		        expires_at, status, revoked_at, rotated_from_id,
 		        coalesce(host(created_ip),'') as created_ip, coalesce(created_ua,'') as created_ua, parent_key_id
 		 from api_keys
@@ -1644,7 +1645,7 @@ func (s *PgStore) ListOrgAPIKeys(ctx context.Context, orgID string) ([]APIKey, e
 func (s *PgStore) GetOrgAPIKey(ctx context.Context, orgID, keyID string) (APIKey, error) {
 	row := s.pool.QueryRow(ctx,
 		`select id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
-		        coalesce(last_used_at, 'epoch'::timestamptz),
+		        last_used_at,
 		        expires_at, status, revoked_at, rotated_from_id,
 		        coalesce(host(created_ip),'') as created_ip, coalesce(created_ua,'') as created_ua, parent_key_id
 		 from api_keys
@@ -1665,7 +1666,7 @@ func (s *PgStore) RevokeOrgAPIKey(ctx context.Context, orgID, keyID string) (API
 		        revoked_at = coalesce(revoked_at, now())
 		  where id = $1 and org_id = $2
 		  returning id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
-		            coalesce(last_used_at, 'epoch'::timestamptz),
+		            last_used_at,
 		            expires_at, status, revoked_at, rotated_from_id,
 		            coalesce(host(created_ip),'') as created_ip, coalesce(created_ua,'') as created_ua, parent_key_id`,
 		keyID, orgID)
@@ -1713,7 +1714,7 @@ func (s *PgStore) RotateOrgAPIKey(ctx context.Context, orgID, oldKeyID string, n
 	// new key inherits them.
 	old, err := scanAPIKeyRow(ctx, tx,
 		`select id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
-		        coalesce(last_used_at, 'epoch'::timestamptz),
+		        last_used_at,
 		        expires_at, status, revoked_at, rotated_from_id,
 		        coalesce(host(created_ip),'') as created_ip, coalesce(created_ua,'') as created_ua, parent_key_id
 		   from api_keys where id = $1`, oldKeyID)
@@ -1730,7 +1731,7 @@ func (s *PgStore) RotateOrgAPIKey(ctx context.Context, orgID, oldKeyID string, n
 		`insert into api_keys (account_id, key_sha256, label, scopes, status, rotated_from_id, org_id)
 		 values ($1, $2, $3, $4, 'active', $5, $6)
 		 returning id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
-		           coalesce(last_used_at, 'epoch'::timestamptz),
+		           last_used_at,
 		           expires_at, status, revoked_at, rotated_from_id,
 		           coalesce(host(created_ip),'') as created_ip, coalesce(created_ua,'') as created_ua, parent_key_id`,
 		old.AccountID, newHash, newLabel, old.Scopes, oldKeyID, old.OrgID)
@@ -1749,7 +1750,7 @@ func (s *PgStore) RotateOrgAPIKey(ctx context.Context, orgID, oldKeyID string, n
 			        revoked_at = coalesce(revoked_at, now())
 			  where id = $1
 			  returning id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
-			            coalesce(last_used_at, 'epoch'::timestamptz),
+			            last_used_at,
 			            expires_at, status, revoked_at, rotated_from_id,
 		            coalesce(host(created_ip),'') as created_ip, coalesce(created_ua,'') as created_ua, parent_key_id`,
 			oldKeyID)
@@ -1763,7 +1764,7 @@ func (s *PgStore) RotateOrgAPIKey(ctx context.Context, orgID, oldKeyID string, n
 			        expires_at = now() + ($1)::interval
 			  where id = $2
 			  returning id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
-			            coalesce(last_used_at, 'epoch'::timestamptz),
+			            last_used_at,
 			            expires_at, status, revoked_at, rotated_from_id,
 		            coalesce(host(created_ip),'') as created_ip, coalesce(created_ua,'') as created_ua, parent_key_id`,
 			graceWindow.String(), oldKeyID)
@@ -1818,7 +1819,7 @@ func (s *PgStore) RotateOrgAPIKeyWithProvenance(ctx context.Context, orgID, oldK
 	// Step 2: read the old row's content (label, scopes, account_id)
 	old, err := scanAPIKeyRow(ctx, tx,
 		`select id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
-		        coalesce(last_used_at, 'epoch'::timestamptz),
+		        last_used_at,
 		        expires_at, status, revoked_at, rotated_from_id,
 		        coalesce(host(created_ip),'') as created_ip, coalesce(created_ua,'') as created_ua, parent_key_id
 		   from api_keys where id = $1`, oldKeyID)
@@ -1834,7 +1835,7 @@ func (s *PgStore) RotateOrgAPIKeyWithProvenance(ctx context.Context, orgID, oldK
 		`insert into api_keys (account_id, key_sha256, label, scopes, status, rotated_from_id, org_id, created_ip, created_ua, parent_key_id)
 		 values ($1, $2, $3, $4, 'active', $5, $6, $7, $8, $9)
 		 returning id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
-		           coalesce(last_used_at, 'epoch'::timestamptz),
+		           last_used_at,
 		           expires_at, status, revoked_at, rotated_from_id,
 		           coalesce(host(created_ip),'') as created_ip, coalesce(created_ua,'') as created_ua, parent_key_id`,
 		old.AccountID, newHash, newLabel, old.Scopes, oldKeyID, old.OrgID,
@@ -1852,7 +1853,7 @@ func (s *PgStore) RotateOrgAPIKeyWithProvenance(ctx context.Context, orgID, oldK
 			        revoked_at = coalesce(revoked_at, now())
 			  where id = $1
 			  returning id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
-			            coalesce(last_used_at, 'epoch'::timestamptz),
+			            last_used_at,
 			            expires_at, status, revoked_at, rotated_from_id,
 			            coalesce(host(created_ip),'') as created_ip, coalesce(created_ua,'') as created_ua, parent_key_id`,
 			oldKeyID)
@@ -1866,7 +1867,7 @@ func (s *PgStore) RotateOrgAPIKeyWithProvenance(ctx context.Context, orgID, oldK
 			        expires_at = now() + ($1)::interval
 			  where id = $2
 			  returning id, account_id, org_id, key_sha256, coalesce(label,''), scopes, created_at,
-			            coalesce(last_used_at, 'epoch'::timestamptz),
+			            last_used_at,
 			            expires_at, status, revoked_at, rotated_from_id,
 			            coalesce(host(created_ip),'') as created_ip, coalesce(created_ua,'') as created_ua, parent_key_id`,
 			graceWindow.String(), oldKeyID)
@@ -2585,7 +2586,8 @@ func (s *PgStore) ListInstancesByNodeID(ctx context.Context, nodeID string) ([]I
 		        coalesce(host(i.host_ip),''), i.ram_mb, i.started_at, i.last_request_at, i.parked_at, i.node_id, i.wake_id, i.framework_ready_at, i.tail_count, i.mode, i.request_count
 		   from instances i
 		   join apps a on a.id = i.app_id
-		  where a.node_id = $1`
+		  where a.node_id = $1
+		    and a.status <> 'deleted'`
 	rows, err := s.pool.Query(ctx, sel, nodeID)
 	if err != nil {
 		return nil, err
@@ -3844,10 +3846,11 @@ func (s *PgStore) RestoreApp(ctx context.Context, id string) (App, error) {
 	var a App
 	row := s.pool.QueryRow(ctx, `
 		update apps
-		   set status = 'active', deleted_at = null, delete_grace_until = null
+		   set status = 'active', deleted_at = null, delete_grace_until = null, purge_claimed_at = null
 		 where id = $1
 		   and status = 'deleted'
 		   and delete_grace_until > now()
+		   and purge_claimed_at is null
 		 returning `+appsSelectColumns, id)
 	if err := scanAppInto(&a, row); err != nil {
 		if errors.Is(err, ErrNotFound) {
@@ -3869,6 +3872,105 @@ func (s *PgStore) ListDeletedApps(ctx context.Context) ([]App, error) {
 	return scanApps(rows)
 }
 
+// ClaimAppDeletion closes the restore window before storage-side deletion.
+// The persisted claim makes retries idempotent while serializing against a
+// restore statement that began just before the deadline.
+func (s *PgStore) ClaimAppDeletion(ctx context.Context, id string) error {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("state: begin app purge claim: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var activeBuckets int
+	if err := tx.QueryRow(ctx,
+		`select count(*) from object_buckets where app_id = $1 and state <> 'deleted'`, id).Scan(&activeBuckets); err != nil {
+		return fmt.Errorf("state: count app buckets for purge claim: %w", err)
+	}
+	if activeBuckets != 0 {
+		return ErrConflict
+	}
+	tag, err := tx.Exec(ctx, `
+		update apps
+		   set purge_claimed_at = coalesce(purge_claimed_at, now())
+		 where id = $1
+		   and status = 'deleted'
+		   and delete_grace_until <= now()`, id)
+	if err != nil {
+		return fmt.Errorf("state: claim app purge: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("state: commit app purge claim: %w", err)
+	}
+	return nil
+}
+
+// ListAppDeletionArtifacts projects every durable artifact reference owned by
+// appID. Keys referenced by another app are deliberately excluded; after one
+// deleted owner is purged, the last owner will become eligible on its pass.
+func (s *PgStore) ListAppDeletionArtifacts(ctx context.Context, appID string) ([]AppDeletionArtifact, error) {
+	rows, err := s.pool.Query(ctx, `
+		with refs(app_id, storage_key, bytes) as materialized (
+			select d.app_id, d.rootfs_key, greatest(coalesce(d.rootfs_bytes, 0), 0)::bigint
+			  from deployments d where d.rootfs_key <> ''
+			union all
+			select d.app_id, l.storage_key, greatest(coalesce(l.bytes, 0), 0)::bigint
+			  from deployment_sidecar_layers l join deployments d on d.id = l.deployment_id
+			 where l.storage_key <> ''
+			union all
+			select d.app_id, sn.storage_key,
+			       greatest(case when coalesce(sn.stored_bytes, 0) > 0
+			                     then sn.stored_bytes
+			                     else coalesce(sn.mem_bytes, 0) + coalesce(sn.disk_bytes, 0)
+			                end, 0)::bigint
+			  from snapshots sn join deployments d on d.id = sn.deployment_id
+			 where sn.storage_key <> ''
+			union all
+			select d.app_id,
+			       case when sn.storage_key like '%/mem'
+			            then left(sn.storage_key, length(sn.storage_key) - 4) || '/vmstate'
+			            else 'snap/' || sn.deployment_id::text ||
+			                 case when sn.tier = 'warm' then '/warm/vmstate' else '/vmstate' end
+			       end,
+			       0::bigint
+			  from snapshots sn join deployments d on d.id = sn.deployment_id
+			 where sn.storage_key <> ''
+			union all
+			select d.app_id, bp.sbom_storage_key, 0::bigint
+			  from build_provenance bp
+			  join builds b on b.id = bp.build_id
+			  join deployments d on d.id = b.deployment_id
+			 where coalesce(bp.sbom_storage_key, '') <> ''
+		)
+		select r.storage_key, max(r.bytes)::bigint
+		  from refs r
+		 where r.app_id = $1
+		   and not exists (
+		       select 1 from refs other
+		        where other.storage_key = r.storage_key and other.app_id <> $1
+		   )
+		 group by r.storage_key
+		 order by r.storage_key`, appID)
+	if err != nil {
+		return nil, fmt.Errorf("state: list app deletion artifacts: %w", err)
+	}
+	defer rows.Close()
+	out := make([]AppDeletionArtifact, 0)
+	for rows.Next() {
+		var artifact AppDeletionArtifact
+		if err := rows.Scan(&artifact.Key, &artifact.Bytes); err != nil {
+			return nil, fmt.Errorf("state: scan app deletion artifact: %w", err)
+		}
+		out = append(out, artifact)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("state: iterate app deletion artifacts: %w", err)
+	}
+	return out, nil
+}
+
 // DeleteAppPermanently removes an expired app and all state that is not
 // covered by an ON DELETE CASCADE. It deliberately rechecks the deadline in
 // the final DELETE so a concurrent restore cannot be lost.
@@ -3888,7 +3990,7 @@ func (s *PgStore) DeleteAppPermanently(ctx context.Context, id string) error {
 	}
 	var exists int
 	if err := tx.QueryRow(ctx,
-		`select 1 from apps where id = $1 and status = 'deleted' and delete_grace_until <= now() for update`, id).Scan(&exists); err != nil {
+		`select 1 from apps where id = $1 and status = 'deleted' and delete_grace_until <= now() and purge_claimed_at is not null for update`, id).Scan(&exists); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
 		}
@@ -3933,7 +4035,7 @@ func (s *PgStore) DeleteAppPermanently(ctx context.Context, id string) error {
 	// webhooks, edge rules, tenant surfaces, and their deliveries).
 	// The parent delete therefore removes those rows atomically as well.
 	tag, err := tx.Exec(ctx,
-		`delete from apps where id = $1 and status = 'deleted' and delete_grace_until <= now()`, id)
+		`delete from apps where id = $1 and status = 'deleted' and delete_grace_until <= now() and purge_claimed_at is not null`, id)
 	if err != nil {
 		return fmt.Errorf("state: purge app %s: %w", id, err)
 	}
@@ -3961,6 +4063,7 @@ func (s *PgStore) SoftDeleteAppCascade(ctx context.Context, id string) (App, err
 		return App{}, mapErr(err)
 	}
 	now := time.Now().UTC()
+	deadline := now.Add(AppDeleteGraceDuration())
 	if _, err := tx.Exec(ctx, `
 		update deployments
 		   set status = 'cancelled',
@@ -3970,6 +4073,13 @@ func (s *PgStore) SoftDeleteAppCascade(ctx context.Context, id string) (App, err
 		 where app_id = $1
 		   and status in ('pending', 'building', 'imaging', 'snapshotting')`, id, now); err != nil {
 		return App{}, fmt.Errorf("state: soft delete app cancel deployments: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		update crons
+		   set enabled = false
+		 where app_id = $1
+		   and enabled = true`, id); err != nil {
+		return App{}, fmt.Errorf("state: soft delete app disable crons: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `
 		with candidates as (
@@ -3996,9 +4106,12 @@ func (s *PgStore) SoftDeleteAppCascade(ctx context.Context, id string) (App, err
 	}
 	var a App
 	if err := scanAppInto(&a, tx.QueryRow(ctx, `
-		update apps set status = 'deleted'
-		where id = $1
-		returning `+appsSelectColumns, id)); err != nil {
+			update apps
+			   set status = 'deleted',
+			       deleted_at = coalesce(deleted_at, $2),
+			       delete_grace_until = coalesce(delete_grace_until, $3)
+			where id = $1
+			returning `+appsSelectColumns, id, now, deadline)); err != nil {
 		return App{}, mapErr(err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -4756,6 +4869,7 @@ func softDeleteAppInTx(ctx context.Context, tx pgx.Tx, id string) (App, error) {
 		return App{}, mapErr(err)
 	}
 	now := time.Now().UTC()
+	deadline := now.Add(AppDeleteGraceDuration())
 	if _, err := tx.Exec(ctx, `update deployments set status='cancelled', cancelled_at=$2, cancelled_by_principal='system:app-delete', cancel_reason='system' where app_id=$1 and status in ('pending','building','imaging','snapshotting')`, id, now); err != nil {
 		return App{}, err
 	}
@@ -4763,7 +4877,9 @@ func softDeleteAppInTx(ctx context.Context, tx pgx.Tx, id string) (App, error) {
 		return App{}, err
 	}
 	var app App
-	if err := scanAppInto(&app, tx.QueryRow(ctx, `update apps set status='deleted' where id=$1 returning `+appsSelectColumns, id)); err != nil {
+	if err := scanAppInto(&app, tx.QueryRow(ctx, `update apps
+		set status='deleted', deleted_at=coalesce(deleted_at,$2), delete_grace_until=coalesce(delete_grace_until,$3)
+		where id=$1 returning `+appsSelectColumns, id, now, deadline)); err != nil {
 		return App{}, mapErr(err)
 	}
 	return app, nil
@@ -8214,7 +8330,6 @@ func (s *PgStore) RetryDeploymentFromStage(ctx context.Context, failedID string,
 	if err != nil {
 		return Deployment{}, err
 	}
-	newDep.ID = uuid.NewString()
 	// Step 4 — INSERT with stage_state seeded to the requested
 	// fromStage. We do not call CreateDeployment because that path
 	// supersedes the prior live row (a retry is independent of
@@ -8705,7 +8820,6 @@ func (s *PgStore) CreatePublicStatusEvent(ctx context.Context, input StatusEvent
 	legacySeverity := legacyStatusSeverity(input.Impact)
 	publicID := uuid.NewString()
 	var inc StatusIncident
-	var dbComponents []string
 	var inserted bool
 	err = tx.QueryRow(ctx, `
 		insert into status_incidents (
@@ -8716,13 +8830,13 @@ func (s *PgStore) CreatePublicStatusEvent(ctx context.Context, input StatusEvent
 		on conflict (create_idempotency_key) do update
 		set create_idempotency_key=excluded.create_idempotency_key
 		returning id,component,severity,message,posted_at,resolved_at,public_id::text,kind,
-		          title,impact,affected_components,lifecycle_state,starts_at,scheduled_start_at,
+		          title,impact,lifecycle_state,starts_at,scheduled_start_at,
 		          scheduled_end_at,updated_at,(xmax = 0)`,
 		legacyComponent, legacySeverity, input.Message, publicID, string(input.Kind), strings.TrimSpace(input.Title),
 		string(input.Impact), components, string(input.State), input.StartsAt, input.ScheduledStartAt,
 		input.ScheduledEndAt, input.IdempotencyKey, input.Actor,
 	).Scan(&inc.ID, &inc.Component, &inc.Severity, &inc.Message, &inc.PostedAt, &inc.ResolvedAt, &inc.PublicID,
-		(*string)(&inc.Kind), &inc.Title, (*string)(&inc.Impact), &dbComponents, (*string)(&inc.State),
+		(*string)(&inc.Kind), &inc.Title, (*string)(&inc.Impact), (*string)(&inc.State),
 		&inc.StartsAt, &inc.ScheduledStartAt, &inc.ScheduledEndAt, &inc.UpdatedAt, &inserted)
 	if err != nil {
 		return StatusIncident{}, err
@@ -8732,7 +8846,6 @@ func (s *PgStore) CreatePublicStatusEvent(ctx context.Context, input StatusEvent
 			return StatusIncident{}, err
 		}
 	}
-	inc.Components = parseComponents(dbComponents)
 	_, err = tx.Exec(ctx, `insert into status_incident_updates(incident_id,lifecycle_state,message,posted_at,actor,idempotency_key)
 		values($1,$2,$3,$4,$5,$6) on conflict(idempotency_key) do nothing`,
 		inc.ID, string(input.State), input.Message, inc.PostedAt, input.Actor, input.IdempotencyKey)
@@ -9516,6 +9629,23 @@ func (s *PgStore) UpdateBuildProvenanceSBOM(ctx context.Context, buildID, sbomKe
 	return nil
 }
 
+// UpdateBuildProvenanceRunnerDigest stamps the digest of the exact function
+// runner injected by imaged onto an existing build_provenance row. The
+// function layer is built after builderd creates the provenance row, so this
+// update is intentionally a separate post-build operation.
+func (s *PgStore) UpdateBuildProvenanceRunnerDigest(ctx context.Context, buildID, runnerDigest string) error {
+	tag, err := s.pool.Exec(ctx,
+		`update build_provenance set runner_digest = $1 where build_id = $2`,
+		nullString(runnerDigest), buildID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // SweepStuckRunningBuilds is the reaper sweep (issue #195 B1.4).
 // Returns the number of build rows flipped. The owning in-flight
 // deployment is failed in the same transaction so a crashed builder
@@ -9874,7 +10004,11 @@ func (s *PgStore) ListUnverifiedCustomDomains(ctx context.Context) ([]CustomDoma
 		       coalesce(cert_failed_at, 'epoch'::timestamptz)
 		  from custom_domains
 		 where verified_at is null
-		 order by domain`)
+		   and verification_next_check_at <= now()
+		   and verification_expires_at > now()
+		 order by row_number() over (partition by app_id order by verification_next_check_at, domain),
+		          verification_next_check_at, domain
+		 limit 64`)
 	if err != nil {
 		return nil, err
 	}
@@ -10072,7 +10206,7 @@ func (s *PgStore) GetDoctorObservation(ctx context.Context, domain string) (Doma
 // query's.
 func (s *PgStore) ListAllCustomDomainsForDoctor(ctx context.Context) ([]string, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT domain FROM custom_domains
+		SELECT domain FROM custom_domains WHERE verified_at IS NOT NULL
 		UNION ALL
 		SELECT hostname FROM tenant_hostnames
 	`)
@@ -14011,6 +14145,44 @@ func (s *PgStore) ListInstancesInTerminalStatesOlderThan(ctx context.Context, st
 	return scanInstancesWithTerminal(rows)
 }
 
+// DeleteParkedInstancesOlderThan removes a bounded batch of obsolete wake
+// history. The candidate rows are locked and the lifecycle predicates are
+// repeated on DELETE, so a PARKED -> WAKING transition can never lose its
+// active row to a retention race. Snapshot rows are keyed by deployment and
+// have no instance foreign key, so the current restore artifact is untouched.
+func (s *PgStore) DeleteParkedInstancesOlderThan(ctx context.Context, threshold time.Time, limit int) (int64, error) {
+	if limit <= 0 {
+		return 0, nil
+	}
+	tag, err := s.pool.Exec(ctx, `
+		with doomed as (
+			select id
+			  from instances
+			 where app_id is not null
+			   and state = 'parked'
+			   and lease_token is null
+			   and migration_started_at is null
+			   and parked_at is not null
+			   and parked_at < $1
+			 order by parked_at asc, id asc
+			 for update skip locked
+			 limit $2
+		)
+		delete from instances i
+		 using doomed d
+		 where i.id = d.id
+		   and i.app_id is not null
+		   and i.state = 'parked'
+		   and i.lease_token is null
+		   and i.migration_started_at is null
+		   and i.parked_at is not null
+		   and i.parked_at < $1`, threshold, limit)
+	if err != nil {
+		return 0, fmt.Errorf("state: delete parked instances older than %s: %w", threshold.UTC().Format(time.RFC3339), err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 // DeleteInstance removes one instance row unconditionally (PR #74).
 // Returns ErrNotFound when the row is gone (the sweep swallows that
 // case for redelivery). No FK cascade — events.subject and
@@ -14839,6 +15011,77 @@ func (s *PgStore) ListComputeNodeHeartbeats(ctx context.Context, nodeID string, 
 	return out, nil
 }
 
+// MaintainComputeNodeHeartbeatHistory folds one bounded batch of expired raw
+// samples into hourly capacity buckets and deletes those exact samples in the
+// same transaction. SKIP LOCKED keeps concurrent maintenance workers from
+// blocking heartbeat inserts or each other during a rollout overlap.
+func (s *PgStore) MaintainComputeNodeHeartbeatHistory(ctx context.Context, cutoff time.Time, batchSize int) (ComputeNodeHeartbeatMaintenanceResult, error) {
+	if batchSize <= 0 {
+		return ComputeNodeHeartbeatMaintenanceResult{}, fmt.Errorf("state: maintain compute heartbeat history: batch size must be positive")
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return ComputeNodeHeartbeatMaintenanceResult{}, fmt.Errorf("state: begin compute heartbeat maintenance: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var result ComputeNodeHeartbeatMaintenanceResult
+	err = tx.QueryRow(ctx, `
+		with candidates as materialized (
+			select id, node_id, received_at, last_heartbeat_at, cpu_pct_60s, disk_used_bytes
+			  from compute_node_heartbeats
+			 where received_at < $1
+			 order by received_at, id
+			 for update skip locked
+			 limit $2
+		), rollups as (
+			insert into compute_node_heartbeat_hourly (
+				node_id, bucket_at, sample_count, cpu_sample_count, cpu_pct_sum,
+				disk_used_max_bytes, first_received_at, last_received_at, last_heartbeat_at
+			)
+			select node_id,
+			       date_trunc('hour', received_at at time zone 'UTC') at time zone 'UTC',
+			       count(*), count(cpu_pct_60s), coalesce(sum(cpu_pct_60s), 0),
+			       max(disk_used_bytes), min(received_at), max(received_at), max(last_heartbeat_at)
+			  from candidates
+			 group by node_id, date_trunc('hour', received_at at time zone 'UTC') at time zone 'UTC'
+			on conflict (node_id, bucket_at) do update set
+				sample_count = compute_node_heartbeat_hourly.sample_count + excluded.sample_count,
+				cpu_sample_count = compute_node_heartbeat_hourly.cpu_sample_count + excluded.cpu_sample_count,
+				cpu_pct_sum = compute_node_heartbeat_hourly.cpu_pct_sum + excluded.cpu_pct_sum,
+				disk_used_max_bytes = case
+					when compute_node_heartbeat_hourly.disk_used_max_bytes is null then excluded.disk_used_max_bytes
+					when excluded.disk_used_max_bytes is null then compute_node_heartbeat_hourly.disk_used_max_bytes
+					else greatest(compute_node_heartbeat_hourly.disk_used_max_bytes, excluded.disk_used_max_bytes)
+				end,
+				first_received_at = least(compute_node_heartbeat_hourly.first_received_at, excluded.first_received_at),
+				last_received_at = greatest(compute_node_heartbeat_hourly.last_received_at, excluded.last_received_at),
+				last_heartbeat_at = greatest(compute_node_heartbeat_hourly.last_heartbeat_at, excluded.last_heartbeat_at)
+			returning 1
+		), deleted as (
+			delete from compute_node_heartbeats h
+			 using candidates c
+			 where h.id = c.id
+			 returning h.id
+		)
+		select (select count(*) from deleted), (select count(*) from rollups)`, cutoff, batchSize).
+		Scan(&result.Deleted, &result.RollupBuckets)
+	if err != nil {
+		return ComputeNodeHeartbeatMaintenanceResult{}, fmt.Errorf("state: roll up compute heartbeat history: %w", err)
+	}
+	var oldest sql.NullTime
+	if err := tx.QueryRow(ctx, `select min(received_at) from compute_node_heartbeats`).Scan(&oldest); err != nil {
+		return ComputeNodeHeartbeatMaintenanceResult{}, fmt.Errorf("state: read oldest compute heartbeat: %w", err)
+	}
+	if oldest.Valid {
+		result.OldestRawAt = oldest.Time
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return ComputeNodeHeartbeatMaintenanceResult{}, fmt.Errorf("state: commit compute heartbeat maintenance: %w", err)
+	}
+	return result, nil
+}
+
 // AppendComputeNodeHeartbeatWithStats (PR #4 / ADR-091 §3.6
 // amendment) extends AppendComputeNodeHeartbeat with the cpu_pct_60s
 // and disk_used_bytes columns added by migration 00199. The two new
@@ -15453,27 +15696,70 @@ func (s *PgStore) loadComputeNodeCertFingerprint(ctx context.Context, name strin
 // node signing key (cmd/vmmd/main.go::loadNodeSigningKey) and
 // computed the key_id (the SHA-256 hex of the SubjectPublicKeyInfo).
 //
-// ON CONFLICT is a no-op (DO NOTHING) because key material is
-// write-once — re-applying public_key_pem on conflict would
-// silently overwrite a rotation that produced a different key
-// (the PK is (compute_node_id, key_id), so a rotated key on the
-// same node has a different key_id and lands as a fresh row).
-// Re-stamping public_key_pem on the same key_id would be a
-// defensive no-op anyway (the bytes are deterministic) but we
-// keep the explicit semantics to flag the omit-intent at review
-// time. Migration 00075's CHECK constraints
+// Re-registering the current key is a no-op because key material is
+// write-once. A new key atomically demotes the current key to a 24-hour
+// overlap and removes any older overlap, bounding the trust set at two rows.
+// Migration 00075's CHECK constraints
 // (compute_node_keys_key_id_shape, compute_node_keys_pem_shape)
 // reject malformed shapes at INSERT — a vmmd that mints a
 // non-64-hex-char key_id or a non-PEM block fails loud at the
 // persist step rather than corrupting the registry.
 func (s *PgStore) UpsertNodeKey(ctx context.Context, nodeID string, keyID string, publicKeyPEM string) error {
-	_, err := s.pool.Exec(ctx, `
-		insert into compute_node_keys (compute_node_id, key_id, public_key_pem)
-		values ($1, $2, $3)
-		on conflict (compute_node_id, key_id) do nothing
-	`, nodeID, keyID, publicKeyPEM)
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("state: upsert compute_node_keys (node=%q, key=%s): %w", nodeID, keyID, err)
+		return fmt.Errorf("state: begin compute node key rotation: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Serialize rotations with node lifecycle changes. The node row is also
+	// the FK authority, so a missing/deleted node fails before any key changes.
+	var lockedNodeID string
+	if err := tx.QueryRow(ctx, `
+		select id::text from compute_nodes where id = $1 for update
+	`, nodeID).Scan(&lockedNodeID); err != nil {
+		return fmt.Errorf("state: lock compute node for key rotation (node=%q): %w", nodeID, err)
+	}
+
+	var currentID string
+	err = tx.QueryRow(ctx, `
+		select key_id
+		  from compute_node_keys
+		 where compute_node_id = $1 and key_state = 'current'
+		 for update
+	`, nodeID).Scan(&currentID)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("state: read current compute node key (node=%q): %w", nodeID, err)
+	}
+	if err == nil && currentID == keyID {
+		return tx.Commit(ctx)
+	}
+
+	// At most one previous key may overlap. A second rotation revokes and
+	// prunes the older overlap before promoting the former current key.
+	if _, err := tx.Exec(ctx, `
+		delete from compute_node_keys
+		 where compute_node_id = $1 and key_state <> 'current'
+	`, nodeID); err != nil {
+		return fmt.Errorf("state: prune previous compute node keys (node=%q): %w", nodeID, err)
+	}
+	if _, err := tx.Exec(ctx, `
+		update compute_node_keys
+		   set key_state = 'overlap',
+		       valid_until = statement_timestamp() + interval '24 hours',
+		       revoked_at = null
+		 where compute_node_id = $1 and key_state = 'current'
+	`, nodeID); err != nil {
+		return fmt.Errorf("state: overlap current compute node key (node=%q): %w", nodeID, err)
+	}
+	if _, err := tx.Exec(ctx, `
+		insert into compute_node_keys
+		       (compute_node_id, key_id, public_key_pem, key_state, valid_until, revoked_at)
+		values ($1, $2, $3, 'current', null, null)
+	`, nodeID, keyID, publicKeyPEM); err != nil {
+		return fmt.Errorf("state: insert current compute node key (node=%q, key=%s): %w", nodeID, keyID, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("state: commit compute node key rotation (node=%q, key=%s): %w", nodeID, keyID, err)
 	}
 	return nil
 }
@@ -16154,6 +16440,63 @@ func (s *PgStore) ListEvents(ctx context.Context, subject string, limit int) ([]
 	return out, rows.Err()
 }
 
+// ListCustomerEvents applies tenant ownership and all public filters in one
+// bounded PostgreSQL query. Anonymous rows with no resolvable customer object
+// remain operator-only.
+func (s *PgStore) ListCustomerEvents(ctx context.Context, filter CustomerEventFilter) ([]Event, error) {
+	if filter.Limit <= 0 {
+		filter.Limit = CustomerEventLimitDefault
+	} else if filter.Limit > CustomerEventLimitMax {
+		filter.Limit = CustomerEventLimitMax
+	}
+	var since any
+	if !filter.Since.IsZero() {
+		since = filter.Since
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT e.id, e.at, e.actor, e.kind, e.subject, e.data
+		  FROM events e
+		 WHERE (
+		       e.subject = $1::uuid
+		       OR ($2::bool AND e.subject IS NULL AND (
+		           EXISTS (SELECT 1 FROM apps a
+		                    WHERE a.account_id = $1::uuid AND a.id::text = e.data->>'app_id')
+		           OR EXISTS (SELECT 1 FROM deployments d JOIN apps a ON a.id = d.app_id
+		                      WHERE a.account_id = $1::uuid AND d.id::text = e.data->>'deployment_id')
+		           OR EXISTS (SELECT 1 FROM builds b JOIN deployments d ON d.id = b.deployment_id JOIN apps a ON a.id = d.app_id
+		                      WHERE a.account_id = $1::uuid AND b.id::text = e.data->>'build_id')
+		           OR EXISTS (SELECT 1 FROM instances i JOIN apps a ON a.id = i.app_id
+		                      WHERE a.account_id = $1::uuid AND i.id::text IN (e.data->>'instance_id', e.data->>'instance'))
+		       ))
+		   )
+		   AND ($3::text = '' OR left(e.kind, length($3::text)) = $3::text)
+		   AND ($4::timestamptz IS NULL OR e.at >= $4::timestamptz)
+		   AND ($5::text = '' OR (
+		       e.data->>'app_id' = $5::text
+		       OR EXISTS (SELECT 1 FROM deployments d WHERE d.id::text = e.data->>'deployment_id' AND d.app_id::text = $5::text)
+		       OR EXISTS (SELECT 1 FROM builds b JOIN deployments d ON d.id = b.deployment_id
+		                  WHERE b.id::text = e.data->>'build_id' AND d.app_id::text = $5::text)
+		       OR EXISTS (SELECT 1 FROM instances i WHERE i.id::text IN (e.data->>'instance_id', e.data->>'instance') AND i.app_id::text = $5::text)
+		   ))
+		 ORDER BY e.at DESC, e.id DESC
+		 LIMIT $6`, filter.AccountID, filter.IncludeAnonymous, filter.KindPrefix, since, filter.AppID, filter.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]Event, 0, CustomerEventLimitMax)
+	for rows.Next() {
+		var event Event
+		var data []byte
+		if err := rows.Scan(&event.ID, &event.At, &event.Actor, &event.Kind, &event.Subject, &data); err != nil {
+			return nil, err
+		}
+		event.Data = json.RawMessage(data)
+		out = append(out, event)
+	}
+	return out, rows.Err()
+}
+
 func (s *PgStore) ListEventsPage(ctx context.Context, subject string, beforeAt time.Time, beforeID int64, limit int) ([]Event, error) {
 	if limit <= 0 {
 		return nil, nil
@@ -16628,7 +16971,8 @@ func (s *PgStore) AppendUsage(ctx context.Context, accountID, appID, instanceID 
 		`insert into usage_minutes (account_id, app_id, instance_id, minute, mb_seconds, requests, cpu_usec, tx_bytes, net_tx_bytes, net_rx_bytes, cold_boot_count, tail_seconds)
 		 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		 on conflict (instance_id, minute) do update
-		   set cpu_usec        = usage_minutes.cpu_usec        + EXCLUDED.cpu_usec,
+		   set mb_seconds      = case when usage_minutes.mb_seconds = 0 and EXCLUDED.mb_seconds > 0 then EXCLUDED.mb_seconds else usage_minutes.mb_seconds end,
+		       cpu_usec        = usage_minutes.cpu_usec        + EXCLUDED.cpu_usec,
 		       tx_bytes        = usage_minutes.tx_bytes        + EXCLUDED.tx_bytes,
 		       net_tx_bytes    = usage_minutes.net_tx_bytes    + EXCLUDED.net_tx_bytes,
 		       net_rx_bytes    = usage_minutes.net_rx_bytes    + EXCLUDED.net_rx_bytes,
@@ -16636,6 +16980,56 @@ func (s *PgStore) AppendUsage(ctx context.Context, accountID, appID, instanceID 
 		       tail_seconds    = usage_minutes.tail_seconds    + EXCLUDED.tail_seconds`,
 		accountID, appID, instanceID, minute, mbSeconds, requests, cpuUsec, txBytes, netTxBytes, netRxBytes, coldBootCount, tailSeconds)
 	return err
+}
+
+// AppendGatewayUsageEvent durably deduplicates one replayable gateway frame
+// and applies its counters in the same transaction. The caller may ACK the
+// frame only after this method returns nil.
+func (s *PgStore) AppendGatewayUsageEvent(ctx context.Context, nodeID, eventID, instanceID string, minute time.Time, requests, txBytes int64, coldBoots int32) error {
+	if requests < 0 || requests > math.MaxInt32 || txBytes < 0 || coldBoots < 0 {
+		return fmt.Errorf("state: invalid gateway usage counters")
+	}
+	node, err := parsePgUUID(nodeID)
+	if err != nil {
+		return err
+	}
+	event, err := parsePgUUID(eventID)
+	if err != nil {
+		return err
+	}
+	instance, err := parsePgUUID(instanceID)
+	if err != nil {
+		return err
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	q := sqlc.New()
+	inserted, err := q.RegisterGatewayUsageEvent(ctx, tx, sqlc.RegisterGatewayUsageEventParams{
+		NodeID: node, EventID: event, InstanceID: instance,
+		Minute: pgtype.Timestamptz{Time: minute.UTC().Truncate(time.Minute), Valid: true},
+	})
+	if err != nil {
+		return err
+	}
+	if inserted {
+		rows, applyErr := q.ApplyGatewayUsageEvent(ctx, tx, sqlc.ApplyGatewayUsageEventParams{
+			ID:      instance,
+			Column2: pgtype.Timestamptz{Time: minute.UTC().Truncate(time.Minute), Valid: true},
+			Column3: int32(requests),
+			Column4: txBytes,
+			Column5: coldBoots,
+		})
+		if applyErr != nil {
+			return applyErr
+		}
+		if rows != 1 {
+			return fmt.Errorf("state: gateway usage instance %s not found", instanceID)
+		}
+	}
+	return tx.Commit(ctx)
 }
 
 // AppendNetworkUsageObservation converts vmmd's cumulative host-interface
@@ -18232,6 +18626,48 @@ func (s *PgStore) LatestSnapshotBytes(ctx context.Context, appID string) (int64,
 		return 0, 0, err
 	}
 	return memBytes, diskBytes, nil
+}
+
+// RetainedLayerBytes sums the physical app-layer artifacts referenced by all
+// non-deleted deployments for an active app. Superseded deployments count
+// because they remain rollback targets and their artifacts remain retained;
+// ClearDeployment removes a row from this accounting by stamping deleted_at.
+// Grouping by storage identity prevents a rebuild or imported legacy row that
+// references the same object from charging capacity twice. Sidecar layers are
+// part of the same retained footprint.
+func (s *PgStore) RetainedLayerBytes(ctx context.Context, appID string) (int64, error) {
+	var total int64
+	err := s.pool.QueryRow(ctx, `
+		select coalesce(sum(retained.bytes), 0)::bigint
+		from (
+			select storage_key, max(bytes)::bigint as bytes
+			from (
+				select coalesce(nullif(d.rootfs_key, ''), nullif(d.rootfs_path, '')) as storage_key,
+				       greatest(coalesce(d.rootfs_bytes, 0), 0)::bigint as bytes
+				from deployments d
+				join apps a on a.id = d.app_id
+				where d.app_id = $1
+				  and a.status <> 'deleted'
+				  and d.deleted_at is null
+				  and coalesce(d.rootfs_bytes, 0) > 0
+				  and coalesce(nullif(d.rootfs_key, ''), nullif(d.rootfs_path, '')) is not null
+				union all
+				select l.storage_key, greatest(l.bytes, 0)::bigint
+				from deployment_sidecar_layers l
+				join deployments d on d.id = l.deployment_id
+				join apps a on a.id = d.app_id
+				where d.app_id = $1
+				  and a.status <> 'deleted'
+				  and d.deleted_at is null
+				  and l.storage_key <> ''
+				  and l.bytes > 0
+			) artifacts
+			group by storage_key
+		) retained`, appID).Scan(&total)
+	if err != nil {
+		return 0, err
+	}
+	return total, nil
 }
 
 // StorageUsage returns the per-(account, app, day) storage rollup

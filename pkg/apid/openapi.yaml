@@ -1763,7 +1763,8 @@ paths:
 
         `window` is the same closed vocabulary as the per-app
         endpoint: `1h` | `24h` (default) | `7d`. Auth chain:
-        `usage:read` scope + MFA.
+        `usage:read` scope + MFA. The SLO rollup is a Hobby+
+        observability surface; Free accounts receive 402.
 
         On Prometheus failure the endpoint returns 200 with
         zeroed fields and `source: "degraded: <reason>"`. When
@@ -1802,6 +1803,7 @@ paths:
                 throttled_total: 23
         '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PlanPerAppMetricsNotAllowed' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /v1/account/export:
@@ -4192,6 +4194,9 @@ paths:
         the PromQL pass succeeded, only `instance_hours` /
         `gb_hours` are zeroed and `source` is
         `"degraded: postgres unavailable"`.
+
+        This is a Hobby+ per-app observability surface. Free
+        accounts receive 402 before the app slug is resolved.
       parameters:
         - name: window
           in: query
@@ -4226,6 +4231,7 @@ paths:
                 throttled_total: 0
         '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PlanPerAppMetricsNotAllowed' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
@@ -5431,7 +5437,7 @@ paths:
           headers:
             X-OpenAPI-Doc-Source:
               schema: { type: string }
-              description: "Provenance marker: manual_import, auto, degraded: routes_unavailable, degraded: rules_unavailable, empty: no_import_no_rules."
+              description: "Provenance marker: manual_import, auto, degraded: routes_partial, degraded: routes_unavailable, degraded: rules_unavailable, empty: no_import_no_rules. Auto documents also carry x-faas-observed-routes with source, availability, and fleet collector coverage."
             X-OpenAPI-Doc-Version:
               schema: { type: string }
               description: "OpenAPI version declared by the imported doc (3.0.x / 3.1.x)."
@@ -5570,10 +5576,13 @@ paths:
         route labels and the app's edge rules. Each route is classified as
         `matched`, `declared_only`, or `observed_only`; `covered` is true
         when at least one enabled edge rule matches the path and method.
-        When the gateway bridge is unavailable the response remains useful,
-        sets `observed_available` to false, and reports
-        `source=degraded: routes_unavailable`. No policy or document writes
-        occur on this endpoint.
+        Observed routes come from the fleet-wide Prometheus aggregate. A
+        partial scrape returns the available union with
+        `source=degraded: routes_partial`; a total bridge failure sets
+        `observed_available` to false and reports
+        `source=degraded: routes_unavailable`. Collector counts distinguish
+        both states from a healthy fleet that has not received traffic. No
+        policy or document writes occur on this endpoint.
       responses:
         '200':
           description: Declared-vs-observed route and policy preview.
@@ -6521,9 +6530,24 @@ paths:
       tags: [instances]
       operationId: listInstances
       summary: Read-only instance list for an app.
+      description: |
+        By default this returns only resident and in-flight instances, bounded
+        by the app's effective concurrency limit. Set `history=true` to return
+        the newest 100 retained lifecycle rows. The history view is not a
+        complete audit log: PARKED wake rows expire after the configured
+        instance-retention window (30 days by default), and only the newest
+        100 retained rows are returned. Snapshots are durable deployment
+        artifacts with their own lifecycle and are not removed with PARKED
+        instance history.
+      parameters:
+        - name: history
+          in: query
+          required: false
+          schema: { type: boolean, default: false }
+          description: "When true, include the newest 100 retained lifecycle rows; PARKED rows expire after 30 days by default."
       responses:
         '200':
-          description: Instances belonging to the app.
+          description: Current instances, or the bounded retained history when `history=true`.
           content:
             application/json:
               schema:
@@ -8714,6 +8738,26 @@ paths:
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/domains/{domain}/retry:
+    parameters:
+      - name: domain
+        in: path
+        required: true
+        description: Customer-owned custom domain to re-arm for TXT verification.
+        schema: { type: string, pattern: '^[a-z0-9.\-]+$' }
+    post:
+      tags: [domains]
+      operationId: retryDomainVerification
+      summary: Re-arm an expired or backed-off TXT verification challenge.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '202': { description: Verification was queued for the next bounded poller cycle. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: The domain is already verified. }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /v1/domains/{domain}/doctor:
@@ -11202,8 +11246,8 @@ paths:
         the body, is sealed with secretbox.SealBytes under the
         APP_WEBHOOK namespace, and is NEVER returned in plaintext
         — the response shape carries the masked constant. event_filter
-        is an optional allowlist; empty subscribes to every event in
-        the closed vocabulary.
+        is an optional allowlist; empty subscribes to every currently
+        supported producer-backed event.
       requestBody:
         required: true
         content:
@@ -11212,7 +11256,7 @@ paths:
             example:
               target_url: "https://example.com/hook"
               webhook_secret: "shh"
-              event_filter: ["cron.fired", "app.created"]
+              event_filter: ["app.parked", "app.woken"]
               retry_policy: "default"
               enabled: true
       responses:
@@ -12192,7 +12236,9 @@ paths:
 
         PromQL cost: 6 round-trips regardless of N apps (vs. 7N
         for the naive per-app loop) — see `pkg/promql.Client.QueryMap`
-        and `Client.QueryBuckets`.
+        and `Client.QueryBuckets`. This rollup exposes the same
+        Hobby+ signals as the per-app endpoint, so Free accounts
+        receive 402.
       parameters:
         - name: range
           in: query
@@ -12227,6 +12273,7 @@ paths:
                     wake_p95_ms: 380.2
         '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PlanPerAppMetricsNotAllowed' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /v1/invocations/{id}:
@@ -13011,11 +13058,19 @@ paths:
         `wake.boot_failed`) are joined in alongside the success
         path so a single GET shows the whole lifecycle.
 
+        For `wake.proxy_first_byte`, `data.latency_ms` is measured from
+        request/queue acceptance through the first upstream byte. New rows
+        also include `data.proxy_latency_ms` for the final bridge hop. Rows
+        written before this contract correction contain the former
+        proxy-only value in `latency_ms` and omit `proxy_latency_ms`.
+
         The endpoint is a sub-resource of `/v1/apps/{slug}`;
         auth and rate-limit share the §12 per-app budget with
         logs/metrics/wake. Cross-account access 404s the
         same way unknown slugs do (forge-proof: every row's
         `data.app_id` is verified to match the resolved app).
+        Wake narratives are a Hobby+ observability surface; Free
+        accounts receive 402 before slug or wake lookup.
       parameters:
         - name: since
           in: query
@@ -13057,11 +13112,12 @@ paths:
                   - at: "2026-07-25T13:25:01.220Z"
                     kind: wake.proxy_first_byte
                     actor: egress
-                    data: { wake_id: "abcdef01-2345-6789-abcd-ef0123456789", app_id: "0123456789abcdef0123456789abcdef", request_id: "r-1", instance_id: "inst-1", node_id: "node-1", latency_ms: 40 }
+                    data: { wake_id: "abcdef01-2345-6789-abcd-ef0123456789", app_id: "0123456789abcdef0123456789abcdef", request_id: "r-1", instance_id: "inst-1", node_id: "node-1", latency_ms: 1097, proxy_latency_ms: 40 }
         '400':
           description: Malformed query parameter on the wake-timeline read — `since` not RFC 3339 or `limit` out of range.
           content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PlanPerAppMetricsNotAllowed' }
         '404':
           description: No such app (slug) or wake_id is unknown.
           content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
@@ -15213,14 +15269,14 @@ components:
 
   schemas:
     StatusUptimeBucket:
-      description: Daily public status uptime point.
+      description: Daily platform-availability point. Successful and total count available and observed complete five-minute platform intervals; customer workload outcomes are excluded.
       type: object
       required: [date, uptime_pct, successful, total]
       properties:
         date: { type: string, format: date-time }
         uptime_pct: { type: number, format: double, minimum: 0, maximum: 100 }
-        successful: { type: integer, format: int64, minimum: 0 }
-        total: { type: integer, format: int64, minimum: 0 }
+        successful: { type: integer, format: int64, minimum: 0, description: Complete five-minute platform intervals that were available. }
+        total: { type: integer, format: int64, minimum: 0, description: Complete five-minute platform intervals with telemetry. }
     StatusIncident:
       description: Public operator-authored status incident.
       type: object
@@ -15261,11 +15317,14 @@ components:
       description: Current error-budget indicator with its unit, target, and comparison direction.
       type: object
       additionalProperties: false
-      required: [id, label, value, unit, target, comparison]
+      required: [id, label, value, sample_status, unit, target, comparison]
       properties:
         id: { type: string, enum: [api_availability, wake_p95, build_success] }
         label: { type: string }
         value: { type: [number, 'null'] }
+        sample_status:
+          type: string
+          description: Distinguishes an observed value, a successful query with insufficient samples, and a telemetry failure.
         unit: { type: string }
         target: { type: number }
         comparison: { type: string, enum: [gte, lte] }
@@ -18709,43 +18768,6 @@ components:
           type: integer
           minimum: 1
           description: "Pull-request number that drove this source-ref deploy request (githubd pull_request.number; Action ${{ github.event.pull_request.number }}). NULL for push-to-main with no inferred PR."
-        # Issue #961 leaf 8 / ADR-118 / Mega-C PR-2: per-deployment
-        # auto-rollback echo. The migration 00354 column shape is
-        # mirrored verbatim onto the wire so the dashboard, CLI
-        # history, and SDK consumers can render the auto-rollback
-        # counters without an audit round-trip. rollback_on_5xx
-        # is always present (NOT NULL DEFAULT false); the four
-        # counters / timestamps are omitempty so pre-PR-2 rows
-        # render with all four absent (byte-identical to the
-        # pre-PR-2 wire shape). The closed-set vocabulary on
-        # last_auto_rollback_reason is enforced at the schema
-        # layer via deployments_last_auto_rollback_reason_check.
-        rollback_on_5xx:
-          type: boolean
-          default: false
-          description: "Per-deployment auto-rollback opt-in (issue #961 leaf 8 / ADR-118 / Mega-C PR-2). Customer sets this at create time (Pro+ only); schedd fires the rollback when first_5xx_count crosses the per-plan threshold inside first_5xx_window_ends_at."
-        first_wake_at:
-          type: [string, "null"]
-          format: date-time
-          description: "Wall-clock timestamp of the first customer-visible wake response (anchor for the auto-rollback window). NULL until the gateway stamps it on the first wake.proxy_first_byte event."
-        first_5xx_window_ends_at:
-          type: [string, "null"]
-          format: date-time
-          description: "Wall-clock timestamp the auto-rollback window closes (first_wake_at + 5 min). NULL until the gateway stamps it on the first wake. The schedd scan checks `now() < first_5xx_window_ends_at` before firing the rollback."
-        first_5xx_count:
-          type: integer
-          minimum: 0
-          default: 0
-          description: "Atomic 5xx counter incremented by schedd on every wake.response_5xx event for this row. Default 0; NOT NULL DEFAULT 0 enforced at the schema layer."
-        last_auto_rollback_at:
-          type: [string, "null"]
-          format: date-time
-          description: "Wall-clock timestamp the most recent auto-rollback fired (idempotent across retries; updated by schedd when the rollback tx commits). NULL until the first auto-rollback."
-        last_auto_rollback_reason:
-          type: [string, "null"]
-          enum: [null, threshold_exceeded, first_window_expired]
-          description: "Closed-set classifier for the most recent auto-rollback trigger. `threshold_exceeded` = first_5xx_count crossed the per-plan threshold inside the window. `first_window_expired` = the window expired without crossing the threshold (clean wake window). Closed-set is enforced at the schema layer via deployments_last_auto_rollback_reason_check."
-
         # SAFE-RELEASES-A/F: canary ladder and durable rollout state.
         canary_preset:
           type: string
@@ -19019,7 +19041,7 @@ components:
       properties:
         field:
           type: string
-          enum: [status, kind, build_id, image_digest, source_url, commit_sha, source_root, scope, build_plan, min_instances, traffic_percent, has_overrides, canary_preset, rollback_on_5xx, rollout_state]
+          enum: [status, kind, build_id, image_digest, source_url, commit_sha, source_root, scope, build_plan, min_instances, traffic_percent, has_overrides, canary_preset, rollout_state]
         before:
           type: [string, number, boolean, object, "null"]
         after:
@@ -19295,18 +19317,16 @@ components:
         Companion to BuildProvenanceResponse (post-mortem export,
         ADR-038) and the /sbom route (post-mortem blob, ADR-038
         Phase 3). The status field mirrors builds.status — a
-        4-state enum `queued|running|succeeded|failed` per the
-        `builds_status_check` CHECK constraint. 'cancelled' is
-        intentionally absent (ADR-089 §1).
+        5-state enum `queued|running|succeeded|failed|cancelled`.
 
         failure_class is the low-cardinality enum
         `oom|timeout|user_error|infra` per the
         `builds_failure_class_check` CHECK; present only when
         status='failed'.
 
-        duration_seconds is server-computed (FinishedAt − StartedAt)
-        only when BOTH timestamps are populated; absent otherwise
-        (so a queued/running build stays minimal). CI scripts can
+        duration_seconds is server-computed from started_at to the terminal
+        finished_at or cancelled_at timestamp; absent when the build never
+        started. CI scripts can
         rely on its presence as "the build reached a terminal state
         and elapsed N wall-clock seconds." error_message is
         intentionally NOT in this response — it lives on
@@ -19325,13 +19345,13 @@ components:
         deployment_id: { type: string, pattern: '^[a-f0-9]{32}$' }
         kind: { type: string, enum: [railpack, dockerfile, tarball, github] }
         source_bytes: { type: integer, format: int64 }
-        status: { type: string, enum: [queued, running, succeeded, failed] }
+        status: { type: string, enum: [queued, running, succeeded, failed, cancelled] }
         failure_class: { type: string, enum: [oom, timeout, user_error, infra] }
-        log_path: { type: string }
         enqueued_at: { type: string, format: date-time }
         started_at: { type: string, format: date-time }
         finished_at: { type: string, format: date-time }
-        duration_seconds: { type: integer, description: "Server-computed FinishedAt − StartedAt in whole seconds. Absent until the build reaches a terminal state." }
+        cancelled_at: { type: string, format: date-time, description: "Terminal cancellation timestamp. A queued cancellation can have cancelled_at without started_at or duration_seconds." }
+        duration_seconds: { type: integer, description: "Server-computed terminal timestamp (finished_at or cancelled_at) minus started_at in whole seconds. Absent when the build never started." }
         cache_status: { type: string, enum: [hit, miss, invalidated], description: "Builderd cache decision for this build." }
         cache_key_sha256: { type: string, pattern: '^[a-f0-9]{64}$', description: "SHA-256 digest of the versioned BuildCacheRecipe." }
 
@@ -19718,14 +19738,6 @@ components:
           type: [integer, "null"]
           minimum: 1
           description: "PR number (when known). 0 / NULL collapses to NULL on the row (DB CHECK rejects 0)."
-        # Issue #961 leaf 8 / ADR-118 / Mega-C PR-2: per-deployment
-        # auto-rollback opt-in. Pro+ only (Hobby/Free get 403
-        # plan_rollback_on_5xx_not_allowed at handler validation).
-        # nil/omitted = server default false (no auto-rollback).
-        rollback_on_5xx:
-          type: [boolean, "null"]
-          description: "Per-deployment auto-rollback opt-in (issue #961 leaf 8 / ADR-118 / Mega-C PR-2). Pro+ only. nil = server default false."
-          example: true
         # Issue #976 / ADR-122 / SAFE-RELEASES-A + production-leveling
         # Stream F: per-deployment canary ladder. nil/omitted =
         # server default 'none' (no canary; traffic_percent stays at
@@ -24624,17 +24636,29 @@ components:
         (API-hosting roadmap item 11 / ADR-126 follow-up). The response
         never writes an OpenAPI document or edge rule.
       type: object
-      required: [app_id, source, observed_available, routes]
+      required: [app_id, source, observed_available, observed_source, collectors_expected, collectors_healthy, routes]
       properties:
         app_id:
           type: string
           format: uuid
         source:
           type: string
-          description: "preview, empty: no_import, or degraded: routes_unavailable."
+          description: "preview, empty: no_import, degraded: routes_partial, or degraded: routes_unavailable."
         observed_available:
           type: boolean
-          description: "Whether the gatewayd observed-route bridge returned successfully."
+          description: "Whether at least one collector returned current route telemetry."
+        observed_source:
+          type: string
+          enum: [live, partial, unavailable]
+          description: "Completeness of the fleet-wide observed-route input."
+        collectors_expected:
+          type: integer
+          minimum: 0
+          description: "Number of registry compute gateways expected to contribute route observations."
+        collectors_healthy:
+          type: integer
+          minimum: 0
+          description: "Expected compute route collectors currently healthy in Prometheus."
         openapi_version:
           type: string
           description: "OpenAPI version from the persisted declaration, when present."
@@ -24687,26 +24711,20 @@ components:
 
     AppRoutesResponse:
       description: |
-        Per-route label snapshot (ADR-093). The bounded route label
-        set the gatewayd-internal control listener emits for the app.
+        Fleet-wide per-route label snapshot (ADR-093). The control-plane
+        Prometheus instance aggregates every active, scrape-ready compute
+        gateway; collector counts distinguish complete, partial, and
+        unavailable observations from a healthy no-traffic result.
         Each item is `"<METHOD> <PATH>"` (pre-edge-rule-rewrite) for
         an admitted route, or the reserved `"__route_other__"` overflow
-        bucket label. Bounded at 50 distinct real routes + the reserved
-        overflow per app (ADR-093 D2).
+        bucket label. The fleet union is bounded again at 50 distinct real
+        routes plus the reserved overflow bucket (ADR-093 D2).
 
-        `cap_hit` (ADR-093 Tier B item #1) is true iff the app's
-        route label set has reached `RouteMetricsPerAppCap` (50) and
-        additional routes are collapsing into the reserved
-        `__route_other__` overflow bucket. When `cap_hit` is true,
-        `len(routes) == RouteMetricsPerAppCap + 2` (50 real + the
-        reserved empty label + `__route_other__`). When false, the
-        dashboard can render "you have N admitted routes" without
-        having to count the array (which is ambiguous: 5 real routes
-        + `__route_other__` is indistinguishable from 50 real routes
-        + overflow). Omitted on the `source: unavailable` path —
-        the gatewayd-internal dial failed, the cap state is unknown.
+        `cap_hit` is true when a compute collector emitted the overflow
+        bucket or the fleet union reached the 50-route bound. It is false
+        on `source: unavailable`, where cap state is unknown.
       type: object
-      required: [slug, routes, source]
+      required: [slug, routes, source, collectors_expected, collectors_healthy, cap_hit]
       properties:
         slug: {type: string, x-since: "2026-08", x-issue: "273"}
         app_id: {type: string, x-since: "2026-08", x-issue: "273"}
@@ -24717,20 +24735,30 @@ components:
           x-issue: "273"
         source:
           type: string
-          enum: ["live", "unavailable"]
+          enum: ["live", "partial", "unavailable"]
           x-since: "2026-08"
           x-issue: "273"
+        collectors_expected:
+          type: integer
+          minimum: 0
+          x-since: "2026-09"
+          x-issue: "2416"
+          description: "Active scrape-ready compute route collectors in the registry."
+        collectors_healthy:
+          type: integer
+          minimum: 0
+          x-since: "2026-09"
+          x-issue: "2416"
+          description: "Expected collectors with a current successful Prometheus scrape."
         cap_hit:
           type: boolean
           default: false
           x-since: "2026-08"
           x-issue: "273"
           description: |
-            True iff the route label set has hit `RouteMetricsPerAppCap`
-            (50) and additional routes are collapsing into
-            `__route_other__`. Omitted on `source: unavailable` paths
-            (cap state is unknown when the gatewayd-internal dial
-            fails).
+            True when the fleet route union reaches `RouteMetricsPerAppCap`
+            (50) or a collector reports `__route_other__`. False on
+            `source: unavailable`, where cap state is unknown.
 
     ThrottleSuggestionRow:
       description: |
@@ -27401,7 +27429,7 @@ components:
           type: array
           items:
             type: string
-            enum: ["cron.fired", "cron.fired.manually", "app.created", "app.deleted", "app.deployed", "app.scaled", "app.parked", "app.woken", "build.succeeded", "build.failed", "deployment.failed", "rollout.aborted", "error.new", "job.finished", "preview.created", "budget.threshold", "usage_statement.finalized"]
+            enum: ["app.parked", "app.woken", "usage_statement.finalized"]
           maxItems: 32
         retry_policy: { type: string, enum: [default, aggressive, none] }
         enabled: { type: boolean }
@@ -27413,7 +27441,7 @@ components:
         account_id: "8b1f5e5d-273e-5a18-ae00-58fceba4fe6c"
         target_url: "https://example.com/hook"
         webhook_secret_sealed_masked: "***"
-        event_filter: ["cron.fired", "app.created"]
+        event_filter: ["app.parked", "app.woken"]
         retry_policy: "default"
         enabled: true
         created_at: "2026-08-06T10:00:00Z"
@@ -27604,14 +27632,14 @@ components:
           type: array
           items:
             type: string
-            enum: ["cron.fired", "cron.fired.manually", "app.created", "app.deleted", "app.deployed", "app.scaled", "app.parked", "app.woken", "build.succeeded", "build.failed", "deployment.failed", "rollout.aborted", "error.new", "job.finished", "preview.created", "budget.threshold", "usage_statement.finalized"]
+            enum: ["app.parked", "app.woken", "usage_statement.finalized"]
           maxItems: 32
         retry_policy: { type: string, enum: [default, aggressive, none], default: default }
         enabled: { type: boolean, default: true }
       example:
         target_url: "https://example.com/hook"
         webhook_secret: "shh"
-        event_filter: ["cron.fired", "app.created"]
+        event_filter: ["app.parked", "app.woken"]
         retry_policy: "default"
         enabled: true
 
@@ -27628,7 +27656,7 @@ components:
           type: array
           items:
             type: string
-            enum: ["cron.fired", "cron.fired.manually", "app.created", "app.deleted", "app.deployed", "app.scaled", "app.parked", "app.woken", "build.succeeded", "build.failed", "deployment.failed", "rollout.aborted", "error.new", "job.finished", "preview.created", "budget.threshold", "usage_statement.finalized"]
+            enum: ["app.parked", "app.woken", "usage_statement.finalized"]
           maxItems: 32
         retry_policy: { type: string, enum: [default, aggressive, none] }
         enabled: { type: boolean }
@@ -28091,6 +28119,12 @@ components:
 
     PaymentRequired:
       description: 'code: billing_past_due — account is suspended; pay invoice to resume.'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+    PlanPerAppMetricsNotAllowed:
+      description: 'code: plan_per_app_metrics_not_allowed — the account plan does not include per-app metrics or wake narratives; upgrade to Hobby or above.'
       content:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }

@@ -1718,6 +1718,7 @@ func TestParkApp_HappyPath(t *testing.T) {
 	if app.Status != state.AppEvictedCold {
 		t.Errorf("status = %s, want evicted_cold", app.Status)
 	}
+	assertLifecycleAudit(t, e, "app.parked", appID, "")
 	deliveries, _, err := e.store.ListAppWebhookDeliveries(t.Context(), appID, hook.ID, 10, "")
 	if err != nil {
 		t.Fatal(err)
@@ -1725,6 +1726,13 @@ func TestParkApp_HappyPath(t *testing.T) {
 	if len(deliveries) != 1 || deliveries[0].Event != state.AppWebhookEventAppParked || deliveries[0].Status != state.AppWebhookDeliveryPending {
 		t.Fatalf("park deliveries = %+v, want one pending app.parked row", deliveries)
 	}
+
+	// A successful idempotent retry is not another lifecycle transition.
+	rec = e.do(t, "POST", "/v1/apps/park-me/park", nil, nil)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("idempotent park status %d: %s", rec.Code, rec.Body)
+	}
+	assertLifecycleAudit(t, e, "app.parked", appID, "")
 }
 
 // TestWakeApp_HappyPath parks, then wakes — exercises the inverse path.
@@ -1752,6 +1760,7 @@ func TestWakeApp_HappyPath(t *testing.T) {
 	if app.Status != state.AppActive {
 		t.Errorf("status = %s, want active", app.Status)
 	}
+	assertLifecycleAudit(t, e, "app.woken", appID, "")
 	deliveries, _, err := e.store.ListAppWebhookDeliveries(t.Context(), appID, hook.ID, 10, "")
 	if err != nil {
 		t.Fatal(err)
@@ -1759,6 +1768,12 @@ func TestWakeApp_HappyPath(t *testing.T) {
 	if len(deliveries) != 1 || deliveries[0].Event != state.AppWebhookEventAppWoken || deliveries[0].Status != state.AppWebhookDeliveryPending {
 		t.Fatalf("wake deliveries = %+v, want one pending app.woken row", deliveries)
 	}
+
+	rec = e.do(t, "POST", "/v1/apps/wake-me/wake", nil, nil)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("idempotent wake status %d: %s", rec.Code, rec.Body)
+	}
+	assertLifecycleAudit(t, e, "app.woken", appID, "")
 }
 
 func TestWakeApp_RejectsAppWithoutLiveDeployment(t *testing.T) {
@@ -1769,6 +1784,79 @@ func TestWakeApp_RejectsAppWithoutLiveDeployment(t *testing.T) {
 	assertProblem(t, rec, http.StatusConflict, api.CodeConflict)
 	if !strings.Contains(rec.Body.String(), "deploy the app") {
 		t.Fatalf("response lacks deploy guidance: %s", rec.Body.String())
+	}
+	assertLifecycleAuditCount(t, e, "app.woken", 0)
+}
+
+func TestRestartApp_EmitsCorrelatedAuditOnlyAfterAcceptedTransition(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	dep := mustSeedDeployment(t, e, "restart-me")
+	if err := e.store.MarkDeploymentLive(t.Context(), dep.ID); err != nil {
+		t.Fatalf("mark deployment live: %v", err)
+	}
+
+	rec := e.do(t, http.MethodPost, "/v1/apps/restart-me/restart", nil, nil)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("restart status %d: %s", rec.Code, rec.Body)
+	}
+	var response api.AppRestartResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode restart response: %v", err)
+	}
+	if response.WakeID == "" {
+		t.Fatal("restart response omitted wake_id")
+	}
+	assertLifecycleAudit(t, e, "app.restart_requested", dep.AppID, response.WakeID)
+
+	// The first request parked the app, so a second request is rejected and
+	// must not manufacture another successful audit row.
+	rec = e.do(t, http.MethodPost, "/v1/apps/restart-me/restart", nil, nil)
+	assertProblem(t, rec, http.StatusConflict, api.CodeConflict)
+	assertLifecycleAudit(t, e, "app.restart_requested", dep.AppID, response.WakeID)
+}
+
+func assertLifecycleAudit(t *testing.T, e testEnv, kind, appID, wakeID string) {
+	t.Helper()
+	rows, err := e.store.ListEvents(t.Context(), e.acct.ID, 100)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	matched := 0
+	for _, row := range rows {
+		if row.Kind != kind {
+			continue
+		}
+		matched++
+		var data map[string]any
+		if err := json.Unmarshal(row.Data, &data); err != nil {
+			t.Fatalf("decode %s audit data: %v", kind, err)
+		}
+		if data["app_id"] != appID {
+			t.Errorf("%s audit app_id = %v, want %s", kind, data["app_id"], appID)
+		}
+		if wakeID != "" && data["wake_id"] != wakeID {
+			t.Errorf("%s audit wake_id = %v, want %s", kind, data["wake_id"], wakeID)
+		}
+	}
+	if matched != 1 {
+		t.Fatalf("%s audit rows = %d, want exactly 1", kind, matched)
+	}
+}
+
+func assertLifecycleAuditCount(t *testing.T, e testEnv, kind string, want int) {
+	t.Helper()
+	rows, err := e.store.ListEvents(t.Context(), e.acct.ID, 100)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	got := 0
+	for _, row := range rows {
+		if row.Kind == kind {
+			got++
+		}
+	}
+	if got != want {
+		t.Fatalf("%s audit rows = %d, want %d", kind, got, want)
 	}
 }
 
@@ -1839,7 +1927,7 @@ func TestListInstancesDefaultsToBoundedResidentState(t *testing.T) {
 	e := setup(t, api.PlanPro)
 	dep := mustSeedDeployment(t, e, "inst-current")
 	ctx := context.Background()
-	for i := 0; i < 12; i++ {
+	for i := 0; i < 105; i++ {
 		ins, err := e.store.CreateInstance(ctx, dep.AppID, dep.ID, string(state.StateRunning), 512, "node-1", "")
 		if err != nil {
 			t.Fatal(err)
@@ -1866,8 +1954,8 @@ func TestListInstancesDefaultsToBoundedResidentState(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 		t.Fatal(err)
 	}
-	if len(out) != 13 {
-		t.Fatalf("explicit history rows = %d, want 13", len(out))
+	if len(out) != api.DefaultInstanceHistoryLimit {
+		t.Fatalf("explicit history rows = %d, want documented cap %d", len(out), api.DefaultInstanceHistoryLimit)
 	}
 	if out[0].ID != current.ID || !out[0].Resident || out[1].Resident {
 		t.Fatalf("history residency projection is incorrect: %+v", out[:2])
@@ -2385,6 +2473,35 @@ func TestListKeys_HappyPath(t *testing.T) {
 	if out[0].Plaintext != "" {
 		t.Errorf("plaintext should be empty on list, got %q", out[0].Plaintext)
 	}
+}
+
+func TestListKeys_NeverUsedTimestampIsOmitted(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	_, hash, err := api.GenerateAPIKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	k, err := e.store.CreateAPIKey(context.Background(), e.acct.ID, hash, "never-used", api.ScopesReadSurface)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := e.do(t, http.MethodGet, "/v1/keys", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	var rows []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &rows); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if row["id"] == k.ID {
+			if value, exists := row["last_used_at"]; exists {
+				t.Fatalf("never-used key serialized last_used_at=%v", value)
+			}
+			return
+		}
+	}
+	t.Fatalf("never-used key %s missing", k.ID)
 }
 
 // TestDeleteKey_HappyPath deletes the test fixture key.

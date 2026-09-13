@@ -67,12 +67,32 @@ func startDNSPoller(ctx context.Context, s *server, log *slog.Logger) {
 func (s *server) runVerifyOnce(ctx context.Context, log *slog.Logger) {
 	pending, err := s.pendingUnverifiedDomains(ctx)
 	if err != nil {
+		if s.domainVerificationMetrics != nil {
+			s.domainVerificationMetrics.cycles.WithLabelValues("error").Inc()
+			s.domainVerificationMetrics.results.WithLabelValues("error").Inc()
+		}
 		log.Warn("dns_poller: list failed", "err", err)
 		return
+	}
+	if s.domainVerificationMetrics != nil {
+		s.domainVerificationMetrics.cycles.WithLabelValues("success").Inc()
+		s.domainVerificationMetrics.batch.Set(float64(len(pending)))
+		s.domainVerificationMetrics.lastSuccess.Set(float64(time.Now().Unix()))
+	}
+	if stats, ok := s.store.(interface {
+		CustomDomainVerificationStats(context.Context) (int, time.Duration, error)
+	}); ok && s.domainVerificationMetrics != nil {
+		if n, age, e := stats.CustomDomainVerificationStats(ctx); e == nil {
+			s.domainVerificationMetrics.backlog.Set(float64(n))
+			s.domainVerificationMetrics.oldest.Set(age.Seconds())
+		}
 	}
 	for _, d := range pending {
 		checkedAt := time.Now().UTC()
 		if checkTXT(ctx, d.Domain, d.ChallengeToken) {
+			if s.domainVerificationMetrics != nil {
+				s.domainVerificationMetrics.results.WithLabelValues("success").Inc()
+			}
 			if d.CertStatus == state.CustomDomainCertDNSDrifted {
 				// Drifted domains must repair the routing target before the
 				// TXT challenge can restore verification. This prevents a
@@ -94,6 +114,9 @@ func (s *server) runVerifyOnce(ctx context.Context, log *slog.Logger) {
 			_ = s.notif.Notify(ctx, db.NotifyDomainVerify, `{"domain":"`+d.Domain+`"}`)
 			log.Info("domain verified", "domain", d.Domain)
 		} else if d.CertStatus != state.CustomDomainCertDNSDrifted {
+			if s.domainVerificationMetrics != nil {
+				s.domainVerificationMetrics.results.WithLabelValues("failure").Inc()
+			}
 			// Keep dns_drifted durable until the customer has both fixed the
 			// target and satisfied the TXT challenge. A failed TXT lookup on
 			// the next tick must not downgrade the warning back to pending.
@@ -186,6 +209,20 @@ func (s *server) pendingUnverifiedDomains(ctx context.Context) ([]pendingDomainR
 	// Fast path: PgStore and MemStore expose the full row through this
 	// optional interface. Keeping it optional preserves compatibility with
 	// narrow test doubles that only implement the historical Store surface.
+	type claimer interface {
+		ClaimCustomDomainsForVerification(context.Context, int) ([]state.CustomDomain, error)
+	}
+	if c, ok := s.store.(claimer); ok {
+		domains, err := c.ClaimCustomDomainsForVerification(ctx, 64)
+		if err != nil {
+			return nil, err
+		}
+		out = make([]pendingDomainRow, 0, len(domains))
+		for _, d := range domains {
+			out = append(out, pendingDomainRow{Domain: d.Domain, ChallengeToken: d.ChallengeToken, CertStatus: d.CertStatus})
+		}
+		return out, nil
+	}
 	type listUnverified interface {
 		ListUnverifiedCustomDomains(ctx context.Context) ([]state.CustomDomain, error)
 	}
@@ -215,8 +252,10 @@ type pendingDomainRow struct {
 // checkTXT does a TXT lookup for _faas-verify.<domain> and reports whether
 // any returned record equals the expected token.
 func checkTXT(ctx context.Context, domain, expected string) bool {
+	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
 	target := state.CustomDomainChallengeName(domain)
-	records, err := txtLookupFunc(ctx, target)
+	records, err := txtLookupFunc(probeCtx, target)
 	if err != nil {
 		return false
 	}
@@ -387,6 +426,13 @@ func (s *server) runDoctorForDomain(ctx context.Context, log *slog.Logger, domai
 		legacyLoaded = legacyErr == nil
 		if legacyErr == nil && !legacy.Verified() {
 			obs.CertState = certStatusPending
+		} else if pointsToG.Status == probeFail {
+			// A definite routing mismatch is already actionable and must not
+			// become a tenant-controlled network probe. Wait for the hostname to
+			// point back to the Gregale edge before opening a TLS connection.
+			obs.CertState = certStatusDialFailed
+			obs.LastError = errCertRoutingMismatch.Error()
+			obs.CertCheckedAt = time.Now().UTC()
 		} else {
 			obs.CertState, obs.LastError, obs.CertNotAfter = dialCertForDoctor(ctx, probeDomain)
 			obs.CertCheckedAt = time.Now().UTC()

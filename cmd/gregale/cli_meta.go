@@ -381,7 +381,13 @@ var cliCommands = []cliCommand{
 		Short:   "Inspect builds (build status|list|provenance|sbom)",
 		Subcommands: []cliSub{
 			{Name: statusLiteral, Short: "Show the current status of one build"},
-			{Name: "list", Short: "List builds and discover build IDs"},
+			{Name: "list", Short: "List builds and discover build IDs", Flags: []cliFlag{
+				{Name: "app", Short: "filter to one app", Value: "SLUG"},
+				{Name: "status", Short: "filter by lifecycle status", Value: "STATUS", ClosedSet: []string{"queued", "running", "succeeded", "failed", "cancelled"}},
+				{Name: "limit", Short: "page size (1..200)", Value: "N"},
+				{Name: "before", Short: "pagination cursor", Value: "CURSOR"},
+				{Name: "all", Short: "walk every page"},
+			}},
 			{Name: "provenance", Short: "Show the build provenance attestation"},
 			{Name: "sbom", Short: "Show the build SBOM"},
 		},
@@ -1093,6 +1099,9 @@ var cliCommands = []cliCommand{
 		Name:    "ps",
 		DocSlug: "ps",
 		Short:   "Show live instances + state for an app",
+		Flags: []cliFlag{
+			{Name: "all", Short: "include the newest 100 retained history rows (parked rows expire after 30d by default)"},
+		},
 	},
 	{
 		Name:    "queue",

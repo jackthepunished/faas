@@ -546,12 +546,18 @@ const (
 	// deployment admissions in the current one-hour window.
 	CodeDeployRateLimited = "deploy_rate_limited"
 	CodeUnauthorized      = "unauthorized"
+	// CodeAuthRateLimited marks a rejected credential after the caller's
+	// source IP exhausted the failed-auth budget. Valid credentials from the
+	// same IP are still admitted, so one broken client behind a shared NAT
+	// cannot lock out other customers.
+	CodeAuthRateLimited = "auth_rate_limited"
 	// CodeForbidden is returned when the authenticated principal lacks
 	// the scope required by the route (IAM-1, ADR-034). Distinct from
 	// CodeUnauthorized so a customer can tell "I need to log in" from
 	// "my key does not have permission for this endpoint".
-	CodeForbidden = "insufficient_scope"
-	CodeNotFound  = "not_found"
+	CodeForbidden        = "insufficient_scope"
+	CodeNotFound         = "not_found"
+	CodeMethodNotAllowed = "method_not_allowed"
 	// CodeUndeclaredRoute is returned directly by gatewayd when the
 	// only-declared-routes contract is enabled and the request path/method is
 	// absent from the explicit list or imported OpenAPI document.
@@ -1672,7 +1678,8 @@ func StatusForCode(code string) int {
 	case CodePlanLimitApps, CodePlanLimitDeveloperApps, CodePlanLimitRAM, CodeAppLayerTooBig, CodeBillingPastDue,
 		CodePlanPublicAuthIPAllowlistNotAllowed, CodePlanHealthPathWakesNotAllowed:
 		return http.StatusForbidden
-	case CodePlanLimitConcur, CodeQuotaExhausted, CodeAppConcurReached, CodeExportRateLimited, CodeDeployRateLimited:
+	case CodePlanLimitConcur, CodeQuotaExhausted, CodeAppConcurReached, CodeExportRateLimited, CodeDeployRateLimited,
+		CodeAuthRateLimited:
 		return http.StatusTooManyRequests
 	case CodeSourceTooLarge:
 		return http.StatusRequestEntityTooLarge

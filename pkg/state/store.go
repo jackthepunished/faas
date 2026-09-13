@@ -762,6 +762,14 @@ type ProjectReconcileStore interface {
 	) (ProjectReconcileResult, error)
 }
 
+// BuildProvenanceRunnerDigestStore is the optional persistence seam used by
+// imaged after it injects the function runner. It remains separate from Store
+// so narrow test doubles and older integrations do not need to grow with this
+// post-build metadata update.
+type BuildProvenanceRunnerDigestStore interface {
+	UpdateBuildProvenanceRunnerDigest(ctx context.Context, buildID, runnerDigest string) error
+}
+
 // Store is the persistence boundary apid and schedd depend on (spec §6, ADR-006).
 // The production implementation is Postgres via the embedded SQL queries in
 // pkg/state/queries.sql; MemStore backs unit tests. Keeping this interface
@@ -2066,7 +2074,15 @@ type Store interface {
 	RestoreApp(ctx context.Context, id string) (App, error)
 	// ListDeletedApps returns tombstones for the app grace sweeper.
 	ListDeletedApps(ctx context.Context) ([]App, error)
-	// DeleteAppPermanently removes an expired app and its dependent state.
+	// ClaimAppDeletion atomically closes the restore window for an expired
+	// tombstone before the grace sweeper deletes external artifacts. Repeated
+	// claims are idempotent so failed artifact deletion remains retryable.
+	ClaimAppDeletion(ctx context.Context, id string) error
+	// ListAppDeletionArtifacts returns storage keys referenced by this app and
+	// no other app. The grace sweeper deletes these before removing database
+	// state so a failed storage operation remains durably retryable.
+	ListAppDeletionArtifacts(ctx context.Context, appID string) ([]AppDeletionArtifact, error)
+	// DeleteAppPermanently removes a claimed, expired app and its dependent state.
 	DeleteAppPermanently(ctx context.Context, id string) error
 
 	// Projects (ADR-050, Phase 1).
@@ -4136,6 +4152,16 @@ type Store interface {
 	// successfully has a stale started_at). PgStore relies on migration
 	// 00017's partial index for the state predicate.
 	ListInstancesInTerminalStatesOlderThan(ctx context.Context, states []State, threshold time.Time) ([]Instance, error)
+	// DeleteParkedInstancesOlderThan atomically removes at most limit
+	// wake-history rows whose current lifecycle state is PARKED and whose
+	// parked_at anchor is strictly older than threshold. Rows carrying a live
+	// migration lease/start marker are recovery-owned and ineligible even if
+	// their state was left PARKED. Implementations must re-check the lifecycle
+	// predicates in the DELETE statement: a row selected before a concurrent
+	// PARKED -> WAKING transition must survive. PARKED rows are not reused by
+	// Wake; snapshots are separate durable rows keyed by deployment and must
+	// not be changed by this operation. limit <= 0 is a no-op.
+	DeleteParkedInstancesOlderThan(ctx context.Context, threshold time.Time, limit int) (int64, error)
 	// DeleteInstance removes a single instance row unconditionally
 	// (PR #74). Returns ErrNotFound when the row is already gone — the
 	// retention sweep swallows that case for redelivery. There are NO
@@ -4905,6 +4931,11 @@ type Store interface {
 	// has no snapshot yet — a cold start, not an error. ADR-049
 	// §B.3.
 	LatestSnapshotBytes(ctx context.Context, appID string) (memBytes, diskBytes int64, err error)
+	// RetainedLayerBytes returns the physical app-layer bytes still referenced
+	// by non-deleted deployments for an active app. It includes the rootfs and
+	// sidecar layer artifacts, deduplicated by storage key, so superseded
+	// rollback artifacts remain visible until their deployment is cleared.
+	RetainedLayerBytes(ctx context.Context, appID string) (int64, error)
 	// StorageUsage returns the per-(account, app, day) storage
 	// rollup rows (migrations/00070_snapshot_storage_daily.sql
 	// ::snapshot_storage_daily). day is a UTC midnight time;
@@ -6138,4 +6169,28 @@ type Store interface {
 	// of POST /v1/uploads. Hits the partial index; returns 0 when
 	// no open sessions.
 	SumOpenUploadSessionBytesByAccount(ctx context.Context, accountID pgtype.UUID) (int64, error)
+}
+
+// CustomerEventFilter is the tenant-safe query contract for the customer audit
+// timeline. Subjectless events are included only when their app, deployment,
+// build, or instance metadata resolves to an app owned by AccountID.
+type CustomerEventFilter struct {
+	AccountID        string
+	IncludeAnonymous bool
+	KindPrefix       string
+	AppID            string
+	Since            time.Time
+	Limit            int
+}
+
+const (
+	CustomerEventLimitDefault = 50
+	CustomerEventLimitMax     = 100
+)
+
+// CustomerEventLister is implemented by production stores without widening
+// Store for narrow test adapters. Callers must fall back to subject-only reads
+// when the optimized ownership query is unavailable.
+type CustomerEventLister interface {
+	ListCustomerEvents(ctx context.Context, filter CustomerEventFilter) ([]Event, error)
 }

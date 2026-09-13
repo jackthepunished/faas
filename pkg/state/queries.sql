@@ -98,7 +98,11 @@ returning id, account_id, slug, type, coalesce(runtime, ''), ram_mb, coalesce(id
 update apps set manifest = $2 where id = $1;
 
 -- name: DeleteApp :exec
-update apps set status = 'deleted' where id = $1;
+update apps
+set status = 'deleted',
+    deleted_at = coalesce(deleted_at, now()),
+    delete_grace_until = coalesce(delete_grace_until, now() + interval '7 days')
+where id = $1;
 
 -- name: CreateDeployment :one
 insert into deployments (id, app_id, build_id, image_digest, kind, source_path, source_root, source_bytes, handler, log_path, status)
@@ -351,12 +355,33 @@ limit $3::int8;
 insert into usage_minutes (account_id, app_id, instance_id, minute, mb_seconds, requests, cpu_usec, tx_bytes, net_tx_bytes, net_rx_bytes, cold_boot_count, tail_seconds)
 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 on conflict (instance_id, minute) do update
-   set cpu_usec        = usage_minutes.cpu_usec        + EXCLUDED.cpu_usec,
+   set mb_seconds      = case when usage_minutes.mb_seconds = 0 and EXCLUDED.mb_seconds > 0 then EXCLUDED.mb_seconds else usage_minutes.mb_seconds end,
+       cpu_usec        = usage_minutes.cpu_usec        + EXCLUDED.cpu_usec,
        tx_bytes        = usage_minutes.tx_bytes        + EXCLUDED.tx_bytes,
        net_tx_bytes    = usage_minutes.net_tx_bytes    + EXCLUDED.net_tx_bytes,
        net_rx_bytes    = usage_minutes.net_rx_bytes    + EXCLUDED.net_rx_bytes,
        cold_boot_count = usage_minutes.cold_boot_count + EXCLUDED.cold_boot_count,
        tail_seconds    = usage_minutes.tail_seconds    + EXCLUDED.tail_seconds;
+
+-- name: RegisterGatewayUsageEvent :one
+with inserted as (
+  insert into meter_gateway_usage_events (node_id, event_id, instance_id, minute)
+  values ($1, $2, $3, $4)
+  on conflict (node_id, event_id) do nothing
+  returning 1
+)
+select exists(select 1 from inserted) as inserted;
+
+-- name: ApplyGatewayUsageEvent :execrows
+insert into usage_minutes (account_id, app_id, instance_id, minute, mb_seconds, requests, cpu_usec, tx_bytes, net_tx_bytes, net_rx_bytes, cold_boot_count, tail_seconds)
+select a.account_id, i.app_id, i.id, $2::timestamptz, 0, $3::int, 0, $4::bigint, 0, 0, $5::int, 0
+  from instances i
+  join apps a on a.id = i.app_id
+ where i.id = $1
+on conflict (instance_id, minute) do update
+   set requests        = usage_minutes.requests        + EXCLUDED.requests,
+       tx_bytes        = usage_minutes.tx_bytes        + EXCLUDED.tx_bytes,
+       cold_boot_count = usage_minutes.cold_boot_count + EXCLUDED.cold_boot_count;
 
 -- name: UsageByMonth :many
 select account_id, app_id, month, mb_seconds, cpu_usec, requests, tx_bytes, net_tx_bytes

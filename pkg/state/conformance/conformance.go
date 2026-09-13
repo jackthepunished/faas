@@ -69,12 +69,148 @@ func Run(t *testing.T, open Open) {
 		{"public_status_lifecycle_is_idempotent", testPublicStatusLifecycle},
 		{"account_deploy_rate_window_is_fixed_and_durable", testAccountDeployRateWindow},
 		{"instance_runtime_publication_is_atomic", testPublishInstanceRuntime},
+		{"parked_instance_retention_is_lifecycle_gated", testParkedInstanceRetention},
+		{"retained_layers_and_deletion_artifacts_match", testRetainedLayersAndDeletionArtifacts},
+		{"app_deletion_claim_closes_restore_window", testAppDeletionClaim},
 		{"terminal_job_task_retains_logs", testJobTaskTerminalLogs},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			tc.fn(t, Seed(t, open(t)))
 		})
+	}
+}
+
+func testAppDeletionClaim(t *testing.T, fx *Fixture) {
+	deadline := time.Now().UTC().Add(-time.Minute)
+	if _, err := fx.Store.ScheduleAppDeletion(fx.Ctx, fx.App.ID, deadline); err != nil {
+		t.Fatalf("ScheduleAppDeletion: %v", err)
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := fx.Store.ClaimAppDeletion(fx.Ctx, fx.App.ID); err != nil {
+			t.Fatalf("ClaimAppDeletion attempt %d: %v", attempt, err)
+		}
+	}
+	if _, err := fx.Store.RestoreApp(fx.Ctx, fx.App.ID); !errors.Is(err, state.ErrConflict) {
+		t.Fatalf("RestoreApp after purge claim = %v, want ErrConflict", err)
+	}
+	if err := fx.Store.DeleteAppPermanently(fx.Ctx, fx.App.ID); err != nil {
+		t.Fatalf("DeleteAppPermanently: %v", err)
+	}
+	if err := fx.Store.DeleteAppPermanently(fx.Ctx, fx.App.ID); !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("repeated DeleteAppPermanently = %v, want ErrNotFound", err)
+	}
+}
+
+func testRetainedLayersAndDeletionArtifacts(t *testing.T, fx *Fixture) {
+	const (
+		rootfsKey  = "conformance/layers/rootfs.ext4"
+		sidecarKey = "conformance/layers/proxy.ext4"
+	)
+	if err := fx.Store.SetDeploymentRootfs(fx.Ctx, fx.Deployment.ID, "/srv/fc/rootfs.ext4", rootfsKey, 10); err != nil {
+		t.Fatalf("SetDeploymentRootfs: %v", err)
+	}
+	if _, err := fx.Store.SetDeploymentSidecarLayer(fx.Ctx, state.DeploymentSidecarLayer{
+		DeploymentID:  fx.Deployment.ID,
+		SidecarName:   "proxy",
+		StorageKey:    sidecarKey,
+		Bytes:         5,
+		ContentDigest: "sha256:conformance-sidecar",
+	}); err != nil {
+		t.Fatalf("SetDeploymentSidecarLayer: %v", err)
+	}
+	retained, err := fx.Store.RetainedLayerBytes(fx.Ctx, fx.App.ID)
+	if err != nil {
+		t.Fatalf("RetainedLayerBytes: %v", err)
+	}
+	if retained != 15 {
+		t.Fatalf("RetainedLayerBytes = %d, want 15", retained)
+	}
+	artifacts, err := fx.Store.ListAppDeletionArtifacts(fx.Ctx, fx.App.ID)
+	if err != nil {
+		t.Fatalf("ListAppDeletionArtifacts: %v", err)
+	}
+	got := make(map[string]int64, len(artifacts))
+	for _, artifact := range artifacts {
+		got[artifact.Key] = artifact.Bytes
+	}
+	if len(got) != 2 || got[rootfsKey] != 10 || got[sidecarKey] != 5 {
+		t.Fatalf("deletion artifacts = %+v, want rootfs=10 and sidecar=5", got)
+	}
+}
+
+func testParkedInstanceRetention(t *testing.T, fx *Fixture) {
+	now := time.Date(2026, 9, 13, 18, 0, 0, 0, time.UTC)
+	create := func(label string) state.Instance {
+		t.Helper()
+		ins, err := fx.Store.CreateInstance(fx.Ctx, fx.App.ID, fx.Deployment.ID,
+			string(state.StateRunning), 256, fx.Node.ID, uuid.NewString())
+		if err != nil {
+			t.Fatalf("CreateInstance(%s): %v", label, err)
+		}
+		return ins
+	}
+	oldest := create("oldest")
+	older := create("older")
+	recent := create("recent")
+	waking := create("waking")
+	leasedParked := create("leased-parked")
+	for _, row := range []struct {
+		instance state.Instance
+		parkedAt time.Time
+	}{
+		{oldest, now.Add(-50 * 24 * time.Hour)},
+		{older, now.Add(-40 * 24 * time.Hour)},
+		{recent, now.Add(-time.Hour)},
+		{waking, now.Add(-60 * 24 * time.Hour)},
+	} {
+		if err := fx.Store.UpdateInstanceStateWithTimestamp(fx.Ctx, row.instance.ID, string(state.StateParked), row.parkedAt); err != nil {
+			t.Fatalf("park %s: %v", row.instance.ID, err)
+		}
+	}
+	if err := fx.Store.UpdateInstanceStateIf(fx.Ctx, waking.ID, string(state.StateParked), string(state.StateWaking)); err != nil {
+		t.Fatalf("move recovery row to waking: %v", err)
+	}
+	if err := fx.Store.MarkInstanceMigrating(fx.Ctx, leasedParked.ID, fx.Node.ID, "lease-retention-conformance"); err != nil {
+		t.Fatalf("MarkInstanceMigrating: %v", err)
+	}
+	if err := fx.Store.UpdateInstanceStateWithTimestamp(fx.Ctx, leasedParked.ID, string(state.StateParked), now.Add(-60*24*time.Hour)); err != nil {
+		t.Fatalf("leave leased row parked: %v", err)
+	}
+
+	snapshot, err := fx.Store.CreateSnapshot(fx.Ctx, state.Snapshot{
+		DeploymentID: fx.Deployment.ID,
+		FCVersion:    "1.10.0",
+		MemBytes:     256 << 20,
+		DiskBytes:    64 << 20,
+		StorageKey:   state.SnapMemKey(fx.Deployment.ID) + "/retention-conformance",
+	})
+	if err != nil {
+		t.Fatalf("CreateSnapshot: %v", err)
+	}
+	if err := fx.Store.MarkDeploymentSuperseded(fx.Ctx, fx.Deployment.ID); err != nil {
+		t.Fatalf("MarkDeploymentSuperseded: %v", err)
+	}
+
+	deleted, err := fx.Store.DeleteParkedInstancesOlderThan(fx.Ctx, now.Add(-30*24*time.Hour), 1)
+	if err != nil || deleted != 1 {
+		t.Fatalf("DeleteParkedInstancesOlderThan(first) = (%d, %v), want (1, nil)", deleted, err)
+	}
+	if _, err := fx.Store.InstanceByID(fx.Ctx, oldest.ID); !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("oldest parked row survived bounded delete: %v", err)
+	}
+	deleted, err = fx.Store.DeleteParkedInstancesOlderThan(fx.Ctx, now.Add(-30*24*time.Hour), 10)
+	if err != nil || deleted != 1 {
+		t.Fatalf("DeleteParkedInstancesOlderThan(second) = (%d, %v), want (1, nil)", deleted, err)
+	}
+	for _, id := range []string{recent.ID, waking.ID, leasedParked.ID} {
+		if _, err := fx.Store.InstanceByID(fx.Ctx, id); err != nil {
+			t.Fatalf("recent/recovery row %s was deleted: %v", id, err)
+		}
+	}
+	latest, err := fx.Store.LatestSnapshot(fx.Ctx, fx.Deployment.ID)
+	if err != nil || latest.ID != snapshot.ID {
+		t.Fatalf("LatestSnapshot after instance cleanup = (%+v, %v), want id=%s", latest, err, snapshot.ID)
 	}
 }
 

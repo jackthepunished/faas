@@ -412,7 +412,7 @@ func defaultDeps() runDeps {
 		openStore:           state.NewPgStore,
 		detectOverlayIP:     nil, // Mega-PR-B Commit 3: detectOverlayIP is bound inline at the only call site (post-LoadConfig) so it can read cfg.ComputeNode.OverlayCIDR. Legacy first-line behavior preserved when the detector finds tailscale but no PreferCIDR match.
 		loadHostKey:         secretbox.LoadHostKey,
-		loadHostKeys:        secretbox.LoadHostKeys,
+		loadHostKeys:        secretbox.LoadFleetAndHostKeys,
 		genAndSaveKey:       secretbox.GenerateAndSaveHostKey,
 		writeRecipient:      secretbox.WriteRecipientFile,
 		popCounters:         netns.PopCounters,
@@ -582,7 +582,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		deps.loadHostKey = secretbox.LoadHostKey
 	}
 	if deps.loadHostKeys == nil {
-		deps.loadHostKeys = secretbox.LoadHostKeys
+		deps.loadHostKeys = secretbox.LoadFleetAndHostKeys
 	}
 	if deps.genAndSaveKey == nil {
 		deps.genAndSaveKey = secretbox.GenerateAndSaveHostKey
@@ -1077,16 +1077,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	//     test container, build hosts without /dev/vsock): bind
 	//     returns EADDRNOTAVAIL. The unit-test seam must keep
 	//     running — the warm-tier path is dormant but the rest of
-	//     vmmd (gRPC, host key, capacity publisher) still needs to
-	//     come up so cmd/vmmd tests can exercise it.
-	//
-	// The production-only vsock path is opt-in: an operator running
-	// the full vmmd on a host whose kernel supports vsock would
-	// see the receiver come up. If bind fails on a real production
-	// host, the warm-tier migration is silently dropped — but the
-	// gRPC server still serves readiness, and the watchdog tick
-	// (memory `schedd-watchdog-tick`) is unaffected.
-	recv, err := StartFrameworkReadyReceiver(ctx, log, mgr)
+	// Guest-initiated platform channels are registered here and bound as
+	// per-instance Firecracker Unix listeners during boot/restore. Registration
+	// remains soft at process startup so diagnostics stay available, but the
+	// receiver health signals below hold /readyz at 503 on failure.
+	guestReceiverHealth := newGuestVsockReceiverHealth(ops.Registry())
+	jailer.WithGuestVsockTransportObserver(guestReceiverHealth.Observe)
+	recv, err := StartFrameworkReadyReceiver(ctx, log, mgr, jailer)
 	if err != nil {
 		log.Warn("vmmd: framework_ready receiver unavailable", "err", err, "goos", runtime.GOOS)
 		recv = nil
@@ -1131,7 +1128,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	if identityErr != nil {
 		log.Warn("vmmd: workload identity signer unavailable", "err", identityErr)
 	}
-	identityRecv, identityRecvErr := StartWorkloadIdentityReceiver(ctx, log, mgr, identitySigner)
+	identityRecv, identityRecvErr := StartWorkloadIdentityReceiver(ctx, log, mgr, identitySigner, jailer)
 	if identityRecvErr != nil {
 		log.Warn("vmmd: workload identity receiver unavailable", "err", identityRecvErr, "goos", runtime.GOOS)
 	} else {
@@ -1258,6 +1255,8 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// BuildReadinessProbe call's failure path (the probe is
 	// ready regardless).
 	vmmdProbe, grpcBound := BuildReadinessProbe()
+	vmmdProbe.RegisterSignal(guestReceiverHealth.Signal(guestReceiverEvents), nil)
+	vmmdProbe.RegisterSignal(guestReceiverHealth.Signal(guestReceiverIdentity), nil)
 	vmmdProbe.SetReadyObserver(func(ready bool, reason string) {
 		ops.MarkReady("vmmd", ready, reason)
 	})
@@ -1452,9 +1451,9 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		if deps.startCapacityPublish != nil {
 			deps.startCapacityPublish(ctx, mgr, nodeID, cfg.ComputeNode, deps.scheddTarget, deps.scheddClientTLS, interval, resident, nodeKey, nodeKeyID, log)
 		} else {
-			stats := telemetryReader(func(statsCtx context.Context) (*vmmdpb.StatsResponse, error) {
+			stats := capacityTelemetryGuard(mgr, nodeID, telemetryReader(func(statsCtx context.Context) (*vmmdpb.StatsResponse, error) {
 				return impl.Stats(statsCtx, &vmmdpb.StatsRequest{})
-			})
+			}), ops, log)
 			go runCapacityPublish(ctx, mgr, nodeID, cfg.ComputeNode, deps.scheddTarget, deps.scheddClientTLS, interval, resident, nodeKey, nodeKeyID, log, stats)
 		}
 		log.Info("vmmd: capacity publisher wired", "node_id", nodeID, "target", deps.scheddTarget, "interval", interval.String())

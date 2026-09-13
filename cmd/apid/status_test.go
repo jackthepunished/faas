@@ -17,10 +17,10 @@ import (
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
-// TestStatusHistoryRollup seeds 90 days of terminal invocation rows and
-// verifies that the public status projection keeps exactly the last 30 days,
-// calculates weighted uptime, and includes the operator incident timeline
-// (issue #276 / spec §12).
+// TestStatusHistoryRollup seeds 90 days of platform observation rows and
+// verifies that the legacy projection keeps exactly the last 30 days,
+// calculates time-weighted uptime, ignores customer outcomes, and includes
+// the operator incident timeline.
 func TestStatusHistoryRollup(t *testing.T) {
 	store := state.NewMemStore()
 	ctx := context.Background()
@@ -40,19 +40,27 @@ func TestStatusHistoryRollup(t *testing.T) {
 
 	now := time.Now().UTC()
 	for daysAgo := 0; daysAgo < 90; daysAgo++ {
-		createdAt := now.AddDate(0, 0, -daysAgo)
+		observedAt := utcDay(now.AddDate(0, 0, -daysAgo)).Add(time.Hour)
 		for i := 0; i < 3; i++ {
-			stateValue := state.InvocationCompleted
+			stateValue := publicstatus.StateOperational
 			if daysAgo >= statusHistoryDays || i == 2 {
-				stateValue = state.InvocationFailed
+				stateValue = publicstatus.StatePartialOutage
 			}
-			if _, err := store.EnqueueInvocation(ctx, state.Invocation{
-				AppID: app.ID, AccountID: account.ID, Source: state.InvocationAsyncInvoke,
-				State: stateValue, CreatedAt: createdAt, DueAt: createdAt,
-			}); err != nil {
-				t.Fatalf("EnqueueInvocation day %d row %d: %v", daysAgo, i, err)
+			for _, component := range publicstatus.AllComponents() {
+				if err := store.RecordStatusBucket(ctx, state.StatusBucket{
+					Component: component, BucketAt: observedAt.Add(time.Duration(i) * 5 * time.Minute),
+					State: stateValue, HasTelemetry: true,
+				}); err != nil {
+					t.Fatalf("RecordStatusBucket day %d interval %d component %s: %v", daysAgo, i, component, err)
+				}
 			}
 		}
+	}
+	if _, err := store.EnqueueInvocation(ctx, state.Invocation{
+		AppID: app.ID, AccountID: account.ID, Source: state.InvocationAsyncInvoke,
+		State: state.InvocationFailed, CreatedAt: now, DueAt: now,
+	}); err != nil {
+		t.Fatalf("EnqueueInvocation customer failure: %v", err)
 	}
 	if _, err := store.InsertStatusIncident(ctx, state.StatusIncidentComponentApid,
 		state.StatusIncidentSeverityDegraded, "API latency elevated"); err != nil {
@@ -117,7 +125,7 @@ func TestStatusJSONHandlerIdleHistogramEmitsJSON(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		query := r.URL.Query().Get("query")
 		switch {
-		case strings.Contains(query, "gateway_wake_latency_seconds_bucket"):
+		case strings.Contains(query, "gateway_platform_wake_latency_seconds_bucket"):
 			_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"value":[0,"NaN"]}]}}`))
 		case strings.Contains(query, "builderd_ops_total"):
 			// Prometheus evaluates the query's idle fallback, vector(100).
@@ -165,7 +173,7 @@ func TestStatusQueriesDefineIdleValues(t *testing.T) {
 			name:     "wake p95",
 			query:    statusWakeP95Query,
 			fallback: "",
-			guard:    "sum(rate(gateway_wake_latency_seconds_count[5m])) > 0",
+			guard:    "sum(increase(gateway_platform_wake_latency_seconds_count[15m])) >= 20",
 		},
 		{
 			name:     "build success",
@@ -173,6 +181,12 @@ func TestStatusQueriesDefineIdleValues(t *testing.T) {
 			fallback: "or vector(100)",
 			guard:    "sum(rate(builderd_ops_total{op=\"build\",code!=\"user_error\"}[5m])) > 0",
 		},
+	}
+	if strings.Contains(statusWakeP95Query, "gateway_wake_latency_seconds") {
+		t.Fatalf("platform 350ms status gate reads legacy end-to-end histogram: %q", statusWakeP95Query)
+	}
+	if !strings.Contains(statusWakeP95Query, "gateway_platform_wake_latency_seconds_bucket[15m]") {
+		t.Fatalf("wake status query is not aligned with the platform SLO window: %q", statusWakeP95Query)
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -200,10 +214,63 @@ func TestStatusQueriesDefineIdleValues(t *testing.T) {
 	}
 }
 
+func TestStatusCacheEmptyWakeVectorIsFreshNoSample(t *testing.T) {
+	var logs strings.Builder
+	prom := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query().Get("query")
+		if strings.Contains(query, "gateway_platform_wake_latency_seconds_bucket") || strings.Contains(query, "ALERTS") {
+			_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[]}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"value":[0,"100"]}]}}`))
+	}))
+	t.Cleanup(prom.Close)
+
+	c := newStatusCache(prom.URL, slog.New(slog.NewTextHandler(&logs, nil)))
+	evaluation, err := c.getEvaluation(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if evaluation.dataStatus != "fresh" || !evaluation.indicatorAvailable["wake_p95"] || evaluation.legacy.WakeP95MS != nil {
+		t.Fatalf("evaluation = %+v, want fresh available wake telemetry with no sample", evaluation)
+	}
+	if strings.Contains(logs.String(), "level=WARN") {
+		t.Fatalf("quiet wake window emitted warning: %s", logs.String())
+	}
+	indicator := statusIndicator("wake_p95", "Platform wake p95", nil, true, "ms", 350, "lte")
+	if indicator.SampleStatus != "no_sample" || indicator.Value != nil {
+		t.Fatalf("indicator = %+v, want explicit no_sample", indicator)
+	}
+}
+
+func TestStatusCacheWakeQueryFailureIsUnavailableAndStale(t *testing.T) {
+	prom := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query().Get("query")
+		if strings.Contains(query, "gateway_platform_wake_latency_seconds_bucket") {
+			http.Error(w, "prometheus unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if strings.Contains(query, "ALERTS") {
+			_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[]}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"value":[0,"100"]}]}}`))
+	}))
+	t.Cleanup(prom.Close)
+
+	evaluation, err := newStatusCache(prom.URL, slog.Default()).getEvaluation(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if evaluation.dataStatus != "stale" || evaluation.indicatorAvailable["wake_p95"] {
+		t.Fatalf("evaluation = %+v, want stale unavailable wake telemetry", evaluation)
+	}
+}
+
 func TestStatusHistoryNoTrafficRemainsUnknown(t *testing.T) {
 	store := state.NewMemStore()
 	prom := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.Query().Get("query"), "gateway_wake_latency_seconds_bucket") {
+		if strings.Contains(r.URL.Query().Get("query"), "gateway_platform_wake_latency_seconds_bucket") {
 			_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[]}}`))
 			return
 		}

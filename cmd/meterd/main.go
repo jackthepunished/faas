@@ -26,12 +26,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"filippo.io/age"
@@ -39,6 +41,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	egresspb "github.com/onebox-faas/faas/api/proto/onebox/faas/egress/v1"
 	"github.com/onebox-faas/faas/pkg/alerts"
@@ -294,7 +297,9 @@ type gatewayEgressAdapter struct {
 	// single-box default-local path; mTLS-wrapped remote
 	// gatewayd-internal deployments pass the loaded *tls.Config here
 	// (ADR-052).
-	dialFn func(ctx context.Context, socketPath string, tlsCfg *tls.Config) (egresspb.EgressTxServiceClient, error)
+	dialFn       func(ctx context.Context, socketPath string, tlsCfg *tls.Config) (egresspb.EgressTxServiceClient, error)
+	persistFrame func(context.Context, *egresspb.BytesFrame) error
+	connected    atomic.Bool
 }
 
 // EgressBytes returns the latest drained (instanceID,
@@ -420,6 +425,9 @@ func (a *gatewayEgressAdapter) startStream(ctx context.Context, socketPath strin
 // server-streaming RPC, fold every frame into the snapshot,
 // return when the upstream closes or the ctx cancels.
 func (a *gatewayEgressAdapter) consumeStream(ctx context.Context, client egresspb.EgressTxServiceClient, log *slog.Logger) bool {
+	if closer, ok := client.(interface{ Close() error }); ok {
+		defer func() { _ = closer.Close() }()
+	}
 	stream, err := client.StreamBytes(ctx, &egresspb.StreamBytesRequest{})
 	if err != nil {
 		if log != nil {
@@ -427,6 +435,8 @@ func (a *gatewayEgressAdapter) consumeStream(ctx context.Context, client egressp
 		}
 		return false
 	}
+	a.connected.Store(true)
+	defer a.connected.Store(false)
 	for {
 		frame, err := stream.Recv()
 		if err != nil {
@@ -434,6 +444,34 @@ func (a *gatewayEgressAdapter) consumeStream(ctx context.Context, client egressp
 				log.Debug("gatewayEgressAdapter: stream recv ended", "err", err)
 			}
 			return true
+		}
+		if frame.GetEventId() != "" && a.persistFrame != nil {
+			if frame.GetInstanceId() == "" || frame.GetMinute() == nil {
+				if log != nil {
+					log.Error("gatewayEgressAdapter: invalid replay frame", "event_id", frame.GetEventId())
+				}
+				return true
+			}
+			if frame.GetBytes() > math.MaxInt64 || frame.GetRequests() > math.MaxInt32 || frame.GetColdBoots() > math.MaxInt32 {
+				if log != nil {
+					log.Error("gatewayEgressAdapter: replay frame counters overflow", "event_id", frame.GetEventId())
+				}
+				return true
+			}
+			if err := a.persistFrame(ctx, frame); err != nil {
+				if log != nil {
+					log.Warn("gatewayEgressAdapter: persist replay frame failed", "event_id", frame.GetEventId(), "err", err)
+				}
+				return true
+			}
+			ack, err := client.AckBytes(ctx, &egresspb.AckBytesRequest{EventIds: []string{frame.GetEventId()}})
+			if err != nil || ack.GetAcknowledged() != 1 {
+				if log != nil {
+					log.Debug("gatewayEgressAdapter: frame ack failed; reconnecting for replay", "event_id", frame.GetEventId(), "acknowledged", ack.GetAcknowledged(), "err", err)
+				}
+				return true
+			}
+			continue
 		}
 		a.recordFrame(frame)
 	}
@@ -496,7 +534,7 @@ func dialGatewayEgressStream(ctx context.Context, target string, tlsCfg *tls.Con
 	if err != nil {
 		return nil, fmt.Errorf("meterd: dial gatewayd-internal egress %s: %w", target, err)
 	}
-	return egresspb.NewEgressTxServiceClient(conn), nil
+	return &closableGatewayEgressClient{EgressTxServiceClient: egresspb.NewEgressTxServiceClient(conn), close: conn.Close}, nil
 }
 
 // egressAggregator combines scheddEgressAdapter (net_tx_bytes)
@@ -508,7 +546,9 @@ func dialGatewayEgressStream(ctx context.Context, target string, tlsCfg *tls.Con
 // didn't report.
 type egressAggregator struct {
 	schedd *scheddEgressAdapter
-	gw     *gatewayEgressAdapter
+	gw     interface {
+		ReadUsageDeltas(string) (meter.UsageDeltas, bool)
+	}
 }
 
 func (a *egressAggregator) ReadUsageDeltas(instanceID string) (meter.UsageDeltas, bool) {
@@ -690,6 +730,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		return err
 	}
 	ops := wire.NewOpsMetrics("meterd")
+	requestTelemetryPartitions := newRequestTelemetryPartitionMetrics(ops.Registry(), deps.now)
 	traceShutdown, traceErr := trace.InitTracerWithRegistry(ctx, "meterd", wire.Version, log, ops.Registry(), ops.MetricPrefix())
 	if traceErr != nil {
 		return fmt.Errorf("meterd: init tracing: %w", traceErr)
@@ -765,6 +806,10 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	if scheddAddr == "" {
 		return fmt.Errorf("meterd: FAAS_SCHEDD_ADDR (or socket_path in meterd.toml) is required")
 	}
+	scheddTLS, err := cfg.LoadScheddTLS()
+	if err != nil {
+		return fmt.Errorf("meterd: load schedd TLS: %w", err)
+	}
 	parker := deps.parker
 	if parker == nil {
 		if deps.dialSchedd == nil {
@@ -774,10 +819,6 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// Single-box deployments keep all three paths empty and
 		// LoadScheddTLS returns (nil, nil); multi-box deployments
 		// pass tcp:// or dns:// + a TLS cluster.
-		scheddTLS, err := cfg.LoadScheddTLS()
-		if err != nil {
-			return fmt.Errorf("meterd: load schedd TLS: %w", err)
-		}
 		c, err := deps.dialSchedd(ctx, scheddAddr, scheddTLS)
 		if err != nil {
 			return fmt.Errorf("meterd: dial schedd %q: %w", scheddAddr, err)
@@ -978,7 +1019,25 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// box (ADR-015) and refreshes the snapshot at most once per 30 s
 	// — bounded staleness without forcing a gRPC round trip per
 	// instance.
-	cpu := &scheddCPUAdapter{parker: parker, now: deps.now}
+	statsMetrics := newFleetStatsMetrics()
+	statsParker := parker
+	if cfg.Role == role.RoleControlPlane {
+		fleetDial := deps.dialSchedd
+		if fleetDial == nil {
+			fleetDial = defaultDeps().dialSchedd
+		}
+		statsParker = &fleetStatsParker{
+			nodes:     store,
+			fallback:  parker,
+			dial:      fleetDial,
+			tlsCfg:    scheddTLS,
+			now:       deps.now,
+			log:       log,
+			metrics:   statsMetrics,
+			snapshots: make(map[string][]scheddgrpc.InstanceStatsRow),
+		}
+	}
+	cpu := &scheddCPUAdapter{parker: statsParker, now: deps.now}
 	// ADR-046 (PR-1 + PR-2): wire the egress adapters so the
 	// sampler can append tx_bytes + net_tx_bytes to
 	// usage_minutes. PR-1 leaves the gateway adapter as a
@@ -1003,12 +1062,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	if err != nil {
 		return fmt.Errorf("meterd: load egress TLS: %w", err)
 	}
-	gwEgress := &gatewayEgressAdapter{
-		now:    deps.now,
-		tlsCfg: gwEgressTLS,
-		data:   make(map[string]map[int64]gatewayUsageBucket),
-		dialFn: dialGatewayEgressStream,
-	}
+	egressMetrics := newFleetEgressMetrics()
 	// PR-2: kick off the gateway stream consumer. The unix-socket
 	// path is resolved by egresssocket.ResolveFromOS, which prefers
 	// FAAS_EGRESS_SOCKET (added in PR-C+D), then the legacy
@@ -1028,8 +1082,27 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		}
 		return ""
 	}
-	gwSocketPath := egresssocket.ResolveFromOS(envOr, cfg.EgressSocket, cfg.GatewayEgressSocket)
-	gwEgress.startStream(ctx, gwSocketPath, log)
+	var gwEgress interface {
+		ReadUsageDeltas(string) (meter.UsageDeltas, bool)
+	}
+	if cfg.Role == role.RoleControlPlane {
+		fleetEgress := &fleetGatewayEgressAdapter{
+			nodes: store, store: store, tlsCfg: gwEgressTLS, dialFn: dialGatewayEgressStream,
+			now: deps.now, log: log, metrics: egressMetrics,
+			active: make(map[string]*fleetEgressEntry),
+		}
+		gwEgress = fleetEgress
+		go fleetEgress.Run(ctx)
+	} else {
+		localEgress := &gatewayEgressAdapter{
+			now: deps.now, tlsCfg: gwEgressTLS,
+			data:   make(map[string]map[int64]gatewayUsageBucket),
+			dialFn: dialGatewayEgressStream,
+		}
+		gwSocketPath := egresssocket.ResolveFromOS(envOr, cfg.EgressSocket, cfg.GatewayEgressSocket)
+		localEgress.startStream(ctx, gwSocketPath, log)
+		gwEgress = localEgress
+	}
 	egress := &egressAggregator{schedd: scheddEgress, gw: gwEgress}
 	// Issue #396 / ADR-045 PR 4: instantiate the alert evaluator and
 	// hand it to the loop. The evaluator is nil-coerced below when
@@ -1126,11 +1199,11 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// ADR-049 §B.3: snapshot/app-layer storage rollup. The store
 	// interface (pkg/meter/storage.go) is a narrow projection over
 	// state.Store so pkg/meter doesn't import the whole surface.
-	// layerFn is nil this PR — overlay staging byte accounting
-	// lands in a follow-up (ADR-049 §B.3 follow-up bullet); the
-	// rollup still emits snapshot_bytes daily.
+	// The layer collector reads every retained rootfs and sidecar artifact for
+	// the app. Superseded rollback targets remain counted until their deployment
+	// is cleared; storage keys are deduplicated in the state query.
 	storageStore := storageStoreAdapter{s: store}
-	go meter.StorageRollupLoop(ctx, storageStore, nil, mc.StorageRollupInterval, log)
+	go meter.StorageRollupLoop(ctx, storageStore, storageStore.RetainedLayerBytes, mc.StorageRollupInterval, log)
 
 	// ADR-049 §B.4: 13-month retention DELETE cron. The pool
 	// satisfies the retentionExecer contract.
@@ -1141,7 +1214,9 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// sweep because Hobby's retention cap is 3 days — a daily
 	// sweep would let the table accumulate several extra days
 	// of rows between ticks.
-	go meter.RetentionLoopRequestTelemetry(ctx, poolAdapter{pool}, meter.RequestTelemetryRetentionInterval, log)
+	partitionDB := poolAdapter{pool}
+	go meter.RequestTelemetryPartitionLoop(ctx, partitionDB, meter.RequestTelemetryPartitionInterval, log, requestTelemetryPartitions.observe)
+	go meter.RetentionLoopRequestTelemetry(ctx, partitionDB, meter.RequestTelemetryRetentionInterval, log)
 
 	// SAFE-RELEASES production-leveling Stream D (issue #976 /
 	// ADR-122 post-merge audit): deployment_audit GC cron.
@@ -1236,7 +1311,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// handler is mounted. Both wire + reconciler registries are
 		// isolated so pkg/billing/reconciler stays free of an import
 		// on pkg/wire. ADR-049 §B.1.
-		gatherers := prometheus.Gatherers{ops.Registry(), recRegistry, jobMetrics.Registry(), prometheus.DefaultGatherer}
+		gatherers := prometheus.Gatherers{ops.Registry(), recRegistry, jobMetrics.Registry(), statsMetrics.registry, egressMetrics.registry, prometheus.DefaultGatherer}
 		mux.Handle(metricsPath, promhttp.HandlerFor(gatherers, promhttp.HandlerOpts{}))
 		// /healthz — 200 when every tracked timer (sample / quota /
 		// stripe / dunning) has fired within
@@ -1392,7 +1467,7 @@ func buildAlertEvaluator(deps runDeps, store state.Store, log *slog.Logger, ops 
 		// (with a Warn) if LoadHostKeys fails — the box is
 		// still unsealing current-keyed envelopes, just not
 		// previous-keyed ones.
-		if identities, loadErr := secretbox.LoadHostKeys(filepath.Dir(identityPath)); loadErr != nil {
+		if identities, loadErr := secretbox.LoadFleetAndHostKeys(filepath.Dir(identityPath)); loadErr != nil {
 			log.Warn("meterd: LoadHostKeys (rotation overlap) failed; alert dispatch will unseal only envelopes sealed under the current host.age",
 				"dir", filepath.Dir(identityPath), "err", loadErr.Error())
 		} else {
@@ -1617,6 +1692,10 @@ func (a poolAdapter) Exec(ctx context.Context, sql string, args ...any) (int64, 
 	return tag.RowsAffected(), nil
 }
 
+func (a poolAdapter) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	return a.p.QueryRow(ctx, sql, args...)
+}
+
 // storageStoreAdapter narrows state.Store to the meter.Store
 // projection pkg/meter/storage.go needs. Defined here so pkg/meter
 // doesn't import the entire state.Store surface just for the
@@ -1640,6 +1719,10 @@ func (a storageStoreAdapter) ListAllApps(ctx context.Context) ([]meter.AppRow, e
 
 func (a storageStoreAdapter) LatestSnapshotBytes(ctx context.Context, appID string) (int64, int64, error) {
 	return a.s.LatestSnapshotBytes(ctx, appID)
+}
+
+func (a storageStoreAdapter) RetainedLayerBytes(ctx context.Context, appID string) (int64, error) {
+	return a.s.RetainedLayerBytes(ctx, appID)
 }
 
 func (a storageStoreAdapter) AppendSnapshotStorage(ctx context.Context, accountID, appID string, day time.Time, snapshotBytes, layerBytes int64) error {

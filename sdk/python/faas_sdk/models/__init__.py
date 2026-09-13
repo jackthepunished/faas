@@ -114,6 +114,7 @@ from .app_open_api_import_response_openapi_version import AppOpenAPIImportRespon
 from .app_open_api_import_response_source import AppOpenAPIImportResponseSource
 from .app_open_api_policy_apply_response import AppOpenAPIPolicyApplyResponse
 from .app_open_api_policy_preview_response import AppOpenAPIPolicyPreviewResponse
+from .app_open_api_policy_preview_response_observed_source import AppOpenAPIPolicyPreviewResponseObservedSource
 from .app_open_api_policy_preview_route import AppOpenAPIPolicyPreviewRoute
 from .app_open_api_policy_preview_route_method import AppOpenAPIPolicyPreviewRouteMethod
 from .app_open_api_policy_preview_route_status import AppOpenAPIPolicyPreviewRouteStatus
@@ -389,13 +390,6 @@ from .deployment_response_deployed_via_type_1 import DeploymentResponseDeployedV
 from .deployment_response_deployed_via_type_2_type_1 import DeploymentResponseDeployedViaType2Type1
 from .deployment_response_deployed_via_type_3_type_1 import DeploymentResponseDeployedViaType3Type1
 from .deployment_response_hosting_receipt_type_0 import DeploymentResponseHostingReceiptType0
-from .deployment_response_last_auto_rollback_reason_type_1 import DeploymentResponseLastAutoRollbackReasonType1
-from .deployment_response_last_auto_rollback_reason_type_2_type_1 import (
-    DeploymentResponseLastAutoRollbackReasonType2Type1,
-)
-from .deployment_response_last_auto_rollback_reason_type_3_type_1 import (
-    DeploymentResponseLastAutoRollbackReasonType3Type1,
-)
 from .deployment_response_override_env_secret_refs import DeploymentResponseOverrideEnvSecretRefs
 from .deployment_response_parked_reason_type_1 import DeploymentResponseParkedReasonType1
 from .deployment_response_parked_reason_type_2_type_1 import DeploymentResponseParkedReasonType2Type1
@@ -1178,6 +1172,7 @@ __all__ = (
     "AppOpenAPIImportResponseSource",
     "AppOpenAPIPolicyApplyResponse",
     "AppOpenAPIPolicyPreviewResponse",
+    "AppOpenAPIPolicyPreviewResponseObservedSource",
     "AppOpenAPIPolicyPreviewRoute",
     "AppOpenAPIPolicyPreviewRouteMethod",
     "AppOpenAPIPolicyPreviewRouteStatus",
@@ -1442,9 +1437,6 @@ __all__ = (
     "DeploymentResponseDeployedViaType2Type1",
     "DeploymentResponseDeployedViaType3Type1",
     "DeploymentResponseHostingReceiptType0",
-    "DeploymentResponseLastAutoRollbackReasonType1",
-    "DeploymentResponseLastAutoRollbackReasonType2Type1",
-    "DeploymentResponseLastAutoRollbackReasonType3Type1",
     "DeploymentResponseOverrideEnvSecretRefs",
     "DeploymentResponseParkedReasonType1",
     "DeploymentResponseParkedReasonType2Type1",

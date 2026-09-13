@@ -1464,6 +1464,7 @@ CREATE TABLE public.apps (
     declared_routes jsonb DEFAULT '[]'::jsonb NOT NULL,
     deleted_at timestamp with time zone,
     delete_grace_until timestamp with time zone,
+    purge_claimed_at timestamp with time zone,
     CONSTRAINT apps_app_protocol_chk CHECK ((app_protocol = ANY (ARRAY['http1'::text, 'http2'::text, 'grpc'::text]))),
     CONSTRAINT apps_autoscale_target_cpu_pct_range CHECK (((autoscale_target_cpu_pct IS NULL) OR ((autoscale_target_cpu_pct >= 0) AND (autoscale_target_cpu_pct <= 100)))),
     CONSTRAINT apps_autoscale_target_rps_nonneg CHECK (((autoscale_target_rps IS NULL) OR (autoscale_target_rps >= 0))),
@@ -1701,6 +1702,27 @@ CREATE TABLE public.cluster_signing_keys (
 
 
 --
+-- Name: compute_node_heartbeat_hourly; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.compute_node_heartbeat_hourly (
+    node_id uuid NOT NULL,
+    bucket_at timestamp with time zone NOT NULL,
+    sample_count bigint NOT NULL,
+    cpu_sample_count bigint DEFAULT 0 NOT NULL,
+    cpu_pct_sum double precision DEFAULT 0 NOT NULL,
+    disk_used_max_bytes bigint,
+    first_received_at timestamp with time zone NOT NULL,
+    last_received_at timestamp with time zone NOT NULL,
+    last_heartbeat_at timestamp with time zone NOT NULL,
+    CONSTRAINT compute_node_heartbeat_hourly_bucket_at_check CHECK ((bucket_at = (date_trunc('hour'::text, (bucket_at AT TIME ZONE 'UTC'::text)) AT TIME ZONE 'UTC'::text))),
+    CONSTRAINT compute_node_heartbeat_hourly_cpu_sample_count_check CHECK ((cpu_sample_count >= 0)),
+    CONSTRAINT compute_node_heartbeat_hourly_first_received_at_check CHECK ((first_received_at <= last_received_at)),
+    CONSTRAINT compute_node_heartbeat_hourly_sample_count_check CHECK ((sample_count > 0))
+);
+
+
+--
 -- Name: compute_node_heartbeats; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1744,8 +1766,12 @@ CREATE TABLE public.compute_node_keys (
     key_id text NOT NULL,
     public_key_pem text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    key_state text DEFAULT 'current'::text NOT NULL,
+    valid_until timestamp with time zone,
+    revoked_at timestamp with time zone,
     CONSTRAINT compute_node_keys_key_id_shape CHECK ((key_id ~ '^[a-f0-9]{64}$'::text)),
-    CONSTRAINT compute_node_keys_pem_shape CHECK ((public_key_pem ~~ '-----BEGIN PUBLIC KEY-----%'::text))
+    CONSTRAINT compute_node_keys_pem_shape CHECK ((public_key_pem ~~ '-----BEGIN PUBLIC KEY-----%'::text)),
+    CONSTRAINT compute_node_keys_state_check CHECK ((((key_state = 'current'::text) AND (valid_until IS NULL) AND (revoked_at IS NULL)) OR ((key_state = 'overlap'::text) AND (valid_until IS NOT NULL) AND (revoked_at IS NULL)) OR ((key_state = 'revoked'::text) AND (revoked_at IS NOT NULL))))
 );
 
 
@@ -2888,6 +2914,18 @@ CREATE TABLE public.meter_network_checkpoints (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT meter_network_checkpoints_net_rx_bytes_check CHECK ((net_rx_bytes >= 0)),
     CONSTRAINT meter_network_checkpoints_net_tx_bytes_check CHECK ((net_tx_bytes >= 0))
+);
+
+--
+-- Name: meter_gateway_usage_events; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.meter_gateway_usage_events (
+    node_id uuid NOT NULL,
+    event_id uuid NOT NULL,
+    instance_id uuid NOT NULL,
+    minute timestamp with time zone NOT NULL,
+    recorded_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
 
@@ -4356,6 +4394,14 @@ ALTER TABLE ONLY public.cluster_signing_keys
 
 
 --
+-- Name: compute_node_heartbeat_hourly compute_node_heartbeat_hourly_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.compute_node_heartbeat_hourly
+    ADD CONSTRAINT compute_node_heartbeat_hourly_pkey PRIMARY KEY (node_id, bucket_at);
+
+
+--
 -- Name: compute_node_heartbeats compute_node_heartbeats_node_at_uniq; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -4649,6 +4695,16 @@ ALTER TABLE ONLY public.instance_billing_intervals
 
 ALTER TABLE ONLY public.instances
     ADD CONSTRAINT instances_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: meter_gateway_usage_events meter_gateway_usage_events_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.meter_gateway_usage_events
+    ADD CONSTRAINT meter_gateway_usage_events_pkey PRIMARY KEY (node_id, event_id);
+
+CREATE INDEX meter_gateway_usage_events_recorded_at_idx ON public.meter_gateway_usage_events USING btree (recorded_at);
 
 
 --
@@ -5704,6 +5760,13 @@ CREATE INDEX cli_auth_codes_pending_idx ON public.cli_auth_codes USING btree (st
 
 
 --
+-- Name: compute_node_heartbeat_hourly_bucket_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX compute_node_heartbeat_hourly_bucket_idx ON public.compute_node_heartbeat_hourly USING btree (bucket_at DESC);
+
+
+--
 -- Name: compute_node_heartbeats_node_at_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -5711,10 +5774,31 @@ CREATE INDEX compute_node_heartbeats_node_at_idx ON public.compute_node_heartbea
 
 
 --
+-- Name: compute_node_heartbeats_received_at_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX compute_node_heartbeats_received_at_idx ON public.compute_node_heartbeats USING btree (received_at, id);
+
+
+--
 -- Name: compute_node_keys_node_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX compute_node_keys_node_idx ON public.compute_node_keys USING btree (compute_node_id);
+
+
+--
+-- Name: compute_node_keys_one_current_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX compute_node_keys_one_current_idx ON public.compute_node_keys USING btree (compute_node_id) WHERE (key_state = 'current'::text);
+
+
+--
+-- Name: compute_node_keys_usable_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX compute_node_keys_usable_idx ON public.compute_node_keys USING btree (compute_node_id, key_id, valid_until) WHERE ((key_state = ANY (ARRAY['current'::text, 'overlap'::text])) AND (revoked_at IS NULL));
 
 
 --
@@ -7876,6 +7960,14 @@ ALTER TABLE ONLY public.builds
 
 ALTER TABLE ONLY public.cli_auth_codes
     ADD CONSTRAINT cli_auth_codes_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: compute_node_heartbeat_hourly compute_node_heartbeat_hourly_node_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.compute_node_heartbeat_hourly
+    ADD CONSTRAINT compute_node_heartbeat_hourly_node_id_fkey FOREIGN KEY (node_id) REFERENCES public.compute_nodes(id) ON DELETE CASCADE;
 
 
 --

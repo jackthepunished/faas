@@ -1933,6 +1933,13 @@ func (s *server) parkApp(w http.ResponseWriter, r *http.Request, acct state.Acco
 	}); err != nil {
 		s.log.WarnContext(r.Context(), "enqueue app.parked webhook", slog.String("app", app.ID), slog.String("err", err.Error()))
 	}
+	if app.Status != state.AppEvictedCold {
+		s.audit.Emit(r.Context(), "app.parked", &acct.ID, map[string]any{
+			"app_id": app.ID,
+			"slug":   app.Slug,
+			"status": st,
+		})
+	}
 	s.log.Info("app parked", "app", app.ID, "account", acct.ID)
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -1963,6 +1970,13 @@ func (s *server) wakeApp(w http.ResponseWriter, r *http.Request, acct state.Acco
 		"app_id": app.ID, "slug": app.Slug, "status": st, "occurred_at": time.Now().UTC(),
 	}); err != nil {
 		s.log.WarnContext(r.Context(), "enqueue app.woken webhook", slog.String("app", app.ID), slog.String("err", err.Error()))
+	}
+	if app.Status != state.AppActive {
+		s.audit.Emit(r.Context(), "app.woken", &acct.ID, map[string]any{
+			"app_id": app.ID,
+			"slug":   app.Slug,
+			"status": st,
+		})
 	}
 	s.log.Info("app woken", "app", app.ID, "account", acct.ID)
 	w.WriteHeader(http.StatusNoContent)
@@ -2001,6 +2015,11 @@ func (s *server) restartApp(w http.ResponseWriter, r *http.Request, acct state.A
 		// preserve the accepted response and log the transient failure.
 		s.log.Warn("app restart: notify schedd failed", "app", app.ID, "err", err)
 	}
+	s.audit.Emit(r.Context(), "app.restart_requested", &acct.ID, map[string]any{
+		"app_id":  app.ID,
+		"slug":    app.Slug,
+		"wake_id": wakeID,
+	})
 	s.log.Info("app restart requested", "app", app.ID, "account", acct.ID, "wake_id", wakeID)
 	writeJSON(w, http.StatusAccepted, api.AppRestartResponse{WakeID: wakeID})
 }
@@ -2095,7 +2114,7 @@ func (s *server) listInstances(w http.ResponseWriter, r *http.Request, acct stat
 	var err error
 	if r.URL.Query().Get("history") == "true" {
 		// History is explicit and still bounded for old, frequently-woken apps.
-		instances, err = s.store.ListLatestInstancesForApp(r.Context(), app.ID, 100)
+		instances, err = s.store.ListLatestInstancesForApp(r.Context(), app.ID, api.DefaultInstanceHistoryLimit)
 	} else if activeStore, ok := s.store.(interface {
 		ListActiveInstancesForApp(context.Context, string, int) ([]state.Instance, error)
 	}); ok {
@@ -2169,8 +2188,21 @@ func (s *server) createDomain(w http.ResponseWriter, r *http.Request, acct state
 		}
 	}
 	token := randomToken(16)
-	d, err := s.store.CreateCustomDomain(r.Context(), domain, app.ID, token)
+	perApp, perAccount, _ := api.CustomDomainLimitsFor(acct.Plan)
+	type quotaCreator interface {
+		CreateCustomDomainIfUnderQuota(context.Context, string, string, string, int, int) (state.CustomDomain, error)
+	}
+	creator, ok := s.store.(quotaCreator)
+	if !ok {
+		api.WriteProblem(w, api.ErrCapacity("domain quota enforcement unavailable"))
+		return
+	}
+	d, err := creator.CreateCustomDomainIfUnderQuota(r.Context(), domain, app.ID, token, perApp, perAccount)
 	if err != nil {
+		if errors.Is(err, state.ErrCustomDomainQuotaExceeded) {
+			api.WriteProblem(w, api.NewProblem(http.StatusTooManyRequests, api.CodeQuotaExhausted, "Custom domain quota reached", err.Error()))
+			return
+		}
 		api.WriteProblem(w, api.NewProblem(http.StatusConflict, api.CodeValidation,
 			"Domain taken", err.Error()))
 		return
@@ -2191,6 +2223,31 @@ func (s *server) createDomain(w http.ResponseWriter, r *http.Request, acct state
 		"domain": d.Domain,
 	})
 	writeJSON(w, http.StatusAccepted, domainResponse(d))
+}
+
+func (s *server) retryDomainVerification(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	domain := strings.ToLower(strings.TrimSpace(r.PathValue("domain")))
+	d, err := s.store.DomainByName(r.Context(), domain)
+	if err != nil {
+		s.notFound(w, "no such domain")
+		return
+	}
+	app, err := s.store.AppByID(r.Context(), d.AppID)
+	if err != nil || app.AccountID != acct.ID {
+		s.notFound(w, "no such domain")
+		return
+	}
+	type retrier interface {
+		RetryCustomDomainVerification(context.Context, string) error
+	}
+	if x, ok := s.store.(retrier); !ok {
+		api.WriteProblem(w, api.ErrCapacity("domain retry unavailable"))
+		return
+	} else if err := x.RetryCustomDomainVerification(r.Context(), domain); err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusConflict, api.CodeValidation, "Domain cannot be retried", err.Error()))
+		return
+	}
+	w.WriteHeader(http.StatusAccepted)
 }
 
 // wildcardTenantSurfaceOverlap checks the non-deleted tenant-surface hostname
@@ -2372,6 +2429,12 @@ func (s *server) domainResponseWithCert(ctx context.Context, d state.CustomDomai
 		return resp, nil
 	}
 	dialDomain, _ := state.WildcardProbeHost(d.Domain)
+	if points := checkPointsToGregale(ctx, dialDomain); points.Status == probeFail {
+		err := fmt.Errorf("%w: %w", errCertFailure, errCertRoutingMismatch)
+		resp.CertStatus = classifyCertError(err)
+		resp.CertLastError = errCertRoutingMismatch.Error()
+		return resp, err
+	}
 	cert, err := dialCert(ctx, dialDomain)
 	if err != nil {
 		resp.CertStatus = classifyCertError(err)
@@ -2397,6 +2460,12 @@ func classifyCertError(err error) string {
 	case errors.Is(err, errCDNCert):
 		return "dial_failed:cdn_cert"
 	case errors.Is(err, errCertFailure):
+		if errors.Is(err, errCertAddressBlocked) {
+			return "dial_failed:address_blocked"
+		}
+		if errors.Is(err, errCertRoutingMismatch) {
+			return "dial_failed:routing_mismatch"
+		}
 		return "dial_failed:" + dialFailureReason(err)
 	case errors.Is(err, context.DeadlineExceeded):
 		return "dial_failed:dial_timeout"
@@ -3152,7 +3221,7 @@ func (s *server) listKeys(w http.ResponseWriter, r *http.Request, acct state.Acc
 			CreatedAt: k.CreatedAt.UTC().Format(time.RFC3339),
 			Status:    k.Status,
 		}
-		if !k.LastUsedAt.IsZero() {
+		if k.LastUsedAt != nil {
 			resp.LastUsedAt = k.LastUsedAt.UTC().Format(time.RFC3339)
 		}
 		if k.ExpiresAt != nil {
@@ -4687,10 +4756,9 @@ func (s *server) buildProvenanceResponse(p state.BuildProvenance) api.BuildProve
 // rely on the omitempty tags on BuildResponse so the JSON stays
 // minimal.
 //
-// duration_seconds is server-computed: only set when BOTH
-// StartedAt and FinishedAt are non-zero — a CI script can always
-// rely on its presence meaning "the build reached a terminal
-// state and elapsed N wall-clock seconds."
+// duration_seconds is server-computed from StartedAt to either FinishedAt or
+// CancelledAt. A cancelled queued build exposes cancelled_at but omits the
+// duration because it never started.
 func (s *server) buildResponse(b state.Build) api.BuildResponse {
 	out := api.BuildResponse{
 		ID:           b.ID,
@@ -4702,17 +4770,19 @@ func (s *server) buildResponse(b state.Build) api.BuildResponse {
 	if b.FailureClass != "" {
 		out.FailureClass = string(b.FailureClass)
 	}
-	if b.LogPath != "" {
-		out.LogPath = b.LogPath
-	}
 	if !b.StartedAt.IsZero() {
 		out.StartedAt = b.StartedAt.UTC().Format(time.RFC3339)
 	}
 	if !b.FinishedAt.IsZero() {
 		out.FinishedAt = b.FinishedAt.UTC().Format(time.RFC3339)
 	}
-	if !b.StartedAt.IsZero() && !b.FinishedAt.IsZero() {
-		out.DurationSeconds = int(b.FinishedAt.Sub(b.StartedAt).Seconds())
+	terminalAt := b.FinishedAt
+	if b.CancelledAt != nil {
+		terminalAt = *b.CancelledAt
+		out.CancelledAt = b.CancelledAt.UTC().Format(time.RFC3339)
+	}
+	if !b.StartedAt.IsZero() && !terminalAt.IsZero() {
+		out.DurationSeconds = int(terminalAt.Sub(b.StartedAt).Seconds())
 	}
 	if b.CacheStatus != "" {
 		out.CacheStatus = b.CacheStatus
@@ -4985,12 +5055,12 @@ func (s *server) listBuilds(w http.ResponseWriter, r *http.Request, acct state.A
 	if statusFilter != "" {
 		switch statusFilter {
 		case api.BuildStatusQueued, api.BuildStatusRunning,
-			api.BuildStatusSucceeded, api.BuildStatusFailed:
+			api.BuildStatusSucceeded, api.BuildStatusFailed, api.BuildStatusCancelled:
 			// ok
 		default:
 			api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, api.CodeValidation,
 				"Bad status filter",
-				"expected one of queued|running|succeeded|failed"))
+				"expected one of queued|running|succeeded|failed|cancelled"))
 			return
 		}
 	}

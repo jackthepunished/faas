@@ -159,7 +159,6 @@ CreateProject
 CreateRuntimeConfigOperation
 CreateSession
 CreateSessionWithBinding
-CreateSnapshot
 CreateTenantHostnameIfUnderQuota
 CreateTenantSurfaceIfUnderQuota
 CreateTriggerIfUnderQuota
@@ -183,7 +182,6 @@ DeleteAppErrorRequestsOlderThan
 DeleteAppErrorsByIDs
 DeleteAppLogDrain
 DeleteAppOpenAPIDoc
-DeleteAppPermanently
 DeleteAppRegistryCredential
 DeleteAppSecret
 DeleteAppSecretInScope
@@ -326,7 +324,6 @@ LatestBuilderHeartbeatStats
 LatestDeployment
 LatestHeartbeatStats
 LatestParkedDeploymentForApp
-LatestSnapshot
 LatestSnapshotBytes
 LatestSnapshotForTier
 LatestSupersededDeployment
@@ -486,12 +483,10 @@ MarkComputeNodeInactive
 MarkCronFired
 MarkDeploymentCancelled
 MarkDeploymentStageFailed
-MarkDeploymentSuperseded
 MarkDomainVerified
 MarkDunningStep
 MarkFireNowRequestFailed
 MarkFireNowRequestSucceeded
-MarkInstanceMigrating
 MarkMFAEnrolled
 MarkOldSnapshotsStale
 MarkOperatorIntentFailed
@@ -593,7 +588,6 @@ ResealAppSecretWithKidAndValueHashInScope
 ResetAppWebhookDeliveryFromDead
 ResolveStatusIncident
 RestoreAccount
-RestoreApp
 RetireRuntimeSnapshot
 RetryDeploymentFromStage
 RetryQueueDeadLetter
@@ -610,7 +604,6 @@ RotateOrgAPIKeyWithProvenance
 RunningInstanceForApp
 SafedeployListPendingRollouts
 SafedeployStampRollout
-ScheduleAppDeletion
 ScheduleWorkflowRun
 SetAccountEgressAllowlistExtra
 SetAccountKeyGraceWindow
@@ -625,8 +618,6 @@ SetComputeNodeRole
 SetDeploymentFailed
 SetDeploymentFailedEx
 SetDeploymentParked
-SetDeploymentRootfs
-SetDeploymentSidecarLayer
 SetDeploymentSourceURL
 SetInstanceFrameworkReadyAt
 SetInstanceMode
@@ -677,9 +668,7 @@ UpdateCustomDomainCertStatus
 UpdateDeploymentMinInstances
 UpdateDeploymentTraffic
 UpdateEdgeRule
-UpdateInstanceStateIf
 UpdateInstanceStateToTerminal
-UpdateInstanceStateWithTimestamp
 UpdateMirrorRule
 UpdateOrgMemberRole
 UpdateOrgName

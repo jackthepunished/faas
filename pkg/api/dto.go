@@ -1780,11 +1780,10 @@ type BuildProvenanceResponse struct {
 // ADR-038 Phase 3): BuildResponse is the LIFECYCLE surface — status,
 // timestamps, failure_class, server-computed duration.
 //
-// Status mirrors builds.status, a 4-state enum (queued|running|
-// succeeded|failed) — schema.sql:662 CHECK constraint. 'cancelled'
-// from the original issue example is intentionally absent; the
-// schema doesn't support it and no transition code exists. Adding
-// it requires a separate migration + builderd path.
+// Status mirrors builds.status, a 5-state enum (queued|running|
+// succeeded|failed|cancelled). A queued cancellation has no started_at or
+// duration; a running cancellation has cancelled_at and a duration measured
+// from started_at.
 //
 // failure_class is empty unless status='failed'; the failure_class
 // CHECK constraint is oom|timeout|user_error|infra (schema.sql:660).
@@ -1811,6 +1810,7 @@ const (
 	BuildStatusRunning   = "running"
 	BuildStatusSucceeded = "succeeded"
 	BuildStatusFailed    = "failed"
+	BuildStatusCancelled = "cancelled"
 )
 
 type BuildResponse struct {
@@ -1818,12 +1818,12 @@ type BuildResponse struct {
 	DeploymentID    string `json:"deployment_id"`
 	Kind            string `json:"kind"` // railpack|dockerfile|tarball|github
 	SourceBytes     int64  `json:"source_bytes"`
-	Status          string `json:"status"` // queued|running|succeeded|failed
+	Status          string `json:"status"` // queued|running|succeeded|failed|cancelled
 	FailureClass    string `json:"failure_class,omitempty"`
-	LogPath         string `json:"log_path,omitempty"`
 	EnqueuedAt      string `json:"enqueued_at"`
 	StartedAt       string `json:"started_at,omitempty"`
 	FinishedAt      string `json:"finished_at,omitempty"`
+	CancelledAt     string `json:"cancelled_at,omitempty"`
 	DurationSeconds int    `json:"duration_seconds,omitempty"`
 	// CacheStatus and CacheKeySHA256 are populated once builderd makes a
 	// cache decision. The status is hit|miss|invalidated; the key is the
@@ -2130,25 +2130,6 @@ type DeploymentResponse struct {
 	Tag        string `json:"tag,omitempty"`
 	DeployedBy string `json:"deployed_by,omitempty"`
 	PRNumber   int    `json:"pr_number,omitempty"`
-	// Issue #961 leaf 8 / ADR-118 / Mega-C PR-2: per-deployment
-	// auto-rollback echo. rollback_on_5xx is always present on
-	// the wire (false for pre-PR-2 rows; the column has a NOT
-	// NULL DEFAULT false so pgx scans it cleanly into the bool).
-	// first_wake_at / first_5xx_window_ends_at / last_auto_rollback_at
-	// are nullable timestamps, stamped by schedd when the gateway
-	// emits the corresponding wake kind; omitempty keeps pre-PR-2
-	// rows byte-identical to the old wire shape. first_5xx_count
-	// is a non-nullable counter (default 0 in the schema). The
-	// closed-set vocabulary on last_auto_rollback_reason is enforced
-	// at the schema layer via deployments_last_auto_rollback_reason_check;
-	// the wire projection coalesces NULL → '' so pre-rollback rows
-	// omit the field.
-	RollbackOn5xx          bool       `json:"rollback_on_5xx"`
-	FirstWakeAt            *time.Time `json:"first_wake_at,omitempty"`
-	First5xxWindowEndsAt   *time.Time `json:"first_5xx_window_ends_at,omitempty"`
-	First5xxCount          int        `json:"first_5xx_count"`
-	LastAutoRollbackAt     *time.Time `json:"last_auto_rollback_at,omitempty"`
-	LastAutoRollbackReason string     `json:"last_auto_rollback_reason,omitempty"`
 	// Canary ladder echo (issue #976 / ADR-122 /
 	// SAFE-RELEASES-A). CanaryPreset is the catalog name; the
 	// handler resolves it via pkg/api/canary.LookupPreset so
@@ -3793,13 +3774,15 @@ type StatusPage struct {
 	// builderd builds (completed/success ÷ (completed/success +
 	// completed/failure)).
 	BuildSuccessPct float64 `json:"build_success_pct"`
-	// Uptime30dPct is the weighted success rate of terminal invocations
-	// observed over the last 30 calendar days. It is null when the period
-	// contains no terminal invocations.
+	// Uptime30dPct is the time-weighted availability of complete five-minute
+	// platform observations over the last 30 calendar days. Customer workload
+	// outcomes never contribute. It is null when the period has no complete
+	// platform telemetry.
 	Uptime30dPct *float64 `json:"uptime_30d_pct"`
 	// Uptime30d contains one bucket for each of the last 30 calendar
-	// days, oldest first. Successful and Total make the no-traffic case
-	// distinguishable from a day with observed failures.
+	// days, oldest first. Successful and Total count complete five-minute
+	// platform intervals, making missing telemetry distinguishable from an
+	// observed outage.
 	Uptime30d []StatusUptimeBucket `json:"uptime_30d"`
 	// Incidents contains status incidents posted in the last 30 days,
 	// plus any still-open incident posted earlier. Results are newest
@@ -3827,7 +3810,9 @@ type StatusPage struct {
 	Source string `json:"source"`
 }
 
-// StatusUptimeBucket is one daily point in StatusPage.Uptime30d.
+// StatusUptimeBucket is one daily platform-availability point in
+// StatusPage.Uptime30d. Successful and Total retain their original wire names
+// for compatibility, but count available and observed five-minute intervals.
 type StatusUptimeBucket struct {
 	Date       time.Time `json:"date"`
 	UptimePct  *float64  `json:"uptime_pct"`
@@ -3878,12 +3863,13 @@ type PublicStatusDaily struct {
 }
 
 type PublicStatusIndicator struct {
-	ID         string   `json:"id"`
-	Label      string   `json:"label"`
-	Value      *float64 `json:"value"`
-	Unit       string   `json:"unit"`
-	Target     float64  `json:"target"`
-	Comparison string   `json:"comparison"`
+	ID           string   `json:"id"`
+	Label        string   `json:"label"`
+	Value        *float64 `json:"value"`
+	SampleStatus string   `json:"sample_status"`
+	Unit         string   `json:"unit"`
+	Target       float64  `json:"target"`
+	Comparison   string   `json:"comparison"`
 }
 
 type PublicStatusEvent struct {
@@ -4596,47 +4582,30 @@ type RouteRow struct {
 	ErrorPct float64 `json:"error_pct"`
 }
 
-// AppRoutesResponse is the per-route label snapshot returned by
-// GET /v1/apps/{slug}/routes (ADR-093). The shape is intentionally
-// narrower than AppMetricsResponse — only the bounded label set
-// the gatewayd-internal control listener emits (method + raw
-// path, capped at 50 + __route_other__). The Prometheus-derived
-// per-route rollup (count, percentiles, error_pct) lives on
-// AppMetricsResponse.Routes, computed lazily when the dashboard
-// needs it. Splitting the two surfaces keeps the lightweight
-// reader cheap (one in-memory map read on gatewayd-internal, one
-// HTTP round-trip from apid) and lets the dashboard render the
-// "what routes is this app serving?" panel without a Prometheus
-// query.
-//
-// Source is "live" when the gatewayd control listener responded
-// 200; "unavailable" when the dial failed (gatewayd not
-// reachable, X-Faas-Routes-State: unavailable header). Routes
-// is []string (not nil) on the unavailable path so the JSON
-// encoder emits `[]` rather than `null`.
-//
-// CapHit (ADR-093 Tier B item #1, issue #273 follow-up) is true
-// iff the app's routeLabelSet has reached RouteMetricsPerAppCap
-// (pkg/api.RouteMetricsPerAppCap = 50) and additional routes are
-// collapsing into the reserved __route_other__ bucket. On the
-// "live" path the dashboard renders CapHit=true as a "you have
-// hit the 50-route cap" chip rather than counting Routes and
-// trying to disambiguate "5 real routes + __route_other__
-// because of one wildcard probe" from "50 real routes +
-// overflow". On the "unavailable" path CapHit is the zero
-// value (false) — the upstream decode doesn't carry it, and
-// the dashboard already renders unavailable as a distinct chip.
+// AppRoutesResponse is the fleet route snapshot returned by
+// GET /v1/apps/{slug}/routes (ADR-093 / issue #2416). Production reads a
+// bounded Prometheus union across all active compute collectors. Source and
+// collector counts distinguish healthy no traffic, partial telemetry, and a
+// total bridge failure. Single-box development retains the loopback gateway
+// control endpoint when Prometheus is not configured.
 type AppRoutesResponse struct {
-	Slug   string   `json:"slug"`
-	AppID  string   `json:"app_id,omitempty"`
-	Routes []string `json:"routes"`
-	Source string   `json:"source"`
-	// CapHit mirrors gatewayd-internal's routesResponseJSON.CapHit.
-	// ADR-093 §D2 invariant: when CapHit==true, len(Routes) ==
-	// RouteMetricsPerAppCap + 2 (the +2 is reservedRouteLabelEmpty
-	// + __route_other__).
+	Slug               string   `json:"slug"`
+	AppID              string   `json:"app_id,omitempty"`
+	Routes             []string `json:"routes"`
+	Source             string   `json:"source"`
+	CollectorsExpected int      `json:"collectors_expected"`
+	CollectorsHealthy  int      `json:"collectors_healthy"`
+	// CapHit is true when a collector emitted __route_other__ or the fleet
+	// union reaches RouteMetricsPerAppCap. It is encoded false when Source is
+	// unavailable, where cap state is unknown.
 	CapHit bool `json:"cap_hit"`
 }
+
+const (
+	AppRoutesSourceLive        = "live"
+	AppRoutesSourcePartial     = "partial"
+	AppRoutesSourceUnavailable = "unavailable"
+)
 
 // AppStreamingStatus is the per-request streaming classification
 // returned by GET /v1/apps/{slug}/streaming-cap (ADR-102 D6). It is
@@ -7648,12 +7617,15 @@ type EdgeRuleSuggestion struct {
 // that match it so a developer can see contract drift and policy coverage
 // before changing any rules.
 type AppOpenAPIPolicyPreviewResponse struct {
-	AppID             string                         `json:"app_id"`
-	Source            string                         `json:"source"`
-	ObservedAvailable bool                           `json:"observed_available"`
-	OpenAPIVersion    string                         `json:"openapi_version,omitempty"`
-	Routes            []AppOpenAPIPolicyPreviewRoute `json:"routes"`
-	Suggestions       []EdgeRuleSuggestion           `json:"suggestions,omitempty"`
+	AppID              string                         `json:"app_id"`
+	Source             string                         `json:"source"`
+	ObservedAvailable  bool                           `json:"observed_available"`
+	ObservedSource     string                         `json:"observed_source"`
+	CollectorsExpected int                            `json:"collectors_expected"`
+	CollectorsHealthy  int                            `json:"collectors_healthy"`
+	OpenAPIVersion     string                         `json:"openapi_version,omitempty"`
+	Routes             []AppOpenAPIPolicyPreviewRoute `json:"routes"`
+	Suggestions        []EdgeRuleSuggestion           `json:"suggestions,omitempty"`
 }
 
 // ApplyAppOpenAPIPolicyRequest controls the explicit OpenAPI policy apply

@@ -341,6 +341,14 @@ Show the current status of one build
 
 List builds and discover build IDs
 
+| Flag | Meaning | |
+|---|---|---|
+| `--app <SLUG>` | filter to one app |  |
+| `--status <STATUS>` | filter by lifecycle status | one of `queued` · `running` · `succeeded` · `failed` · `cancelled` |
+| `--limit <N>` | page size (1..200) |  |
+| `--before <CURSOR>` | pagination cursor |  |
+| `--all` | walk every page |  |
+
 ### build provenance
 
 Show the build provenance attestation
@@ -1460,7 +1468,11 @@ Manage app database bindings
 
 Show live instances + state for an app
 
-`gregale ps`
+`gregale ps [--all]`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--all` | include the newest 100 retained history rows (parked rows expire after 30d by default) |  |
 
 
 ## queue

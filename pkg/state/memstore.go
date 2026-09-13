@@ -110,6 +110,12 @@ type auditEventOutboxRow struct {
 // concurrent use and enforces the same uniqueness constraints as the schema
 // (unique email, unique slug, unique key hash) so tests exercise real error
 // paths. It is NOT durable — production uses the Postgres store.
+type memComputeNodeKey struct {
+	publicKeyPEM string
+	state        string
+	validUntil   time.Time
+}
+
 type MemStore struct {
 	objectBuckets           map[string]ObjectBucket
 	objectUsage             map[string]ObjectBucketUsage
@@ -130,6 +136,7 @@ type MemStore struct {
 	deployTokens            map[string]DeployToken
 	deployTokenByHash       map[string]DeployToken
 	apps                    map[string]App
+	appDeletionClaims       map[string]struct{}
 	// consumerKeys is the ADR-120 store. Keyed by ConsumerKey.ID
 	// (UUID, generated at create time). The (appID, prefix) hot-
 	// path index is in-memory only — we walk the map on lookup
@@ -617,7 +624,7 @@ type MemStore struct {
 	// — same as a fresh Postgres cluster with no vmmd registered
 	// yet. The pkg/sched.NodeKeyRegistry's Refresh path treats
 	// both as "no rows, return empty map".
-	computeNodeKeys map[string]string
+	computeNodeKeys map[string]memComputeNodeKey
 	// computeNodeHeartbeats is the append-only history (CP-1,
 	// migration 00065). Mirrors the same wire shape as the SQL
 	// table; rows are append-only, never mutated, and dropped with
@@ -826,6 +833,7 @@ func NewMemStore() *MemStore {
 		deployTokens:            map[string]DeployToken{},
 		deployTokenByHash:       map[string]DeployToken{},
 		apps:                    map[string]App{},
+		appDeletionClaims:       map[string]struct{}{},
 		githubDeployBranches:    map[string]map[string]string{},
 		githubDeployPolicies:    map[string]GitHubDeployPolicy{},
 		githubBindings:          map[string]GitHubBinding{},
@@ -1018,7 +1026,7 @@ func NewMemStore() *MemStore {
 		// signature path inject rows by calling the method
 		// directly; tests that don't care about slice-3 see
 		// an empty map (same as a fresh Postgres cluster).
-		computeNodeKeys: map[string]string{},
+		computeNodeKeys: map[string]memComputeNodeKey{},
 		// computeNodeHeartbeats is the CP-1 history mirror. Empty here;
 		// rows accumulate via AppendComputeNodeHeartbeat as the schedd
 		// Heartbeat.Tick goroutine (or test setup) drives them.
@@ -2089,7 +2097,8 @@ func (m *MemStore) TouchKeyLastUsed(_ context.Context, keyID string) error {
 	if !ok {
 		return ErrNotFound
 	}
-	k.LastUsedAt = time.Now()
+	now := time.Now()
+	k.LastUsedAt = &now
 	m.keys[keyID] = k
 	return nil
 }
@@ -2955,7 +2964,15 @@ func (m *MemStore) ApplyProjectReconcile(
 			out.Changed = append(out.Changed, app)
 		case "remove":
 			app := m.apps[mutation.App.ID]
+			now := time.Now().UTC()
+			deadline := now.Add(AppDeleteGraceDuration())
 			app.Status = AppDeleted
+			if app.DeletedAt == nil {
+				app.DeletedAt = &now
+			}
+			if app.DeleteGraceUntil == nil {
+				app.DeleteGraceUntil = &deadline
+			}
 			m.apps[app.ID] = app
 			out.Removed = append(out.Removed, app)
 		}
@@ -3765,7 +3782,8 @@ func (m *MemStore) ListOwnedCronsByNodeID(_ context.Context, nodeID string) ([]C
 	}
 	var out []Cron
 	for _, c := range m.crons {
-		if owner[c.AppID] == nodeID {
+		app, ok := m.apps[c.AppID]
+		if ok && owner[c.AppID] == nodeID && app.Status != AppDeleted && c.Enabled {
 			out = append(out, c)
 		}
 	}
@@ -4728,8 +4746,12 @@ func (m *MemStore) ScheduleAppDeletion(_ context.Context, id string, graceUntil 
 		deadline := graceUntil.UTC()
 		a.DeleteGraceUntil = &deadline
 	}
+	wasDeleted := a.Status == AppDeleted
 	a.Status = AppDeleted
 	m.apps[id] = a
+	if !wasDeleted {
+		delete(m.appDeletionClaims, id)
+	}
 	// Retire replica placements immediately while preserving snapshot rows for
 	// GC and a possible restore during the grace window.
 	for i := range m.snapshots {
@@ -4748,13 +4770,14 @@ func (m *MemStore) RestoreApp(_ context.Context, id string) (App, error) {
 	if !ok {
 		return App{}, ErrNotFound
 	}
-	if a.Status != AppDeleted || a.DeleteGraceUntil == nil || !a.DeleteGraceUntil.After(time.Now()) {
+	if _, claimed := m.appDeletionClaims[id]; claimed || a.Status != AppDeleted || a.DeleteGraceUntil == nil || !a.DeleteGraceUntil.After(time.Now()) {
 		return App{}, ErrConflict
 	}
 	a.Status = AppActive
 	a.DeletedAt = nil
 	a.DeleteGraceUntil = nil
 	m.apps[id] = a
+	delete(m.appDeletionClaims, id)
 	return a, nil
 }
 
@@ -4779,11 +4802,81 @@ func (m *MemStore) ListDeletedApps(_ context.Context) ([]App, error) {
 	return out, nil
 }
 
-func (m *MemStore) DeleteAppPermanently(_ context.Context, id string) error {
+func (m *MemStore) ListAppDeletionArtifacts(_ context.Context, appID string) ([]AppDeletionArtifact, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	type ref struct {
+		owners map[string]struct{}
+		bytes  int64
+	}
+	refs := make(map[string]*ref)
+	add := func(owner, key string, bytes int64) {
+		if key == "" {
+			return
+		}
+		r := refs[key]
+		if r == nil {
+			r = &ref{owners: make(map[string]struct{})}
+			refs[key] = r
+		}
+		r.owners[owner] = struct{}{}
+		if bytes > r.bytes {
+			r.bytes = bytes
+		}
+	}
+	for _, d := range m.deployments {
+		add(d.AppID, d.RootfsKey, d.RootfsBytes)
+	}
+	for _, layer := range m.deploymentSidecarLayers {
+		if d, ok := m.deployments[layer.DeploymentID]; ok {
+			add(d.AppID, layer.StorageKey, layer.Bytes)
+		}
+	}
+	for _, snap := range m.snapshots {
+		if d, ok := m.deployments[snap.DeploymentID]; ok {
+			add(d.AppID, snap.StorageKey, snap.StoredBytes)
+			add(d.AppID, SnapshotVMStateKey(snap), 0)
+		}
+	}
+	for buildID, provenance := range m.buildProvenance {
+		if b, ok := m.builds[buildID]; ok {
+			if d, ok := m.deployments[b.DeploymentID]; ok {
+				add(d.AppID, provenance.SBOMStorageKey, 0)
+			}
+		}
+	}
+	out := make([]AppDeletionArtifact, 0)
+	for key, r := range refs {
+		if _, owns := r.owners[appID]; owns && len(r.owners) == 1 {
+			out = append(out, AppDeletionArtifact{Key: key, Bytes: r.bytes})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out, nil
+}
+
+func (m *MemStore) ClaimAppDeletion(_ context.Context, id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	a, ok := m.apps[id]
 	if !ok || a.Status != AppDeleted || a.DeleteGraceUntil == nil || a.DeleteGraceUntil.After(time.Now()) {
+		return ErrNotFound
+	}
+	for _, b := range m.objectBuckets {
+		if b.AppID == id && b.State != "deleted" {
+			return ErrConflict
+		}
+	}
+	m.appDeletionClaims[id] = struct{}{}
+	return nil
+}
+
+func (m *MemStore) DeleteAppPermanently(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.apps[id]
+	_, claimed := m.appDeletionClaims[id]
+	if !ok || !claimed || a.Status != AppDeleted || a.DeleteGraceUntil == nil || a.DeleteGraceUntil.After(time.Now()) {
 		if ok && a.Status == AppDeleted {
 			return ErrNotFound
 		}
@@ -4794,6 +4887,7 @@ func (m *MemStore) DeleteAppPermanently(_ context.Context, id string) error {
 			return ErrConflict
 		}
 	}
+	delete(m.appDeletionClaims, id)
 	for key, v := range m.envs {
 		if v.AppID == id {
 			delete(m.envs, key)
@@ -4841,10 +4935,20 @@ func (m *MemStore) DeleteAppPermanently(_ context.Context, id string) error {
 			delete(m.deployments, key)
 		}
 	}
+	for key, layer := range m.deploymentSidecarLayers {
+		if _, ok := depIDs[layer.DeploymentID]; ok {
+			delete(m.deploymentSidecarLayers, key)
+		}
+	}
+	buildIDs := make(map[string]struct{})
 	for key, b := range m.builds {
 		if _, ok := depIDs[b.DeploymentID]; ok {
+			buildIDs[key] = struct{}{}
 			delete(m.builds, key)
 		}
+	}
+	for buildID := range buildIDs {
+		delete(m.buildProvenance, buildID)
 	}
 	filtered := m.snapshots[:0]
 	for _, snap := range m.snapshots {
@@ -4884,9 +4988,22 @@ func (m *MemStore) SoftDeleteAppCascade(_ context.Context, id string) (App, erro
 			return App{}, ErrConflict
 		}
 	}
-	a.Status = AppDeleted
-	m.apps[id] = a
 	now := time.Now().UTC()
+	deadline := now.Add(AppDeleteGraceDuration())
+	a.Status = AppDeleted
+	if a.DeletedAt == nil {
+		a.DeletedAt = &now
+	}
+	if a.DeleteGraceUntil == nil {
+		a.DeleteGraceUntil = &deadline
+	}
+	m.apps[id] = a
+	for cronID, cron := range m.crons {
+		if cron.AppID == id && cron.Enabled {
+			cron.Enabled = false
+			m.crons[cronID] = cron
+		}
+	}
 	for deploymentID, d := range m.deployments {
 		if d.AppID != id || !d.Status.IsCancelEligible() {
 			continue
@@ -6522,6 +6639,9 @@ func (m *MemStore) MarkDeploymentCancelled(_ context.Context, id, principal stri
 	d.CancelledAt = &when
 	d.CancelledByPrincipal = principal
 	d.CancelReason = string(reason)
+	if err := finalizeCancelledDeploymentState(&d, when, reason); err != nil {
+		return err
+	}
 	m.deployments[id] = d
 	return nil
 }
@@ -6555,6 +6675,9 @@ func (m *MemStore) CancelDeploymentTx(ctx context.Context, id, principal string,
 	d.CancelledAt = &now
 	d.CancelledByPrincipal = principal
 	d.CancelReason = string(reason)
+	if err := finalizeCancelledDeploymentState(&d, now, reason); err != nil {
+		return Deployment{}, nil, fmt.Errorf("CancelDeploymentTx: %w", err)
+	}
 	m.deployments[id] = d
 	// Cascade-cancel any non-terminal build rows attached to
 	// this deployment. Mirrors pgstore.CancelDeploymentTx.
@@ -8084,6 +8207,21 @@ func (m *MemStore) UpdateBuildProvenanceSBOM(_ context.Context, buildID, sbomKey
 	return nil
 }
 
+// UpdateBuildProvenanceRunnerDigest mirrors PgStore.UpdateBuildProvenanceRunnerDigest.
+// The imaged function-layer path calls this after the rootfs builder has
+// copied the exact runner bytes into the artifact.
+func (m *MemStore) UpdateBuildProvenanceRunnerDigest(_ context.Context, buildID, runnerDigest string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.buildProvenance[buildID]
+	if !ok {
+		return ErrNotFound
+	}
+	p.RunnerDigest = runnerDigest
+	m.buildProvenance[buildID] = p
+	return nil
+}
+
 // SweepStuckRunningBuilds mirrors PgStore.SweepStuckRunningBuilds
 // (issue #195 B1.4). Returns the number of rows flipped.
 func (m *MemStore) SweepStuckRunningBuilds(ctx context.Context, threshold time.Time) (int, error) {
@@ -8609,7 +8747,10 @@ func (m *MemStore) ListAllCustomDomainsForDoctor(_ context.Context) ([]string, e
 	defer m.mu.Unlock()
 	seen := make(map[string]struct{})
 	var out []string
-	for d := range m.domains {
+	for d, row := range m.domains {
+		if !row.Verified() {
+			continue
+		}
 		seen[d] = struct{}{}
 		out = append(out, d)
 	}
@@ -10963,6 +11104,46 @@ func (m *MemStore) ListInstancesInTerminalStatesOlderThan(_ context.Context, sta
 	return out, nil
 }
 
+// DeleteParkedInstancesOlderThan mirrors PgStore's atomic lifecycle-gated
+// cleanup. Holding m.mu across selection and deletion is the in-memory
+// equivalent of the PostgreSQL row locks: a wake cannot move a selected row
+// back into an active state between the eligibility check and DELETE.
+func (m *MemStore) DeleteParkedInstancesOlderThan(_ context.Context, threshold time.Time, limit int) (int64, error) {
+	if limit <= 0 {
+		return 0, nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	type candidate struct {
+		id       string
+		parkedAt time.Time
+	}
+	candidates := make([]candidate, 0)
+	for id, ins := range m.instances {
+		// Job-task rows are linked from job_tasks.instance_id and have their
+		// own result-retention contract. Ordinary wake/build rows always carry
+		// AppID; keep the cleanup scoped to that shape.
+		if ins.AppID == "" || State(ins.State) != StateParked || ins.LeaseToken != "" || ins.MigrationStartedAt != nil ||
+			ins.ParkedAt.IsZero() || !ins.ParkedAt.Before(threshold) {
+			continue
+		}
+		candidates = append(candidates, candidate{id: id, parkedAt: ins.ParkedAt})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].parkedAt.Equal(candidates[j].parkedAt) {
+			return candidates[i].id < candidates[j].id
+		}
+		return candidates[i].parkedAt.Before(candidates[j].parkedAt)
+	})
+	if len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+	for _, row := range candidates {
+		delete(m.instances, row.id)
+	}
+	return int64(len(candidates)), nil
+}
+
 // DeleteInstance removes an instance row unconditionally (PR #74).
 // Returns ErrNotFound when the row is already gone — the retention
 // sweep swallows that case for redelivery. There are no FK cascades;
@@ -11988,11 +12169,24 @@ func (m *MemStore) UpsertNodeKey(_ context.Context, nodeID string, keyID string,
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	const overlap = 24 * time.Hour
 	composite := nodeID + "\x00" + keyID
-	if _, ok := m.computeNodeKeys[composite]; ok {
+	if existing, ok := m.computeNodeKeys[composite]; ok && existing.state == "current" {
 		return nil
 	}
-	m.computeNodeKeys[composite] = publicKeyPEM
+	for candidate, existing := range m.computeNodeKeys {
+		if !strings.HasPrefix(candidate, nodeID+"\x00") {
+			continue
+		}
+		if existing.state == "current" {
+			existing.state = "overlap"
+			existing.validUntil = time.Now().Add(overlap)
+			m.computeNodeKeys[candidate] = existing
+			continue
+		}
+		delete(m.computeNodeKeys, candidate)
+	}
+	m.computeNodeKeys[composite] = memComputeNodeKey{publicKeyPEM: publicKeyPEM, state: "current"}
 	return nil
 }
 
@@ -12010,8 +12204,11 @@ func (m *MemStore) LookupNodeKey(_ context.Context, computeNodeID string, keyID 
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	pem, ok := m.computeNodeKeys[computeNodeID+"\x00"+keyID]
-	return pem, ok
+	entry, ok := m.computeNodeKeys[computeNodeID+"\x00"+keyID]
+	if !ok || (entry.state == "overlap" && !entry.validUntil.After(time.Now())) {
+		return "", false
+	}
+	return entry.publicKeyPEM, true
 }
 
 // SetComputeNodeActive flips active on a row by id (issue #98 /
@@ -12765,6 +12962,74 @@ func (m *MemStore) ListEvents(_ context.Context, subject string, limit int) ([]E
 		}
 	}
 	return out, nil
+}
+
+func (m *MemStore) ListCustomerEvents(_ context.Context, filter CustomerEventFilter) ([]Event, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	subject := parseSubjectID(filter.AccountID)
+	if subject == nil {
+		return nil, nil
+	}
+	if filter.Limit <= 0 {
+		filter.Limit = CustomerEventLimitDefault
+	} else if filter.Limit > CustomerEventLimitMax {
+		filter.Limit = CustomerEventLimitMax
+	}
+	out := make([]Event, 0, CustomerEventLimitMax)
+	for i := len(m.events) - 1; i >= 0 && len(out) < filter.Limit; i-- {
+		event := m.events[i]
+		ownedSubject := event.Subject != nil && *event.Subject == *subject
+		appID, ownedAnonymous := m.eventOwnedAppLocked(event.Data, filter.AccountID)
+		if !ownedSubject && (!filter.IncludeAnonymous || event.Subject != nil || !ownedAnonymous) {
+			continue
+		}
+		if filter.KindPrefix != "" && !strings.HasPrefix(event.Kind, filter.KindPrefix) {
+			continue
+		}
+		if !filter.Since.IsZero() && event.At.Before(filter.Since) {
+			continue
+		}
+		if filter.AppID != "" && appID != filter.AppID {
+			continue
+		}
+		out = append(out, event)
+	}
+	return out, nil
+}
+
+func (m *MemStore) eventOwnedAppLocked(raw json.RawMessage, accountID string) (string, bool) {
+	var data map[string]any
+	if json.Unmarshal(raw, &data) != nil {
+		return "", false
+	}
+	if appID, _ := data["app_id"].(string); appID != "" {
+		app, ok := m.apps[appID]
+		return appID, ok && app.AccountID == accountID
+	}
+	if deploymentID, _ := data["deployment_id"].(string); deploymentID != "" {
+		if deployment, ok := m.deployments[deploymentID]; ok {
+			app, appOK := m.apps[deployment.AppID]
+			return deployment.AppID, appOK && app.AccountID == accountID
+		}
+	}
+	if buildID, _ := data["build_id"].(string); buildID != "" {
+		if build, ok := m.builds[buildID]; ok {
+			if deployment, depOK := m.deployments[build.DeploymentID]; depOK {
+				app, appOK := m.apps[deployment.AppID]
+				return deployment.AppID, appOK && app.AccountID == accountID
+			}
+		}
+	}
+	instanceID, _ := data["instance_id"].(string)
+	if instanceID == "" {
+		instanceID, _ = data["instance"].(string)
+	}
+	if instance, ok := m.instances[instanceID]; ok {
+		app, appOK := m.apps[instance.AppID]
+		return instance.AppID, appOK && app.AccountID == accountID
+	}
+	return "", false
 }
 
 func (m *MemStore) ListEventsPage(_ context.Context, subject string, beforeAt time.Time, beforeID int64, limit int) ([]Event, error) {
@@ -13628,7 +13893,7 @@ func (m *MemStore) RecordInvoiceRefund(_ context.Context, refund InvoiceRefund) 
 	newState := classifyInvoiceRefundStatus(refund.Status)
 	var settledDelta, pendingDelta, creditDelta int64
 	var reverseCredit bool
-	storedRefund := refund
+	var storedRefund InvoiceRefund
 	storedRefundKey := existingKey
 	if existingKey == "" {
 		if newState != invoiceRefundFailed && (paid <= 0 || inv.AmountRefundedCents+inv.AmountRefundPendingCents+refund.AmountCents > paid) {
@@ -14520,6 +14785,48 @@ func storageUsageKey(accountID, appID string, day time.Time) string {
 // PgStore against a real Postgres (migrations/00070_snapshot_storage_daily_test.go).
 func (m *MemStore) LatestSnapshotBytes(_ context.Context, _ string) (int64, int64, error) {
 	return 0, 0, nil
+}
+
+// RetainedLayerBytes mirrors PgStore's retained-artifact accounting. The
+// in-memory map is keyed by deployment id rather than storage identity, so use
+// a temporary identity map to preserve the SQL deduplication contract.
+func (m *MemStore) RetainedLayerBytes(_ context.Context, appID string) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	app, ok := m.apps[appID]
+	if !ok || app.Status == AppDeleted {
+		return 0, nil
+	}
+	artifacts := make(map[string]int64)
+	retainedDeployments := make(map[string]struct{})
+	for _, deployment := range m.deployments {
+		if deployment.AppID != appID || deployment.DeletedAt != nil {
+			continue
+		}
+		retainedDeployments[deployment.ID] = struct{}{}
+		key := deployment.RootfsKey
+		if key == "" {
+			key = deployment.RootfsPath
+		}
+		if key != "" && deployment.RootfsBytes > artifacts[key] {
+			artifacts[key] = deployment.RootfsBytes
+		}
+	}
+	for _, layer := range m.deploymentSidecarLayers {
+		if _, retained := retainedDeployments[layer.DeploymentID]; !retained || layer.StorageKey == "" {
+			continue
+		}
+		if layer.Bytes > artifacts[layer.StorageKey] {
+			artifacts[layer.StorageKey] = layer.Bytes
+		}
+	}
+	var total int64
+	for _, bytes := range artifacts {
+		if bytes > 0 {
+			total += bytes
+		}
+	}
+	return total, nil
 }
 
 // HasStripePushHour + RecordStripePushHour implement the pkg/billing/stripe

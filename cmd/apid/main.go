@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -45,6 +46,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/capdecl/runtimecheck"
 	"github.com/onebox-faas/faas/pkg/daemonenv"
 	"github.com/onebox-faas/faas/pkg/daemonunit"
+	"github.com/onebox-faas/faas/pkg/daemonunitspec"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/eventretention"
 	"github.com/onebox-faas/faas/pkg/events"
@@ -98,6 +100,46 @@ func seedDevAccount(ctx context.Context, store state.Store, token string) error 
 		return err
 	}
 	_ = acct // find-or-create confirmed; the row exists either way
+	return nil
+}
+
+// rejectProductionDevEnvironment keeps local bootstrap conveniences out of a
+// control-plane process. The registry filter also catches future dev-only
+// variables owned directly by apid; shared test-only variables are excluded
+// except for the process-wide FAAS_DEV switch.
+func rejectProductionDevEnvironment(boxRole role.Role, getenv func(string) string) error {
+	if boxRole != role.RoleControlPlane {
+		return nil
+	}
+	if getenv == nil {
+		getenv = os.Getenv
+	}
+	var configured []string
+	for _, row := range daemonunitspec.EnvContractForDaemon("apid") {
+		if row.Source != daemonunitspec.EnvSourceDevOnly {
+			continue
+		}
+		directOwner := false
+		for _, owner := range row.Owners {
+			if owner == "apid" {
+				directOwner = true
+				break
+			}
+		}
+		if row.Name != "FAAS_DEV" && !directOwner {
+			continue
+		}
+		if _, prefix := strings.CutSuffix(row.Name, "_"); prefix {
+			continue
+		}
+		if strings.TrimSpace(getenv(row.Name)) != "" {
+			configured = append(configured, row.Name)
+		}
+	}
+	if len(configured) > 0 {
+		sort.Strings(configured)
+		return fmt.Errorf("apid: production role forbids dev-only environment variables: %s", strings.Join(configured, ", "))
+	}
 	return nil
 }
 
@@ -535,6 +577,9 @@ func run(ctx context.Context, log *slog.Logger) error {
 		role.RoleSingleBox, role.RoleControlPlane); err != nil {
 		return err
 	}
+	if err := rejectProductionDevEnvironment(cfg.Role, deps.getenv); err != nil {
+		return err
+	}
 
 	pool, err := db.OpenWithAppName(ctx, cfg.DBURL, "faas-apid")
 	if err != nil {
@@ -693,10 +738,12 @@ func run(ctx context.Context, log *slog.Logger) error {
 		// ListAllAccounts walk so it stays bounded by the customer
 		// count on the one box.
 		graceLoop := grace.New(grace.Params{
-			Store:    srv.store,
-			Mailer:   graceSenderAdapter{m: srv.mailer},
-			Log:      log,
-			Interval: graceIntervalFromEnv(log),
+			Store:     srv.store,
+			Mailer:    graceSenderAdapter{m: srv.mailer},
+			Log:       log,
+			Interval:  graceIntervalFromEnv(log),
+			Artifacts: srv.sbomStorage,
+			Registry:  srv.ops.Registry(),
 			Notif: func(ctx context.Context, ch, payload string) error {
 				return srv.notif.Notify(ctx, ch, payload)
 			},
@@ -1560,10 +1607,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// signal that the box is misconfigured rather than a silent accept-and-
 	// drop of plaintext. The unit tests don't set the var because the
 	// handlers they're checking don't exercise the seal path.
-	if recipientPath := deps.getenv("FAAS_HOST_AGE_RECIPIENT_PATH"); recipientPath != "" {
+	recipientPath := deps.getenv("FAAS_FLEET_AGE_RECIPIENT_PATH")
+	if recipientPath == "" {
+		recipientPath = deps.getenv("FAAS_HOST_AGE_RECIPIENT_PATH")
+	}
+	if recipientPath != "" {
 		r, err := secretbox.LoadRecipient(recipientPath)
 		if err != nil {
-			return fmt.Errorf("apid: load host age recipient %q: %w", recipientPath, err)
+			return fmt.Errorf("apid: load fleet age recipient %q: %w", recipientPath, err)
 		}
 		setSecretRecipient = func() *age.X25519Recipient { return r }
 		// Issue #463 / ADR-068: the sidecar seal helper reuses the
@@ -1571,9 +1622,9 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// separate getter keeps the seal helpers testable in
 		// isolation without leaking the secret-handler test seam.
 		setSidecarRecipient = func() *age.X25519Recipient { return r }
-		log.Info("host age recipient loaded", "path", recipientPath)
+		log.Info("fleet age recipient loaded", "path", recipientPath)
 	} else {
-		log.Warn("FAAS_HOST_AGE_RECIPIENT_PATH unset — secrets PUT will return 503")
+		log.Warn("FAAS_FLEET_AGE_RECIPIENT_PATH unset — secrets PUT will return 503")
 	}
 
 	// MFA (IAM-2, issue #186): load the host age identity so
@@ -1589,14 +1640,18 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// so the 30-day rotation overlap window unseals envelopes
 	// sealed under the previous key. The single-identity SetMFAIdentity
 	// stays wired for backward compat with the existing tests.
-	if identityPath := deps.getenv("FAAS_HOST_AGE_IDENTITY_PATH"); identityPath != "" {
+	identityPath := deps.getenv("FAAS_FLEET_AGE_IDENTITY_PATH")
+	if identityPath == "" {
+		identityPath = deps.getenv("FAAS_HOST_AGE_IDENTITY_PATH")
+	}
+	if identityPath != "" {
 		ident, err := secretbox.LoadHostKey(identityPath)
 		if err != nil {
-			return fmt.Errorf("apid: load host age identity %q: %w", identityPath, err)
+			return fmt.Errorf("apid: load fleet age identity %q: %w", identityPath, err)
 		}
 		SetMFARecipient(func() *age.X25519Recipient { return ident.Recipient() })
 		SetMFAIdentity(func() *age.X25519Identity { return ident })
-		log.Info("host age identity loaded for MFA", "path", identityPath)
+		log.Info("fleet age identity loaded for MFA", "path", identityPath)
 
 		// Rotation-overlap wiring: load the multi-identity slice from
 		// the same directory. If LoadHostKeys fails (e.g. .previous
@@ -1605,9 +1660,22 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// envelopes under the current key, just not the previous one.
 		// A hard error would lock every MFA customer out, which is
 		// worse than the operator-visible degraded-mode log line.
-		identities, loadErr := secretbox.LoadHostKeys(filepath.Dir(identityPath))
+		identities, loadErr := secretbox.LoadFleetAndHostKeys(filepath.Dir(identityPath))
 		if loadErr != nil {
-			log.Warn("apid: LoadHostKeys (rotation overlap) failed; MFA unseal will work only for envelopes sealed under the current host.age",
+			// Legacy installations have host.age plus an optional
+			// host.age.previous, but no fleet.age. Preserve that overlap during
+			// the fleet migration so old envelopes can still be unsealed and
+			// rekeyed. If the legacy scan itself fails, the explicitly loaded
+			// identity remains a safe last-resort accessor.
+			if legacy, legacyErr := secretbox.LoadHostKeys(filepath.Dir(identityPath)); legacyErr == nil {
+				identities = legacy
+			} else {
+				identities = []*age.X25519Identity{ident}
+			}
+			SetMFAIdentities(func() []*age.X25519Identity {
+				return identities
+			})
+			log.Warn("apid: fleet identity load failed; using legacy host identities for MFA unseal",
 				"dir", filepath.Dir(identityPath), "err", loadErr.Error())
 		} else {
 			SetMFAIdentities(func() []*age.X25519Identity { return identities })
@@ -1862,6 +1930,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			prometheus.Gatherers{ops.Registry(), budgetReg},
 			promhttp.HandlerOpts{Registry: ops.Registry()},
 		))
+		metricsMux.Handle("/v1/internal/metrics/", srv.metricsDiscoveryHandler())
 		wire.ControlMuxLite(metricsMux, apidProbe.ReadyFunc(), apidProbe.ReasonFunc())
 		metricsSrv = &http.Server{
 			Addr:    metricsAddr,

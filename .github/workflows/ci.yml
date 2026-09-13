@@ -312,6 +312,9 @@ jobs:
       - name: systemd hardening gate
         run: make systemd-hardening-check
 
+      - name: canary artifact retention gate
+        run: make canary-artifact-retention-test
+
       - name: GCP public-beta policy gate
         run: make gcp-public-beta-policy-test
 
@@ -1098,6 +1101,8 @@ jobs:
           # ADR-143: the post-activation verify playbook is production
           # tooling (`make verify-fleet`) and must stay parseable.
           ansible-playbook --syntax-check verify.yml
+          # Internal mTLS renewal is a scheduled production entrypoint.
+          ansible-playbook --syntax-check pki_renew.yml
           # Gate-F: the opt-in acceptance playbooks. Neither was parsed by any
           # job, so a syntax error in them would only surface when an operator
           # ran one by hand against a real host.
@@ -1152,20 +1157,22 @@ jobs:
             -m ansible.builtin.template \
             -a "src=$(pwd)/roles/prometheus/templates/prometheus.service.j2 dest=$RUNNER_TEMP/prometheus.service"
           grep -q 'job_name: "gatewayd-internal"' "$RUNNER_TEMP/prometheus.yml"
-          grep -q 'http://127.0.0.1:8081/v1/internal/metrics/targets' "$RUNNER_TEMP/prometheus.yml"
+          grep -q 'http://127.0.0.1:9101/v1/internal/metrics/targets' "$RUNNER_TEMP/prometheus.yml"
           grep -q 'job_name: "vmmd"' "$RUNNER_TEMP/prometheus.yml"
-          grep -q 'http://127.0.0.1:8081/v1/internal/metrics/vmmd-targets' "$RUNNER_TEMP/prometheus.yml"
+          grep -q 'http://127.0.0.1:9101/v1/internal/metrics/vmmd-targets' "$RUNNER_TEMP/prometheus.yml"
           grep -q 'job_name: "imaged"' "$RUNNER_TEMP/prometheus.yml"
-          grep -q 'http://127.0.0.1:8081/v1/internal/metrics/imaged-targets' "$RUNNER_TEMP/prometheus.yml"
+          grep -q 'http://127.0.0.1:9101/v1/internal/metrics/imaged-targets' "$RUNNER_TEMP/prometheus.yml"
           grep -q 'job_name: "builderd"' "$RUNNER_TEMP/prometheus.yml"
-          grep -q 'http://127.0.0.1:8081/v1/internal/metrics/builderd-targets' "$RUNNER_TEMP/prometheus.yml"
+          grep -q 'http://127.0.0.1:9101/v1/internal/metrics/builderd-targets' "$RUNNER_TEMP/prometheus.yml"
+          grep -q 'job_name: "node-compute"' "$RUNNER_TEMP/prometheus.yml"
+          grep -q 'http://127.0.0.1:9101/v1/internal/metrics/node-targets' "$RUNNER_TEMP/prometheus.yml"
           if grep -q 'job_name: "promtail' "$RUNNER_TEMP/prometheus.yml"; then
             echo 'default Prometheus config scrapes Promtail without an enabled Loki transport' >&2
             exit 1
           fi
           grep -q 'job_name: "promtail"' "$RUNNER_TEMP/prometheus-with-promtail.yml"
           grep -q 'job_name: "promtail-compute"' "$RUNNER_TEMP/prometheus-with-promtail.yml"
-          grep -q 'http://127.0.0.1:8081/v1/internal/metrics/promtail-targets' "$RUNNER_TEMP/prometheus-with-promtail.yml"
+          grep -q 'http://127.0.0.1:9101/v1/internal/metrics/promtail-targets' "$RUNNER_TEMP/prometheus-with-promtail.yml"
           grep -q 'target_limit: 1000' "$RUNNER_TEMP/prometheus.yml"
           grep -q -- '--web.listen-address=127.0.0.1:9095' "$RUNNER_TEMP/prometheus.service"
           if grep -q '{{' "$RUNNER_TEMP/prometheus.service"; then

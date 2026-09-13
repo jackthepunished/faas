@@ -812,7 +812,7 @@ type APIKey struct {
 	Hash          []byte
 	Label         string
 	Scopes        []string
-	LastUsedAt    time.Time
+	LastUsedAt    *time.Time
 	CreatedAt     time.Time
 	ExpiresAt     *time.Time
 	Status        string
@@ -1317,6 +1317,16 @@ type App struct {
 	// 00215_apps_cors_defaults.sql for the rationale.
 	CORSDefaultOrigins []string
 	CreatedAt          time.Time
+}
+
+// AppDeletionArtifact is a durable artifact owned exclusively by an app that
+// is waiting for permanent deletion. Shared keys are excluded by the Store so
+// the grace sweeper can remove every returned key without breaking another
+// app. Bytes is the best available physical allocation and is used for the
+// overdue-artifact gauge; zero means the writer predates byte accounting.
+type AppDeletionArtifact struct {
+	Key   string
+	Bytes int64
 }
 
 // DeclaredRoute is the persisted explicit route-list shape used by the
@@ -2213,7 +2223,7 @@ type StageStateItem struct {
 	StartedAt  *time.Time `json:"started_at"`
 	EndedAt    *time.Time `json:"ended_at"`
 	DurationMs int64      `json:"duration_ms"`
-	Status     string     `json:"status"` // "completed" | "failed"
+	Status     string     `json:"status"` // "completed" | "failed" | "cancelled"
 	Reason     string     `json:"reason,omitempty"`
 }
 
@@ -2349,7 +2359,10 @@ type CustomDomain struct {
 	// CertFailureEmailAt is the in-memory mirror of the durable 24-hour
 	// notification cooldown. PgStore keeps this value in its column and does
 	// not need to expose it on customer-facing domain responses.
-	CertFailureEmailAt time.Time
+	CertFailureEmailAt      time.Time
+	VerificationNextCheckAt time.Time
+	VerificationExpiresAt   time.Time
+	VerificationAttempts    int
 }
 
 // Verified reports whether the TXT challenge has been satisfied.
@@ -3977,6 +3990,15 @@ type ComputeNodeHeartbeat struct {
 	// scratchpad at heartbeat-mint time (PR #4). Nil when the row
 	// predates the migration or vmmd hadn't sampled yet.
 	DiskUsedBytes *int64
+}
+
+// ComputeNodeHeartbeatMaintenanceResult reports one bounded raw-history
+// maintenance transaction. Deleted raw samples have already been folded into
+// durable hourly buckets when this value is returned.
+type ComputeNodeHeartbeatMaintenanceResult struct {
+	Deleted       int64
+	RollupBuckets int64
+	OldestRawAt   time.Time
 }
 
 // ComputeNodeHeartbeatStats is the read shape for LatestHeartbeatStats
@@ -6867,10 +6889,11 @@ func legacyIncidentTitle(message string) string {
 	return title
 }
 
-// StatusUptimeBucket is the daily terminal-invocation rollup used by the
-// public status page. It deliberately lives in state so both PgStore and
-// MemStore can expose the same optional read seam without widening Store's
-// large compatibility interface.
+// StatusUptimeBucket is the daily platform-observation rollup used by the
+// legacy public status page. Successful and Total count complete five-minute
+// intervals, not customer workload outcomes. It deliberately lives in state
+// so both PgStore and MemStore can expose the same optional read seam without
+// widening Store's large compatibility interface.
 type StatusUptimeBucket struct {
 	Day        time.Time
 	Successful int64

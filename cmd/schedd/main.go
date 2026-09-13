@@ -36,6 +36,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/fcvm"
+	"github.com/onebox-faas/faas/pkg/heartbeatretention"
 	mirrorRollup "github.com/onebox-faas/faas/pkg/mirror"
 	"github.com/onebox-faas/faas/pkg/role"
 	"github.com/onebox-faas/faas/pkg/runtimeconfig"
@@ -67,7 +68,12 @@ func loadHostAgeIdentities(path string) ([]*age.X25519Identity, error) {
 	if path == "" {
 		path = secretbox.DefaultHostKeyPath
 	}
-	return secretbox.LoadHostKeys(filepath.Dir(path))
+	dir := filepath.Dir(path)
+	identities, err := secretbox.LoadFleetAndHostKeys(dir)
+	if errors.Is(err, secretbox.ErrHostKeyNotFound) {
+		return secretbox.LoadHostKeys(dir)
+	}
+	return identities, err
 }
 
 // scheddServerVerifier permits the registered compute-node identities and the
@@ -548,6 +554,9 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	ops := wire.NewOpsMetrics("schedd")
 	wire.BootStamps(ctx, "schedd", ops)
 	wire.RegisterDefaultOps(ops)
+	heartbeatRetentionMetrics := heartbeatretention.NewMetrics(ops.Registry(), ops.MetricPrefix())
+	heartbeatRetention := heartbeatretention.New(store, log, heartbeatRetentionMetrics)
+	go heartbeatRetention.Run(ctx)
 	workflowMetrics := wire.NewWorkflowMetrics(ops.Registry())
 	prewarmMetrics := wire.NewPrewarmMetrics(ops.Registry())
 	// Dashboard gauges (spec §12): schedd owns the snapshots table and the
@@ -695,6 +704,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// ErrUnknownNodeKey, which is the safer default (silent
 	// unsigned-accept is the failure mode slice-3 closes).
 	keys := sched.NewNodeKeyRegistry(pgNodeKeyLoader{pool: pool}, log)
+	wireNodeKeyMetrics(ops.Registry(), keys)
 	engine.WithNodeKeyRegistry(keys)
 	if n, err := keys.Refresh(ctx); err != nil {
 		log.Warn("schedd: initial node key registry refresh failed; first notify will populate",
@@ -1389,9 +1399,9 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		WithJobsDispatched(jobsDispatched).
 		WithFlowCounter(sched.NewNodeAwareFlowCounter(engine.NodeTelemetryCache(), flowcount.NewReader(wire.ExecRunner{}))).
 		WithWatchdog(sched.NewWatchdog(store, engine, log)).
-		// PR #74: §17 retention sweep — DELETEs STOPPED/FAILED rows older
-		// than cfg.RetentionDuration (defaults to api.DefaultInstanceRetention
-		// when zero). Ticker fires at api.DefaultRetentionInterval (1h).
+		// §17 / issue #2415 retention sweep — DELETEs STOPPED/FAILED rows
+		// from terminal_at and obsolete PARKED history from parked_at after
+		// cfg.RetentionDuration (default api.DefaultInstanceRetention).
 		WithRetention(sched.NewRetention(store, log).WithRetention(time.Duration(cfg.RetentionDuration))).
 		WithHeartbeat(hb).
 		WithInstanceStats(statsPoller).

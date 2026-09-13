@@ -600,11 +600,18 @@ The §12 dashboard pipeline is wired end-to-end:
 
 #### Status page history contract
 
-- `uptime_30d_pct` is the weighted terminal-invocation success rate for the
-  last 30 UTC calendar days. `uptime_30d` always contains 30 daily points;
-  each point carries `successful`, `total`, and `uptime_pct`. Pending work is
-  excluded, and a day with no terminal traffic is shown as no traffic rather
-  than as a failure.
+- `uptime_30d_pct` is the time-weighted availability of complete five-minute
+  platform observations for the last 30 UTC calendar days. It is derived from
+  the same component telemetry and operator incident overlays as the public
+  status endpoint; customer function results, timeouts, dead letters, and
+  cancellations never lower platform uptime.
+- `uptime_30d` always contains 30 daily points. The compatibility fields
+  `successful` and `total` count available and observed five-minute platform
+  intervals. A day with no complete platform telemetry has `total: 0` and
+  `uptime_pct: null`, so missing coverage is not published as an outage.
+- The switch to platform observations intentionally resets the legacy 30-day
+  history to the observation-bucket retention window. Historical customer
+  invocation failures are not backfilled into the new series.
 - `incidents` contains incidents posted in the last 30 days, plus any still-
   open older incident. The public projection includes `started_at`,
   `resolved_at`, `severity`, `summary`, and the affected `component`.
@@ -717,13 +724,10 @@ ADR-075 / issue #475 / migration 00138.
   (per-app / per-account → 422 `plan_webhook_quota`). Closed enum
   drift on `retry_policy` and `event_filter` surfaces as 400
   `app_webhook_invalid` BEFORE the row is created.
-- **Event vocabulary (issue #1395 B5 + API consumer billing delivery)** — the closed event set is shared by
-  state, API/OpenAPI, CLI, SDK, and the delivery-ledger CHECK: `cron.fired`,
-  `cron.fired.manually`, `app.created`, `app.deleted`, `app.deployed`,
-  `app.scaled`, `app.parked`, `app.woken`, `build.succeeded`,
-  `build.failed`, `deployment.failed`, `rollout.aborted`, `error.new`,
-  `job.finished`, `preview.created`, `budget.threshold`, and
-  `usage_statement.finalized`. Producers call
+- **Event vocabulary (issue #2444)** — new subscriptions expose only the
+  producer-backed events `app.parked`, `app.woken`, and
+  `usage_statement.finalized`. The delivery ledger retains its historical
+  closed set so old delivery rows remain readable across upgrades. Producers call
   `pkg/webhook.Emit` after their source mutation commits; it stores the raw
   JSON payload in one durable row per enabled matching subscription, so the
   existing retry endpoint can replay every event. OpenAPI carries a payload
