@@ -264,6 +264,7 @@ type MemStore struct {
 	appWebhooks              map[string]AppWebhook
 	appWebhookDeliveries     map[string]AppWebhookDelivery
 	managedRealtimeEndpoints map[string]ManagedRealtimeEndpoint
+	managedRealtimeOwners    map[string]ManagedRealtimeConnectionOwner
 	appLogDrains             map[string]AppLogDrain
 	appLogDrainHealth        map[string]AppLogDrainHealth
 	appLogDrainAnalytics     map[string]AppLogDrainDeliveryAnalytics
@@ -874,6 +875,7 @@ func NewMemStore() *MemStore {
 		appWebhooks:               map[string]AppWebhook{},
 		appWebhookDeliveries:      map[string]AppWebhookDelivery{},
 		managedRealtimeEndpoints:  map[string]ManagedRealtimeEndpoint{},
+		managedRealtimeOwners:     map[string]ManagedRealtimeConnectionOwner{},
 		appLogDrains:              map[string]AppLogDrain{},
 		appLogDrainHealth:         map[string]AppLogDrainHealth{},
 		appLogDrainAnalytics:      map[string]AppLogDrainDeliveryAnalytics{},
