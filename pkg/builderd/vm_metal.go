@@ -170,6 +170,10 @@ func buildManifestForRequest(req VMRequest, timeoutSec int) (api.BuildManifest, 
 	if err != nil {
 		return api.BuildManifest{}, fmt.Errorf("builderd: source root: %w", err)
 	}
+	dockerfilePath, err := buildDockerfilePath(req.DockerfilePath)
+	if err != nil {
+		return api.BuildManifest{}, fmt.Errorf("builderd: Dockerfile path: %w", err)
+	}
 	return api.BuildManifest{
 		SchemaVersion:   1,
 		BuildID:         req.BuildID,
@@ -178,6 +182,7 @@ func buildManifestForRequest(req VMRequest, timeoutSec int) (api.BuildManifest, 
 		SourceTarPath:   "/build/src.tar",
 		BuildContext:    "/build/src",
 		Workdir:         workdir,
+		DockerfilePath:  dockerfilePath,
 		OutDir:          "/build/out",
 		Framework:       MapFramework(req.Framework),
 		Runtime:         req.Runtime,
