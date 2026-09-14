@@ -822,6 +822,78 @@ func buildCreateRequest(slug string, sh shape, runtime string, requireAuthnPtr *
 	return req
 }
 
+// validateDeploySourceSelection keeps the source transport explicit. Deploy
+// accepts zero selectors for the local zero-config path, or exactly one of the
+// explicit selectors below. A ref is meaningful only for the repository
+// transport. Run this before authentication or source I/O so a malformed CI
+// invocation cannot silently deploy different bytes.
+func validateDeploySourceSelection(sourcePath string, worktree bool, image, archive, repo, templateName string, githubSnippet bool, ref string) error {
+	var selected []string
+	if sourcePath != "" || worktree {
+		if sourcePath != "" {
+			selected = append(selected, "--path")
+		} else {
+			selected = append(selected, "--worktree")
+		}
+	}
+	if image != "" {
+		selected = append(selected, "--image")
+	}
+	if archive != "" {
+		selected = append(selected, "--tarball")
+	}
+	if repo != "" {
+		selected = append(selected, "--repo")
+	}
+	if templateName != "" {
+		selected = append(selected, "--template")
+	}
+	if githubSnippet {
+		selected = append(selected, "--github")
+	}
+	if ref != "" && repo == "" {
+		return errors.New("--ref requires --repo")
+	}
+	if len(selected) > 1 {
+		return fmt.Errorf("source selectors are mutually exclusive: %s", strings.Join(selected, ", "))
+	}
+	return nil
+}
+
+func validateRepoDeployFlags(explicit map[string]bool) error {
+	var unsupported []string
+	for _, name := range []string{
+		"function", "app", "runtime", "handler", "dockerfile", "vcpu",
+		"require-authn", "no-require-authn", "app-protocol",
+		"doctor-strict", "no-doctor", "secret-scan",
+	} {
+		if explicit[name] {
+			unsupported = append(unsupported, "--"+name)
+		}
+	}
+	if len(unsupported) == 0 {
+		return nil
+	}
+	return fmt.Errorf("unsupported with --repo: %s", strings.Join(unsupported, ", "))
+}
+
+func validateExplicitDockerfile(sourceDir string) error {
+	if sourceDir == "" {
+		return errors.New("--dockerfile requires a local, tarball, or template source containing Dockerfile")
+	}
+	info, err := os.Stat(filepath.Join(sourceDir, "Dockerfile"))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return errors.New("--dockerfile was set but Dockerfile was not found at the selected source root")
+		}
+		return fmt.Errorf("inspect Dockerfile: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("dockerfile at the selected source root must be a regular file")
+	}
+	return nil
+}
+
 // createOrFetchApp issues CreateApp and, on a 409 (the slug is taken),
 // probes the server with GetApp to disambiguate "owned by this account"
 // from "owned by another account". Returns nil on success (either a fresh
@@ -948,6 +1020,9 @@ func manifestCronKey(schedule, path string) string {
 // the CLI creates or fetches the target app and returns the definitions to
 // include in the deployment request.
 func loadWorkflowManifestForDeploy(ctx context.Context, client manifestCronClient, cwd string) ([]api.WorkflowSpec, error) {
+	if cwd == "" {
+		return nil, nil
+	}
 	m, ok, err := gregalemanifest.Load(cwd)
 	if err != nil {
 		return nil, err
@@ -1003,6 +1078,9 @@ func deployManifestTriggers(ctx context.Context, client manifestCronClient, slug
 // cleanupManifestTriggers when the deployment is rejected. If staging itself
 // fails, already-created rows are compensated before the error is returned.
 func deployManifestTriggersWithRollback(ctx context.Context, client manifestCronClient, slug, cwd string) ([]string, error) {
+	if cwd == "" {
+		return nil, nil
+	}
 	m, ok, err := gregalemanifest.Load(cwd)
 	if err != nil {
 		return nil, err
@@ -1362,10 +1440,10 @@ func cmdDeployTarballToExisting(ctx context.Context, args []string, existingApp 
 	// standalone cmdDoctor semantics). Scoped via --doctor-strict
 	// because --strict/--lenient are taken by --diff above.
 	//
-	// v1 only fires on the cwd / auto-pack path. --tarball and
-	// --image skip the doctor (the source isn't a directory the
-	// doctor can scan); the server-side validators still run on
-	// upload.
+	// Explicit archives are extracted into an authoritative temporary source
+	// view below, so --doctor-strict also scans --tarball/--template contents.
+	// Images still skip the local doctor; server-side validators remain the
+	// source of truth for image deploys.
 	doctorStrict := fs.Bool("doctor-strict", false, "run `gregale doctor` first; abort the deploy on any error-class finding (warnings are warn-only)")
 	noDoctor := fs.Bool("no-doctor", false, "skip the automatic local doctor preflight")
 	// Issue #977 / ADR-116: deployment annotations surface. Four
@@ -1480,12 +1558,8 @@ func cmdDeployTarballToExisting(ctx context.Context, args []string, existingApp 
 	if *function && *app {
 		return printErr("Invalid flags", fmt.Errorf("--function and --app are mutually exclusive"))
 	}
-	// --path and --worktree select the local zero-config source. They
-	// cannot be combined with another source shape: silently preferring
-	// an image or an explicit tarball would make the selected directory
-	// appear to have been deployed when it was never uploaded.
-	if (*sourcePath != "" || *worktree) && (*image != "" || *tarball != "" || *repo != "" || *templateName != "" || *githubSnippet) {
-		return printErr("Invalid flags", fmt.Errorf("--path/--worktree can only be used with a local zero-config deploy"))
+	if err := validateDeploySourceSelection(*sourcePath, *worktree, *image, *tarball, *repo, *templateName, *githubSnippet, *ref); err != nil {
+		return printErr("Invalid flags", err)
 	}
 	// --secret-scan=off is the documented escape hatch for customers who
 	// genuinely need to ship a Stripe test key at boot (local dev
@@ -1650,6 +1724,9 @@ func cmdDeployTarballToExisting(ctx context.Context, args []string, existingApp 
 	// in PR-B; the server resolves the install token from
 	// github_installations, so CI runs need only FAAS_TOKEN + --ref.
 	if *repo != "" {
+		if err := validateRepoDeployFlags(explicit); err != nil {
+			return printErr("Invalid flags", err)
+		}
 		if *createOnly {
 			return printErr("Invalid flags", fmt.Errorf("--create-only is not supported with --repo; use --template or --path"))
 		}
@@ -1687,49 +1764,22 @@ func cmdDeployTarballToExisting(ctx context.Context, args []string, existingApp 
 		if keyErr != nil {
 			return printErr("Invalid --idempotency-key", keyErr)
 		}
-		// Source-ref deploys target an already-existing app and return
-		// before the single-app upload path below, so stage the local
-		// manifest explicitly here. This keeps source-ref's JSON transport
-		// under the same compensation rule as multipart, resumable, and
-		// image deployments without changing its server-side source pull.
-		var stagedSourceRefTriggerIDs []string
-		var sourceRefClient *Client
-		if !*noTriggers {
-			var authErr error
-			sourceRefClient, authErr = authedClient()
-			if authErr != nil {
-				return printErr("Not logged in", authErr)
-			} else if sourceRefCwd, cwdErr := os.Getwd(); cwdErr == nil {
-				var triggerErr error
-				stagedSourceRefTriggerIDs, triggerErr = deployManifestTriggersWithRollback(ctx, sourceRefClient, slug, sourceRefCwd)
-				if triggerErr != nil {
-					return printErr("Manifest triggers fan-out failed", triggerErr)
-				}
-			}
-		}
-		defer func() {
-			if len(stagedSourceRefTriggerIDs) == 0 {
-				return
-			}
-			if rollbackErr := cleanupManifestTriggers(ctx, sourceRefClient, stagedSourceRefTriggerIDs); rollbackErr != nil {
-				PrintWarn(osStderr, "Manifest trigger rollback incomplete: %v", rollbackErr)
-				return
-			}
-			PrintProgress(osStderr, "Manifest trigger rollback complete (%d trigger(s) removed)", len(stagedSourceRefTriggerIDs))
-		}()
-		code := cmdDeployRepoSourceRefContextWithJSONWaitOptions(ctx, slug, *repo, *ref, api.DeployAnnotations{
+		code := cmdDeployRepoSourceRefContextWithJSONWaitOptionsAndManifest(ctx, slug, *repo, *ref, api.DeployAnnotations{
 			Reason:         *reason,
 			Tag:            *tag,
 			DeployedBy:     resolveDeployedBy(*deployedBy),
 			PRNumber:       *prNumber,
 			TrafficPercent: optTrafficPercent(*trafficPercent),
 			Canary:         buildCanarySpec(*canaryPreset, *canaryStages),
-		}, waitForDeploy, jsonWait, refKey, time.Duration(*waitTimeoutSeconds)*time.Second)
-		if code == 0 {
-			stagedSourceRefTriggerIDs = nil
-		}
+		}, waitForDeploy, jsonWait, refKey, time.Duration(*waitTimeoutSeconds)*time.Second, *noTriggers)
 		return code
 	}
+
+	// Remember whether the source was explicitly supplied. The zero-config
+	// path may populate *tarball later with an auto-packed cwd archive, but its
+	// metadata source must remain the selected working tree rather than an
+	// extracted copy.
+	explicitTarball := *tarball != ""
 
 	// --template materializes an embedded starter project. For function
 	// templates we force the runtime + handler so the customer doesn't
@@ -1757,6 +1807,7 @@ func cmdDeployTarballToExisting(ctx context.Context, args []string, existingApp 
 			return printErr("Could not materialize template", err)
 		}
 		*tarball = tmpPath
+		explicitTarball = true
 		// --image would have precedence over --template by accident;
 		// reject it explicitly so the customer isn't surprised by
 		// which one wins.
@@ -1836,6 +1887,11 @@ func cmdDeployTarballToExisting(ctx context.Context, args []string, existingApp 
 		cwd = ""
 	}
 	sourceDir := cwd
+	if *image != "" {
+		// An immutable image has no local source view. Keep cwd out of
+		// framework detection, doctor, manifest, workflow, and trigger paths.
+		sourceDir = ""
+	}
 	if *sourcePath != "" {
 		if cwdErr != nil {
 			return printErr("Could not resolve deploy source", cwdErr)
@@ -1877,7 +1933,7 @@ func cmdDeployTarballToExisting(ctx context.Context, args []string, existingApp 
 		}
 		*projectSlug = sanitizeSlug(projectName)
 	}
-	// Authenticate before any zero-config source scan or archive work. The
+	// Authenticate before any zero-config source scan or archive extraction. The
 	// zero-config path can inspect the working tree, run doctor checks, and
 	// materialise a potentially large archive; doing that for an unauthenticated
 	// invocation wastes customer CPU/IO and can expose source-side diagnostics
@@ -1887,27 +1943,46 @@ func cmdDeployTarballToExisting(ctx context.Context, args []string, existingApp 
 	localZeroConfig := *image == "" && *tarball == ""
 	var client *Client
 	var err error
-	if localZeroConfig {
+	if localZeroConfig || explicitTarball {
 		var authErr error
 		client, authErr = authedClientWithDeployTimeout(5 * time.Minute)
 		if authErr != nil {
 			return printErr("Not logged in", authErr)
 		}
 	}
+	if explicitTarball {
+		// Snapshot and extract the explicit archive before any doctor,
+		// preview, manifest, or trigger work. The snapshot is also the path
+		// uploaded below, so every local decision is made against the exact
+		// bytes that reach the API rather than against the caller's cwd.
+		archivePath, archiveSourceDir, archiveCleanup, archiveErr := materializeDeployArchive(*tarball)
+		if archiveErr != nil {
+			return printErr("Bad --tarball", archiveErr)
+		}
+		*tarball = archivePath
+		sourceDir = archiveSourceDir
+		defer archiveCleanup()
+	}
+	if *dockerfile {
+		if dockerfileErr := validateExplicitDockerfile(sourceDir); dockerfileErr != nil {
+			return printErr("Invalid --dockerfile", dockerfileErr)
+		}
+	}
 	// Cluster A: local doctor preflight. Zero-config deploys run the
 	// deterministic source checks automatically in warn-only mode; the
 	// explicit --doctor-strict variant keeps the fail-fast policy gate.
-	// Runs runDoctorChecks
-	// against the selected source directory BEFORE any HTTP / pack. Errors exit 1 with the
-	// doctor report printed to stderr (pre-network, no half-state).
+	// Runs runDoctorChecks against the selected source directory (cwd for
+	// zero-config, extracted archive contents for --tarball/--template) BEFORE
+	// any HTTP / pack. Errors exit 1 with the doctor report printed to stderr
+	// (pre-network, no half-state).
 	// Warnings render but don't fail (mirrors the standalone cmdDoctor
-	// exit semantics). The cwd scan fires regardless of --tarball /
-	// --image — the doctor catches source-side failure modes
-	// (stateless_only_violation, app_loopback_bound, env_var_missing)
-	// that the tarball/image bytes alone can't reveal. Only when
-	// cwd itself is unreachable (cwdErr != nil) does the gate
-	// skip — in that case the server-side validators on upload are
-	// the catch.
+	// exit semantics). The selected source is scanned regardless of whether
+	// it came from --tarball, --template, or zero-config — the doctor catches
+	// source-side failure modes
+	// (stateless_only_violation, app_loopback_bound, env_var_missing) from the
+	// selected source. Only when that source is unreachable (cwdErr != nil for
+	// zero-config) does the gate skip — in that case the server-side validators
+	// on upload are the catch.
 	doctorEnabled := *doctorStrict || (!*noDoctor && localZeroConfig)
 	if doctorEnabled && sourceDir != "" {
 		doctorShape := resolvedShape
@@ -1932,7 +2007,7 @@ func cmdDeployTarballToExisting(ctx context.Context, args []string, existingApp 
 		if !*doctorStrict && (rep.HasErrors() || rep.HasWarnings() || rep.HasProfileWarnings()) {
 			renderDoctorDeployPreflight(rep, jsonOutput)
 		}
-		// Cluster A (F7 perf): doctor already walked cwd. Signal
+		// Cluster A (F7 perf): doctor already walked the selected source. Signal
 		// runPackPreflight to skip its own loopback-bind and
 		// arch-mismatch scans so we don't double-walk the repo.
 		doctorPreflightRan = true

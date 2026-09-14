@@ -88,9 +88,19 @@ func cmdDeployRepoSourceRefContextWithJSONWait(ctx context.Context, slug, repo, 
 // wrapper above keeps the helper's default behavior for callers that do not
 // need the deploy-local flags.
 func cmdDeployRepoSourceRefContextWithJSONWaitOptions(ctx context.Context, slug, repo, ref string, ann api.DeployAnnotations, waitForDeploy, jsonWait bool, idempotencyKey string, waitTimeout time.Duration) int {
+	return cmdDeployRepoSourceRefContextWithJSONWaitOptionsAndManifest(ctx, slug, repo, ref, ann, waitForDeploy, jsonWait, idempotencyKey, waitTimeout, false)
+}
+
+func cmdDeployRepoSourceRefContextWithJSONWaitOptionsAndManifest(ctx context.Context, slug, repo, ref string, ann api.DeployAnnotations, waitForDeploy, jsonWait bool, idempotencyKey string, waitTimeout time.Duration, noTriggers bool) int {
 	client, err := authedClient()
 	if err != nil {
 		return printErr("Not logged in", err)
+	}
+	// Source-ref is a first-deploy transport as well as a redeploy transport.
+	// Probe first so an existing app can redeploy even when the account is at
+	// its app cap; create only after the account-scoped lookup returns 404.
+	if err := ensureSourceRefApp(ctx, client, slug); err != nil {
+		return printErr("Could not create or fetch app", err)
 	}
 	req := api.SourceRefDeployRequest{
 		Repo:           repo,
@@ -102,6 +112,7 @@ func cmdDeployRepoSourceRefContextWithJSONWaitOptions(ctx context.Context, slug,
 		PRNumber:       ann.PRNumber,
 		TrafficPercent: ann.TrafficPercent,
 		Canary:         ann.Canary,
+		NoTriggers:     noTriggers,
 	}
 	deployCtx := ctx
 	if idempotencyKey != "" {
@@ -147,4 +158,13 @@ func cmdDeployRepoSourceRefContextWithJSONWaitOptions(ctx context.Context, slug,
 		return writeWaitedDeploymentReceiptUntil(ctx, client, dep, nil, deployedAppURL(slug), "", slug, waitTimeout)
 	}
 	return streamDeployLogsContextWithOptions(ctx, client, dep, slug, streamDeployOptions{waitTimeout: waitTimeout})
+}
+
+func ensureSourceRefApp(ctx context.Context, client *Client, slug string) error {
+	if _, err := client.GetApp(ctx, slug); err == nil {
+		return nil
+	} else if !isNotFound(err) {
+		return err
+	}
+	return createOrFetchApp(ctx, client, buildCreateRequest(slug, shapeApp, "", nil, nil), nil, nil, nil)
 }
