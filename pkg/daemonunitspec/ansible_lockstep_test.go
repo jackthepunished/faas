@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -85,5 +86,34 @@ func TestDaemonsYAML_LockstepWithRegistry(t *testing.T) {
 		if !found {
 			t.Errorf("faas_daemon_probes lists %s which is not a Registry daemon", unit)
 		}
+	}
+}
+
+// TestComputeOnlyScheddUsesRemoteDatabaseUnit protects the split-box boot
+// contract. The control-plane schedd unit is intentionally different: it may
+// order after the local PostgreSQL service, while a compute node has no local
+// PostgreSQL and must start from compute-db.env instead.
+func TestComputeOnlyScheddUsesRemoteDatabaseUnit(t *testing.T) {
+	root := repoRoot(t)
+	unitPath := filepath.Join(root, "deploy", "ansible", "roles", "compute_only_service", "files", "faas-schedd.service")
+	unit, err := os.ReadFile(unitPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unitText := string(unit)
+	if strings.Contains(unitText, "postgresql.service") {
+		t.Fatalf("compute-only schedd must not depend on local PostgreSQL: %s", unitPath)
+	}
+	if !strings.Contains(unitText, "EnvironmentFile=-/etc/faas/compute-db.env") {
+		t.Fatalf("compute-only schedd must load the remote database environment")
+	}
+
+	tasksPath := filepath.Join(root, "deploy", "ansible", "roles", "compute_only_service", "tasks", "main.yml")
+	tasks, err := os.ReadFile(tasksPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(tasks), "src: faas-schedd.service") {
+		t.Fatalf("compute-only role must install its local remote-DB schedd unit")
 	}
 }
