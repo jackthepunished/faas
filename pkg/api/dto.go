@@ -2892,15 +2892,16 @@ type AddTenantHostnameRequest struct {
 // optional scheduling controls; LastFiredAt is the most recent fire stamp
 // schedd wrote (MarkCronFired).
 type CronResponse struct {
-	ID            string `json:"id"`
-	AppID         string `json:"app_id"`
-	Schedule      string `json:"schedule"`
-	Path          string `json:"path"`
-	Enabled       bool   `json:"enabled"`
-	Timezone      string `json:"timezone"`
-	SkipIfRunning bool   `json:"skip_if_running"`
-	CreatedAt     string `json:"created_at"`
-	LastFiredAt   string `json:"last_fired_at,omitempty"`
+	ID              string `json:"id"`
+	AppID           string `json:"app_id"`
+	Schedule        string `json:"schedule"`
+	Path            string `json:"path"`
+	Enabled         bool   `json:"enabled"`
+	SuspendedReason string `json:"suspended_reason,omitempty"`
+	Timezone        string `json:"timezone"`
+	SkipIfRunning   bool   `json:"skip_if_running"`
+	CreatedAt       string `json:"created_at"`
+	LastFiredAt     string `json:"last_fired_at,omitempty"`
 }
 
 // CreateCronRequest creates a scheduled synthetic POST.
