@@ -406,6 +406,14 @@ func (c *Client) Whoami(ctx context.Context) (AccountResponse, error) {
 	return out, c.do(ctx, "GET", "/v1/account", nil, &out)
 }
 
+// PatchAccountBilling updates the authenticated account's legal billing
+// identity. Omitted fields are preserved; an explicitly empty string clears
+// that field. The response is the refreshed account profile.
+func (c *Client) PatchAccountBilling(ctx context.Context, req UpdateAccountBillingInfoRequest) (AccountResponse, error) {
+	var out AccountResponse
+	return out, c.do(ctx, "PATCH", "/v1/account/billing", req, &out)
+}
+
 // GetAccountRateLimits returns the authenticated account's current deploy
 // rate window and plan-derived limit.
 func (c *Client) GetAccountRateLimits(ctx context.Context) (AccountRateLimitsResponse, error) {

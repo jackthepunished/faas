@@ -990,6 +990,7 @@ from .trigger_source_type_1 import TriggerSourceType1
 from .trigger_source_type_2_type_1 import TriggerSourceType2Type1
 from .trigger_source_type_3_type_1 import TriggerSourceType3Type1
 from .trusted_signer import TrustedSigner
+from .update_account_billing_info_request import UpdateAccountBillingInfoRequest
 from .update_alert_rule_request import UpdateAlertRuleRequest
 from .update_alert_rule_request_action import UpdateAlertRuleRequestAction
 from .update_alert_rule_request_comparison import UpdateAlertRuleRequestComparison
@@ -2066,6 +2067,7 @@ __all__ = (
     "TriggerSourceType2Type1",
     "TriggerSourceType3Type1",
     "TrustedSigner",
+    "UpdateAccountBillingInfoRequest",
     "UpdateAlertRuleRequest",
     "UpdateAlertRuleRequestAction",
     "UpdateAlertRuleRequestComparison",

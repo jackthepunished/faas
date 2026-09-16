@@ -15,6 +15,15 @@ package api
 
 import "time"
 
+// UpdateAccountBillingInfoRequest is the partial update payload for
+// PATCH /v1/account/billing. A nil field leaves its existing value unchanged;
+// an explicitly empty string clears it.
+type UpdateAccountBillingInfoRequest struct {
+	BusinessName   *string `json:"business_name,omitempty"`
+	BillingAddress *string `json:"billing_address,omitempty"`
+	TaxID          *string `json:"tax_id,omitempty"`
+}
+
 // BillingStatusResponse is the provider-independent customer projection
 // returned by GET /v1/billing/status. It intentionally carries no provider
 // catalog handles or customer identifiers: callers only need to know whether
