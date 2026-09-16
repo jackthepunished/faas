@@ -1111,6 +1111,11 @@ var cliCommands = []cliCommand{
 				{Name: "point-in-time", Short: "RFC3339 restore timestamp", Req: true, Value: "TIMESTAMP"},
 			}},
 			{Name: "bindings", Short: "Manage app database bindings"},
+			{Name: "attach", Short: "Attach a database to an app", Flags: []cliFlag{
+				{Name: "scope", Short: "environment scope", Value: "SCOPE"},
+				{Name: "env", Short: "connection environment variable", Value: "KEY"},
+				{Name: "access", Short: "credential access", Value: "MODE", ClosedSet: []string{"read_write", "read_only"}},
+			}},
 		},
 	},
 	{
