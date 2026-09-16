@@ -1884,6 +1884,7 @@ type DebugReplayView struct {
 type DebugRegressionView struct {
 	DeploymentID    string
 	Route           string
+	State           string
 	P95MS           int
 	P95BaseMS       int
 	AffectedCount   int
