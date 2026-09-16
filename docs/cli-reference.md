@@ -5,6 +5,7 @@ Generated from the CLI's command manifest by `gregale man --markdown`. Do not ed
 | Command | What it does |
 |---|---|
 | [`account`](#account) | Manage the local account (account export\|delete\|restore\|status\|dpa\|slo) |
+| [`add`](#add) | Provision and bind managed resources to an app |
 | [`capabilities`](#capabilities) | Show feature maturity and plan availability |
 | [`alerts`](#alerts) | Per-app alert rules (alerts list\|add\|info\|update\|rm\|rotate-secret\|preset --app &lt;slug&gt;) |
 | [`audit-events`](#audit-events) | Audit-log query (audit-events list\|get &lt;id&gt;) |
@@ -110,6 +111,49 @@ Show DPA metadata
 ### account slo
 
 Account-wide SLO panel
+
+
+## add
+
+Provision and bind managed resources to an app
+
+`gregale add [<subcommand>]`
+
+### add postgres
+
+Provision or attach PostgreSQL and inject DATABASE_URL
+
+| Flag | Meaning | |
+|---|---|---|
+| `--app <APP>` | app slug | required |
+| `--env <SCOPE>` | environment scope | required |
+| `--scope <SCOPE>` | environment scope (alias for --env) |  |
+| `--database <REF>` | existing database ID or name |  |
+| `--region <REGION>` | provider-neutral region when creating |  |
+| `--postgres-major <N>` | PostgreSQL major version |  |
+| `--class <CLASS>` | service class | one of `development` · `burstable` · `production` |
+| `--availability <MODE>` | availability mode | one of `single_zone` · `high_availability` |
+| `--scale-to-zero` | suspend compute when idle |  |
+| `--environment-key <KEY>` | connection environment variable |  |
+| `--access <MODE>` | credential access | one of `read_write` · `read_only` |
+| `--wait-timeout <DURATION>` | readiness timeout |  |
+
+### add bucket
+
+Provision or attach object storage and inject sealed S3 settings
+
+| Flag | Meaning | |
+|---|---|---|
+| `--app <APP>` | app slug | required |
+| `--env <SCOPE>` | environment scope | required |
+| `--scope <SCOPE>` | environment scope (alias for --env) |  |
+| `--region <REGION>` | object-storage region |  |
+| `--public` | serve objects publicly from the app host |  |
+| `--serve-at <PATH>` | public mount path |  |
+| `--permission <MODE>` | compute binding permission | one of `read` · `write` · `read_write` |
+| `--label <LABEL>` | bucket-scoped compute credential label |  |
+| `--prefix <PREFIX>` | injected storage secret prefix |  |
+| `--wait-timeout <DURATION>` | readiness timeout |  |
 
 
 ## capabilities
@@ -1890,4 +1934,3 @@ Print the powershell completion snippet
 Print the gregale(1) man page (or gregale-&lt;command&gt;(1) with one arg)
 
 `gregale man <command>`
-
