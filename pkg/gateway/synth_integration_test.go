@@ -1,3 +1,4 @@
+// adr: 122
 package gateway
 
 import (
@@ -289,5 +290,16 @@ func TestNewSynthServer_AppliesCanonicalShape(t *testing.T) {
 	}
 	if s.srv.MaxHeaderBytes != int(api.DefaultMaxHeaderBytes) {
 		t.Errorf("MHB = %d, want %d", s.srv.MaxHeaderBytes, int(api.DefaultMaxHeaderBytes))
+	}
+}
+
+func TestSynthServerSetHandlerAdoptsCustomerRequestEnvelope(t *testing.T) {
+	s := NewSynthServer("/tmp/unused.sock", &fakeDispatcher{}, slog.Default())
+	s.SetHandler(http.NotFoundHandler())
+	if got := s.srv.ReadTimeout; got != api.CustomerRequestEnvelopeTimeout {
+		t.Fatalf("ReadTimeout = %v, want %v", got, api.CustomerRequestEnvelopeTimeout)
+	}
+	if got := s.srv.WriteTimeout; got != api.CustomerRequestEnvelopeTimeout {
+		t.Fatalf("WriteTimeout = %v, want %v", got, api.CustomerRequestEnvelopeTimeout)
 	}
 }

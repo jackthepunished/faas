@@ -1,3 +1,4 @@
+// adr: 080
 // Tests for the issue #676 PR-1 review fixes. Each test pins a
 // specific finding from the code review (PR #694) so a future
 // refactor cannot silently regress the fix:
@@ -22,12 +23,14 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 
 	vmmdpb "github.com/onebox-faas/faas/api/proto/onebox/faas/vmmd/v1"
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/netns"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -350,6 +353,17 @@ func TestRawBridgePathEnv_TakesEffect(t *testing.T) {
 		// Catch the bodyErrCh path: this assertion must not
 		// be reachable.
 		t.Fatalf("resolveRawBridgePath returned context error")
+	}
+}
+
+func TestRawBridgeCommandUsesLiveInstancePIDNamespace(t *testing.T) {
+	cmd := rawBridgeCommand(context.Background(), 4242, "/opt/faas/current/bin/vmmd-raw-bridge", 8080)
+	want := []string{
+		"nsenter", "--target", "4242", "--net", "--",
+		"/opt/faas/current/bin/vmmd-raw-bridge", netns.GuestIP, "8080",
+	}
+	if !slices.Equal(cmd.Args, want) {
+		t.Fatalf("raw bridge argv = %#v, want %#v", cmd.Args, want)
 	}
 }
 
