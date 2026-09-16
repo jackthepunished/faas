@@ -1479,7 +1479,7 @@ Show a project and its workloads
 
 ### projects environments
 
-Manage project environments (list|create|protect|unprotect|preview|promote|status)
+Manage project environments (list|create|protect|unprotect|releases|history|config|diff|preview|promote|status|rollback)
 
 ### projects update
 
