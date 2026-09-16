@@ -2,6 +2,9 @@ package objectstorage
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -9,6 +12,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -130,6 +134,29 @@ func (h *uploadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		uploadProblem(w, http.StatusRequestEntityTooLarge, "upload exceeds the route byte limit")
 		return
 	}
+	idempotencyKey, err := parseUploadIdempotencyKey(r.Header.Get("Idempotency-Key"))
+	if err != nil {
+		uploadProblem(w, http.StatusBadRequest, "Idempotency-Key is invalid")
+		return
+	}
+	requestFingerprint := ""
+	if idempotencyKey != "" {
+		// APIKey.Hash is the durable, non-reversible credential fingerprint
+		// already available after authentication. Use it as the HMAC key so
+		// idempotency material is not exposed through a bare SHA-256 digest
+		// (which CodeQL correctly rejects for sensitive request data).
+		requestFingerprint = uploadRequestFingerprint(key.Hash, route.ID, subject, r.ContentLength, contentType, r.Header)
+		objectKey = idempotentUploadKey(key.Hash, route.KeyPrefix, route.ID, subject, idempotencyKey)
+		existing, lookupErr := h.routes.GetObjectUploadIntent(r.Context(), route.ID, subject, idempotencyKey)
+		if lookupErr == nil {
+			if h.replayIdempotent(w, existing, requestFingerprint) {
+				return
+			}
+		} else if !errors.Is(lookupErr, state.ErrNotFound) {
+			uploadProblem(w, http.StatusServiceUnavailable, "upload idempotency state is unavailable")
+			return
+		}
+	}
 	if h.accounting == nil || !h.registry.Accounting.Valid() {
 		uploadProblem(w, http.StatusServiceUnavailable, "object storage usage is temporarily unavailable")
 		return
@@ -159,19 +186,69 @@ func (h *uploadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	completion := state.ObjectUploadCompletion{ID: uuid.NewString(), RouteID: route.ID, AccountID: app.AccountID, AppID: app.ID, BucketID: bucket.ID, SubjectID: subject, Key: objectKey, Bytes: r.ContentLength, ContentType: contentType, RequestID: r.Header.Get("X-Request-ID"), IdempotencyKey: idempotencyKey, RequestFingerprint: requestFingerprint, Status: "pending", CreatedAt: h.now()}
+	if idempotencyKey != "" {
+		intent, intentErr := h.routes.CreateObjectUploadIntent(r.Context(), completion)
+		if intentErr != nil {
+			if errors.Is(intentErr, state.ErrConflict) {
+				existing, lookupErr := h.routes.GetObjectUploadIntent(r.Context(), route.ID, subject, idempotencyKey)
+				if lookupErr == nil {
+					h.replayIdempotent(w, existing, requestFingerprint)
+					return
+				}
+			}
+			uploadProblem(w, http.StatusServiceUnavailable, "upload idempotency state is unavailable")
+			return
+		}
+		completion = intent
+	}
 	result, err := writer.WriteObject(r.Context(), bucket.PhysicalName, objectKey, io.LimitReader(r.Body, route.MaxBytes+1), r.ContentLength, ObjectMetadata{ContentType: contentType})
-	completion := state.ObjectUploadCompletion{ID: uuid.NewString(), RouteID: route.ID, AccountID: app.AccountID, AppID: app.ID, BucketID: bucket.ID, SubjectID: subject, Key: objectKey, Bytes: r.ContentLength, ContentType: contentType, ETag: result.ETag, RequestID: r.Header.Get("X-Request-ID"), CreatedAt: h.now()}
+	completion.ETag = result.ETag
 	if err != nil {
 		completion.Status = "failed"
 		completion.ErrorCode = "provider_write_failed"
-		h.record(r.Context(), completion)
+		if idempotencyKey != "" {
+			if _, updateErr := h.routes.UpdateObjectUploadCompletion(context.WithoutCancel(r.Context()), completion); updateErr != nil {
+				h.log.Warn("object upload failure receipt update failed", "err", updateErr)
+				uploadProblem(w, http.StatusServiceUnavailable, "object storage completion is temporarily unavailable")
+				return
+			}
+		} else {
+			h.record(r.Context(), completion)
+		}
 		uploadProblem(w, http.StatusBadGateway, "object storage upload failed")
 		return
 	}
 	completion.Status = "completed"
-	h.record(r.Context(), completion)
+	if idempotencyKey != "" {
+		if _, updateErr := h.routes.UpdateObjectUploadCompletion(context.WithoutCancel(r.Context()), completion); updateErr != nil {
+			h.log.Warn("object upload completion update failed", "err", updateErr)
+			uploadProblem(w, http.StatusServiceUnavailable, "object storage completion is temporarily unavailable")
+			return
+		}
+	} else {
+		h.record(r.Context(), completion)
+	}
 	h.log.Info("object upload completed", "route", route.Name, "bucket_id", bucket.ID, "bytes", r.ContentLength)
-	writeUploadJSON(w, http.StatusCreated, map[string]any{"id": completion.ID, "bucket_id": bucket.ID, "key": objectKey, "bytes": completion.Bytes, "content_type": contentType, "etag": result.ETag, "status": completion.Status})
+	writeUploadJSON(w, http.StatusCreated, uploadResponse(completion))
+}
+
+func (h *uploadHandler) replayIdempotent(w http.ResponseWriter, completion state.ObjectUploadCompletion, requestFingerprint string) bool {
+	if completion.RequestFingerprint != requestFingerprint {
+		uploadProblem(w, http.StatusConflict, "Idempotency-Key was already used with different upload parameters")
+		return true
+	}
+	switch completion.Status {
+	case "completed":
+		writeUploadJSON(w, http.StatusCreated, uploadResponse(completion))
+	case "failed":
+		uploadProblem(w, http.StatusBadGateway, "object storage upload failed")
+	case "pending":
+		uploadProblem(w, http.StatusConflict, "an upload with this Idempotency-Key is already in progress")
+	default:
+		uploadProblem(w, http.StatusConflict, "Idempotency-Key cannot be replayed")
+	}
+	return true
 }
 
 func (h *uploadHandler) authenticate(w http.ResponseWriter, r *http.Request, app state.App) (state.Account, state.APIKey, bool) {
@@ -219,6 +296,51 @@ func (h *uploadHandler) record(ctx context.Context, completion state.ObjectUploa
 	if _, err := h.routes.RecordObjectUploadCompletion(context.WithoutCancel(ctx), completion); err != nil {
 		h.log.Warn("object upload completion record failed", "err", err)
 	}
+}
+
+const maxUploadIdempotencyKeyBytes = 128
+
+func parseUploadIdempotencyKey(value string) (string, error) {
+	if value == "" {
+		return "", nil
+	}
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > maxUploadIdempotencyKeyBytes {
+		return "", errors.New("invalid idempotency key")
+	}
+	for _, r := range value {
+		if r < 0x20 || r == 0x7f {
+			return "", errors.New("invalid idempotency key")
+		}
+	}
+	return value, nil
+}
+
+func uploadRequestFingerprint(key []byte, routeID, subject string, size int64, contentType string, headers http.Header) string {
+	material := strings.Join([]string{routeID, subject, strconv.FormatInt(size, 10), contentType, strings.TrimSpace(headers.Get("Content-MD5")), strings.TrimSpace(headers.Get("Digest"))}, "\x00")
+	return uploadMaterialMAC(key, material)
+}
+
+func idempotentUploadKey(key []byte, prefix, routeID, subject, idempotencyKey string) string {
+	material := routeID + "\x00" + subject + "\x00" + idempotencyKey
+	prefix = strings.Trim(prefix, "/")
+	if prefix == "" {
+		return subject + "/idem-" + uploadMaterialMAC(key, material)
+	}
+	return prefix + "/" + subject + "/idem-" + uploadMaterialMAC(key, material)
+}
+
+func uploadMaterialMAC(key []byte, material string) string {
+	// HMAC-SHA256 is intentionally used instead of a bare SHA-256 digest:
+	// route, subject, and idempotency inputs are request-derived sensitive
+	// data, and the API-key fingerprint provides a stable per-principal key.
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write([]byte(material))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func uploadResponse(completion state.ObjectUploadCompletion) map[string]any {
+	return map[string]any{"id": completion.ID, "bucket_id": completion.BucketID, "key": completion.Key, "bytes": completion.Bytes, "content_type": completion.ContentType, "etag": completion.ETag, "status": completion.Status}
 }
 
 func uploadRouteName(path string) (string, bool) {
