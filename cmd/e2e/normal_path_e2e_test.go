@@ -91,6 +91,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/db/pgtest"
 	"github.com/onebox-faas/faas/pkg/e2etest"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/storage"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -98,14 +99,15 @@ import (
 )
 
 type normalPathFixture struct {
-	h      *e2etest.Harness
-	vmmd   *normalPathVMMD
-	store  *state.PgStore
-	app    api.AppResponse
-	key    string
-	nodeID string
-	host   string
-	ctx    context.Context
+	h         *e2etest.Harness
+	vmmd      *normalPathVMMD
+	store     *state.PgStore
+	app       api.AppResponse
+	key       string
+	nodeID    string
+	host      string
+	ctx       context.Context
+	artifacts storage.StorageBackend
 }
 
 func newNormalPathFixture(t *testing.T, slug string) *normalPathFixture {
@@ -113,6 +115,10 @@ func newNormalPathFixture(t *testing.T, slug string) *normalPathFixture {
 }
 
 func newNormalPathFixtureWithPlan(t *testing.T, slug string, plan api.Plan) *normalPathFixture {
+	return newNormalPathFixtureWithPlanAndEnv(t, slug, plan)
+}
+
+func newNormalPathFixtureWithPlanAndEnv(t *testing.T, slug string, plan api.Plan, extraEnv ...string) *normalPathFixture {
 	t.Helper()
 	pool := pgtest.OpenMigrated(t)
 	if pool == nil {
@@ -130,7 +136,7 @@ func newNormalPathFixtureWithPlan(t *testing.T, slug string, plan api.Plan) *nor
 	vmmdSock := filepath.Join(vmmdSockDir, "vmmd.sock")
 	vmmd := startNormalPathVMMD(t, vmmdSock)
 	t.Setenv("FAAS_E2E_VMMD_SOCKET", vmmdSock)
-	h := e2etest.Start(t, pool, e2etest.APID|e2etest.Schedd|e2etest.Gatewayd)
+	h := e2etest.StartWithEnv(t, pool, e2etest.APID|e2etest.Schedd|e2etest.Gatewayd, extraEnv)
 	ctx := context.Background()
 	key := h.SeedAccount(ctx, plan, slug)
 	body, statusCode := doReq(t, h, key, http.MethodPost, "/v1/apps",
@@ -1691,6 +1697,7 @@ type normalPathVMMD struct {
 	lastBody         []byte
 	lastBodyChunks   int
 	forwardCount     int
+	defaultVersion   string
 }
 
 type normalPathResponse struct {
@@ -1791,6 +1798,12 @@ func (s *normalPathVMMD) SetVersion(instanceID, version string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.versions[instanceID] = version
+}
+
+func (s *normalPathVMMD) SetDefaultVersion(version string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.defaultVersion = version
 }
 
 func (s *normalPathVMMD) FailNext(instanceID string, err error) {
@@ -1924,6 +1937,16 @@ func (s *normalPathVMMD) Ping(context.Context, *vmmdpb.PingRequest) (*vmmdpb.Pin
 	return &vmmdpb.PingResponse{}, nil
 }
 
+func (s *normalPathVMMD) CreateColdBoot(_ context.Context, request *vmmdpb.CreateColdBootRequest) (*vmmdpb.WakeResponse, error) {
+	return &vmmdpb.WakeResponse{
+		Instance: request.GetInstance(),
+		LeaseUid: 20000,
+		HostIp:   "127.0.0.1",
+		Netns:    "fake-" + request.GetInstance(),
+		Method:   vmmdpb.WakeMethod_WAKE_COLD_BOOT,
+	}, nil
+}
+
 func (s *normalPathVMMD) ForwardHTTPStream(stream vmmdpb.Vmmd_ForwardHTTPStreamServer) error {
 	request, err := stream.Recv()
 	if err != nil {
@@ -1980,6 +2003,9 @@ func (s *normalPathVMMD) ForwardHTTPStream(stream vmmdpb.Vmmd_ForwardHTTPStreamS
 		Body: append([]byte(nil), body...),
 	})
 	version := s.versions[init.Instance]
+	if version == "" {
+		version = s.defaultVersion
+	}
 	response := s.responses[init.Instance]
 	if byPath := s.responsesByPath[init.Instance]; byPath != nil {
 		if pathResponse, ok := byPath[init.RequestUri]; ok {
