@@ -1476,7 +1476,7 @@ Show a project and its workloads
 
 ### projects environments
 
-Manage project environments (list|create|protect|unprotect)
+Manage project environments (list|create|protect|unprotect|preview)
 
 ### projects update
 
