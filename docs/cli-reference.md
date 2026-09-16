@@ -1108,7 +1108,7 @@ Production debugger (ADR-127)
 
 ### debug requests
 
-Per-request telemetry (list/watch filters: deployment, status, cold boot, consumer, latency)
+Per-request telemetry (list/export/watch/get/evidence/replay)
 
 ### debug coverage
 
@@ -1120,7 +1120,7 @@ Explain why an app is still running, with request evidence when available (runni
 
 ### debug regressions
 
-Active regression observations (list|watch [--interval D] [--once])
+Regressions (per-app/--all, watch, and confirmed rollback)
 
 ### debug compare
 
