@@ -90,6 +90,7 @@ ConsumeEmailVerificationToken
 ConsumeLoginToken
 ConsumeMFADisableRequest
 ConsumeOrgInvitation
+ConsumeProjectEnvironmentApproval
 ConsumeRecoveryCode
 ConsumerKeyByAppAndPrefix
 CountAPIKeys
@@ -540,6 +541,7 @@ PreviewAppsByParent
 ProjectByID
 ProjectByRepo
 ProjectBySlug
+ProjectEnvironmentApprovalByID
 ProjectEnvironmentApprovalByToken
 ProjectEnvironmentPromotionByID
 ProjectEnvironmentPromotionByIdempotencyKey
