@@ -66,6 +66,9 @@ func TestMemStoreAlertRule_RoundTrip(t *testing.T) {
 	if created.State != AlertStateOk {
 		t.Errorf("default state = %q, want %q", created.State, AlertStateOk)
 	}
+	if created.Action != AlertActionWebhook {
+		t.Errorf("default action = %q, want %q", created.Action, AlertActionWebhook)
+	}
 
 	got, err := m.AlertRuleByID(ctx, created.ID)
 	if err != nil {
@@ -114,6 +117,34 @@ func TestMemStoreAlertRule_RoundTrip(t *testing.T) {
 	}
 	if _, err := m.AlertRuleByID(ctx, created.ID); !errors.Is(err, ErrNotFound) {
 		t.Errorf("post-delete lookup = %v", err)
+	}
+}
+
+func TestMemStoreAlertRule_ActionRoundTrip(t *testing.T) {
+	m, ctx, acct, app := alertFixture(t)
+	limits := api.MustLimitsFor(api.PlanPro)
+	for _, action := range []AlertAction{
+		AlertActionWebhook,
+		AlertActionRollback,
+		AlertActionDemote,
+		AlertActionPromote,
+	} {
+		rule := memSampleRule(acct.ID, app.ID)
+		rule.Action = action
+		created, err := m.CreateAlertRuleIfUnderQuota(ctx, rule, limits)
+		if err != nil {
+			t.Fatalf("create %q: %v", action, err)
+		}
+		if created.Action != action {
+			t.Fatalf("created action = %q, want %q", created.Action, action)
+		}
+		got, err := m.AlertRuleByID(ctx, created.ID)
+		if err != nil {
+			t.Fatalf("read %q: %v", action, err)
+		}
+		if got.Action != action {
+			t.Fatalf("stored action = %q, want %q", got.Action, action)
+		}
 	}
 }
 
@@ -251,6 +282,10 @@ func TestMemStoreAlertRule_StateTransition(t *testing.T) {
 	changed, err = m.SetAlertRuleState(ctx, rule.ID, AlertStateFiring, time.Now())
 	if err != nil || changed {
 		t.Errorf("repeat = (%v, %v); want (false, nil)", changed, err)
+	}
+	changed, err = m.SetAlertRuleState(ctx, rule.ID, AlertStateDegraded, time.Now())
+	if err != nil || !changed {
+		t.Errorf("degraded = (%v, %v); want (true, nil)", changed, err)
 	}
 	// real transition back
 	changed, err = m.SetAlertRuleState(ctx, rule.ID, AlertStateOk, time.Now())
