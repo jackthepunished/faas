@@ -917,6 +917,16 @@ Sync the dirty working tree to a stable remote developer environment
 
 show developer-environment quota usage
 
+### dev history
+
+show edit-to-live timings and SLO guidance
+
+| Flag | Meaning | |
+|---|---|---|
+| `--path <DIR>` | source directory |  |
+| `--name <PROJECT>` | developer-session project name |  |
+| `--limit <N>` | number of recent syncs to show |  |
+
 
 ## preview
 
