@@ -1,5 +1,6 @@
 // Tests for CloudflareRecordProvider (Tier A8 / ADR-083 /
 // code-review fix #3 + #7).
+// adr: 083
 
 package gateway
 
@@ -73,6 +74,17 @@ func TestCloudflare_Constructor_PropagatesUnsealError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "unseal") {
 		t.Errorf("error %q should mention 'unseal' so the operator sees the real cause", err)
+	}
+}
+
+func TestCloudflare_RejectsOversizedZoneResponse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"result":"`+strings.Repeat("x", cloudflareResponseMaxBytes)+`"}`)
+	}))
+	defer srv.Close()
+	p := &CloudflareRecordProvider{zone: "example.com", apiURL: srv.URL, hc: srv.Client()}
+	if _, err := p.queryZoneID(context.Background()); err == nil || !strings.Contains(err.Error(), "response body too large") {
+		t.Fatalf("expected response-size error, got %v", err)
 	}
 }
 
