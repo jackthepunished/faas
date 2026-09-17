@@ -638,6 +638,10 @@ Cancel a run
 
 List tasks for one run
 
+### jobs retry
+
+Retry one failed task
+
 ### jobs logs
 
 Tail logs for one task

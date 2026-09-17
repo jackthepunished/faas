@@ -654,6 +654,7 @@ from .job_task_log_response_task_status import JobTaskLogResponseTaskStatus
 from .job_task_response import JobTaskResponse
 from .job_task_response_error_class import JobTaskResponseErrorClass
 from .job_task_response_status import JobTaskResponseStatus
+from .job_task_retry_response import JobTaskRetryResponse
 from .kafka_sasl_config import KafkaSASLConfig
 from .kafka_sasl_mechanism import KafkaSASLMechanism
 from .kafka_tls_config import KafkaTLSConfig
@@ -1872,6 +1873,7 @@ __all__ = (
     "JobTaskResponse",
     "JobTaskResponseErrorClass",
     "JobTaskResponseStatus",
+    "JobTaskRetryResponse",
     "KafkaSASLConfig",
     "KafkaSASLMechanism",
     "KafkaTLSConfig",
