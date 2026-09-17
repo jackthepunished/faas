@@ -1719,6 +1719,17 @@ Close a bounded, filtered set of live connections
 | `--limit <N>` | maximum connections to select (1-1000) |  |
 | `--dry-run` | preview without closing connections |  |
 | `--allow-partial` | allow the reachable subset when nodes are unavailable |  |
+| `--wait` | wait for the drain to reach a terminal state |  |
+| `--timeout <DURATION>` | maximum time to wait with --wait |  |
+
+### realtime drain-status
+
+Show or wait for a durable realtime drain
+
+| Flag | Meaning | |
+|---|---|---|
+| `--wait` | wait for the drain to reach a terminal state |  |
+| `--timeout <DURATION>` | maximum time to wait with --wait |  |
 
 ### realtime send
 
