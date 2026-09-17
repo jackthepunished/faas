@@ -49,6 +49,10 @@ class ScalingPolicy:
     429 immediately. Empty uses queue."""
     max_queue_wait_ms: int | Unset = UNSET
     """Maximum admission wait in milliseconds. 0 uses the plan default; capped at 120000."""
+    wake_max_queue_depth: int | Unset = UNSET
+    """Per-app cold-wake waiter cap. 0 uses the plan default; positive values are capped at 8x the plan default."""
+    wake_max_queue_wait_seconds: int | Unset = UNSET
+    """Per-app cold-wake wait budget in seconds. 0 uses the plan default; capped at 60 seconds."""
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.scaling_target import ScalingTarget
@@ -75,6 +79,10 @@ class ScalingPolicy:
 
         max_queue_wait_ms = self.max_queue_wait_ms
 
+        wake_max_queue_depth = self.wake_max_queue_depth
+
+        wake_max_queue_wait_seconds = self.wake_max_queue_wait_seconds
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update({})
@@ -92,6 +100,10 @@ class ScalingPolicy:
             field_dict["concurrency_overflow"] = concurrency_overflow
         if max_queue_wait_ms is not UNSET:
             field_dict["max_queue_wait_ms"] = max_queue_wait_ms
+        if wake_max_queue_depth is not UNSET:
+            field_dict["wake_max_queue_depth"] = wake_max_queue_depth
+        if wake_max_queue_wait_seconds is not UNSET:
+            field_dict["wake_max_queue_wait_seconds"] = wake_max_queue_wait_seconds
 
         return field_dict
 
@@ -134,6 +146,10 @@ class ScalingPolicy:
 
         max_queue_wait_ms = d.pop("max_queue_wait_ms", UNSET)
 
+        wake_max_queue_depth = d.pop("wake_max_queue_depth", UNSET)
+
+        wake_max_queue_wait_seconds = d.pop("wake_max_queue_wait_seconds", UNSET)
+
         scaling_policy = cls(
             min_instances=min_instances,
             max_instances=max_instances,
@@ -142,6 +158,8 @@ class ScalingPolicy:
             scale_in_cooldown_s=scale_in_cooldown_s,
             concurrency_overflow=concurrency_overflow,
             max_queue_wait_ms=max_queue_wait_ms,
+            wake_max_queue_depth=wake_max_queue_depth,
+            wake_max_queue_wait_seconds=wake_max_queue_wait_seconds,
         )
 
         return scaling_policy
