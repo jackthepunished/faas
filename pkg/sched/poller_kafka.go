@@ -447,7 +447,13 @@ func (k *kafkaPoller) Nack(commitCtx context.Context, t sqlc.Trigger, ids []stri
 			continue
 		}
 		var err error
-		if reason == triggerReasonPoisonRecord {
+		switch reason {
+		case triggerReasonMaxAttempts:
+			// Retry exhaustion is terminal regardless of the poison
+			// strategy: committing advances the broker and prevents a
+			// configured seek-to-offset policy from redelivering forever.
+			err = k.reader.CommitMessages(commitCtx, msg)
+		case triggerReasonPoisonRecord:
 			// Audit #10: the strategy column gates the
 			// poison-specific terminal broker op. The empty
 			// default ("") is treated as "commit" — matches the
@@ -471,7 +477,7 @@ func (k *kafkaPoller) Nack(commitCtx context.Context, t sqlc.Trigger, ids []stri
 				// it here it's a deliberate "commit".
 				err = k.reader.CommitMessages(commitCtx, msg)
 			}
-		} else {
+		default:
 			// Rewind to the failed offset. segmentio/kafka-go's
 			// Reader tracks its own offset; SetOffset rewinds.
 			// Next FetchMessage returns this message again.

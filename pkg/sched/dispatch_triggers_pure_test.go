@@ -8,6 +8,8 @@
 //
 // Whitebox `package sched` (matches existing pkg/sched tests).
 
+// spec: §6.2
+
 package sched
 
 import (
@@ -166,6 +168,27 @@ func TestClaimedItemIDs_Multiple(t *testing.T) {
 	got := claimedItemIDs(in)
 	if len(got) != 2 || got[0] != "a" || got[1] != "b" {
 		t.Errorf("got %v", got)
+	}
+}
+
+func TestRetryExhausted(t *testing.T) {
+	tests := []struct {
+		name        string
+		nextAttempt int32
+		maxAttempts int32
+		want        bool
+	}{
+		{name: "legacy unlimited", nextAttempt: 100, maxAttempts: 0, want: false},
+		{name: "below cap", nextAttempt: 2, maxAttempts: 3, want: false},
+		{name: "at cap", nextAttempt: 3, maxAttempts: 3, want: true},
+		{name: "past cap", nextAttempt: 4, maxAttempts: 3, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := retryExhausted(tt.nextAttempt, tt.maxAttempts); got != tt.want {
+				t.Fatalf("retryExhausted(%d, %d) = %v, want %v", tt.nextAttempt, tt.maxAttempts, got, tt.want)
+			}
+		})
 	}
 }
 
