@@ -10186,6 +10186,10 @@ func (m *MemStore) CreateTriggerIfUnderQuota(_ context.Context, appID, kind, slu
 		if t.AppID.String() == canonicalAppID {
 			perApp++
 		}
+		if kind == "queue" && enabled && source != "" && t.Kind == "queue" && t.Enabled &&
+			t.AppID.String() == canonicalAppID && t.Source.Valid && t.Source.String == source {
+			return sqlc.Trigger{}, ErrConflict
+		}
 	}
 	if limits.TriggerLimitPerApp > 0 && perApp >= limits.TriggerLimitPerApp {
 		return sqlc.Trigger{}, &TriggerQuotaError{Scope: TriggerQuotaScopeApp, Limit: limits.TriggerLimitPerApp, Observed: perApp}
@@ -10236,7 +10240,7 @@ func (m *MemStore) TriggerByID(_ context.Context, id string) (sqlc.Trigger, erro
 	return t, nil
 }
 
-func (m *MemStore) UpdateTrigger(_ context.Context, id string, enabled *bool, config []byte, batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes *int32, brokerPoisonStrategy *string, filterCriteria *[]byte) (sqlc.Trigger, error) {
+func (m *MemStore) UpdateTrigger(_ context.Context, id string, enabled *bool, config []byte, batchSizeMax, batchWindowMs, maxAttempts, payloadMaxBytes *int32, brokerPoisonStrategy *string, filterCriteria *[]byte, source *string) (sqlc.Trigger, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	t, ok := m.triggers[id]
@@ -10269,6 +10273,17 @@ func (m *MemStore) UpdateTrigger(_ context.Context, id string, enabled *bool, co
 		// pgstore coalesce()); non-nil = "replace the JSONB
 		// column". Memstore treats the byte slice as opaque.
 		t.FilterCriteria = append([]byte(nil), (*filterCriteria)...)
+	}
+	if source != nil {
+		t.Source = pgtype.Text{String: *source, Valid: *source != ""}
+	}
+	if t.Kind == "queue" && t.Enabled && t.Source.Valid {
+		for otherID, other := range m.triggers {
+			if otherID != id && other.Kind == "queue" && other.Enabled &&
+				other.AppID == t.AppID && other.Source.Valid && other.Source.String == t.Source.String {
+				return sqlc.Trigger{}, ErrConflict
+			}
+		}
 	}
 	t.UpdatedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
 	m.triggers[id] = t
@@ -10546,6 +10561,18 @@ func (m *MemStore) ListDueInvocations(_ context.Context, now time.Time, limit in
 			continue
 		}
 		if inv.DueAt.After(now) {
+			continue
+		}
+		ownedByTrigger := false
+		for _, trigger := range m.triggers {
+			if trigger.Enabled && trigger.Kind == "queue" && trigger.Source.Valid &&
+				trigger.AppID.String() == canonicalMemUUID(inv.AppID) &&
+				trigger.Source.String == string(inv.Source) {
+				ownedByTrigger = true
+				break
+			}
+		}
+		if ownedByTrigger {
 			continue
 		}
 		out = append(out, inv)
