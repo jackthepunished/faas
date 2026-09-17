@@ -25,11 +25,20 @@ type edgeRuleGenerationStore interface {
 	NextEdgeRuleGeneration(context.Context) (int64, error)
 }
 
+// edgeRuleMutationLocker is optional so MemStore-backed unit tests and
+// legacy single-box adapters retain the process-local fallback. Production
+// PgStore implements it with a session-scoped PostgreSQL advisory lock,
+// closing the cross-apid race where two mutations for one app could publish
+// generations out of order.
+type edgeRuleMutationLocker interface {
+	AcquireEdgeRuleMutationLock(context.Context, string) (func(context.Context), error)
+}
+
 type edgeRuleConvergence struct {
 	notif      Notifier
 	events     <-chan db.Notification
 	cancel     func()
-	unlock     func()
+	unlock     func(context.Context)
 	done       sync.Once
 	generation int64
 	appID      string
@@ -43,24 +52,36 @@ var edgeRuleMutationMu sync.Mutex
 
 func (s *server) prepareEdgeRuleMutation(ctx context.Context, appID, ruleID, operation string, hosts ...string) (*edgeRuleConvergence, error) {
 	edgeRuleMutationMu.Lock()
+	unlock := func(context.Context) { edgeRuleMutationMu.Unlock() }
+	if locker, ok := s.store.(edgeRuleMutationLocker); ok {
+		release, err := locker.AcquireEdgeRuleMutationLock(ctx, appID)
+		if err != nil {
+			edgeRuleMutationMu.Unlock()
+			return nil, err
+		}
+		unlock = func(ctx context.Context) {
+			release(ctx)
+			edgeRuleMutationMu.Unlock()
+		}
+	}
 	allocator, ok := s.store.(edgeRuleGenerationStore)
 	if !ok {
-		edgeRuleMutationMu.Unlock()
+		unlock(ctx)
 		return nil, errors.New("edge-rule generation store is unavailable")
 	}
 	generation, err := allocator.NextEdgeRuleGeneration(ctx)
 	if err != nil {
-		edgeRuleMutationMu.Unlock()
+		unlock(ctx)
 		return nil, err
 	}
 	conv := &edgeRuleConvergence{
 		notif: s.notif, generation: generation, appID: appID, ruleID: ruleID,
 		operation: operation, hosts: canonicalEdgeRuleHosts(hosts), expected: map[string]struct{}{},
-		cancel: func() {}, unlock: edgeRuleMutationMu.Unlock,
+		cancel: func() {}, unlock: unlock,
 	}
 	nodes, err := s.store.ListComputeNodes(ctx, false)
 	if err != nil {
-		conv.close()
+		conv.close(ctx)
 		return nil, fmt.Errorf("list serving gateways: %w", err)
 	}
 	for _, node := range nodes {
@@ -78,7 +99,7 @@ func (s *server) prepareEdgeRuleMutation(ctx context.Context, appID, ruleID, ope
 	// policy. Unnamed legacy single-box installs and local development
 	// intentionally have no compute registry.
 	if s.edgeRuleFleetRequired && len(conv.expected) == 0 {
-		conv.close()
+		conv.close(ctx)
 		return nil, errors.New("no active serving gateways are registered")
 	}
 	if len(conv.expected) > 0 {
@@ -90,7 +111,7 @@ func (s *server) prepareEdgeRuleMutation(ctx context.Context, appID, ruleID, ope
 		conv.events, subscriptionCancel, err = s.notif.Subscribe(listenCtx, []string{db.NotifyEdgeRuleAck})
 		if err != nil {
 			listenCancel()
-			conv.close()
+			conv.close(ctx)
 			return nil, fmt.Errorf("subscribe edge-rule acknowledgements: %w", err)
 		}
 		conv.cancel = func() {
@@ -181,7 +202,7 @@ func (c *edgeRuleConvergence) apply(ctx context.Context, ruleID string) error {
 	if c == nil {
 		return errors.New("nil edge-rule convergence")
 	}
-	defer c.close()
+	defer c.close(ctx)
 	c.ruleID = ruleID
 	applyCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), edgeRuleConvergenceTimeout+time.Second)
 	defer cancel()
@@ -192,7 +213,7 @@ func (c *edgeRuleConvergence) abort(ctx context.Context) {
 	if c == nil {
 		return
 	}
-	defer c.close()
+	defer c.close(ctx)
 	abortCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
 	defer cancel()
 	payload, err := c.payload("abort")
@@ -201,13 +222,13 @@ func (c *edgeRuleConvergence) abort(ctx context.Context) {
 	}
 }
 
-func (c *edgeRuleConvergence) close() {
+func (c *edgeRuleConvergence) close(ctx context.Context) {
 	if c == nil {
 		return
 	}
 	c.done.Do(func() {
 		c.cancel()
-		c.unlock()
+		c.unlock(ctx)
 	})
 }
 
