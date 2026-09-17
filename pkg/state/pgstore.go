@@ -13487,7 +13487,7 @@ func (s *PgStore) RequeueExpiredInvocations(ctx context.Context, now time.Time, 
 		limit = 64
 	}
 	// PR-B fixup (code-review #1185 finding #4): the dispatching→pending
-	// transition and the per-account counter decrement share one
+	// transition and the per-account counter decrements share one
 	// transaction. Without the tx, a crash between the two leaked
 	// the slot until the next cap hit. Keep the reclaimed rows in a
 	// data-modifying CTE so each account's counter is decremented once
@@ -28407,7 +28407,7 @@ func (s *PgStore) ListDeadlineBreachedInvocations(ctx context.Context, now time.
 }
 
 // ForceDeadlineBreachedInvocations transitions the listed invocations
-// to dead_letter with outcome='deadline'. Decrements the per-account
+// to dead_letter with outcome='timeout'. Decrements the per-account
 // counter for each one so the cap reflects the abandoned work.
 func (s *PgStore) ForceDeadlineBreachedInvocations(ctx context.Context, ids []string) (int, error) {
 	if len(ids) == 0 {
@@ -28419,40 +28419,36 @@ func (s *PgStore) ForceDeadlineBreachedInvocations(ctx context.Context, ids []st
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// Capture account_ids before the UPDATE so we can decrement
-	// the counter for each one. The cap row should already exist
-	// (the increment path created it), but tolerant decrement.
+	// Return account_ids from the state-changing UPDATE itself. A
+	// deadline batch can contain a row that completed after the list
+	// query; only rows that actually transition may release a slot.
 	rows, err := tx.Query(ctx,
-		`select account_id from invocations where id = any($1::uuid[])`, ids)
+		`update invocations
+		   set state = 'dead_letter',
+		       outcome = 'timeout',
+		       last_error = 'deadline_at breached',
+		       completed_at = now(),
+		       received_at = coalesce(received_at, now())
+		 where id = any($1::uuid[])
+		   and state in ('pending', 'dispatching')
+		 returning account_id`, ids)
 	if err != nil {
-		return 0, fmt.Errorf("state: invocations deadline lookup: %w", err)
+		return 0, fmt.Errorf("state: invocations deadline force: %w", err)
 	}
 	var accounts []string
 	for rows.Next() {
 		var a string
 		if err := rows.Scan(&a); err != nil {
 			rows.Close()
-			return 0, fmt.Errorf("state: invocations deadline scan account: %w", err)
+			return 0, fmt.Errorf("state: invocations deadline scan: %w", err)
 		}
 		accounts = append(accounts, a)
 	}
-	rows.Close()
 	if err := rows.Err(); err != nil {
+		rows.Close()
 		return 0, err
 	}
-
-	tag, err := tx.Exec(ctx, `
-		update invocations
-		   set state = 'dead_letter',
-		       outcome = 'deadline',
-		       last_error = 'deadline_at breached',
-		       completed_at = now(),
-		       received_at = coalesce(received_at, now())
-		 where id = any($1::uuid[])
-		   and state in ('pending', 'dispatching')`, ids)
-	if err != nil {
-		return 0, fmt.Errorf("state: invocations deadline force: %w", err)
-	}
+	rows.Close()
 
 	for _, a := range accounts {
 		if _, err := tx.Exec(ctx, `
@@ -28467,7 +28463,7 @@ func (s *PgStore) ForceDeadlineBreachedInvocations(ctx context.Context, ids []st
 	if err := tx.Commit(ctx); err != nil {
 		return 0, fmt.Errorf("state: invocations deadline commit: %w", err)
 	}
-	return int(tag.RowsAffected()), nil
+	return len(accounts), nil
 }
 
 // ----------------------------------------------------------------------------

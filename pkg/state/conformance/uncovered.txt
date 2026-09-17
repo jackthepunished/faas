@@ -60,7 +60,6 @@ CheckWebhookReplay
 ClaimAlertFire
 ClaimCliAuthCode
 ClaimDueAppWebhookDeliveries
-ClaimInvocationWithCap
 ClaimNextDueWorkflowRun
 ClaimNextPendingRun
 ClaimNextQueuedBuild
@@ -81,7 +80,6 @@ CloseDeploymentStage
 ColdWakeRatePctSince
 CompleteBuild
 CompleteGdprRequest
-CompleteInvocation
 ComputeNodeByID
 ComputeNodeByName
 ComputeNodeUsedMB
@@ -152,7 +150,6 @@ CreateEdgeRule
 CreateEdgeRuleIfUnderQuota
 CreateInstanceWithMode
 CreateJobInstance
-CreateMirrorRuleIfUnderQuota
 CreateOrg
 CreateOrgAPIKey
 CreateOrgAPIKeyWithProvenance
@@ -222,7 +219,6 @@ DomainByName
 DropTriggerRecordByOperator
 EditPublicStatusEventTitle
 EditPublicStatusUpdateMessage
-EnsureAccountAsyncQuota
 ExpireOrgInvitations
 ExpireUploadSession
 FailBuild
@@ -232,10 +228,8 @@ FailSourceDeployment
 FinalizeServiceRollout
 FindGdprRequestByRequestID
 FindMatchingEvent
-ForceDeadlineBreachedInvocations
 GetAPIConsumerByID
 GetAPIKey
-GetAccountAsyncQuota
 GetAccountEgressAllowlistExtra
 GetAccountKeyGraceWindow
 GetAppErrorSample
@@ -256,7 +250,6 @@ GetGithubWebhookSecret
 GetIdempotent
 GetInstanceTailCount
 GetMFADisableRequest
-GetMirrorRuleByID
 GetOIDCExchangedTokenByHash
 GetOIDCTrustPolicy
 GetOperatorIntent
@@ -299,7 +292,6 @@ InsertTriggerRecord
 InsertWorkflowEvent
 InstallationIDForRepo
 InstanceListByNodeForRecovery
-InvocationByID
 IsMailSuppressed
 IssueCliAuthCode
 IssueEmailVerificationToken
@@ -682,7 +674,6 @@ UpdateDeploymentMinInstances
 UpdateDeploymentTraffic
 UpdateEdgeRule
 UpdateInstanceStateToTerminal
-UpdateMirrorRule
 UpdateOrgMemberRole
 UpdateOrgName
 UpdateOrgPlan
