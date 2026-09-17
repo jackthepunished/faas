@@ -3322,6 +3322,7 @@ func (m *MemStore) CreateApp(_ context.Context, app App) (App, error) {
 	if app.Status == "" {
 		app.Status = AppActive
 	}
+	app.Visibility = api.NormalizeAppVisibility(app.Visibility)
 	if app.CPUMillicores == 0 {
 		app.CPUMillicores = api.DefaultAppCPUMillicores
 	}
@@ -3411,6 +3412,7 @@ func (m *MemStore) CreateAppIfUnderQuota(_ context.Context, app App, limits api.
 	if app.Status == "" {
 		app.Status = AppActive
 	}
+	app.Visibility = api.NormalizeAppVisibility(app.Visibility)
 	if app.CPUMillicores == 0 {
 		app.CPUMillicores = api.DefaultAppCPUMillicores
 	}
@@ -4974,6 +4976,9 @@ func (m *MemStore) UpdateApp(_ context.Context, id string, p UpdateAppParams) (A
 	}
 	if p.SetConsumerAuthMode && p.ConsumerAuthMode != nil {
 		a.ConsumerAuthMode = ConsumerAuthMode(*p.ConsumerAuthMode)
+	}
+	if p.SetVisibility && p.Visibility != nil {
+		a.Visibility = api.NormalizeAppVisibility(*p.Visibility)
 	}
 	// Issue #477 / ADR-079: per-app public_auth
 	// (open|bearer|basic). Memstore mirrors the on-disk shape —
