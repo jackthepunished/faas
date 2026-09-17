@@ -361,6 +361,8 @@ from .dead_letter_event_headers import DeadLetterEventHeaders
 from .dead_letter_event_payload import DeadLetterEventPayload
 from .dead_letter_event_source import DeadLetterEventSource
 from .dead_letter_events_response import DeadLetterEventsResponse
+from .dead_letter_purge_response import DeadLetterPurgeResponse
+from .dead_letter_replay_all_response import DeadLetterReplayAllResponse
 from .debug_compare_request import DebugCompareRequest
 from .debug_compare_response import DebugCompareResponse
 from .debug_compare_route_stats import DebugCompareRouteStats
@@ -1587,6 +1589,8 @@ __all__ = (
     "DeadLetterEventPayload",
     "DeadLetterEventSource",
     "DeadLetterEventsResponse",
+    "DeadLetterPurgeResponse",
+    "DeadLetterReplayAllResponse",
     "DebugCompareRequest",
     "DebugCompareResponse",
     "DebugCompareRouteStats",

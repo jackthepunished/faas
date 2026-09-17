@@ -192,6 +192,8 @@ DeleteCorsPreset
 DeleteCron
 DeleteCustomDomain
 DeleteDataUpstreamByID
+DeleteDeadLetterEvent
+DeleteDeadLetterEvents
 DeleteDeploymentOpenAPIDoc
 DeleteDeploymentScopeExclusion
 DeleteEdgeRule
@@ -572,6 +574,7 @@ RemoveOrgMember
 RenameApp
 ReorderDeployment
 ReplaceProvisionedStaticEgressIPs
+ReplayDeadLetterEvents
 RequestTelemetryAnalyticsByDimension
 RequestTelemetryAnalyticsByRoute
 RequestTelemetryAnalyticsSummary
