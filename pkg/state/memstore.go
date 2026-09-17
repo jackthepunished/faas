@@ -10988,6 +10988,8 @@ func (m *MemStore) QueueState(_ context.Context, appID string) (QueueStats, erro
 			if inv.LeaseExpiresAt == nil || inv.LeaseExpiresAt.After(time.Now()) {
 				s.InFlight++
 			}
+		case InvocationDeadLetter:
+			s.DeadLetter++
 		}
 	}
 	return s, nil
