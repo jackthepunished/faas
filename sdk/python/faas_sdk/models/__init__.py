@@ -320,6 +320,7 @@ from .create_object_upload_route_request import CreateObjectUploadRouteRequest
 from .create_org_api_key_request import CreateOrgAPIKeyRequest
 from .create_org_api_key_request_scopes_item import CreateOrgAPIKeyRequestScopesItem
 from .create_org_request import CreateOrgRequest
+from .create_private_network_request import CreatePrivateNetworkRequest
 from .create_project_environment_approval_request import CreateProjectEnvironmentApprovalRequest
 from .create_project_environment_request import CreateProjectEnvironmentRequest
 from .create_tenant_surface_request import CreateTenantSurfaceRequest
@@ -868,6 +869,9 @@ from .prewarm_intent_response import PrewarmIntentResponse
 from .prewarm_intent_response_status import PrewarmIntentResponseStatus
 from .prewarm_intent_response_trigger import PrewarmIntentResponseTrigger
 from .prewarm_request import PrewarmRequest
+from .private_network import PrivateNetwork
+from .private_network_list_response import PrivateNetworkListResponse
+from .private_network_status import PrivateNetworkStatus
 from .problem import Problem
 from .programmatic_api_key import ProgrammaticAPIKey
 from .programmatic_auth_response import ProgrammaticAuthResponse
@@ -1538,6 +1542,7 @@ __all__ = (
     "CreateOrgAPIKeyRequest",
     "CreateOrgAPIKeyRequestScopesItem",
     "CreateOrgRequest",
+    "CreatePrivateNetworkRequest",
     "CreateProjectEnvironmentApprovalRequest",
     "CreateProjectEnvironmentRequest",
     "CreateTenantSurfaceRequest",
@@ -2078,6 +2083,9 @@ __all__ = (
     "PrewarmIntentResponseStatus",
     "PrewarmIntentResponseTrigger",
     "PrewarmRequest",
+    "PrivateNetwork",
+    "PrivateNetworkListResponse",
+    "PrivateNetworkStatus",
     "Problem",
     "ProgrammaticAPIKey",
     "ProgrammaticAuthResponse",
