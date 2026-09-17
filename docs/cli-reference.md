@@ -649,6 +649,10 @@ Retry one failed task
 
 Tail logs for one task
 
+| Flag | Meaning | |
+|---|---|---|
+| `--max-bytes <N>` | maximum log payload size (1..1048576) |  |
+
 
 ## workflows
 
