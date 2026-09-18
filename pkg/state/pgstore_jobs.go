@@ -32,10 +32,13 @@ import (
 // jobSelectCols is the canonical column order for jobs. Keep in lock-
 // step with scanJobCols and the migrations 00255 + 00572 DDL. The
 // command column (00572) is the last entry so the SELECT list reads
-// in schema-add order.
+// in schema-add order; image materialization columns follow it.
 const jobSelectCols = `id, account_id, kind, name, image_ref, ram_mb, task_timeout_s,
        max_parallelism, retry_max, env_overrides, status, created_at,
-       updated_at, command`
+       updated_at, command, coalesce(image_resolved_digest, ''),
+       coalesce(image_storage_key, ''), image_materialization_status,
+       coalesce(image_materialization_error, ''),
+       image_materialized_at`
 
 // jobRunSelectCols is the canonical column order for job_runs.
 // Includes dead_letter_count (00574). ORDER BY id keeps the contract
@@ -55,6 +58,16 @@ const jobTaskSelectCols = `run_id, task_index, status, attempt, instance_id, err
        next_attempt_at, lease_token, lease_expires_at, last_lease_node,
        log_content, log_truncated`
 
+// jobTaskSelectColsQualified is the same column order as jobTaskSelectCols,
+// with an explicit table qualifier for joins that also expose a status column.
+const jobTaskSelectColsQualified = `job_tasks.run_id, job_tasks.task_index,
+       job_tasks.status, job_tasks.attempt, job_tasks.instance_id,
+       job_tasks.error_class, job_tasks.error_message, job_tasks.exit_code,
+       job_tasks.started_at, job_tasks.finished_at, job_tasks.created_at,
+       job_tasks.next_attempt_at, job_tasks.lease_token,
+       job_tasks.lease_expires_at, job_tasks.last_lease_node,
+       job_tasks.log_content, job_tasks.log_truncated`
+
 // scanJobCols reads the jobSelectCols row into a Job. Nullable columns
 // don't apply (every column on jobs is NOT NULL), but env_overrides
 // is jsonb — pgx decodes it into json.RawMessage directly via Scan.
@@ -63,7 +76,9 @@ func scanJobCols(scan func(...any) error) (Job, error) {
 	var envOverrides []byte
 	if err := scan(&j.ID, &j.AccountID, &j.Kind, &j.Name, &j.ImageRef, &j.RAMMB,
 		&j.TaskTimeoutS, &j.MaxParallelism, &j.RetryMax, &envOverrides, &j.Status,
-		&j.CreatedAt, &j.UpdatedAt, &j.Command); err != nil {
+		&j.CreatedAt, &j.UpdatedAt, &j.Command, &j.ImageResolvedDigest,
+		&j.ImageStorageKey, &j.ImageMaterializationStatus,
+		&j.ImageMaterializationError, &j.ImageMaterializedAt); err != nil {
 		return Job{}, err
 	}
 	if len(envOverrides) > 0 {
@@ -269,6 +284,11 @@ func (s *PgStore) JobUpdate(ctx context.Context, id string, command []string, im
 		`update jobs set
 		   command         = coalesce($2::text[],  command),
 		   image_ref       = coalesce($3,          image_ref),
+		   image_resolved_digest = case when $3 is null then image_resolved_digest else null end,
+		   image_storage_key = case when $3 is null then image_storage_key else null end,
+		   image_materialization_status = case when $3 is null then image_materialization_status else 'pending' end,
+		   image_materialization_error = case when $3 is null then image_materialization_error else null end,
+		   image_materialized_at = case when $3 is null then image_materialized_at else null end,
 		   ram_mb          = coalesce($4,          ram_mb),
 		   task_timeout_s  = coalesce($5,          task_timeout_s),
 		   max_parallelism = coalesce($6,          max_parallelism),
@@ -280,6 +300,50 @@ func (s *PgStore) JobUpdate(ctx context.Context, id string, command []string, im
 		 returning `+jobSelectCols,
 		id, command, imageRef, ramMB, taskTimeoutSec, maxParallelism, retryMax,
 		envOverridesArg, status)
+	return scanJob(row)
+}
+
+// JobListPendingImageMaterialization returns active jobs whose source image
+// has not yet produced a canonical ext4 artifact. The order is stable so a
+// restart drains the oldest pending work first.
+func (s *PgStore) JobListPendingImageMaterialization(ctx context.Context, limit int) ([]Job, error) {
+	if limit <= 0 {
+		limit = 64
+	}
+	rows, err := s.pool.Query(ctx,
+		`select `+jobSelectCols+` from jobs
+		  where status <> 'deleted'
+		    and image_materialization_status = 'pending'
+		  order by updated_at asc, id asc
+		  limit $1`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("state: list pending job image materializations: %w", err)
+	}
+	defer rows.Close()
+	return scanJobs(rows)
+}
+
+// JobSetImageMaterialization atomically publishes the resolved digest and
+// storage key, or records a failed attempt. A ready row must carry both
+// immutable identifiers; failed/pending rows clear the materialized timestamp.
+func (s *PgStore) JobSetImageMaterialization(ctx context.Context, id, sourceRef, status, resolvedDigest, storageKey, failure string) (Job, error) {
+	if status != "pending" && status != "ready" && status != "failed" {
+		return Job{}, fmt.Errorf("state: invalid job image materialization status %q", status)
+	}
+	if status == "ready" && (resolvedDigest == "" || storageKey == "") {
+		return Job{}, fmt.Errorf("state: ready job image materialization requires digest and storage key")
+	}
+	row := s.pool.QueryRow(ctx,
+		`update jobs set
+		   image_materialization_status = $3,
+		   image_resolved_digest = nullif($4, ''),
+		   image_storage_key = nullif($5, ''),
+		   image_materialization_error = nullif($6, ''),
+		   image_materialized_at = case when $3 = 'ready' then now() else null end,
+		   updated_at = now()
+		 where id = $1::uuid and image_ref = $2 and status <> 'deleted'
+		 returning `+jobSelectCols,
+		id, sourceRef, status, resolvedDigest, storageKey, failure)
 	return scanJob(row)
 }
 
@@ -752,10 +816,14 @@ func (s *PgStore) JobTaskClaimBatch(ctx context.Context, limit int) ([]JobTask, 
 	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after Commit
 
 	rows, err := tx.Query(ctx,
-		`select `+jobTaskSelectCols+` from job_tasks
-		  where status = 'queued'
-		    and (next_attempt_at is null or next_attempt_at <= now())
-		  order by created_at asc
+		`select `+jobTaskSelectColsQualified+` from job_tasks
+		  join job_runs r on r.id = job_tasks.run_id
+		  join jobs j on j.id = r.job_id
+		  where job_tasks.status = 'queued'
+		    and (job_tasks.next_attempt_at is null or job_tasks.next_attempt_at <= now())
+		    and j.image_materialization_status = 'ready'
+		    and j.image_storage_key is not null
+		  order by job_tasks.created_at asc
 		  limit $1
 		  for update skip locked`,
 		limit)
