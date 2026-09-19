@@ -813,6 +813,12 @@ func (d *Drain) invocationRetryDelay(inv state.Invocation) time.Duration {
 	return time.Duration(d.retryAfterSeconds) * time.Second
 }
 
+// retryAfterFor is retained as a compatibility wrapper for drain callers
+// that predate the unified invocation retry policy helper.
+func (d *Drain) retryAfterFor(inv state.Invocation) time.Duration {
+	return d.invocationRetryDelay(inv)
+}
+
 // accountAsyncCap (ADR-134 PR-B) returns the per-plan cap on
 // concurrent in-flight async invocations for the account owning
 // inv. Resolved via the same AppByID → AccountByID → MustLimitsFor

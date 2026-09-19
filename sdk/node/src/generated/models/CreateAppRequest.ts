@@ -3,6 +3,7 @@
 /* tslint:disable */
 /* eslint-disable */
 import type { ResourceProfile } from './ResourceProfile.js';
+import type { RetryPolicyDTO } from './RetryPolicyDTO.js';
 import type { ServiceReplicas } from './ServiceReplicas.js';
 import type { WorkloadPort } from './WorkloadPort.js';
 /**
@@ -47,6 +48,10 @@ export type CreateAppRequest = {
    * Maximum consecutive restart attempts. 0 uses the plan default.
    */
   max_retries?: number;
+  /**
+   * Initial app-level invocation retry default; queue binding and per-invocation policies may override it.
+   */
+  retry_policy?: RetryPolicyDTO;
   service_replicas?: ServiceReplicas;
   /**
    * App-owned listener declarations. Named TCP listeners are publicly routable at `<slug>--port-<name>.<domain>`; UDP listeners remain guest-only.
