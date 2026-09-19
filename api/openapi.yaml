@@ -19615,7 +19615,17 @@ components:
           description: "Trailing 30-day percentage of cache-eligible deployments served from the builder cache. Zero means no cache decision was recorded in the window."
         deleted_at: { type: [string, "null"], format: date-time }
         delete_grace_until: { type: [string, "null"], format: date-time }
-        url: { type: string, format: uri }
+        url:
+          type: string
+          format: uri
+          description: "Stable platform hostname for the app (for example, https://my-app.gregale.dev)."
+        canonical_url:
+          type: string
+          format: uri
+          description: "Customer-facing URL to share. Uses the verified default custom domain when configured, otherwise the platform URL."
+        default_domain:
+          type: string
+          description: "Verified custom domain selected as the app's canonical host, when configured."
         preview_of_slug:
           type: string
           description: "Parent app slug for a pull-request or developer preview. Absent for production apps."

@@ -1061,16 +1061,24 @@ func incompatibleCreateOnlyFlags(explicit map[string]bool) []string {
 // makes redeploy independent of create-admission ordering when the account is
 // already at its app cap. A missing app still falls through to CreateApp; a
 // 409 then retries the lookup once to cover a concurrent same-account create.
-func createOrFetchApp(ctx context.Context, client *Client, req api.CreateAppRequest, requireAuthnPtr *bool, appProtocolPtr *string, publicAuthPtr *api.PublicAuthBlock) error {
+func createOrFetchApp(ctx context.Context, client *Client, req api.CreateAppRequest, requireAuthnPtr *bool, appProtocolPtr *string, publicAuthPtr *api.PublicAuthBlock, resolved ...*api.AppResponse) error {
+	setResolved := func(app api.AppResponse) {
+		if len(resolved) > 0 && resolved[0] != nil {
+			*resolved[0] = app
+		}
+	}
 	existing, err := client.GetApp(ctx, req.Slug)
 	if err == nil {
+		setResolved(existing)
 		return configureExistingApp(ctx, client, existing, req, requireAuthnPtr, appProtocolPtr, publicAuthPtr)
 	}
 	var ae *APIError
 	if !errors.As(err, &ae) || ae.Problem.Status != http.StatusNotFound {
 		return err
 	}
-	if _, err = client.CreateApp(ctx, req); err == nil {
+	created, err := client.CreateApp(ctx, req)
+	if err == nil {
+		setResolved(created)
 		if publicAuthPtr != nil {
 			_, err = client.UpdateApp(ctx, req.Slug, api.UpdateAppRequest{PublicAuth: publicAuthPtr})
 		}
@@ -1083,6 +1091,7 @@ func createOrFetchApp(ctx context.Context, client *Client, req api.CreateAppRequ
 	if err != nil {
 		return fmt.Errorf("slug %q is already in use; pick a different --name", req.Slug)
 	}
+	setResolved(existing)
 	return configureExistingApp(ctx, client, existing, req, requireAuthnPtr, appProtocolPtr, publicAuthPtr)
 }
 
@@ -3294,13 +3303,14 @@ func cmdDeployTarballToExisting(ctx context.Context, args []string, existingApp 
 	if err != nil {
 		return printErr("Manifest resource scope resolution failed", err)
 	}
+	resolvedApp := api.AppResponse{}
 	if !existingApp {
 		createReq := buildCreateRequest(slug, resolvedShape, deployRuntime, requireAuthnPtr, appProtocolPtr, *profile)
 		applyDeployLifecycleToCreateRequest(&createReq, *executionMode, *restartPolicy, *startupDeadlineS, *maxRetries)
 		if *vcpu != 0 {
 			createReq.VCPU = *vcpu
 		}
-		if err := createOrFetchApp(ctx, client, createReq, requireAuthnPtr, appProtocolPtr, publicAuthPtr); err != nil {
+		if err := createOrFetchApp(ctx, client, createReq, requireAuthnPtr, appProtocolPtr, publicAuthPtr, &resolvedApp); err != nil {
 			return printErr("Could not create or fetch app", err)
 		}
 		if *createOnly {
@@ -3326,6 +3336,10 @@ func cmdDeployTarballToExisting(ctx context.Context, args []string, existingApp 
 		if _, err := client.UpdateApp(ctx, slug, api.UpdateAppRequest{ResourceProfile: profile}); err != nil {
 			return printErr("Could not update app resource profile", err)
 		}
+	}
+	appURL := deployedAppURL(slug)
+	if resolvedApp.ID != "" {
+		appURL = canonicalAppURL(resolvedApp)
 	}
 	if err := deployManifestPostgresBindings(ctx, client, slug, sourceDir, *environment); err != nil {
 		return printErr("Manifest database bindings failed", err)
@@ -3487,7 +3501,7 @@ func cmdDeployTarballToExisting(ctx context.Context, args []string, existingApp 
 				if err := applyManifestScaling(); err != nil {
 					return printErr("Manifest scaling policy failed", err)
 				}
-				code := jsonOut(writeJSON(newDeployReceipt(dep, prov, deployedAppURL(slug), sourceSHA256)))
+				code := jsonOut(writeJSON(newDeployReceipt(dep, prov, appURL, sourceSHA256)))
 				if code == 0 {
 					commitManifestTriggers()
 				}
@@ -3499,11 +3513,11 @@ func cmdDeployTarballToExisting(ctx context.Context, args []string, existingApp 
 				return printErr("Manifest scaling policy failed", err)
 			}
 			commitManifestTriggers()
-			PrintOK(osStdout, "Deployment %s queued. %s", dep.ID, deployedAppURL(slug))
+			PrintOK(osStdout, "Deployment %s queued. %s", dep.ID, appURL)
 			return 0
 		}
 		if jsonWait {
-			code := writeWaitedDeploymentReceiptUntilWithOptions(ctx, client, dep, prov, deployedAppURL(slug), sourceSHA256, slug, time.Duration(*waitTimeoutSeconds)*time.Second, *safeDeploy)
+			code := writeWaitedDeploymentReceiptUntilWithOptions(ctx, client, dep, prov, appURL, sourceSHA256, slug, time.Duration(*waitTimeoutSeconds)*time.Second, *safeDeploy)
 			if code == 0 {
 				if err := applyManifestScaling(); err != nil {
 					return printErr("Manifest scaling policy failed", err)
@@ -3579,7 +3593,7 @@ func cmdDeployTarballToExisting(ctx context.Context, args []string, existingApp 
 		if err := applyManifestScaling(); err != nil {
 			return printErr("Manifest scaling policy failed", err)
 		}
-		code := jsonOut(writeJSON(newDeployReceipt(dep, nil, deployedAppURL(slug), "")))
+		code := jsonOut(writeJSON(newDeployReceipt(dep, nil, appURL, "")))
 		if code == 0 {
 			commitManifestTriggers()
 		}
@@ -3590,11 +3604,11 @@ func cmdDeployTarballToExisting(ctx context.Context, args []string, existingApp 
 			return printErr("Manifest scaling policy failed", err)
 		}
 		commitManifestTriggers()
-		PrintOK(osStdout, "Deployment %s queued. %s", dep.ID, deployedAppURL(slug))
+		PrintOK(osStdout, "Deployment %s queued. %s", dep.ID, appURL)
 		return 0
 	}
 	if jsonWait {
-		code := writeWaitedDeploymentReceiptUntilWithOptions(ctx, client, dep, nil, deployedAppURL(slug), "", slug, time.Duration(*waitTimeoutSeconds)*time.Second, *safeDeploy)
+		code := writeWaitedDeploymentReceiptUntilWithOptions(ctx, client, dep, nil, appURL, "", slug, time.Duration(*waitTimeoutSeconds)*time.Second, *safeDeploy)
 		if code == 0 {
 			if err := applyManifestScaling(); err != nil {
 				return printErr("Manifest scaling policy failed", err)
@@ -4796,7 +4810,7 @@ func cmdOpen(args []string) int {
 	if err != nil {
 		return printErr("Could not fetch app", err)
 	}
-	target := app.URL
+	target := canonicalAppURL(app)
 	if *dash {
 		// Dashboard page is always served; skip the cold-wake probe.
 		target = dashboardAppURL(apiBase(), slug)
@@ -6080,6 +6094,18 @@ func deployedAppURL(appID string) string {
 		domain = "gregale.dev"
 	}
 	return "https://" + appID + "." + domain
+}
+
+// canonicalAppURL prefers the server-resolved customer-facing URL while
+// retaining compatibility with older API responses that only include url.
+func canonicalAppURL(app api.AppResponse) string {
+	if value := strings.TrimSpace(app.CanonicalURL); value != "" {
+		return value
+	}
+	if value := strings.TrimSpace(app.URL); value != "" {
+		return value
+	}
+	return deployedAppURL(app.Slug)
 }
 
 // printDeployColdWakeSentence emits the UX §2.5 cold-wake honesty

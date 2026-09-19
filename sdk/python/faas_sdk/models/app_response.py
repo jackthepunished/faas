@@ -65,6 +65,7 @@ class AppResponse:
     """Trailing 30-day percentage of cache-eligible deployments served from the builder cache. Zero means no cache
     decision was recorded in the window."""
     url: str
+    """Stable platform hostname for the app (for example, https://my-app.gregale.dev)."""
     manifest: AppManifest
     """App manifest: environment variables, build commands, working directory, healthcheck, user, and Dockerfile-
     as-source flag (§ux 6.3). The optional `env_secrets` field carries sealed-secret refs ("secret:NAME" strings)
@@ -98,6 +99,11 @@ class AppResponse:
     """Configured per-app request wall-clock timeout in seconds; 0 means the plan/type default."""
     deleted_at: datetime.datetime | None | Unset = UNSET
     delete_grace_until: datetime.datetime | None | Unset = UNSET
+    canonical_url: str | Unset = UNSET
+    """Customer-facing URL to share. Uses the verified default custom domain when configured, otherwise the
+    platform URL."""
+    default_domain: str | Unset = UNSET
+    """Verified custom domain selected as the app's canonical host, when configured."""
     preview_of_slug: str | Unset = UNSET
     """Parent app slug for a pull-request or developer preview. Absent for production apps."""
     preview_pr_number: int | Unset = UNSET
@@ -271,6 +277,10 @@ class AppResponse:
         else:
             delete_grace_until = self.delete_grace_until
 
+        canonical_url = self.canonical_url
+
+        default_domain = self.default_domain
+
         preview_of_slug = self.preview_of_slug
 
         preview_pr_number = self.preview_pr_number
@@ -443,6 +453,10 @@ class AppResponse:
             field_dict["deleted_at"] = deleted_at
         if delete_grace_until is not UNSET:
             field_dict["delete_grace_until"] = delete_grace_until
+        if canonical_url is not UNSET:
+            field_dict["canonical_url"] = canonical_url
+        if default_domain is not UNSET:
+            field_dict["default_domain"] = default_domain
         if preview_of_slug is not UNSET:
             field_dict["preview_of_slug"] = preview_of_slug
         if preview_pr_number is not UNSET:
@@ -626,6 +640,10 @@ class AppResponse:
             return cast(datetime.datetime | None | Unset, data)
 
         delete_grace_until = _parse_delete_grace_until(d.pop("delete_grace_until", UNSET))
+
+        canonical_url = d.pop("canonical_url", UNSET)
+
+        default_domain = d.pop("default_domain", UNSET)
 
         preview_of_slug = d.pop("preview_of_slug", UNSET)
 
@@ -874,6 +892,8 @@ class AppResponse:
             request_timeout_s=request_timeout_s,
             deleted_at=deleted_at,
             delete_grace_until=delete_grace_until,
+            canonical_url=canonical_url,
+            default_domain=default_domain,
             preview_of_slug=preview_of_slug,
             preview_pr_number=preview_pr_number,
             preview_pr_state=preview_pr_state,
