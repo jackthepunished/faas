@@ -1,3 +1,4 @@
+// adr: 079
 package gateway
 
 // handler_public_auth_constants_test.go — gateway-side
@@ -7,10 +8,9 @@ package gateway
 // stay byte-for-byte in sync with the exported api-layer
 // constants and the state-layer constants. A drift surfaces
 // as a runtime mismatch in pkg/gateway/handler.go's
-// enforcePublicAuth switch (handler.go:3477-3483) — the
-// switch silently fall-throughs to "open" for any mode
-// string the gateway doesn't recognise, which means a
-// typo here is a silent auth bypass.
+// enforcePublicAuth switch — a typo here can change which
+// authentication gate handles a request, so unknown values
+// are rejected before the switch can be reached.
 //
 // This test lives in `package gateway` (white-box) so it
 // can read the unexported constants directly. The
