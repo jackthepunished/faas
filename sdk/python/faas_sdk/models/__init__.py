@@ -384,6 +384,8 @@ from .debug_compare_response import DebugCompareResponse
 from .debug_compare_route_stats import DebugCompareRouteStats
 from .debug_coverage_response import DebugCoverageResponse
 from .debug_coverage_signal import DebugCoverageSignal
+from .debug_critical_path_span import DebugCriticalPathSpan
+from .debug_critical_path_span_dependency_type import DebugCriticalPathSpanDependencyType
 from .debug_dependency_latency_item import DebugDependencyLatencyItem
 from .debug_dependency_latency_item_type import DebugDependencyLatencyItemType
 from .debug_dependency_latency_response import DebugDependencyLatencyResponse
@@ -414,6 +416,7 @@ from .debug_request_correlation import DebugRequestCorrelation
 from .debug_request_correlation_stage import DebugRequestCorrelationStage
 from .debug_request_correlation_stage_phase import DebugRequestCorrelationStagePhase
 from .debug_request_correlation_stage_status import DebugRequestCorrelationStageStatus
+from .debug_request_critical_path import DebugRequestCriticalPath
 from .debug_request_dependency_latency import DebugRequestDependencyLatency
 from .debug_request_dependency_latency_type import DebugRequestDependencyLatencyType
 from .debug_request_evidence_response import DebugRequestEvidenceResponse
@@ -1665,6 +1668,8 @@ __all__ = (
     "DebugCompareRouteStats",
     "DebugCoverageResponse",
     "DebugCoverageSignal",
+    "DebugCriticalPathSpan",
+    "DebugCriticalPathSpanDependencyType",
     "DebugDependencyLatencyItem",
     "DebugDependencyLatencyItemType",
     "DebugDependencyLatencyResponse",
@@ -1695,6 +1700,7 @@ __all__ = (
     "DebugRequestCorrelationStage",
     "DebugRequestCorrelationStagePhase",
     "DebugRequestCorrelationStageStatus",
+    "DebugRequestCriticalPath",
     "DebugRequestDependencyLatency",
     "DebugRequestDependencyLatencyType",
     "DebugRequestEvidenceResponse",
