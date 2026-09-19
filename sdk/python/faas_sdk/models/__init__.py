@@ -375,6 +375,9 @@ from .debug_compare_response import DebugCompareResponse
 from .debug_compare_route_stats import DebugCompareRouteStats
 from .debug_coverage_response import DebugCoverageResponse
 from .debug_coverage_signal import DebugCoverageSignal
+from .debug_dependency_latency_item import DebugDependencyLatencyItem
+from .debug_dependency_latency_item_type import DebugDependencyLatencyItemType
+from .debug_dependency_latency_response import DebugDependencyLatencyResponse
 from .debug_evidence_explanation import DebugEvidenceExplanation
 from .debug_evidence_explanation_confidence import DebugEvidenceExplanationConfidence
 from .debug_evidence_explanation_diagnosis import DebugEvidenceExplanationDiagnosis
@@ -1636,6 +1639,9 @@ __all__ = (
     "DebugCompareRouteStats",
     "DebugCoverageResponse",
     "DebugCoverageSignal",
+    "DebugDependencyLatencyItem",
+    "DebugDependencyLatencyItemType",
+    "DebugDependencyLatencyResponse",
     "DebugEvidenceExplanation",
     "DebugEvidenceExplanationConfidence",
     "DebugEvidenceExplanationDiagnosis",
