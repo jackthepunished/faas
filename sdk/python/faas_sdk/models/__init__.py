@@ -1018,6 +1018,7 @@ from .queue_binding_response import QueueBindingResponse
 from .queue_binding_response_mode import QueueBindingResponseMode
 from .queue_binding_response_workload_class import QueueBindingResponseWorkloadClass
 from .queue_binding_status_response import QueueBindingStatusResponse
+from .queue_binding_status_response_consumer_liveness import QueueBindingStatusResponseConsumerLiveness
 from .queue_binding_status_response_consumer_state import QueueBindingStatusResponseConsumerState
 from .queue_binding_status_response_mode import QueueBindingStatusResponseMode
 from .queue_binding_status_response_workload_class import QueueBindingStatusResponseWorkloadClass
@@ -2273,6 +2274,7 @@ __all__ = (
     "QueueBindingResponseMode",
     "QueueBindingResponseWorkloadClass",
     "QueueBindingStatusResponse",
+    "QueueBindingStatusResponseConsumerLiveness",
     "QueueBindingStatusResponseConsumerState",
     "QueueBindingStatusResponseMode",
     "QueueBindingStatusResponseWorkloadClass",
