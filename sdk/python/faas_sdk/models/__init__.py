@@ -331,6 +331,7 @@ from .create_org_api_key_request import CreateOrgAPIKeyRequest
 from .create_org_api_key_request_scopes_item import CreateOrgAPIKeyRequestScopesItem
 from .create_org_request import CreateOrgRequest
 from .create_preview_request import CreatePreviewRequest
+from .create_private_network_peering_request import CreatePrivateNetworkPeeringRequest
 from .create_private_network_request import CreatePrivateNetworkRequest
 from .create_project_environment_approval_request import CreateProjectEnvironmentApprovalRequest
 from .create_project_environment_request import CreateProjectEnvironmentRequest
@@ -927,6 +928,9 @@ from .private_network_firewall_rule import PrivateNetworkFirewallRule
 from .private_network_firewall_rule_direction import PrivateNetworkFirewallRuleDirection
 from .private_network_firewall_rule_protocol import PrivateNetworkFirewallRuleProtocol
 from .private_network_list_response import PrivateNetworkListResponse
+from .private_network_peering import PrivateNetworkPeering
+from .private_network_peering_list_response import PrivateNetworkPeeringListResponse
+from .private_network_peering_status import PrivateNetworkPeeringStatus
 from .private_network_status import PrivateNetworkStatus
 from .problem import Problem
 from .programmatic_api_key import ProgrammaticAPIKey
@@ -1629,6 +1633,7 @@ __all__ = (
     "CreateOrgAPIKeyRequestScopesItem",
     "CreateOrgRequest",
     "CreatePreviewRequest",
+    "CreatePrivateNetworkPeeringRequest",
     "CreatePrivateNetworkRequest",
     "CreateProjectEnvironmentApprovalRequest",
     "CreateProjectEnvironmentRequest",
@@ -2217,6 +2222,9 @@ __all__ = (
     "PrivateNetworkFirewallRuleDirection",
     "PrivateNetworkFirewallRuleProtocol",
     "PrivateNetworkListResponse",
+    "PrivateNetworkPeering",
+    "PrivateNetworkPeeringListResponse",
+    "PrivateNetworkPeeringStatus",
     "PrivateNetworkStatus",
     "Problem",
     "ProgrammaticAPIKey",
