@@ -193,6 +193,7 @@ Add an alert rule
 
 | Flag | Meaning | |
 |---|---|---|
+| `--action <ACTION>` | alert action | one of `webhook` · `rollback` · `demote` · `promote` |
 | `--webhook-secret-stdin` | read the webhook secret from stdin |  |
 
 ### alerts info
@@ -205,6 +206,7 @@ Update one alert rule
 
 | Flag | Meaning | |
 |---|---|---|
+| `--action <ACTION>` | alert action | one of `webhook` · `rollback` · `demote` · `promote` |
 | `--webhook-secret-stdin` | read the replacement webhook secret from stdin |  |
 
 ### alerts rm
