@@ -26,8 +26,14 @@ import (
 	"github.com/onebox-faas/faas/pkg/cursor"
 	"github.com/onebox-faas/faas/pkg/hostport"
 	"github.com/onebox-faas/faas/pkg/publicstatus"
+	"github.com/onebox-faas/faas/pkg/safetext"
 	"github.com/onebox-faas/faas/pkg/state/sqlc"
 )
+
+// builderVMCleanupErrorMaxBytes bounds the recorded cleanup failure for a
+// builder VM. Mirrors the PgStore column bound; applied with safetext.Truncate
+// because the message is an err.Error() string and may not be valid UTF-8.
+const builderVMCleanupErrorMaxBytes = 4096
 
 // stripePushKey is the (account, hour) dedupe key the hourly Stripe
 // pusher uses; declared above MemStore so the struct field below can
@@ -6362,6 +6368,11 @@ func (m *MemStore) RecoverRollout(_ context.Context, appID string, action, reaso
 	default:
 		return Deployment{}, 0, ErrInvalidRecoverAction
 	}
+	// Mirror PgStore.RecoverRollout exactly. MemStore has no encoding to
+	// violate, so the normalization is not load-bearing here — but if the two
+	// stores disagree, a MemStore test observes a reason the SQL store would
+	// have rewritten, and the divergence goes unnoticed until production.
+	reason = normalizeRolloutReason(reason)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -6464,7 +6475,7 @@ func (m *MemStore) RecoverRollout(_ context.Context, appID string, action, reaso
 			Kind:         DeployTrafficChanged,
 			Actor:        "operator:cli:recover_rollout",
 			At:           now,
-			Data:         json.RawMessage(fmt.Sprintf(`{"action":"advance","reason":%q}`, reason)),
+			Data:         json.RawMessage(rolloutAuditData("advance", reason)),
 		})
 		if err != nil {
 			return Deployment{}, 0, fmt.Errorf("state: append recovery audit: %w", err)
@@ -6498,7 +6509,7 @@ func (m *MemStore) RecoverRollout(_ context.Context, appID string, action, reaso
 			Kind:         DeployTrafficChanged,
 			Actor:        "operator:cli:recover_rollout",
 			At:           now,
-			Data:         json.RawMessage(fmt.Sprintf(`{"action":"promote","reason":%q}`, reason)),
+			Data:         json.RawMessage(rolloutAuditData("promote", reason)),
 		})
 		if err != nil {
 			return Deployment{}, 0, fmt.Errorf("state: append recovery audit: %w", err)
@@ -6536,7 +6547,7 @@ func (m *MemStore) RecoverRollout(_ context.Context, appID string, action, reaso
 			Kind:         DeployRolledBack,
 			Actor:        "operator:cli:recover_rollout",
 			At:           now,
-			Data:         json.RawMessage(fmt.Sprintf(`{"action":"abort","reason":%q}`, reason)),
+			Data:         json.RawMessage(rolloutAuditData("abort", reason)),
 		})
 		if err != nil {
 			return Deployment{}, 0, fmt.Errorf("state: append recovery audit: %w", err)
@@ -9138,9 +9149,7 @@ func (m *MemStore) CompleteBuildVMCleanup(_ context.Context, buildID, claimToken
 	row.claimToken = ""
 	row.nextAttemptAt = time.Now().UTC()
 	row.lastError = cleanupErr.Error()
-	if len(row.lastError) > 4096 {
-		row.lastError = row.lastError[:4096]
-	}
+	row.lastError = safetext.Truncate(row.lastError, builderVMCleanupErrorMaxBytes)
 	m.builderVMCleanup[buildID] = row
 	return nil
 }
@@ -10004,9 +10013,7 @@ func (m *MemStore) MarkFireNowRequestFailed(_ context.Context, requestID, errMsg
 		return ErrFireNowRequestNotFound
 	}
 	r.Status = FireNowStatusFailed
-	if len(errMsg) > 1024 {
-		errMsg = errMsg[:1024]
-	}
+	errMsg = safetext.Truncate(errMsg, api.AuditReasonMaxBytes)
 	r.Error = &errMsg
 	now := time.Now().UTC()
 	r.FinishedAt = &now
@@ -10129,9 +10136,7 @@ func (m *MemStore) MarkOperatorIntentFailed(_ context.Context, id, errMsg string
 	if !ok || r.Status != OperatorIntentRunning {
 		return ErrOperatorIntentNotFound
 	}
-	if len(errMsg) > 1024 {
-		errMsg = errMsg[:1024]
-	}
+	errMsg = safetext.Truncate(errMsg, api.AuditReasonMaxBytes)
 	r.Status = OperatorIntentFailed
 	r.Error = errMsg
 	// P2d R4 review fix: persist snapIDs on the failure path so

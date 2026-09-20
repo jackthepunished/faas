@@ -35,6 +35,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/mail"
 	"github.com/onebox-faas/faas/pkg/meter"
 	"github.com/onebox-faas/faas/pkg/openapidiff"
+	"github.com/onebox-faas/faas/pkg/safetext"
 	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/state"
 	artifactstorage "github.com/onebox-faas/faas/pkg/storage"
@@ -42,6 +43,11 @@ import (
 	"github.com/onebox-faas/faas/pkg/webhookdedupe"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
+
+// dialFailureDetailMaxBytes bounds the error text folded into a dial-failure
+// reason. The value can originate from a hostile DNS server, so it is both
+// capped and normalized before it reaches a stored reason string.
+const dialFailureDetailMaxBytes = 96
 
 // --- apps CRUD --------------------------------------------------------------
 
@@ -2063,7 +2069,12 @@ func (s *server) rollbackAppCore(ctx context.Context, acct state.Account, app st
 	auditEntry := state.DeploymentAudit{
 		DeploymentID: depUUID, AccountID: acctUUID, Kind: state.DeployRolledBack,
 		Actor: "apid:rollback", At: time.Now().UTC(),
-		Data: json.RawMessage(fmt.Sprintf(`{"from":%q,"to":%q,"mode":%q,"phase":"readiness_requested"}`, current.ID, target.ID, mode)),
+		Data: json.RawMessage(safetext.JSONObject(struct {
+			From  string `json:"from"`
+			To    string `json:"to"`
+			Mode  string `json:"mode"`
+			Phase string `json:"phase"`
+		}{From: current.ID, To: target.ID, Mode: mode, Phase: "readiness_requested"})),
 	}
 	if alertRuleID != uuid.Nil {
 		auditEntry.AlertRuleID = &alertRuleID
@@ -2340,7 +2351,12 @@ func (s *server) renameApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	// race-conditions with concurrent deploys that still reference the
 	// old slug in their deployment.app_id-to-slug lookup.
 	_ = s.notif.Notify(r.Context(), db.NotifyAppChanged,
-		fmt.Sprintf(`{"kind":"renamed","app_id":"%s","from":%q,"to":%q}`, app.ID, oldSlug, req.NewSlug))
+		string(safetext.JSONObject(struct {
+			Kind  string `json:"kind"`
+			AppID string `json:"app_id"`
+			From  string `json:"from"`
+			To    string `json:"to"`
+		}{Kind: "renamed", AppID: app.ID, From: oldSlug, To: req.NewSlug})))
 	// CodeQL go/log-injection (CWE-117): oldSlug came from the
 	// apps.slug column (regex-validated at create) and req.NewSlug
 	// passed the same validSlug check on this request's body. Wrap
@@ -2788,10 +2804,7 @@ func classifyCertError(err error) string {
 		// net.OpError (DNS, connection refused) etc. Fall back to
 		// the wrapped error's message but cap the length so a
 		// hostile DNS server can't blow up the wire.
-		msg := err.Error()
-		if len(msg) > 96 {
-			msg = msg[:96] + "…"
-		}
+		msg := safetext.Ellipsis(err.Error(), dialFailureDetailMaxBytes)
 		return "dial_failed:" + msg
 	}
 }
@@ -2811,11 +2824,7 @@ func dialFailureReason(err error) string {
 	if err == nil || err.Error() == "" {
 		return "unknown"
 	}
-	msg := err.Error()
-	if len(msg) > 96 {
-		msg = msg[:96] + "…"
-	}
-	return msg
+	return safetext.Ellipsis(err.Error(), dialFailureDetailMaxBytes)
 }
 
 // --- domain doctor (ADR-120) --------------------------------------------
