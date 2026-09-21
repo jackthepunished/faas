@@ -28,6 +28,9 @@ const (
 	// drain. Unlike the others this is compared fleet-wide: the fleet is
 	// hot when depth exceeds target × workers.
 	ScalingMetricQueueDepth = "queue_depth"
+	// ScalingMetricQueueLag targets the consumer group lag each worker should
+	// drain.
+	ScalingMetricQueueLag = "queue_lag"
 )
 
 // ScalingMetricP99LatencyMS was in the closed set before ADR-194 and had no
@@ -46,6 +49,7 @@ func ScalingMetrics() []string {
 		ScalingMetricCPU,
 		ScalingMetricConcurrentRequests,
 		ScalingMetricQueueDepth,
+		ScalingMetricQueueLag,
 	}
 }
 
@@ -180,10 +184,10 @@ func ValidateLegacyScalingTarget(t *ScalingTarget) *Problem {
 			"Invalid scaling policy",
 			fmt.Sprintf("target.value must be >= 0; got %v.", t.Value))
 	}
-	if t.Metric == ScalingMetricQueueDepth && t.Value <= 0 {
+	if (t.Metric == ScalingMetricQueueDepth || t.Metric == ScalingMetricQueueLag) && t.Value <= 0 {
 		return NewProblem(http.StatusUnprocessableEntity, CodeValidation,
 			"Invalid scaling policy",
-			fmt.Sprintf("target.value must be > 0 for queue_depth; got %v.", t.Value))
+			fmt.Sprintf("target.value must be > 0 for %s; got %v.", t.Metric, t.Value))
 	}
 	return nil
 }

@@ -1464,6 +1464,14 @@ type ServiceReplicas struct {
 	Desired int `json:"desired"`
 }
 
+// WorkerScaling is the queue-driven autoscaling policy for worker-mode apps.
+type WorkerScaling struct {
+	Min    int     `json:"min"`
+	Max    int     `json:"max"`
+	Metric string  `json:"metric,omitempty"`
+	Target float64 `json:"target,omitempty"`
+}
+
 // AppManifest is the runner-scaffold and app-owned lifecycle payload. Stored
 // as jsonb in Postgres; lifecycle fields are overlaid onto each deployment's
 // image manifest before it is written into the snapshot for guest-init.
@@ -1493,6 +1501,7 @@ type AppManifest struct {
 	// the plan request-budget ceiling before persistence.
 	RequestTimeoutS int              `json:"request_timeout_s,omitempty"`
 	ServiceReplicas *ServiceReplicas `json:"service_replicas,omitempty"`
+	WorkerReplicas  *WorkerScaling   `json:"worker_replicas,omitempty"`
 	Favicon         []byte           `json:"favicon,omitempty"`
 	RobotsTxt       string           `json:"robots_txt,omitempty"`
 	HeadWakes       bool             `json:"head_wakes,omitempty"`
@@ -1525,7 +1534,7 @@ func (m AppManifest) IsZero() bool {
 		m.Port == 0 && len(m.Ports) == 0 && m.Healthz == "" && m.User == "" &&
 		m.ExecutionMode == "" && m.RestartPolicy == "" &&
 		m.StartupDeadlineS == 0 && m.MaxRetries == 0 && m.RequestTimeoutS == 0 &&
-		m.ServiceReplicas == nil && len(m.Favicon) == 0 &&
+		m.ServiceReplicas == nil && m.WorkerReplicas == nil && len(m.Favicon) == 0 &&
 		m.RobotsTxt == "" && !m.HeadWakes && m.CrawlerPolicy == "" &&
 		m.HealthPath == "" && !m.HealthPathWakes && !m.SessionAffinity
 }
@@ -1638,7 +1647,7 @@ type ScalingPolicy struct {
 
 // ScalingTarget is the (metric, value) pair the engine watches for
 // the scale-up trigger. The metric surface is closed and lives in one
-// place — pkg/sched/scalesignal.Metrics() — so validation cannot name a
+// place — pkg/api.ScalingMetrics() — so validation cannot name a
 // metric no trigger reads. Empty Metric = "disabled" (the engine falls
 // back to the legacy autoscale_target_rps / autoscale_target_cpu_pct
 // columns).
@@ -1647,7 +1656,7 @@ type ScalingPolicy struct {
 // release; it is rejected on write now. Rows that still carry it stay
 // inert, exactly as they always were.
 type ScalingTarget struct {
-	Metric string  // "" | "rps" | "cpu" | "concurrent_requests" | "queue_depth"
+	Metric string  // "" | "rps" | "cpu" | "concurrent_requests" | "queue_depth" | "queue_lag"
 	Value  float64 // target value (units depend on Metric)
 }
 

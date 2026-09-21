@@ -144,6 +144,11 @@ type QueueBindingStatsReader interface {
 	QueueStateForQueue(ctx context.Context, appID, queueName string) (state.QueueStats, error)
 }
 
+// BrokerLagReader supplies broker-reported consumer lag / queue depth for an app.
+type BrokerLagReader interface {
+	BrokerLag(ctx context.Context, appID string) (int64, bool, error)
+}
+
 // queueDepthSignal keeps the aggregate queue projection used by the generic
 // scaler together with the binding-level samples needed to size a worker
 // fleet fairly. A single app-level depth is not enough when two bindings have
@@ -163,9 +168,13 @@ type queueBindingDepth struct {
 // bindings, each active backlog earns at least one worker and is capped by its
 // binding max-concurrency before the app/account cap is applied by the caller.
 // The legacy app-wide queue path preserves its original aggregate formula.
-func (s queueDepthSignal) desiredWorkers(target float64, maxInstances int) int {
+func (s queueDepthSignal) desiredWorkers(target float64, maxInstances int, minWorkers ...int) int {
+	minAllowed := 1
+	if len(minWorkers) > 0 {
+		minAllowed = minWorkers[0]
+	}
 	if target <= 0 {
-		return 1
+		return minAllowed
 	}
 	desired := 0
 	if len(s.bindings) == 0 {
@@ -177,8 +186,8 @@ func (s queueDepthSignal) desiredWorkers(target float64, maxInstances int) int {
 			desired += perBinding
 		}
 	}
-	if desired < 1 {
-		desired = 1
+	if desired < minAllowed {
+		desired = minAllowed
 	}
 	if maxInstances > 0 && desired > maxInstances {
 		desired = maxInstances
@@ -421,6 +430,7 @@ type Trigger struct {
 	instats       InstatsReader
 	queueStats    QueueStatsReader
 	queueBindings QueueBindingStatsReader
+	brokerLag     BrokerLagReader
 	engine        Engine
 	ledger        Ledger
 	metrics       *wire.OpsMetrics
@@ -464,6 +474,8 @@ type Options struct {
 	// enabled binding backlogs for queue_depth targets. It is optional so
 	// legacy app-wide queues continue to use QueueStatsReader.
 	QueueBindingStatsReader QueueBindingStatsReader
+	// BrokerLagReader supplies broker-reported consumer lag for queue_lag / queue_depth targets.
+	BrokerLagReader BrokerLagReader
 }
 
 // New constructs the trigger. instats is REQUIRED (unlike the
@@ -483,6 +495,7 @@ func New(appStore AppStore, instats InstatsReader, engine Engine, ledger Ledger,
 		instats:          instats,
 		queueStats:       opts.QueueStatsReader,
 		queueBindings:    opts.QueueBindingStatsReader,
+		brokerLag:        opts.BrokerLagReader,
 		engine:           engine,
 		ledger:           ledger,
 		metrics:          opts.Metrics,
@@ -493,12 +506,29 @@ func New(appStore AppStore, instats InstatsReader, engine Engine, ledger Ledger,
 	}
 }
 
+// WithBrokerLagReader attaches a broker lag reader to the trigger.
+func (t *Trigger) WithBrokerLagReader(r BrokerLagReader) *Trigger {
+	if t != nil {
+		t.brokerLag = r
+	}
+	return t
+}
+
 // readQueueState returns the queue signal used by the existing scaler. When
 // bindings exist, only enabled binding queues contribute to the aggregate;
 // the individual samples are retained so worker pools can scale fairly across
 // bindings. An app with no bindings falls back to the legacy app-wide queue
 // projection.
 func (t *Trigger) readQueueState(ctx context.Context, app state.App, now time.Time) (queueDepthSignal, bool, error) {
+	if t.brokerLag != nil {
+		lag, ok, err := t.brokerLag.BrokerLag(ctx, app.ID)
+		if err != nil {
+			return queueDepthSignal{}, false, err
+		}
+		if ok {
+			return queueDepthSignal{queue: state.QueueStats{Depth: int(lag)}}, true, nil
+		}
+	}
 	if t.queueBindings != nil {
 		bindings, err := t.queueBindings.ListQueueBindingsForApp(ctx, app.AccountID, app.ID)
 		if err != nil {
@@ -585,7 +615,7 @@ func (t *Trigger) admit(ctx context.Context, appID string, count int) ([]AdmitRe
 // effects are the admission/reconciliation call on the scale branch and the
 // metric observations.
 func (t *Trigger) Tick(ctx context.Context) error {
-	if t == nil || t.appStore == nil || (t.instats == nil && t.queueStats == nil && t.queueBindings == nil) {
+	if t == nil || t.appStore == nil || (t.instats == nil && t.queueStats == nil && t.queueBindings == nil && t.brokerLag == nil) {
 		return nil
 	}
 	now := time.Now()
@@ -616,7 +646,8 @@ func (t *Trigger) Tick(ctx context.Context) error {
 		// raised. Across a tick pair that is the max over all signals.
 		inflightTarget, haveInflightTarget := policy.TargetFor(api.ScalingMetricConcurrentRequests)
 		queueTarget, haveQueueTarget := policy.TargetFor(api.ScalingMetricQueueDepth)
-		if !haveInflightTarget && !haveQueueTarget {
+		queueLagTarget, haveQueueLagTarget := policy.TargetFor(api.ScalingMetricQueueLag)
+		if !haveInflightTarget && !haveQueueTarget && !haveQueueLagTarget {
 			continue
 		}
 		conc := 0
@@ -667,12 +698,12 @@ func (t *Trigger) Tick(ctx context.Context) error {
 			})
 		}
 
-		if haveQueueTarget {
+		if haveQueueTarget || haveQueueLagTarget {
 			// A missing reader is not an empty queue. Never admit blindly
 			// on an unknown backlog — contribute no reading instead.
 			haveQueue := false
 			var queueSignal queueDepthSignal
-			if t.queueStats != nil || t.queueBindings != nil {
+			if t.queueStats != nil || t.queueBindings != nil || t.brokerLag != nil {
 				sig, ok, err := t.readQueueState(ctx, app, now)
 				switch {
 				case err != nil:
@@ -692,26 +723,47 @@ func (t *Trigger) Tick(ctx context.Context) error {
 				workerMaxInstances = maxInstances
 				workerQueuePath = app.WorkloadClass == state.WorkloadClassWorker || app.Manifest.ExecutionMode == api.ExecutionModeWorker
 				if workerQueuePath {
+					activeTarget := queueTarget
+					if !haveQueueTarget || (haveQueueLagTarget && queueLagTarget < queueTarget) {
+						activeTarget = queueLagTarget
+					}
 					if t.metrics != nil {
-						for binding, demand := range queueSignal.bindingWorkerDemand(queueTarget) {
+						for binding, demand := range queueSignal.bindingWorkerDemand(activeTarget) {
 							t.metrics.SetQueueBindingWorkerDemand(app.ID, binding, demand)
 						}
 					}
-					workerDesired = queueSignal.desiredWorkers(queueTarget, maxInstances)
+					minAllowed := 1
+					if app.Manifest.WorkerReplicas != nil && app.Manifest.WorkerReplicas.Min == 0 {
+						minAllowed = 0
+					}
+					workerDesired = queueSignal.desiredWorkers(activeTarget, maxInstances, minAllowed)
 					if policy.MinInstances > workerDesired {
 						workerDesired = policy.MinInstances
+					}
+					if workerDesired < minAllowed {
+						workerDesired = minAllowed
 					}
 					if workerDesired > maxInstances && maxInstances > 0 {
 						workerDesired = maxInstances
 					}
 				}
 			}
-			obs = append(obs, scalesignal.Observation{
-				Metric:   api.ScalingMetricQueueDepth,
-				Target:   queueTarget,
-				Measured: float64(observedQueueDepth),
-				Have:     haveQueue,
-			})
+			if haveQueueTarget {
+				obs = append(obs, scalesignal.Observation{
+					Metric:   api.ScalingMetricQueueDepth,
+					Target:   queueTarget,
+					Measured: float64(observedQueueDepth),
+					Have:     haveQueue,
+				})
+			}
+			if haveQueueLagTarget {
+				obs = append(obs, scalesignal.Observation{
+					Metric:   api.ScalingMetricQueueLag,
+					Target:   queueLagTarget,
+					Measured: float64(observedQueueDepth),
+					Have:     haveQueue,
+				})
+			}
 		}
 
 		// MaxInstances bounds the arbitrated result for every axis. Before
@@ -741,8 +793,12 @@ func (t *Trigger) Tick(ctx context.Context) error {
 				if dec.Outcome == OutcomeRejectAtCap && workerMaxInstances > 0 {
 					workerDesired = workerMaxInstances
 				}
-				if workerDesired <= 0 {
-					workerDesired = 1
+				minAllowed := 1
+				if app.Manifest.WorkerReplicas != nil && app.Manifest.WorkerReplicas.Min == 0 {
+					minAllowed = 0
+				}
+				if workerDesired < minAllowed {
+					workerDesired = minAllowed
 				}
 				if t.admissionBackoffActive(app.ID, now) {
 					continue

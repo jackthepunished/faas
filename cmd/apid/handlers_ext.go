@@ -708,10 +708,12 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 				if app.WorkloadClass == state.WorkloadClassWorker {
 					return api.ErrScalingTargetIncompatibleWithWorkloadClass("concurrent_requests")
 				}
-			case "queue_depth":
+			case "queue_depth", "queue_lag":
 				if app.WorkloadClass != state.WorkloadClassWorker &&
-					app.WorkloadClass != state.WorkloadClassJob {
-					return api.ErrScalingTargetIncompatibleWithWorkloadClass("queue_depth")
+					app.WorkloadClass != state.WorkloadClassJob &&
+					app.Manifest.ExecutionMode != api.ExecutionModeWorker &&
+					app.Manifest.ExecutionMode != api.ExecutionModeJob {
+					return api.ErrScalingTargetIncompatibleWithWorkloadClass(sp.Target.Metric)
 				}
 			}
 		}
@@ -787,7 +789,6 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 		// compat). The metric surface is the only field that
 		// triggers the workload-class gate, but the actual reject
 		// runs in updateApp after loadApp — the validator here
-		// only checks the value shape.
 		//
 		// ADR-194: the closed set and the per-metric value rules live in
 		// pkg/api so this handler, the manifest loader and the deploy-diff
