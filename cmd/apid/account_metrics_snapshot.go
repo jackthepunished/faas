@@ -4,10 +4,13 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/appmetrics"
 	"github.com/onebox-faas/faas/pkg/promql"
 )
+
+const accountMetricsPromQLTimeout = 5 * time.Second
 
 // accountMetricsSnapshot is one bounded Prometheus projection for the apps
 // owned by an account. Request totals and error-rate inputs deliberately come
@@ -31,10 +34,13 @@ type accountMetricsSnapshot struct {
 	wakeErr      error
 }
 
-// fetchAccountMetricsSnapshot evaluates independent metric families in
-// parallel. Every tenant-bearing selector is constrained to the closed app-ID
-// set before Prometheus evaluates it; the allowed map is a second boundary on
-// returned labels. includeThrottled is used by the account SLO panel;
+// fetchAccountMetricsSnapshot evaluates the two raw 24h scans sequentially,
+// then fans out the cheap metric families. Running the request counter and
+// latency-bucket scans together can saturate a small Prometheus and make both
+// exceed their independent budgets even though each finishes comfortably
+// on its own. Every tenant-bearing selector is constrained to the closed
+// app-ID set before Prometheus evaluates it; the allowed map is a second
+// boundary on returned labels. includeThrottled is used by the account SLO panel;
 // includeFleetWake is reserved for the legacy apps-metrics response, whose
 // contract explicitly labels wake p95 as a fleet figure.
 func fetchAccountMetricsSnapshot(ctx context.Context, client *promql.Client, appIDs []string, window string, includeThrottled, includeFleetWake bool) accountMetricsSnapshot {
@@ -42,6 +48,7 @@ func fetchAccountMetricsSnapshot(ctx context.Context, client *promql.Client, app
 	if client == nil || len(appIDs) == 0 {
 		return out
 	}
+	client = client.WithTimeout(accountMetricsPromQLTimeout)
 
 	allowed := make(map[string]struct{}, len(appIDs))
 	for _, id := range appIDs {
@@ -49,8 +56,40 @@ func fetchAccountMetricsSnapshot(ctx context.Context, client *promql.Client, app
 	}
 	matcher := appmetrics.AppIDMatcher(appIDs)
 
+	rows, err := client.QueryVector(ctx, fmt.Sprintf(
+		`sum by (app, class)(increase(gateway_request_duration_seconds_count{%s}[%s]))`,
+		matcher, window))
+	if err != nil {
+		out.requestsErr = err
+		return out
+	}
+	out.requestsByApp = make(map[string]float64, len(appIDs))
+	out.eligibleByApp = make(map[string]float64, len(appIDs))
+	out.errorsByApp = make(map[string]float64, len(appIDs))
+	for _, row := range rows {
+		appID := row.Labels["app"]
+		if _, ok := allowed[appID]; !ok {
+			continue
+		}
+		out.requestsByApp[appID] += row.Value
+		switch row.Labels["class"] {
+		case "2xx":
+			out.eligibleByApp[appID] += row.Value
+		case "5xx":
+			out.eligibleByApp[appID] += row.Value
+			out.errorsByApp[appID] += row.Value
+		}
+	}
+
+	out.latencyBucketsByApp, out.latencyErr = client.QueryBuckets(ctx, fmt.Sprintf(
+		`sum by (app, le)(increase(gateway_request_duration_seconds_bucket{%s,class="2xx"}[%s]))`,
+		matcher, window))
+	if out.latencyErr != nil {
+		return out
+	}
+
 	var wg sync.WaitGroup
-	taskCount := 3
+	taskCount := 1
 	if includeThrottled {
 		taskCount++
 	}
@@ -61,43 +100,8 @@ func fetchAccountMetricsSnapshot(ctx context.Context, client *promql.Client, app
 
 	go func() {
 		defer wg.Done()
-		rows, err := client.QueryVector(ctx, fmt.Sprintf(
-			`sum by (app, class)(increase(gateway_request_duration_seconds_count{%s}[%s]))`,
-			matcher, window))
-		if err != nil {
-			out.requestsErr = err
-			return
-		}
-		out.requestsByApp = make(map[string]float64, len(appIDs))
-		out.eligibleByApp = make(map[string]float64, len(appIDs))
-		out.errorsByApp = make(map[string]float64, len(appIDs))
-		for _, row := range rows {
-			appID := row.Labels["app"]
-			if _, ok := allowed[appID]; !ok {
-				continue
-			}
-			out.requestsByApp[appID] += row.Value
-			switch row.Labels["class"] {
-			case "2xx":
-				out.eligibleByApp[appID] += row.Value
-			case "5xx":
-				out.eligibleByApp[appID] += row.Value
-				out.errorsByApp[appID] += row.Value
-			}
-		}
-	}()
-
-	go func() {
-		defer wg.Done()
 		out.coldBootsByApp, out.coldBootsErr = client.QueryMap(ctx, fmt.Sprintf(
 			`sum by (app)(increase(gateway_cold_boot_total{%s}[%s]))`,
-			matcher, window))
-	}()
-
-	go func() {
-		defer wg.Done()
-		out.latencyBucketsByApp, out.latencyErr = client.QueryBuckets(ctx, fmt.Sprintf(
-			`sum by (app, le)(increase(gateway_request_duration_seconds_bucket{%s,class="2xx"}[%s]))`,
 			matcher, window))
 	}()
 
