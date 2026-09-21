@@ -280,6 +280,11 @@ var restoreTimingPhases = []string{
 	"load_snapshot_ms",
 	"wait_ready_ms",
 	"bind_tun_ms",
+	"tun_wait_mntns_ms",
+	"tun_wait_chroot_ms",
+	"tun_setup_jail_ms",
+	"tun_setup_jail_work_us",
+	"cgroup_fence_ms",
 	"start_jailer_ms",
 	"chroot_ms",
 	"helper_ms",
@@ -295,7 +300,7 @@ var restoreTimingPhases = []string{
 func reportRestoreTiming(t *testing.T, rows []map[string]int64) {
 	t.Helper()
 	t.Logf("restore timing over %d park→restore cycles (nearest-rank percentiles, ms)", len(rows))
-	t.Logf("%-24s %6s %6s %6s %6s %6s %6s", "phase", "min", "p50", "p90", "p95", "max", "mean")
+	t.Logf("%-26s %6s %6s %6s %6s %6s %6s", "phase (ms unless noted)", "min", "p50", "p90", "p95", "max", "mean")
 	for _, phase := range restoreTimingPhases {
 		vals := make([]int64, 0, len(rows))
 		for _, r := range rows {
@@ -311,8 +316,15 @@ func reportRestoreTiming(t *testing.T, rows []map[string]int64) {
 		for _, v := range vals {
 			sum += v
 		}
-		t.Logf("%-24s %6d %6d %6d %6d %6d %6.1f",
-			phase, vals[0], nearestRank(vals, 50), nearestRank(vals, 90),
+		// Most phases are milliseconds; the helper's self-reported work is
+		// microseconds because it is sub-millisecond. Label the row with its
+		// unit rather than silently mixing the two in one column.
+		label := phase
+		if strings.HasSuffix(phase, "_us") {
+			label = phase + " (µs)"
+		}
+		t.Logf("%-26s %6d %6d %6d %6d %6d %6.1f",
+			label, vals[0], nearestRank(vals, 50), nearestRank(vals, 90),
 			nearestRank(vals, 95), vals[len(vals)-1], float64(sum)/float64(len(vals)))
 	}
 }
@@ -386,6 +398,22 @@ func stageBenchMountHelper(t *testing.T, v *JailerVMM) {
 	src := v.mountHelperPath
 	if src == "" {
 		return
+	}
+	// Mirror production's helper SELECTION, not just its placement.
+	// newMetalVMM pins mountHelperPath to the vmmd that `make test-metal`
+	// builds, so ensureMountHelper returns early and resolveMountHelper --
+	// which prefers the sibling vmmd-jail-helper -- never runs. Production
+	// therefore execs a ~1.6 MB helper per restore while the harness execed
+	// a ~79 MB vmmd, and Go runtime + package init of that binary measured
+	// ~22 ms against ~3 ms: the whole of tun_setup_jail_ms, invented by the
+	// fixture. The Makefile already builds the helper next to the vmmd.
+	if sibling := filepath.Join(filepath.Dir(src), "vmmd-jail-helper"); sibling != src {
+		if info, statErr := os.Stat(sibling); statErr == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0 {
+			src = sibling
+		} else {
+			t.Logf("WARNING: %s absent; execing the full vmmd per restore, so "+
+				"tun_setup_jail_ms will overstate production by ~20 ms", sibling)
+		}
 	}
 	if err := os.MkdirAll(v.chrootBase, 0o700); err != nil {
 		t.Fatalf("create chroot base %s: %v", v.chrootBase, err)
