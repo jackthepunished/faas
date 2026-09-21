@@ -143,7 +143,12 @@ func (f *httpFetcher) Fetch(ctx context.Context, repoFullName, commitSHA, token 
 	if err != nil {
 		return nil, fmt.Errorf("gitfetch: fetch: new request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
+	// A public repository needs no credential. An empty bearer token reads
+	// upstream as a failed authentication rather than an anonymous request,
+	// so the header is omitted entirely when no token is supplied.
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 	req.Header.Set("Accept", "application/x-gzip")
 	req.Header.Set("User-Agent", "onebox-faas-githubd/1.0")
 
