@@ -6,47 +6,65 @@
 // false amber costs a sentence of explanation.
 package preflight
 
-import "github.com/onebox-faas/faas/pkg/frameworkprofile"
+import (
+	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/frameworkprofile"
+)
 
-// Level is the headline verdict for a source tree.
-type Level string
+// The wire contract lives in pkg/api so the console and external callers bind
+// to one set of types. These aliases keep the analysis code readable without
+// introducing a second shape to convert between.
+type (
+	// Level is the headline verdict for a source tree.
+	Level = api.PreflightLevel
+	// Finding is one actionable observation about the source tree.
+	Finding = api.PreflightFinding
+	// Verdict is the complete preflight answer for one source tree.
+	Verdict = api.PreflightVerdict
+	// Source is a validated public GitHub repository reference.
+	Source = api.PreflightSource
+	// PlanBudget is what one plan buys, stated as running time.
+	PlanBudget = api.PreflightPlanBudget
+	// Report is one complete answer, pinned to a commit.
+	Report = api.PreflightReport
+)
 
 const (
 	// LevelGreen means the source already satisfies the container contract.
-	LevelGreen Level = "green"
+	LevelGreen = api.PreflightGreen
 	// LevelAmber means the source runs once a declared change is supplied.
-	LevelAmber Level = "amber"
+	LevelAmber = api.PreflightAmber
 	// LevelRed means a hard disqualifier from the container contract applies.
-	LevelRed Level = "red"
+	LevelRed = api.PreflightRed
 )
-
-// Finding is one actionable observation about the source tree. Detail says
-// what was seen; Remedy says what to do about it.
-type Finding struct {
-	Code    string   `json:"code"`
-	Level   Level    `json:"level"`
-	Title   string   `json:"title"`
-	Detail  string   `json:"detail"`
-	Remedy  string   `json:"remedy,omitempty"`
-	Sources []string `json:"sources,omitempty"`
-}
-
-// Verdict is the complete preflight answer for one source tree.
-type Verdict struct {
-	Level    Level                    `json:"level"`
-	Findings []Finding                `json:"findings,omitempty"`
-	Profile  frameworkprofile.Profile `json:"profile"`
-}
 
 // Evaluate maps an inferred profile onto the container contract. It considers
 // only what static inference can see; contract disqualifiers that live in a
 // Dockerfile or compose file are added by ScanContract.
 func Evaluate(profile frameworkprofile.Profile) Verdict {
-	verdict := Verdict{Level: LevelGreen, Profile: profile}
+	verdict := Verdict{Level: LevelGreen, Profile: wireProfile(profile)}
 	for _, w := range profile.Warnings {
 		finding := findingForWarning(w)
 		verdict.Findings = append(verdict.Findings, finding)
 		verdict.Level = worst(verdict.Level, finding.Level)
 	}
 	return verdict
+}
+
+// wireProfile projects the analyzer's result onto the published contract. The
+// warning list is deliberately dropped: warnings reach the caller as findings,
+// with a remedy attached, rather than twice in two shapes.
+func wireProfile(profile frameworkprofile.Profile) api.PreflightProfile {
+	return api.PreflightProfile{
+		Version:        profile.Version,
+		Framework:      profile.Framework,
+		FrameworkVer:   profile.FrameworkVer,
+		PackageManager: profile.PackageManager,
+		DockerfilePath: profile.DockerfilePath,
+		StartCommand:   profile.StartCommand,
+		Port:           profile.Port,
+		HealthPath:     profile.HealthPath,
+		ConfigFile:     profile.ConfigFile,
+		Inferred:       profile.Inferred,
+	}
 }

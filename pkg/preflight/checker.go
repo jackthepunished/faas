@@ -30,16 +30,6 @@ var (
 // from it, so a large body is a signal to stop rather than something to parse.
 const resolveBodyLimit = 1 << 20
 
-// Report is one complete answer, pinned to the commit it was computed from so
-// a permalink always re-renders the same verdict.
-type Report struct {
-	Source      Source       `json:"source"`
-	CommitSHA   string       `json:"commit_sha"`
-	Verdict     Verdict      `json:"verdict"`
-	PlanBudgets []PlanBudget `json:"plan_budgets"`
-	CheckedAt   time.Time    `json:"checked_at"`
-}
-
 // Checker runs static preflight checks against public GitHub repositories.
 //
 // The HTTP client is the SSRF-guarded egress client from pkg/oci, which

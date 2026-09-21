@@ -12,20 +12,6 @@ import (
 // repository. Callers map it to a 422 with a stable RFC 7807 code.
 var ErrInvalidSource = errors.New("preflight: not a github.com repository")
 
-// Source is a validated GitHub repository reference. Every field has passed
-// the character and length rules below, so callers may interpolate them into
-// an upstream URL.
-type Source struct {
-	Owner string `json:"owner"`
-	Repo  string `json:"repo"`
-	// Ref is an optional branch or tag parsed from a /tree/<ref> URL. Empty
-	// means the repository's default branch.
-	Ref string `json:"ref,omitempty"`
-}
-
-// FullName is the owner/repo form the fetch transport expects.
-func (s Source) FullName() string { return s.Owner + "/" + s.Repo }
-
 // GitHub's own rules: an owner is at most 39 characters of alphanumerics and
 // hyphens and may not begin or end with a hyphen; a repository is at most 100
 // characters of alphanumerics, hyphen, underscore and period.

@@ -484,6 +484,10 @@ var codeExclude = map[string]bool{
 // Either inline anonymous structs in handlers, or pure-documentation shapes
 // (error envelopes that don't directly mirror a Go type).
 var schemaSpecOnly = map[string]bool{
+	// Migration preflight verdict level is a typed string, not a struct, so
+	// the DTO scanner does not surface it. Same pattern as TriggerKind and
+	// ResourceProfile below.
+	"PreflightLevel": true,
 	// Status create is decoded into the shared Go request DTO, while the
 	// OpenAPI discriminator exposes stricter kind-specific SDK request shapes.
 	"AdminStatusIncidentCreateRequest":    true,
@@ -946,6 +950,7 @@ func testSchemasParity(t *testing.T, root string, spec *specDoc) {
 		filepath.Join(root, "pkg", "api", privateNetworkFile),
 		filepath.Join(root, "pkg", "api", queueBindingFile),
 		filepath.Join(root, "pkg", "api", "tcp_listeners.go"),
+		filepath.Join(root, "pkg", "api", "preflight.go"),
 	}
 	dtos, err := scanDTOs(files)
 	if err != nil {
