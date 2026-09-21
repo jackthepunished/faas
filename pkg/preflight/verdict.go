@@ -43,12 +43,37 @@ const (
 // Dockerfile or compose file are added by ScanContract.
 func Evaluate(profile frameworkprofile.Profile) Verdict {
 	verdict := Verdict{Level: LevelGreen, Profile: wireProfile(profile)}
+	// Inference emits one warning per file, so a real repository yields the
+	// same code many times over. The report states each problem once and
+	// gathers the files under it; a wall of identical entries is noise to the
+	// person deciding whether to migrate.
+	index := make(map[string]int, len(profile.Warnings))
 	for _, w := range profile.Warnings {
+		if at, seen := index[w.Code]; seen {
+			verdict.Findings[at].Sources = appendCappedSources(verdict.Findings[at].Sources, w.Sources)
+			continue
+		}
 		finding := findingForWarning(w)
+		finding.Sources = appendCappedSources(nil, finding.Sources)
+		index[w.Code] = len(verdict.Findings)
 		verdict.Findings = append(verdict.Findings, finding)
 		verdict.Level = worst(verdict.Level, finding.Level)
 	}
 	return verdict
+}
+
+// maxFindingSources bounds the paths listed under one finding. Past a handful
+// the list stops informing and starts burying the remedy.
+const maxFindingSources = 10
+
+func appendCappedSources(existing, incoming []string) []string {
+	for _, source := range incoming {
+		if len(existing) >= maxFindingSources {
+			return existing
+		}
+		existing = append(existing, source)
+	}
+	return existing
 }
 
 // wireProfile projects the analyzer's result onto the published contract. The

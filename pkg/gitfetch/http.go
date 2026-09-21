@@ -354,6 +354,15 @@ func extractStream(dst string, r io.Reader, maxTotalBytes int64, lim extractLimi
 		if hdr.Name == "" {
 			continue
 		}
+		// A pax global header carries archive-level metadata, not a file.
+		// Every codeload.github.com archive begins with one and Go's tar
+		// reader surfaces it to the caller rather than consuming it, so an
+		// allow-list of regular files and directories alone rejects every
+		// real GitHub archive. Skipped before the path, type and budget
+		// checks because it is not content.
+		if hdr.Typeflag == tar.TypeXGlobalHeader {
+			continue
+		}
 		if escapesArchiveRoot(hdr.Name) {
 			return fmt.Errorf("invalid path %q: %w", hdr.Name, ErrBadArchive)
 		}
