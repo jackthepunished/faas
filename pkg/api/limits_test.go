@@ -199,6 +199,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// plan-gated to Hobby+. The limits surface reflects only
 			// what the create handler will accept (5 rules total).
 			EdgeRulesPerApp: 5, EdgeRulesJWTAllowed: false, EdgeRulesIPAllowed: false, EdgeRulesGeoPerApp: 1, EdgeRulesThrottlePerApp: 1, EdgeRulesCachePerApp: 0,
+			EdgeRulesRetryPerApp: 0, EdgeRulesCircuitBreakerPerApp: 0, EgressCircuitBreakersPerApp: 0,
 			// issue #975 #4 / Mega-Foundation #979-b — Free is the abuse-floor tier;
 			// the abstraction is the upsell. PR-B (#979-c) wires the writer.
 			CorsPresetsPerAccount: 0, CorsPresetsPerApp: 0, CorsPresetMaxOrigins: 0, CorsPresetMaxAllowMethods: 0, CorsPresetMaxNameLength: 64,
@@ -264,7 +265,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// bounded to +1 instance for the length of the rollout,
 			// so this does not move Free's steady-state RAM shape.
 			TrafficSplit: true,
-			// ADR-200: auto-rollback costs no extra runtime resources —
+			// ADR-201: auto-rollback costs no extra runtime resources —
 			// the 5xx counters are already collected on every plan.
 			RollbackOn5xxAllowed: true,
 			// ADR-124: Free stays on http1/http2 (universal) but is
@@ -361,6 +362,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// (EdgeRulesJWTAllowed / EdgeRulesIPAllowed) feeds the
 			// 402 response in handlers_edge_rules.go for Free.
 			EdgeRulesPerApp: 25, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true, EdgeRulesGeoPerApp: 5, EdgeRulesThrottlePerApp: 5, EdgeRulesCachePerApp: 1,
+			EdgeRulesRetryPerApp: 3, EdgeRulesCircuitBreakerPerApp: 3, EgressCircuitBreakersPerApp: 3,
 			// issue #975 #4 / Mega-Foundation #979-b — Hobby is the entry paid tier.
 			CorsPresetsPerAccount: 10, CorsPresetsPerApp: 5, CorsPresetMaxOrigins: 25, CorsPresetMaxAllowMethods: 8, CorsPresetMaxNameLength: 64,
 			// ADR-099 (#879): tenant surfaces — Hobby is the entry
@@ -421,7 +423,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// ADR-199: Hobby unlocks traffic splitting and the canary
 			// ladder — see the Free row above for the rationale.
 			TrafficSplit: true,
-			// ADR-200: see the Free row above.
+			// ADR-201: see the Free row above.
 			RollbackOn5xxAllowed: true,
 			// ADR-124: Hobby unlocks gRPC framing. Hobby is the
 			// smallest paid tier where the gRPC service-migration
@@ -516,6 +518,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// AND jwt|ip. Same surface as Hobby; the gate only
 			// flips the Free arm of the kind-switch.
 			EdgeRulesPerApp: 100, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true, EdgeRulesGeoPerApp: 25, EdgeRulesThrottlePerApp: 25, EdgeRulesCachePerApp: 5,
+			EdgeRulesRetryPerApp: 10, EdgeRulesCircuitBreakerPerApp: 10, EgressCircuitBreakersPerApp: 10,
 			// issue #975 #4 / Mega-Foundation #979-b — Pro is the typical SaaS tier.
 			CorsPresetsPerAccount: 50, CorsPresetsPerApp: 15, CorsPresetMaxOrigins: 100, CorsPresetMaxAllowMethods: 8, CorsPresetMaxNameLength: 64,
 			// ADR-099 (#879): tenant surfaces — Pro gets 5 surfaces
@@ -676,6 +679,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// bound the LRU + per-host matcher budget tolerates before
 			// per-host invalidation becomes load-bearing.
 			EdgeRulesPerApp: 500, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true, EdgeRulesGeoPerApp: 100, EdgeRulesThrottlePerApp: 100, EdgeRulesCachePerApp: 20,
+			EdgeRulesRetryPerApp: 25, EdgeRulesCircuitBreakerPerApp: 25, EgressCircuitBreakersPerApp: 50,
 			// issue #975 #4 / Mega-Foundation #979-b — Scale is the large-fleet tier.
 			CorsPresetsPerAccount: 250, CorsPresetsPerApp: 50, CorsPresetMaxOrigins: 500, CorsPresetMaxAllowMethods: 8, CorsPresetMaxNameLength: 64,
 			// ADR-099 (#879): tenant surfaces — Scale gets 25 surfaces
@@ -1910,7 +1914,7 @@ func TestPlanTrafficSplitAllowed(t *testing.T) {
 
 // TestPlanRollbackOn5xxAllowed pins the per-plan gate for the first-wake 5xx
 // auto-rollback opt-in (issue #961 / ADR-118, opened to every plan by
-// ADR-200).
+// ADR-201).
 //
 // Every known plan is now true. Unlike TrafficSplit this never had a cost
 // argument to answer: the 5xx counters are already collected on every plan,

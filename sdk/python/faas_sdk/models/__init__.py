@@ -537,6 +537,7 @@ from .edge_rule_budget_action import EdgeRuleBudgetAction
 from .edge_rule_cache_action import EdgeRuleCacheAction
 from .edge_rule_cache_action_methods_item import EdgeRuleCacheActionMethodsItem
 from .edge_rule_cache_action_vary_on_item import EdgeRuleCacheActionVaryOnItem
+from .edge_rule_circuit_breaker_action import EdgeRuleCircuitBreakerAction
 from .edge_rule_cors_action import EdgeRuleCORSAction
 from .edge_rule_geo_action import EdgeRuleGeoAction
 from .edge_rule_header_op import EdgeRuleHeaderOp
@@ -555,6 +556,7 @@ from .edge_rule_respond_action import EdgeRuleRespondAction
 from .edge_rule_response import EdgeRuleResponse
 from .edge_rule_response_kind import EdgeRuleResponseKind
 from .edge_rule_response_validate_mode import EdgeRuleResponseValidateMode
+from .edge_rule_retry_action import EdgeRuleRetryAction
 from .edge_rule_rewrite_action import EdgeRuleRewriteAction
 from .edge_rule_route_action import EdgeRuleRouteAction
 from .edge_rule_suggestion import EdgeRuleSuggestion
@@ -566,6 +568,8 @@ from .edge_rule_throttle_action_key_by import EdgeRuleThrottleActionKeyBy
 from .edge_rule_validate_action import EdgeRuleValidateAction
 from .edge_rule_validate_action_schema import EdgeRuleValidateActionSchema
 from .edge_rule_validate_action_validate_mode import EdgeRuleValidateActionValidateMode
+from .egress_circuit_breaker_policy import EgressCircuitBreakerPolicy
+from .egress_circuit_breaker_policy_state import EgressCircuitBreakerPolicyState
 from .enable_alert_preset_request import EnableAlertPresetRequest
 from .enable_alert_preset_request_action import EnableAlertPresetRequestAction
 from .env_diff_cell import EnvDiffCell
@@ -1274,6 +1278,7 @@ from .update_trigger_request_broker_poison_strategy_type_3_type_1 import (
     UpdateTriggerRequestBrokerPoisonStrategyType3Type1,
 )
 from .update_trigger_request_config_type_0 import UpdateTriggerRequestConfigType0
+from .update_upstream_circuit_breaker_request import UpdateUpstreamCircuitBreakerRequest
 from .upload_deploy_options import UploadDeployOptions
 from .upload_session_response import UploadSessionResponse
 from .upload_session_response_status import UploadSessionResponseStatus
@@ -1296,6 +1301,8 @@ from .wake_timeline_json_row_kind import WakeTimelineJSONRowKind
 from .wake_timeline_json_row_tier import WakeTimelineJSONRowTier
 from .wake_timeline_json_row_trigger_class import WakeTimelineJSONRowTriggerClass
 from .wake_timeline_response import WakeTimelineResponse
+from .worker_scaling import WorkerScaling
+from .worker_scaling_metric import WorkerScalingMetric
 from .workflow_retry_spec import WorkflowRetrySpec
 from .workflow_retry_spec_backoff import WorkflowRetrySpecBackoff
 from .workflow_run_response import WorkflowRunResponse
@@ -1843,6 +1850,7 @@ __all__ = (
     "EdgeRuleCacheAction",
     "EdgeRuleCacheActionMethodsItem",
     "EdgeRuleCacheActionVaryOnItem",
+    "EdgeRuleCircuitBreakerAction",
     "EdgeRuleCORSAction",
     "EdgeRuleGeoAction",
     "EdgeRuleHeaderOp",
@@ -1861,6 +1869,7 @@ __all__ = (
     "EdgeRuleResponse",
     "EdgeRuleResponseKind",
     "EdgeRuleResponseValidateMode",
+    "EdgeRuleRetryAction",
     "EdgeRuleRewriteAction",
     "EdgeRuleRouteAction",
     "EdgeRuleSuggestion",
@@ -1872,6 +1881,8 @@ __all__ = (
     "EdgeRuleValidateAction",
     "EdgeRuleValidateActionSchema",
     "EdgeRuleValidateActionValidateMode",
+    "EgressCircuitBreakerPolicy",
+    "EgressCircuitBreakerPolicyState",
     "EnableAlertPresetRequest",
     "EnableAlertPresetRequestAction",
     "EnvDiffCell",
@@ -2548,6 +2559,7 @@ __all__ = (
     "UpdateTriggerRequestBrokerPoisonStrategyType2Type1",
     "UpdateTriggerRequestBrokerPoisonStrategyType3Type1",
     "UpdateTriggerRequestConfigType0",
+    "UpdateUpstreamCircuitBreakerRequest",
     "UploadDeployOptions",
     "UploadSessionResponse",
     "UploadSessionResponseStatus",
@@ -2570,6 +2582,8 @@ __all__ = (
     "WakeTimelineJSONRowTier",
     "WakeTimelineJSONRowTriggerClass",
     "WakeTimelineResponse",
+    "WorkerScaling",
+    "WorkerScalingMetric",
     "WorkflowRetrySpec",
     "WorkflowRetrySpecBackoff",
     "WorkflowRunResponse",

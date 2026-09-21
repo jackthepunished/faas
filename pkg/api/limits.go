@@ -879,6 +879,37 @@ type Limits struct {
 	// CodePlanEdgeRuleKindQuotaReached.
 	EdgeRulesCachePerApp int
 
+	// EdgeRulesRetryPerApp caps how many kind='retry' rules one app
+	// may hold (ADR-201 §1). Per-plan: Free 0, Hobby 3, Pro 10,
+	// Scale 25.
+	//
+	// Free is 0 for a capacity reason, not a packaging one: a replay
+	// doubles the worst-case work a single request can cause, and a
+	// Free app is capped at max_concurrency 1, so there is rarely a
+	// healthy sibling to replay against in the first place. Enabling
+	// it there would spend the admission ledger without improving
+	// availability.
+	EdgeRulesRetryPerApp int
+
+	// EdgeRulesCircuitBreakerPerApp caps how many
+	// kind='circuit_breaker' rules one app may hold (ADR-201 §2).
+	// Per-plan: Free 0, Hobby 3, Pro 10, Scale 25.
+	//
+	// This gates TUNING, not protection. The breaker runs for every
+	// app on every plan with circuit.DefaultConfig; a Free customer
+	// is protected from a flapping instance exactly as a Scale
+	// customer is. What the paid tiers buy is the ability to move the
+	// thresholds, which is a knob that can also be set badly.
+	EdgeRulesCircuitBreakerPerApp int
+
+	// EgressCircuitBreakersPerApp caps how many declared upstreams one
+	// app may opt into egress breaking for (ADR-201 §3). Per-plan:
+	// Free 0, Hobby 3, Pro 10, Scale 50 — deliberately mirroring
+	// DataPlacementHintsPerApp, since a breaker can only exist for an
+	// upstream the ADR-098 capture path already recorded and Free
+	// captures none.
+	EgressCircuitBreakersPerApp int
+
 	// CorsPresetsPerAccount caps how many cors_presets rows one
 	// account may own in total (account-wide + app-scoped). The
 	// cap defends against a customer pinning one preset per
@@ -1280,7 +1311,7 @@ type Limits struct {
 	// RollbackOn5xxAllowed (issue #961 / ADR-118) gates the
 	// per-deployment first-wake 5xx auto-rollback opt-in.
 	//
-	// TRUE ON EVERY PLAN as of ADR-200. Unlike TrafficSplit, this one
+	// TRUE ON EVERY PLAN as of ADR-201. Unlike TrafficSplit, this one
 	// never had a cost argument to answer: auto-rollback consumes no
 	// extra runtime resources. It reads the first_5xx_count column the
 	// platform already increments on every deployment regardless of
@@ -1832,6 +1863,13 @@ var planLimits = map[Plan]Limits{
 		// upsell is the wake-elision guarantee. Same posture as
 		// tenant_surfaces / alert_rules / cors_presets on Free.
 		EdgeRulesCachePerApp: 0,
+		// ADR-201 traffic primitives. Retry and breaker TUNING are
+		// paid; the breaker itself runs on every plan. Egress
+		// breaking mirrors DataPlacementHintsPerApp because it can
+		// only apply to an upstream ADR-098 already captured.
+		EdgeRulesRetryPerApp:          0,
+		EdgeRulesCircuitBreakerPerApp: 0,
+		EgressCircuitBreakersPerApp:   0,
 		// CORS presets (issue #975 item #4 / Mega-Foundation #979-b,
 		// slot 00294). Free=0 mirrors the tenant_surfaces / alert_rules
 		// posture: the abstraction is the upsell, the abuse-floor tier
@@ -1990,7 +2028,7 @@ var planLimits = map[Plan]Limits{
 		// The column default (100) still keeps today's
 		// behaviour for every app that never opts in.
 		TrafficSplit: true,
-		// ADR-200: Free unlocks first-wake 5xx auto-rollback. It costs
+		// ADR-201: Free unlocks first-wake 5xx auto-rollback. It costs
 		// no extra runtime resources — the 5xx counters are already
 		// collected on every plan — and the tier least able to absorb
 		// a bad release is the one that benefits most. Still off by
@@ -2222,6 +2260,13 @@ var planLimits = map[Plan]Limits{
 		// to demonstrate the wake-elision value before the
 		// customer upgrades to Pro.
 		EdgeRulesCachePerApp: 1,
+		// ADR-201 traffic primitives. Retry and breaker TUNING are
+		// paid; the breaker itself runs on every plan. Egress
+		// breaking mirrors DataPlacementHintsPerApp because it can
+		// only apply to an upstream ADR-098 already captured.
+		EdgeRulesRetryPerApp:          3,
+		EdgeRulesCircuitBreakerPerApp: 3,
+		EgressCircuitBreakersPerApp:   3,
 		// CORS presets (issue #975 #4 / Mega-Foundation #979-b, slot
 		// 00294). Hobby is the entry paid tier — 10 presets per
 		// account, 5 per app. MaxOrigins 25 covers the typical
@@ -2372,7 +2417,7 @@ var planLimits = map[Plan]Limits{
 		//
 		// See the Free block above for the full rationale.
 		TrafficSplit: true,
-		// ADR-200: Hobby unlocks first-wake 5xx auto-rollback — see the
+		// ADR-201: Hobby unlocks first-wake 5xx auto-rollback — see the
 		// Free row above. Still opt-in per deployment.
 		RollbackOn5xxAllowed: true,
 		// Mirror (issue #72 / ADR-125): Free stays locked — see
@@ -2597,6 +2642,13 @@ var planLimits = map[Plan]Limits{
 		// plus one wildcard. Same five-fold upgrade as throttle and
 		// geo so the upsell curve is single-shape.
 		EdgeRulesCachePerApp: 5,
+		// ADR-201 traffic primitives. Retry and breaker TUNING are
+		// paid; the breaker itself runs on every plan. Egress
+		// breaking mirrors DataPlacementHintsPerApp because it can
+		// only apply to an upstream ADR-098 already captured.
+		EdgeRulesRetryPerApp:          10,
+		EdgeRulesCircuitBreakerPerApp: 10,
+		EgressCircuitBreakersPerApp:   10,
 		// CORS presets (issue #975 #4 / Mega-Foundation #979-b, slot
 		// 00294). Pro is the typical SaaS tier — 50 presets per
 		// account, 15 per app, 100 origins per preset.
@@ -2960,6 +3012,13 @@ var planLimits = map[Plan]Limits{
 		// category, etc.). Pin in limits_test.go so the per-plan
 		// monotonic ladder Free < Hobby < Pro < Scale is enforced.
 		EdgeRulesCachePerApp: 20,
+		// ADR-201 traffic primitives. Retry and breaker TUNING are
+		// paid; the breaker itself runs on every plan. Egress
+		// breaking mirrors DataPlacementHintsPerApp because it can
+		// only apply to an upstream ADR-098 already captured.
+		EdgeRulesRetryPerApp:          25,
+		EdgeRulesCircuitBreakerPerApp: 25,
+		EgressCircuitBreakersPerApp:   50,
 		// CORS presets (issue #975 #4 / Mega-Foundation #979-b, slot
 		// 00294). Scale is the large-fleet tier — 250 presets per
 		// account, 50 per app, 500 origins per preset. Numbers
@@ -3565,6 +3624,65 @@ const (
 	// EdgeRuleMaintenanceRetryAfterSeconds (which is the default,
 	// not the cap).
 	MaxEdgeRuleMaintenanceRetryAfterSeconds = 24 * 60 * 60 // 86400 (24h)
+
+	// --- ADR-201 §1: kind=retry bounds -------------------------------
+	// These are global bounds, not plan quotas. The per-plan rule count
+	// is EdgeRulesRetryPerApp above.
+
+	// EdgeRuleRetryDefaultMaxAttempts is the attempt count applied when a
+	// kind=retry rule omits max_attempts. 2 = the original plus one replay.
+	EdgeRuleRetryDefaultMaxAttempts = 2
+	// EdgeRuleRetryMaxAttempts caps total attempts at 3.
+	//
+	// The bound is deliberately tight. Every replay consumes a fresh
+	// instance's concurrency slot for the duration of the request, so a
+	// generous attempt count converts one client request into a
+	// multiplier against the app's own capacity at exactly the moment the
+	// app is already losing instances. Two attempts covers the case this
+	// feature exists for — one dead peer, one healthy sibling.
+	EdgeRuleRetryMaxAttempts = 3
+	// EdgeRuleRetryDefaultMinRemainingMs is the request-budget floor below
+	// which a replay is skipped. Below this a retry mostly converts a 502
+	// into a 504 without improving the customer's outcome.
+	EdgeRuleRetryDefaultMinRemainingMs = 250
+	// MaxEdgeRuleRetryMinRemainingMs caps the floor at 30 s so a customer
+	// cannot set a value that silently disables retry for every request.
+	MaxEdgeRuleRetryMinRemainingMs = 30_000
+	// MaxEdgeRuleRetryBackoffMs caps the inter-attempt delay at 1 s. The
+	// default is 0: the failure being retried is a dead peer, and the next
+	// instance is a different process, so waiting buys nothing. The knob
+	// exists only for the case where the sibling is still waking.
+	MaxEdgeRuleRetryBackoffMs = 1_000
+
+	// --- ADR-201 §2: kind=circuit_breaker bounds ----------------------
+
+	// EdgeRuleCircuitDefaultFailureThreshold is the failure ratio at or
+	// above which a closed breaker opens.
+	EdgeRuleCircuitDefaultFailureThreshold = 0.5
+	// EdgeRuleCircuitDefaultMinRequests is the minimum number of
+	// observations inside the window before the ratio is consulted.
+	//
+	// This is the field most likely to be set badly. At 1 a single
+	// transport blip opens the circuit, which on an app serving one
+	// request a minute reads as a 100% failure rate — so the validator
+	// requires an explicit value rather than letting a zero mean 1.
+	EdgeRuleCircuitDefaultMinRequests = 5
+	// MaxEdgeRuleCircuitMinRequests caps the low-traffic guard. Beyond
+	// this a breaker on a low-volume route can never accumulate enough
+	// observations to trip, which is a silent no-op.
+	MaxEdgeRuleCircuitMinRequests = 1_000
+	// EdgeRuleCircuitDefaultWindowSeconds is the rolling failure window.
+	EdgeRuleCircuitDefaultWindowSeconds = 10
+	// MaxEdgeRuleCircuitWindowSeconds caps the window at 5 minutes.
+	MaxEdgeRuleCircuitWindowSeconds = 300
+	// EdgeRuleCircuitDefaultOpenSeconds is the first open interval.
+	EdgeRuleCircuitDefaultOpenSeconds = 5
+	// EdgeRuleCircuitDefaultMaxOpenSeconds caps the exponential backoff.
+	EdgeRuleCircuitDefaultMaxOpenSeconds = 60
+	// MaxEdgeRuleCircuitOpenSeconds caps both open fields at 1 hour. A
+	// longer bench outlives most instances, so the breaker would be
+	// holding state about a target that no longer exists.
+	MaxEdgeRuleCircuitOpenSeconds = 3_600
 
 	// API-key lifetime (issue #189 / IAM-5). New non-admin keys
 	// minted by createKey get `expires_at = now + DefaultAPIKeyLifetimeDays`.
