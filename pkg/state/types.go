@@ -1638,12 +1638,12 @@ type ScalingPolicy struct {
 	// Zero means the gateway uses the plan-derived default.
 	WakeMaxQueueWaitSeconds int
 	// Timezone is the IANA zone every schedule's cron is evaluated in
-	// (ADR-195). Empty means UTC. One zone per app rather than one per
+	// (ADR-198). Empty means UTC. One zone per app rather than one per
 	// schedule: a business has a working day, not a working day per rule.
 	Timezone string
-	// Schedules raise the warm floor for recurring windows (ADR-195).
+	// Schedules raise the warm floor for recurring windows (ADR-198).
 	// Empty means the floor is whatever MinInstances says at all times,
-	// which is every app written before ADR-195. The column is jsonb, so
+	// which is every app written before ADR-198. The column is jsonb, so
 	// this needs no migration.
 	Schedules []ScalingSchedule
 }
@@ -2130,6 +2130,30 @@ type Deployment struct {
 	// live row per (app_id, scope)). A scope change requires a
 	// NEW deployment — there is no update-time scope change.
 	Scope string `json:"scope,omitempty"`
+	// Revision (ADR-198) is the per-AppID monotonic counter that makes
+	// an immutable deployment row addressable as `v42` instead of a
+	// uuid. Assigned inside CreateDeployment's existing `FOR UPDATE`
+	// window on the parent apps row, so concurrent deploys of the same
+	// app serialize on the lock already held and cannot mint a
+	// duplicate — the partial unique index
+	// `deployments_app_revision_uniq` is the schema-side backstop.
+	//
+	// This is the SAME number DeploymentOrdinal returns, which stamps
+	// the `deploy-{N}-{slug}.gregale.dev` preview hostname (ADR-122).
+	// The migration backfilled it with that method's exact ordering,
+	// so stored and previously-computed values agree. Deliberately NOT
+	// partitioned by Scope: a scope-partitioned counter would fork into
+	// a second, different N and silently rot issued preview URLs. The
+	// cost is that a PR preview consumes a production revision number,
+	// leaving gaps in the production sequence — which is already true
+	// of the preview hostnames today.
+	//
+	// Zero is the "unassigned" sentinel for rows written by a raw-SQL
+	// fixture that predates the column. Both stores always assign a
+	// positive value, so a zero reaching a customer surface means a
+	// write path bypassed CreateDeployment — the API projection omits
+	// it rather than rendering a misleading `v0`.
+	Revision int `json:"revision,omitempty"`
 	// StageState (ADR-117, migration 00302) — per-deployment
 	// customer-UX stage projection. Owned entirely by
 	// Store.AppendDeploymentStage — handlers MUST NOT write the

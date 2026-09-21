@@ -717,13 +717,13 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 				}
 			}
 		}
-		// ADR-195: schedules are validated BEFORE the plan gates so an
+		// ADR-198: schedules are validated BEFORE the plan gates so an
 		// unparseable cron is a 422 about the cron rather than a 403
 		// about a floor the customer cannot reach anyway.
 		if problem := api.ValidateScalingSchedules("schedules", sp.Timezone, sp.Schedules); problem != nil {
 			return problem
 		}
-		// ADR-195: every min_instances gate below reads the MAXIMUM
+		// ADR-198: every min_instances gate below reads the MAXIMUM
 		// REACHABLE floor, not the static field. A schedule buys the
 		// same warm capacity min_instances does, so gating only the
 		// static value would let `min_instances: 0` plus a schedule of
@@ -1995,6 +1995,17 @@ func (s *server) rollbackAppCore(ctx context.Context, acct state.Account, app st
 	mode := "latest_superseded"
 	if req.TargetDeploymentID != nil && *req.TargetDeploymentID != "" {
 		mode = "explicit"
+		// ADR-198 — accept the customer-facing `v42` handle (or a bare
+		// `42`) in place of a uuid. Resolved here, inside the app scope,
+		// so a revision can only ever address a deployment of the app
+		// named in the request path; the IDOR posture is unchanged.
+		// Every downstream error message keeps echoing the original
+		// reference so the operator sees the string they typed.
+		resolved, problem := s.resolveDeploymentRef(ctx, app.ID, *req.TargetDeploymentID)
+		if problem != nil {
+			return state.Deployment{}, problem
+		}
+		req.TargetDeploymentID = &resolved
 		target, err = s.store.GetDeploymentByIDScopedToSuperseded(ctx, app.ID, *req.TargetDeploymentID)
 		if err != nil {
 			switch {
@@ -4816,6 +4827,7 @@ func (s *server) deploymentResponse(d state.Deployment, app state.App) api.Deplo
 		StageState:        append(json.RawMessage(nil), d.StageState...),
 		ID:                d.ID,
 		AppID:             d.AppID,
+		Revision:          d.Revision, // ADR-198 — the `v42` handle.
 		BuildID:           d.BuildID,
 		ImageDigest:       d.ImageDigest,
 		Kind:              string(d.Kind),
