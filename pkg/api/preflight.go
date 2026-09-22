@@ -1,6 +1,11 @@
 package api
 
-import "time"
+import (
+	"context"
+	"net/http"
+	"net/url"
+	"time"
+)
 
 // Wire DTOs for the public migration preflight check (GET /v1/preflight).
 //
@@ -94,4 +99,22 @@ type PreflightReport struct {
 	Verdict     PreflightVerdict      `json:"verdict"`
 	PlanBudgets []PreflightPlanBudget `json:"plan_budgets"`
 	CheckedAt   time.Time             `json:"checked_at"`
+}
+
+// GetPreflight runs the public migration check against a public GitHub
+// repository. The endpoint is unauthenticated: it exists to answer "would my
+// app run here" for someone who has not signed up.
+//
+// source is caller-supplied text — typically a pasted repository URL — so it
+// is percent-encoded rather than concatenated. An empty ref means the
+// repository's default branch.
+func (c *Client) GetPreflight(ctx context.Context, source, ref string) (PreflightReport, error) {
+	query := url.Values{}
+	query.Set("source", source)
+	if ref != "" {
+		query.Set("ref", ref)
+	}
+	var out PreflightReport
+	err := c.do(ctx, http.MethodGet, "/v1/preflight?"+query.Encode(), nil, &out)
+	return out, err
 }

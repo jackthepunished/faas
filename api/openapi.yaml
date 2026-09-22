@@ -17723,6 +17723,9 @@ components:
         declared change, `red` cannot run.
     PreflightSource:
       type: object
+      description: |
+        A validated public GitHub repository reference. Every field has passed
+        the character and length rules, so it is safe to interpolate upstream.
       required: [owner, repo]
       properties:
         owner: { type: string }
@@ -17730,6 +17733,9 @@ components:
         ref: { type: string, description: Branch or tag parsed from the input; empty means the default branch. }
     PreflightFinding:
       type: object
+      description: |
+        One actionable observation about the source. `detail` says what was
+        observed; `remedy` says what to change about it.
       required: [code, level, title, detail]
       properties:
         code: { type: string, description: Stable machine-readable finding code. }
@@ -17757,6 +17763,9 @@ components:
         inferred: { type: boolean }
     PreflightVerdict:
       type: object
+      description: |
+        The assessed result for one source tree: a headline level, the findings
+        behind it, and the run contract that was inferred.
       required: [level, profile]
       properties:
         level: { $ref: '#/components/schemas/PreflightLevel' }
@@ -17781,6 +17790,9 @@ components:
         overage_millicents_per_gb_hour: { type: integer, format: int64 }
     PreflightReport:
       type: object
+      description: |
+        One complete preflight answer, pinned to the commit it was computed
+        from so a permalink always re-renders the same verdict.
       required: [source, commit_sha, verdict, plan_budgets, checked_at]
       properties:
         source: { $ref: '#/components/schemas/PreflightSource' }
