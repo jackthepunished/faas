@@ -335,7 +335,7 @@ func envPush(args []string) int {
 	scope := fs.String("scope", "", "env scope (defaults to linked project environment)")
 	in := fs.String("f", ".env", "input file (default .env)")
 	fromStdin := fs.Bool("from-stdin", false, "read KEY=VALUE pairs from stdin (one per line)")
-	restart := fs.Bool("restart", false, "restart app after applying changes (otherwise changes apply on next wake)")
+	restart := fs.Bool("restart", false, "restart app after applying changes (otherwise changes apply on next cold wake)")
 	// --secret-scan mirrors the deploy-side flag. Default ON because the
 	// failure mode (a Stripe key pasted into a `gregale env push`
 	// heredoc) is the same as the deploy-side case — the value lands in
@@ -505,26 +505,6 @@ func envPush(args []string) int {
 	if err != nil {
 		return printErr("Not logged in", err)
 	}
-	// Same rotation-hint flow as secretsSet (commands3.go).
-	existing := map[string]bool{}
-	if list, err := client.ListSecretsWithScope(context.Background(), *app, *scope); err == nil {
-		for _, s := range list.Secrets {
-			existing[s.Key] = true
-		}
-	}
-	rotated := 0
-	for _, p := range pairs {
-		if existing[p.k] {
-			rotated++
-		}
-	}
-	if rotated > 0 {
-		_, _ = fmt.Fprintf(osStdout,
-			"note: %d secret(s) already existed in scope=%q and are being rotated.\n"+
-				"  Any parked snapshots still hold the previous plaintext until the next wake.\n"+
-				"  Deploy, or call `gregale wake %s`, to force an overstamp.\n",
-			rotated, scopeOrDefault(*scope), *app)
-	}
 	for _, p := range pairs {
 		if err := client.SetSecretWithScope(context.Background(), *app, p.k, p.v, *scope); err != nil {
 			return printErr("Set "+p.k+" failed", err)
@@ -532,11 +512,9 @@ func envPush(args []string) int {
 		PrintOK(osStdout, "%s set (scope=%s)", p.k, scopeOrDefault(*scope))
 	}
 	if *restart {
-		// The env PUT invalidates parked snapshots, but running instances
-		// intentionally keep their old process environment. Reuse the
-		// customer restart endpoint so `--restart` has the same durable
-		// park-and-replacement-wake semantics as `gregale app <slug> restart`.
-		out, err := client.RestartApp(context.Background(), *app)
+		// Runtime configuration must not use the ordinary snapshot restart:
+		// capturing process memory would preserve the previous environment.
+		out, err := client.RestartAppFresh(context.Background(), *app)
 		if err != nil {
 			return printErr("Restart failed", err)
 		}
@@ -544,10 +522,10 @@ func envPush(args []string) int {
 		return 0
 	}
 	// Default semantics are deliberately lazy: the API keeps live
-	// instances on their existing environment and the next wake picks up
+	// instances on their existing environment and the next cold wake picks up
 	// the persisted values. Say this even when no key was a re-PUT — a new
 	// key is just as invisible to already-running processes as a rotation.
-	PrintWarn(osStdout, "Updated env values apply on the next wake; running instances keep their current environment. Use --restart to apply now.")
+	PrintWarn(osStdout, "Updated env values apply on the next cold wake; running instances keep their current environment. Use --restart to apply now.")
 	return 0
 }
 

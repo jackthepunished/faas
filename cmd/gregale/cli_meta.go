@@ -1009,7 +1009,7 @@ var cliCommands = []cliCommand{
 			}},
 			{Name: "push", Short: "Push KEY=VALUE pairs to sealed secrets (use --restart to apply now)", Flags: []cliFlag{
 				{Name: "scope", Short: "env scope (defaults to linked project environment)", Value: "SCOPE"},
-				{Name: "restart", Short: "restart app after applying changes (otherwise changes apply on next wake)"},
+				{Name: "restart", Short: "restart app after applying changes (otherwise changes apply on next cold wake)"},
 			}},
 			{Name: "diff", Short: "Render the env-diff matrix (presence / value-equality across scopes)"},
 		},
@@ -1512,10 +1512,10 @@ var cliCommands = []cliCommand{
 		Short:   "Manage env secrets (secrets list|set|unset|list-all|rotate)",
 		Subcommands: []cliSub{
 			{Name: "list", Short: "List sealed secrets", Flags: []cliFlag{{Name: "scope", Short: "env scope filter (defaults to linked project environment)", Value: "SCOPE|__all__"}}},
-			{Name: "set", Short: "Set a sealed secret", Flags: []cliFlag{{Name: "scope", Short: "env scope to write (defaults to linked project environment)", Value: "SCOPE"}}},
+			{Name: "set", Short: "Set a sealed secret", Flags: []cliFlag{{Name: "scope", Short: "env scope to write (defaults to linked project environment)", Value: "SCOPE"}, {Name: "restart", Short: "restart the app and apply updated secrets now"}}},
 			{Name: "unset", Short: "Remove a sealed secret", Flags: []cliFlag{{Name: "scope", Short: "env scope to delete from (defaults to linked project environment)", Value: "SCOPE"}}},
 			{Name: "list-all", Short: "List every secret across apps"},
-			{Name: subRotate, Short: "Re-seal one secret under the current host key", Flags: []cliFlag{{Name: "scope", Short: "env scope to rotate (defaults to linked project environment)", Value: "SCOPE"}}},
+			{Name: subRotate, Short: "Re-seal one secret under the current host key", Flags: []cliFlag{{Name: "scope", Short: "env scope to rotate (defaults to linked project environment)", Value: "SCOPE"}, {Name: "restart", Short: "restart the app and apply the rotated secret now"}}},
 		},
 	},
 	{
