@@ -1167,6 +1167,9 @@ from .sidecar import Sidecar
 from .sidecar_cpu_millicores import SidecarCpuMillicores
 from .sidecar_disk_io_profile import SidecarDiskIoProfile
 from .sidecar_env import SidecarEnv
+from .sidecar_timeline_response import SidecarTimelineResponse
+from .sidecar_timeline_status import SidecarTimelineStatus
+from .sidecar_timeline_status_status import SidecarTimelineStatusStatus
 from .sidecar_type import SidecarType
 from .slo_duration import SLODuration
 from .source_ref_deploy_request import SourceRefDeployRequest
@@ -2474,6 +2477,9 @@ __all__ = (
     "SidecarCpuMillicores",
     "SidecarDiskIoProfile",
     "SidecarEnv",
+    "SidecarTimelineResponse",
+    "SidecarTimelineStatus",
+    "SidecarTimelineStatusStatus",
     "SidecarType",
     "SLODuration",
     "SourceRefDeployRequest",
