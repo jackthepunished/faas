@@ -1174,6 +1174,9 @@ from .security_quarantine_recovery_request import SecurityQuarantineRecoveryRequ
 from .security_quarantine_recovery_response import SecurityQuarantineRecoveryResponse
 from .security_quarantine_recovery_response_status import SecurityQuarantineRecoveryResponseStatus
 from .service_replicas import ServiceReplicas
+from .service_rollout_handoff_response import ServiceRolloutHandoffResponse
+from .service_rollout_handoff_response_action import ServiceRolloutHandoffResponseAction
+from .service_rollout_handoff_response_phase import ServiceRolloutHandoffResponsePhase
 from .session_info import SessionInfo
 from .session_list_response import SessionListResponse
 from .sessions_revoke_all_response import SessionsRevokeAllResponse
@@ -2506,6 +2509,9 @@ __all__ = (
     "SecurityQuarantineRecoveryResponse",
     "SecurityQuarantineRecoveryResponseStatus",
     "ServiceReplicas",
+    "ServiceRolloutHandoffResponse",
+    "ServiceRolloutHandoffResponseAction",
+    "ServiceRolloutHandoffResponsePhase",
     "SessionInfo",
     "SessionListResponse",
     "SessionsRevokeAllResponse",
