@@ -1079,6 +1079,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// Gregale-owned networks use the durable network store directly, while the
 	// legacy operator registry remains available for external/provider attachments.
 	var privateNetworkSubscriber *sched.PrivateNetworkAttachmentSubscriber
+	var privateNetworkPolicySubscriber *sched.PrivateNetworkPolicySubscriber
 	var privateNetworkPeeringSubscriber *sched.PrivateNetworkPeeringSubscriber
 	if api.PrivateNetworkEnabled() {
 		reconcileStore, ok := any(store).(state.AppPrivateNetworkAttachmentReconcileStore)
@@ -1200,6 +1201,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 				// keeps both the operator-managed registry and Gregale's own
 				// network fabric on the same provider-neutral path.
 				privateNetworkSubscriber = sched.NewPrivateNetworkAttachmentSubscriber(applier, log).WithNotificationPool(pool)
+				privateNetworkPolicySubscriber = sched.NewPrivateNetworkPolicySubscriber(reconciler, log)
 				log.Info("schedd: private network reconciler enabled", "configured_networks", configuredCount, "gregale_fabric", api.PrivateNetworkFabricEnabled())
 			}
 		}
@@ -1618,6 +1620,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		WithLiveness(liveness).
 		WithAppDeleteSubscriber(appDeleteSub).
 		WithPrivateNetworkAttachmentSubscriber(privateNetworkSubscriber).
+		WithPrivateNetworkPolicySubscriber(privateNetworkPolicySubscriber).
 		WithPrivateNetworkPeeringSubscriber(privateNetworkPeeringSubscriber).
 		WithTriggerSecretIdentities(hostAgeIdentities).
 		WithJobsDispatched(jobsDispatched).
@@ -2080,15 +2083,15 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			log.Warn("schedd: durable notification replay exited", "err", err)
 		}
 	}()
-	if privateNetworkSubscriber != nil || privateNetworkPeeringSubscriber != nil {
-		// Detach cleanup has its own durable channel because the attachment
-		// row is deleted and peering withdrawal carries the affected region so
-		// it can converge even after the peering row is gone.
+	if privateNetworkSubscriber != nil || privateNetworkPolicySubscriber != nil || privateNetworkPeeringSubscriber != nil {
+		// Private-network mutations have their own durable channel because an
+		// attachment policy update must converge immediately, while a peering
+		// withdrawal carries the affected region after its row is gone.
 		go func() {
 			err := db.RunNotificationOutbox(ctx, pool, "schedd-private-network",
 				[]string{db.NotifyPrivateNetworkAttachmentChanged, db.NotifyPrivateNetworkChanged}, loop.HandleDurableNotification, log)
 			if err != nil && !errors.Is(err, context.Canceled) && ctx.Err() == nil {
-				log.Warn("schedd: private network detach replay exited", "err", err)
+				log.Warn("schedd: private network mutation replay exited", "err", err)
 			}
 		}()
 	}
