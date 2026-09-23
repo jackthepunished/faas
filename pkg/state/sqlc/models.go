@@ -700,6 +700,7 @@ type CreditLedger struct {
 	CreatedAt         pgtype.Timestamptz
 	ProviderInvoiceID pgtype.Text
 	RefundReversalID  pgtype.UUID
+	Provider          string
 }
 
 type Cron struct {
@@ -1384,6 +1385,7 @@ type MirrorInvocationResult struct {
 	Crashed            bool
 	RequestID          string
 	CompletedAt        pgtype.Timestamptz
+	RollupCounted      bool
 }
 
 type MirrorInvocationSummary struct {

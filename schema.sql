@@ -2114,7 +2114,9 @@ CREATE TABLE public.credit_ledger (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     provider_invoice_id text,
     refund_reversal_id uuid,
-    CONSTRAINT credit_ledger_delta_cents_check CHECK ((delta_cents <> 0))
+    provider text DEFAULT ''::text NOT NULL,
+    CONSTRAINT credit_ledger_delta_cents_check CHECK ((delta_cents <> 0)),
+    CONSTRAINT credit_ledger_provider_check CHECK ((provider = ANY (ARRAY[''::text, 'stripe'::text, 'paddle'::text, 'polar'::text])))
 );
 
 
@@ -3147,7 +3149,8 @@ CREATE TABLE public.mirror_invocation_results (
     body_diff boolean DEFAULT false NOT NULL,
     crashed boolean DEFAULT false NOT NULL,
     request_id text NOT NULL,
-    completed_at timestamp with time zone DEFAULT now() NOT NULL
+    completed_at timestamp with time zone DEFAULT now() NOT NULL,
+    rollup_counted boolean DEFAULT false NOT NULL
 );
 
 
@@ -6234,7 +6237,7 @@ CREATE INDEX credit_ledger_account_created_idx ON public.credit_ledger USING btr
 -- Name: credit_ledger_invoice_credit_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE UNIQUE INDEX credit_ledger_invoice_credit_idx ON public.credit_ledger USING btree (provider_invoice_id, credit_id) WHERE ((provider_invoice_id IS NOT NULL) AND (delta_cents < 0));
+CREATE UNIQUE INDEX credit_ledger_invoice_credit_idx ON public.credit_ledger USING btree (provider, provider_invoice_id, credit_id) WHERE ((provider_invoice_id IS NOT NULL) AND (delta_cents < 0));
 
 
 --
@@ -6982,6 +6985,13 @@ CREATE INDEX mirror_invocation_results_completed_at_idx ON public.mirror_invocat
 --
 
 CREATE INDEX mirror_invocation_results_rule_time_idx ON public.mirror_invocation_results USING btree (mirror_rule_id, completed_at DESC);
+
+
+--
+-- Name: mirror_invocation_results_uncounted_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX mirror_invocation_results_uncounted_idx ON public.mirror_invocation_results USING btree (completed_at) WHERE (NOT rollup_counted);
 
 
 --

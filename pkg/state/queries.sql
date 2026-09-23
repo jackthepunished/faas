@@ -1,3 +1,117 @@
+-- name: ReadAccountCreditConsumption :one
+-- An unqualified legacy row blocks the whole key; guessing could double-debit.
+SELECT coalesce(sum(-delta_cents) FILTER (WHERE provider = sqlc.arg(provider)::text), 0)::bigint AS consumed_cents,
+       coalesce(bool_or(delta_cents < 0) FILTER (WHERE provider = sqlc.arg(provider)), false)::boolean AS has_prior,
+       coalesce(bool_or(provider = ''), false)::boolean AS has_unqualified
+FROM credit_ledger
+WHERE account_id = sqlc.arg(account_id)::uuid
+  AND provider_invoice_id = sqlc.arg(provider_invoice_id)::text;
+
+-- name: ReverseAccountInvoiceCreditConsumption :execrows
+WITH consumed AS (
+    SELECT ledger.credit_id, sum(-ledger.delta_cents)::bigint AS cents
+    FROM credit_ledger AS ledger
+    JOIN account_credits AS credit
+      ON credit.id = ledger.credit_id AND credit.account_id = ledger.account_id
+    WHERE ledger.account_id = sqlc.arg(account_id)::uuid
+      AND ledger.provider_invoice_id = sqlc.arg(provider_invoice_id)::text
+      AND ledger.provider = sqlc.arg(provider)::text
+    GROUP BY ledger.credit_id
+    HAVING sum(-ledger.delta_cents) > 0
+), inserted AS (
+    INSERT INTO credit_ledger
+        (account_id, credit_id, delta_cents, reason, actor, provider, provider_invoice_id, refund_reversal_id)
+    SELECT sqlc.arg(account_id), credit_id, cents, 'provider refund failed',
+           'apid-refund-reversal', sqlc.arg(provider), sqlc.arg(provider_invoice_id), sqlc.arg(refund_id)::uuid
+    FROM consumed
+    ON CONFLICT (refund_reversal_id, credit_id) WHERE refund_reversal_id IS NOT NULL
+        DO NOTHING
+    RETURNING credit_id, delta_cents
+)
+UPDATE account_credits AS credit
+SET cents_remaining = credit.cents_remaining + inserted.delta_cents
+FROM inserted
+WHERE credit.id = inserted.credit_id AND credit.account_id = sqlc.arg(account_id);
+
+-- name: SumAccountCreditRefundReversal :one
+SELECT coalesce(sum(delta_cents), 0)::bigint AS reversed_cents
+FROM credit_ledger
+WHERE account_id = sqlc.arg(account_id)::uuid
+  AND refund_reversal_id = sqlc.arg(refund_id)::uuid;
+
+-- name: AppendAccountCreditLedgerEntry :exec
+INSERT INTO credit_ledger (account_id, credit_id, delta_cents, reason, actor, provider, provider_invoice_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7);
+
+-- name: ReserveAccountCreditConsumption :one
+INSERT INTO credit_ledger (account_id, credit_id, delta_cents, reason, actor, provider, provider_invoice_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
+ON CONFLICT (provider, provider_invoice_id, credit_id)
+    WHERE provider_invoice_id IS NOT NULL AND delta_cents < 0 DO NOTHING
+RETURNING id;
+
+-- name: LockInvoiceForRefund :one
+SELECT account_id, provider, provider_invoice_id, amount_paid_cents,
+       total_cents, amount_refunded_cents, amount_refund_pending_cents, credits_applied_cents
+FROM invoices WHERE id = $1 FOR UPDATE;
+
+-- name: LockCreditConsumption :exec
+-- Keep the historical broad lock key, also shared with refund compensation.
+SELECT pg_advisory_xact_lock(hashtextextended('consume-account-credit:' || sqlc.arg(provider_invoice_id)::text, 0));
+
+-- name: FindInvoiceIDsByProviderKey :many
+-- Two matches mean an invoice ID collides with another invoice's charge ID.
+SELECT id FROM invoices
+WHERE account_id = sqlc.arg(account_id)::uuid
+  AND provider = sqlc.arg(provider)::text
+  AND (provider_invoice_id = sqlc.arg(provider_key)::text
+       OR provider_charge_id = sqlc.arg(provider_key))
+LIMIT 2;
+
+-- name: RollupMirrorResults :execrows
+-- ADR-221: claiming and counting share one statement/transaction. SKIP LOCKED
+-- permits concurrent workers without counting the same result twice.
+WITH pending AS MATERIALIZED (
+    SELECT id FROM mirror_invocation_results
+    WHERE NOT rollup_counted
+      AND completed_at >= sqlc.arg(window_start)::timestamptz
+      AND completed_at < sqlc.arg(window_end)::timestamptz
+    ORDER BY id
+    FOR UPDATE SKIP LOCKED
+), counted AS (
+    UPDATE mirror_invocation_results AS result
+    SET rollup_counted = true
+    FROM pending
+    WHERE result.id = pending.id
+    RETURNING result.*
+)
+INSERT INTO mirror_invocation_summary (
+    rule_id, app_id, hour_bucket, total_invocations,
+    status_diff_count, schema_diff_count, body_diff_count, crash_count,
+    cap_at_max_count, sum_latency_ms, rolled_up_at
+)
+SELECT mirror_rule_id, app_id,
+    date_trunc('hour', completed_at AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',
+    count(*), count(*) FILTER (WHERE status_diff),
+    count(*) FILTER (WHERE schema_diff), count(*) FILTER (WHERE body_diff),
+    count(*) FILTER (WHERE crashed), 0, coalesce(sum(latency_ms), 0), now()
+FROM counted
+GROUP BY 1, 2, 3
+ORDER BY 1, 3
+ON CONFLICT (rule_id, hour_bucket) DO UPDATE SET
+    total_invocations = mirror_invocation_summary.total_invocations + EXCLUDED.total_invocations,
+    status_diff_count = mirror_invocation_summary.status_diff_count + EXCLUDED.status_diff_count,
+    schema_diff_count = mirror_invocation_summary.schema_diff_count + EXCLUDED.schema_diff_count,
+    body_diff_count = mirror_invocation_summary.body_diff_count + EXCLUDED.body_diff_count,
+    crash_count = mirror_invocation_summary.crash_count + EXCLUDED.crash_count,
+    cap_at_max_count = mirror_invocation_summary.cap_at_max_count + EXCLUDED.cap_at_max_count,
+    sum_latency_ms = mirror_invocation_summary.sum_latency_ms + EXCLUDED.sum_latency_ms,
+    rolled_up_at = now();
+
+-- name: SweepCountedMirrorResults :execrows
+DELETE FROM mirror_invocation_results
+WHERE completed_at < sqlc.arg(cutoff)::timestamptz AND rollup_counted;
+
 -- name: CreateAccount :one
 insert into accounts (id, email, plan, status, provider_customer_id)
 values (gen_random_uuid(), $1, $2, $3, null)
