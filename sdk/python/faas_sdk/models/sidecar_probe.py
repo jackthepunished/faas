@@ -14,18 +14,20 @@ if TYPE_CHECKING:
     from ..models.sidecar_tcp_socket_probe import SidecarTCPSocketProbe
 
 
-T = TypeVar("T", bound="AppManifestHealthcheck")
+T = TypeVar("T", bound="SidecarProbe")
 
 
 @_attrs_define
-class AppManifestHealthcheck:
-    """AppManifest-level healthcheck shape: OCI HEALTHCHECK fields plus typed deployment probe overrides. Durations are
-    integer seconds at the JSON boundary to match OCI/Docker conventions.
+class SidecarProbe:
+    """Container-local startup or liveness probe for a companion. Specify
+    exactly one action: exec, http_get, tcp_socket, or the legacy OCI
+    test field. Port 0/omitted uses the workload's declared port, then
+    the image port, then the platform default.
 
     """
 
     test: list[str] | Unset = UNSET
-    """Argv of the check command, prefixed by "CMD", "CMD-SHELL", or "NONE" per Docker semantics."""
+    """Legacy OCI exec form: CMD, CMD-SHELL, or NONE. Retained for startup_probe compatibility."""
     exec_: SidecarExecProbe | Unset = UNSET
     """Exec probe command passed as argv inside the container; no shell is implied."""
     http_get: SidecarHTTPGetProbe | Unset = UNSET
@@ -33,21 +35,21 @@ class AppManifestHealthcheck:
     tcp_socket: SidecarTCPSocketProbe | Unset = UNSET
     """TCP connection probe opened from inside the container."""
     period_s: int | Unset = UNSET
-    """Typed sidecar probe cadence in seconds; defaults to 10, or 30 for legacy OCI checks."""
-    interval_s: int | None | Unset = UNSET
-    """Poll cadence after StartPeriodS elapses (Docker default 30s)."""
-    timeout_s: int | None | Unset = UNSET
-    """Per-probe exec timeout (Docker default 30s)."""
-    retries: int | None | Unset = UNSET
-    """Consecutive failure count to mark unhealthy (Docker default 3)."""
+    """Probe interval in seconds; typed-probe default 10, legacy OCI default 30."""
+    interval_s: int | Unset = UNSET
+    """Legacy alias for period_s."""
+    timeout_s: int | Unset = UNSET
+    """Probe timeout in seconds; defaults to 1 for typed probes and 30 for legacy OCI probes."""
     failure_threshold: int | Unset = UNSET
-    """Failure count that marks a startup probe failed or restarts a liveness workload; defaults to 3."""
+    """Consecutive failures before startup fails or liveness restarts the workload; defaults to 3."""
+    retries: int | Unset = UNSET
+    """Legacy alias for failure_threshold."""
     success_threshold: int | Unset = UNSET
-    """Consecutive passes required before the probe reports healthy; defaults to 1."""
+    """Consecutive passes required to become healthy; defaults to 1."""
     initial_delay_s: int | Unset = UNSET
-    """Seconds to wait before the first typed sidecar probe."""
-    start_period_s: int | None | Unset = UNSET
-    """Startup grace during which failures don't count (Docker 17.05+, default 0s)."""
+    """Delay before the first probe."""
+    start_period_s: int | Unset = UNSET
+    """Legacy OCI liveness grace period during which failures do not count."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -69,35 +71,19 @@ class AppManifestHealthcheck:
 
         period_s = self.period_s
 
-        interval_s: int | None | Unset
-        if isinstance(self.interval_s, Unset):
-            interval_s = UNSET
-        else:
-            interval_s = self.interval_s
+        interval_s = self.interval_s
 
-        timeout_s: int | None | Unset
-        if isinstance(self.timeout_s, Unset):
-            timeout_s = UNSET
-        else:
-            timeout_s = self.timeout_s
-
-        retries: int | None | Unset
-        if isinstance(self.retries, Unset):
-            retries = UNSET
-        else:
-            retries = self.retries
+        timeout_s = self.timeout_s
 
         failure_threshold = self.failure_threshold
+
+        retries = self.retries
 
         success_threshold = self.success_threshold
 
         initial_delay_s = self.initial_delay_s
 
-        start_period_s: int | None | Unset
-        if isinstance(self.start_period_s, Unset):
-            start_period_s = UNSET
-        else:
-            start_period_s = self.start_period_s
+        start_period_s = self.start_period_s
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -116,10 +102,10 @@ class AppManifestHealthcheck:
             field_dict["interval_s"] = interval_s
         if timeout_s is not UNSET:
             field_dict["timeout_s"] = timeout_s
-        if retries is not UNSET:
-            field_dict["retries"] = retries
         if failure_threshold is not UNSET:
             field_dict["failure_threshold"] = failure_threshold
+        if retries is not UNSET:
+            field_dict["retries"] = retries
         if success_threshold is not UNSET:
             field_dict["success_threshold"] = success_threshold
         if initial_delay_s is not UNSET:
@@ -161,49 +147,21 @@ class AppManifestHealthcheck:
 
         period_s = d.pop("period_s", UNSET)
 
-        def _parse_interval_s(data: object) -> int | None | Unset:
-            if data is None:
-                return data
-            if isinstance(data, Unset):
-                return data
-            return cast(int | None | Unset, data)
+        interval_s = d.pop("interval_s", UNSET)
 
-        interval_s = _parse_interval_s(d.pop("interval_s", UNSET))
-
-        def _parse_timeout_s(data: object) -> int | None | Unset:
-            if data is None:
-                return data
-            if isinstance(data, Unset):
-                return data
-            return cast(int | None | Unset, data)
-
-        timeout_s = _parse_timeout_s(d.pop("timeout_s", UNSET))
-
-        def _parse_retries(data: object) -> int | None | Unset:
-            if data is None:
-                return data
-            if isinstance(data, Unset):
-                return data
-            return cast(int | None | Unset, data)
-
-        retries = _parse_retries(d.pop("retries", UNSET))
+        timeout_s = d.pop("timeout_s", UNSET)
 
         failure_threshold = d.pop("failure_threshold", UNSET)
+
+        retries = d.pop("retries", UNSET)
 
         success_threshold = d.pop("success_threshold", UNSET)
 
         initial_delay_s = d.pop("initial_delay_s", UNSET)
 
-        def _parse_start_period_s(data: object) -> int | None | Unset:
-            if data is None:
-                return data
-            if isinstance(data, Unset):
-                return data
-            return cast(int | None | Unset, data)
+        start_period_s = d.pop("start_period_s", UNSET)
 
-        start_period_s = _parse_start_period_s(d.pop("start_period_s", UNSET))
-
-        app_manifest_healthcheck = cls(
+        sidecar_probe = cls(
             test=test,
             exec_=exec_,
             http_get=http_get,
@@ -211,15 +169,15 @@ class AppManifestHealthcheck:
             period_s=period_s,
             interval_s=interval_s,
             timeout_s=timeout_s,
-            retries=retries,
             failure_threshold=failure_threshold,
+            retries=retries,
             success_threshold=success_threshold,
             initial_delay_s=initial_delay_s,
             start_period_s=start_period_s,
         )
 
-        app_manifest_healthcheck.additional_properties = d
-        return app_manifest_healthcheck
+        sidecar_probe.additional_properties = d
+        return sidecar_probe
 
     @property
     def additional_keys(self) -> list[str]:
