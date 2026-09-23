@@ -256,6 +256,8 @@ export type { DelayedTaskAfterRequest } from './models/DelayedTaskAfterRequest.j
 export type { DelayedTaskAtRequest } from './models/DelayedTaskAtRequest.js';
 export type { DelayedTaskRequest } from './models/DelayedTaskRequest.js';
 export type { DelayedTaskResponse } from './models/DelayedTaskResponse.js';
+export type { DeliverAppEventRequest } from './models/DeliverAppEventRequest.js';
+export type { DeliverAppEventResponse } from './models/DeliverAppEventResponse.js';
 export type { DeploymentAuditResponse } from './models/DeploymentAuditResponse.js';
 export type { DeploymentChange } from './models/DeploymentChange.js';
 export type { DeploymentFailedWebhookPayload } from './models/DeploymentFailedWebhookPayload.js';
@@ -622,6 +624,8 @@ export type { SecretKey } from './models/SecretKey.js';
 export type { SecretScanResult } from './models/SecretScanResult.js';
 export type { SecurityQuarantineRecoveryRequest } from './models/SecurityQuarantineRecoveryRequest.js';
 export type { SecurityQuarantineRecoveryResponse } from './models/SecurityQuarantineRecoveryResponse.js';
+export type { SendAppMessageRequest } from './models/SendAppMessageRequest.js';
+export type { SendAppMessageResponse } from './models/SendAppMessageResponse.js';
 export type { ServiceBindingPolicy } from './models/ServiceBindingPolicy.js';
 export type { ServiceReplicas } from './models/ServiceReplicas.js';
 export type { ServiceRolloutHandoffResponse } from './models/ServiceRolloutHandoffResponse.js';

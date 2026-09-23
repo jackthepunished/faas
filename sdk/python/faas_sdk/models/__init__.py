@@ -192,7 +192,6 @@ from .app_wake_timeline_response_trigger_class_histogram import AppWakeTimelineR
 from .app_wake_timeline_response_trigger_histogram import AppWakeTimelineResponseTriggerHistogram
 from .app_webhook_delivery_list_response import AppWebhookDeliveryListResponse
 from .app_webhook_delivery_response import AppWebhookDeliveryResponse
-from .app_webhook_delivery_response_event import AppWebhookDeliveryResponseEvent
 from .app_webhook_delivery_response_payload import AppWebhookDeliveryResponsePayload
 from .app_webhook_delivery_response_status import AppWebhookDeliveryResponseStatus
 from .app_webhook_response import AppWebhookResponse
@@ -480,6 +479,9 @@ from .delayed_task_response import DelayedTaskResponse
 from .delayed_task_response_state import DelayedTaskResponseState
 from .delete_account_session_body import DeleteAccountSessionBody
 from .delete_deployment_scope_exclusion_response_200 import DeleteDeploymentScopeExclusionResponse200
+from .deliver_app_event_request import DeliverAppEventRequest
+from .deliver_app_event_response import DeliverAppEventResponse
+from .deliver_app_event_response_status import DeliverAppEventResponseStatus
 from .deploy_dev_source_body import DeployDevSourceBody
 from .deploy_dev_source_body_runtime import DeployDevSourceBodyRuntime
 from .deploy_token_response import DeployTokenResponse
@@ -1194,6 +1196,10 @@ from .secret_scan_result import SecretScanResult
 from .security_quarantine_recovery_request import SecurityQuarantineRecoveryRequest
 from .security_quarantine_recovery_response import SecurityQuarantineRecoveryResponse
 from .security_quarantine_recovery_response_status import SecurityQuarantineRecoveryResponseStatus
+from .send_app_message_request import SendAppMessageRequest
+from .send_app_message_request_data_content_type import SendAppMessageRequestDataContentType
+from .send_app_message_response import SendAppMessageResponse
+from .send_app_message_response_status import SendAppMessageResponseStatus
 from .service_binding_policy import ServiceBindingPolicy
 from .service_replicas import ServiceReplicas
 from .service_rollout_handoff_response import ServiceRolloutHandoffResponse
@@ -1589,7 +1595,6 @@ __all__ = (
     "AppWakeTimelineResponseTriggerHistogram",
     "AppWebhookDeliveryListResponse",
     "AppWebhookDeliveryResponse",
-    "AppWebhookDeliveryResponseEvent",
     "AppWebhookDeliveryResponsePayload",
     "AppWebhookDeliveryResponseStatus",
     "AppWebhookResponse",
@@ -1862,6 +1867,9 @@ __all__ = (
     "DelayedTaskResponseState",
     "DeleteAccountSessionBody",
     "DeleteDeploymentScopeExclusionResponse200",
+    "DeliverAppEventRequest",
+    "DeliverAppEventResponse",
+    "DeliverAppEventResponseStatus",
     "DeployDevSourceBody",
     "DeployDevSourceBodyRuntime",
     "DeploymentAuditResponse",
@@ -2552,6 +2560,10 @@ __all__ = (
     "SecurityQuarantineRecoveryRequest",
     "SecurityQuarantineRecoveryResponse",
     "SecurityQuarantineRecoveryResponseStatus",
+    "SendAppMessageRequest",
+    "SendAppMessageRequestDataContentType",
+    "SendAppMessageResponse",
+    "SendAppMessageResponseStatus",
     "ServiceBindingPolicy",
     "ServiceReplicas",
     "ServiceRolloutHandoffResponse",

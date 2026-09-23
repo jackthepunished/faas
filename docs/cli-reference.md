@@ -11,6 +11,8 @@ Generated from the CLI's command manifest by `gregale man --markdown`. Do not ed
 | [`alerts`](#alerts) | Per-app alert rules (alerts list\|add\|info\|update\|rm\|rotate-secret\|preset --app &lt;slug&gt;) |
 | [`audit-events`](#audit-events) | Audit-log query (audit-events list\|get &lt;id&gt;) |
 | [`events`](#events) | Publish events and inspect subscriptions and deliveries |
+| [`send`](#send) | Reliably send work to another Gregale application |
+| [`deliver`](#deliver) | Reliably deliver an event to a registered webhook |
 | [`apps`](#apps) | List your apps |
 | [`app`](#app) | Get/update one app (gregale app &lt;slug&gt; [scale\|rename &lt;new&gt;\|restart\|--profile NAME\|--ram N\|…]) |
 | [`billing`](#billing) | Manage billing (portal, invoices, subscription, card on file) |
@@ -284,6 +286,36 @@ Inspect event delivery lifecycle
 | `--state <STATE>` | filter by delivery state |  |
 | `--before <ID>` | pagination cursor |  |
 | `--limit <N>` | max deliveries (1..200) |  |
+
+
+## send
+
+Reliably send work to another Gregale application
+
+`gregale send <target-app> --type <TYPE> --data <J|@file|-> [--id <ID>] [--source <SOURCE>] [--time <RFC3339>] [--queue-name <QUEUE>] [--idempotency-key <KEY>]`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--type <TYPE>` | event type | required |
+| `--data <J|@file|->` | JSON event data (inline \| @file \| -) | required |
+| `--id <ID>` | stable event id |  |
+| `--source <SOURCE>` | event source |  |
+| `--time <RFC3339>` | event time |  |
+| `--queue-name <QUEUE>` | target logical queue name |  |
+| `--idempotency-key <KEY>` | stable key for retrying an uncertain send |  |
+
+
+## deliver
+
+Reliably deliver an event to a registered webhook
+
+`gregale deliver <source-app> <webhook-id|url> --type <TYPE> --data <J|@file|-> [--idempotency-key <KEY>]`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--type <TYPE>` | event type | required |
+| `--data <J|@file|->` | JSON event data (inline \| @file \| -) | required |
+| `--idempotency-key <KEY>` | stable key for retrying an uncertain delivery |  |
 
 
 ## apps
