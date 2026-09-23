@@ -4000,6 +4000,28 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  /v1/preview/{slug}:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+    get:
+      tags: [previews]
+      operationId: getPreview
+      summary: Get a first-class preview resource.
+      description: |
+        Returns preview identity, public URL, expiration, latest preview and
+        production deployments, safe changes from production, and links to
+        the native streaming logs, time-windowed metrics, and configuration
+        endpoints. Secret values and ciphertext are never included.
+      responses:
+        '200':
+          description: Preview resource and production comparison.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PreviewResourceResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   /v1/preview/{slug}/destroy:
     parameters:
       - $ref: '#/components/parameters/Slug'
@@ -11638,6 +11660,14 @@ paths:
       tags: [projects]
       operationId: createProjectEnvironment
       summary: Create a durable project environment.
+      description: |
+        When from_environment is supplied, the create is atomic and copies the
+        latest non-secret configuration, runtime variables, and already-sealed
+        customer secrets. Managed PostgreSQL and object-storage bindings receive
+        fresh target-scoped credentials and isolated data by default. Set
+        share_resources to attach fresh credentials to the source resources
+        instead. Provider-issued credential bytes are never copied. Domains,
+        routes, and policies remain application-scoped and are shared.
       requestBody:
         required: true
         content:
@@ -11707,10 +11737,13 @@ paths:
         Deletes only an unprotected, non-production environment that has no
         live releases. Configuration and approval history for the registry
         entry is removed with it. Production, protected environments, and
-        environments still serving a live release return 409.
+        environments still serving a live release return 409. If managed
+        resources cannot be revoked immediately, cleanup is durably queued and
+        retried; the deleted environment returns 202 while cleanup is pending.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       responses:
+        '202': { description: Project environment deleted; managed-resource cleanup is queued for retry. }
         '204': { description: Project environment deleted. }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -11794,6 +11827,74 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  /v1/projects/{slug}/environments/{environment}/state:
+    parameters:
+      - name: slug
+        in: path
+        required: true
+        description: Project whose environment state is requested.
+        schema: { type: string, pattern: '^[a-z0-9][a-z0-9-]{0,62}$' }
+      - name: environment
+        in: path
+        required: true
+        description: Target environment whose effective state is returned.
+        schema: { type: string, pattern: '^[a-z0-9](?:[a-z0-9-]{0,31}[a-z0-9])?$' }
+    get:
+      tags: [projects]
+      operationId: getProjectEnvironmentState
+      summary: Get effective state for a project environment.
+      description: |
+        Returns configuration, live releases, non-secret runtime variables,
+        secret fingerprints, and managed binding metadata. Secret plaintext,
+        ciphertext, and sealing-key identifiers are never returned. Resources
+        that remain application-scoped are identified under shared_resources.
+      responses:
+        '200':
+          description: Effective environment state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectEnvironmentStateResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/projects/{slug}/environments/{environment}/diff:
+    parameters:
+      - name: slug
+        in: path
+        required: true
+        description: Project slug whose environments are compared.
+        schema: { type: string, pattern: '^[a-z0-9][a-z0-9-]{0,62}$' }
+      - name: environment
+        in: path
+        required: true
+        description: Target environment.
+        schema: { type: string, pattern: '^[a-z0-9](?:[a-z0-9-]{0,31}[a-z0-9])?$' }
+      - name: from
+        in: query
+        required: true
+        description: Source environment being compared with the target environment.
+        schema: { type: string, pattern: '^[a-z0-9](?:[a-z0-9-]{0,31}[a-z0-9])?$' }
+    get:
+      tags: [projects]
+      operationId: getProjectEnvironmentDiff
+      summary: Compare two effective project environments.
+      description: |
+        Compares configuration, releases, runtime variables, secret
+        fingerprints and credential generations, and managed bindings. Secret
+        values are never returned. A secret without a fingerprint is reported
+        as unknown rather than incorrectly reported as equal.
+      responses:
+        '200':
+          description: Unified effective-state diff.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectEnvironmentDiffResponse' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
   /v1/projects/{slug}/environments/{environment}/config/diff:
     parameters:
       - name: slug
@@ -11804,12 +11905,12 @@ paths:
       - name: environment
         in: path
         required: true
-        description: Target environment receiving the configuration comparison.
+        description: Destination environment for the configuration comparison.
         schema: { type: string, pattern: '^[a-z0-9](?:[a-z0-9-]{0,31}[a-z0-9])?$' }
       - name: from
         in: query
         required: true
-        description: Source environment to compare against the target.
+        description: Baseline environment for the configuration snapshot comparison.
         schema: { type: string, pattern: '^[a-z0-9](?:[a-z0-9-]{0,31}[a-z0-9])?$' }
     get:
       tags: [projects]
@@ -21215,6 +21316,52 @@ components:
           default: 168
           description: Preview lease duration. The server defaults to 168 hours and caps it at 30 days.
 
+    PreviewResourceResponse:
+      description: A first-class preview with production comparison and observability links.
+      type: object
+      required: [app, changes_from_production, links]
+      properties:
+        app: { $ref: '#/components/schemas/AppResponse' }
+        parent: { $ref: '#/components/schemas/AppResponse' }
+        latest_deployment: { $ref: '#/components/schemas/DeploymentResponse' }
+        production_deployment: { $ref: '#/components/schemas/DeploymentResponse' }
+        changes_from_production: { $ref: '#/components/schemas/PreviewProductionChangesResponse' }
+        links: { $ref: '#/components/schemas/PreviewResourceLinksResponse' }
+
+    PreviewProductionChangesResponse:
+      description: Non-secret preview differences from the production parent.
+      type: object
+      required: [artifact_changed, preview_artifact, production_artifact, configuration_changed_groups]
+      properties:
+        artifact_changed: { type: boolean }
+        preview_artifact: { $ref: '#/components/schemas/PreviewArtifactResponse' }
+        production_artifact: { $ref: '#/components/schemas/PreviewArtifactResponse' }
+        configuration_changed_groups:
+          type: array
+          items: { type: string, enum: [runtime, resources, scaling, routing, policies] }
+
+    PreviewArtifactResponse:
+      description: Strongest available non-secret deployment artifact identity.
+      type: object
+      properties:
+        deployment_id: { type: string }
+        revision: { type: integer, minimum: 1 }
+        status: { type: string }
+        image_digest: { type: string }
+        source_sha256: { type: string }
+        commit_sha: { type: string }
+        build_id: { type: string }
+
+    PreviewResourceLinksResponse:
+      description: Public preview URL and native APIs for its logs, metrics, and effective app configuration.
+      type: object
+      required: [url, logs, metrics, configuration]
+      properties:
+        url: { type: string, format: uri }
+        logs: { type: string }
+        metrics: { type: string }
+        configuration: { type: string }
+
     UpsertDevSessionRequest:
       description: Application shape and opaque local identity for a CLI-managed developer environment.
       type: object
@@ -25356,10 +25503,30 @@ components:
       properties:
         id: { type: string, pattern: '^[a-f0-9]{32}$' }
         project_id: { type: string, pattern: '^[a-f0-9]{32}$' }
-        slug: { type: string, pattern: '^[a-z0-9](?:[a-z0-9-]{0,31}[a-z0-9])?$' }
+        slug:
+          type: string
+          pattern: '^[a-z0-9](?:[a-z0-9-]{0,31}[a-z0-9])?$'
+          not: { const: default }
+          description: Project environment slug; the reserved app scope `default` cannot be used.
         protected: { type: boolean }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
+        cloned_from: { type: string }
+        clone: { $ref: '#/components/schemas/ProjectEnvironmentCloneResponse' }
+
+    ProjectEnvironmentCloneResponse:
+      description: Non-secret copy counts for an environment clone. Managed database or bucket data appears as shared only after explicit opt-in.
+      type: object
+      required: [configuration_copied, variables_copied, secrets_copied, workloads_copied, bindings_copied, shared_resources]
+      properties:
+        configuration_copied: { type: boolean }
+        variables_copied: { type: integer, minimum: 0 }
+        secrets_copied: { type: integer, minimum: 0 }
+        workloads_copied: { type: integer, minimum: 0 }
+        bindings_copied: { type: integer, minimum: 0 }
+        shared_resources:
+          type: array
+          items: { type: string, enum: [domains, policies, routes, managed_postgres_data, object_storage_bucket_data] }
 
     ProjectEnvironmentReleaseListResponse:
       description: Current non-secret release inventory for a project environment.
@@ -25388,6 +25555,169 @@ components:
         source_sha256: { type: string }
         traffic_percent: { type: integer, minimum: 0, maximum: 100 }
         created_at: { type: string, format: date-time }
+
+    ProjectEnvironmentVariableResponse:
+      description: Non-secret runtime variable attached to an environment workload.
+      type: object
+      required: [key, value]
+      properties:
+        key: { type: string }
+        value: { type: string }
+        updated_at: { type: string, format: date-time }
+
+    ProjectEnvironmentSecretResponse:
+      description: Safe secret metadata. Secret values and ciphertext are never included.
+      type: object
+      required: [key]
+      properties:
+        key: { type: string }
+        value_hash: { type: string, pattern: '^[a-f0-9]{16}$' }
+        managed_by: { type: string, enum: [managed_postgres, object_storage] }
+        binding_id: { type: string }
+        credential_generation: { type: integer, format: int64, minimum: 1 }
+        updated_at: { type: string, format: date-time }
+
+    ProjectEnvironmentBindingResponse:
+      description: Managed resource binding and its target-scoped credential metadata.
+      type: object
+      required: [kind, binding_id, secret_keys]
+      properties:
+        kind: { type: string, enum: [managed_postgres, object_storage] }
+        binding_id: { type: string }
+        credential_generation: { type: integer, format: int64, minimum: 1 }
+        secret_keys:
+          type: array
+          items: { type: string }
+
+    ProjectEnvironmentStateWorkloadResponse:
+      description: Effective configuration and live release state for one workload.
+      type: object
+      required: [workload_slug, workload_name, release, variables, secrets, bindings]
+      properties:
+        workload_slug: { type: string }
+        workload_name: { type: string }
+        release: { $ref: '#/components/schemas/ProjectEnvironmentReleaseWorkloadResponse' }
+        variables:
+          type: array
+          items: { $ref: '#/components/schemas/ProjectEnvironmentVariableResponse' }
+        secrets:
+          type: array
+          items: { $ref: '#/components/schemas/ProjectEnvironmentSecretResponse' }
+        bindings:
+          type: array
+          items: { $ref: '#/components/schemas/ProjectEnvironmentBindingResponse' }
+
+    ProjectEnvironmentSharedResourceResponse:
+      description: Application-scoped resource that is shared by all environments.
+      type: object
+      required: [kind, ownership, note]
+      properties:
+        kind: { type: string, enum: [domains, policies, routes] }
+        ownership: { type: string, enum: [application] }
+        note: { type: string }
+
+    ProjectEnvironmentStateResponse:
+      description: Point-in-time effective state snapshot for a project environment.
+      type: object
+      required: [project_slug, environment, protected, configuration, workloads, shared_resources, generated_at]
+      properties:
+        project_slug: { type: string }
+        environment: { type: string }
+        protected: { type: boolean }
+        configuration: { $ref: '#/components/schemas/ProjectEnvironmentConfigResponse' }
+        workloads:
+          type: array
+          items: { $ref: '#/components/schemas/ProjectEnvironmentStateWorkloadResponse' }
+        shared_resources:
+          type: array
+          items: { $ref: '#/components/schemas/ProjectEnvironmentSharedResourceResponse' }
+        generated_at: { type: string, format: date-time }
+
+    ProjectEnvironmentReleaseDiffResponse:
+      description: Before-and-after release state for a workload in an environment diff.
+      type: object
+      required: [kind, before, after]
+      properties:
+        kind: { type: string, enum: [added, removed, changed, unchanged] }
+        before: { $ref: '#/components/schemas/ProjectEnvironmentReleaseWorkloadResponse' }
+        after: { $ref: '#/components/schemas/ProjectEnvironmentReleaseWorkloadResponse' }
+
+    ProjectEnvironmentVariableChangeResponse:
+      description: Non-secret runtime variable change between two environments.
+      type: object
+      required: [key, kind]
+      properties:
+        key: { type: string }
+        kind: { type: string, enum: [added, removed, changed] }
+        before: { type: string }
+        after: { type: string }
+
+    ProjectEnvironmentSecretCellResponse:
+      description: One side of a secret comparison; never contains secret material.
+      type: object
+      required: [present]
+      properties:
+        present: { type: boolean }
+        value_hash: { type: string, pattern: '^[a-f0-9]{16}$' }
+        managed_by: { type: string, enum: [managed_postgres, object_storage] }
+        binding_id: { type: string }
+        credential_generation: { type: integer, format: int64, minimum: 1 }
+
+    ProjectEnvironmentSecretChangeResponse:
+      description: Secret metadata comparison that excludes secret values and ciphertext.
+      type: object
+      required: [key, kind, before, after]
+      properties:
+        key: { type: string }
+        kind: { type: string, enum: [added, removed, changed, unknown] }
+        before: { $ref: '#/components/schemas/ProjectEnvironmentSecretCellResponse' }
+        after: { $ref: '#/components/schemas/ProjectEnvironmentSecretCellResponse' }
+
+    ProjectEnvironmentBindingChangeResponse:
+      description: Managed resource binding change between two environment states.
+      type: object
+      required: [kind, binding_id, change]
+      properties:
+        kind: { type: string, enum: [managed_postgres, object_storage] }
+        binding_id: { type: string }
+        change: { type: string, enum: [added, removed, changed] }
+        before: { $ref: '#/components/schemas/ProjectEnvironmentBindingResponse' }
+        after: { $ref: '#/components/schemas/ProjectEnvironmentBindingResponse' }
+
+    ProjectEnvironmentWorkloadDiffResponse:
+      description: Release, variable, secret, and binding changes for one workload.
+      type: object
+      required: [workload_slug, workload_name, release, variables, secrets, bindings]
+      properties:
+        workload_slug: { type: string }
+        workload_name: { type: string }
+        release: { $ref: '#/components/schemas/ProjectEnvironmentReleaseDiffResponse' }
+        variables:
+          type: array
+          items: { $ref: '#/components/schemas/ProjectEnvironmentVariableChangeResponse' }
+        secrets:
+          type: array
+          items: { $ref: '#/components/schemas/ProjectEnvironmentSecretChangeResponse' }
+        bindings:
+          type: array
+          items: { $ref: '#/components/schemas/ProjectEnvironmentBindingChangeResponse' }
+
+    ProjectEnvironmentDiffResponse:
+      description: Effective-state comparison from one project environment to another.
+      type: object
+      required: [project_slug, from_environment, to_environment, configuration, workloads, shared_resources, generated_at]
+      properties:
+        project_slug: { type: string }
+        from_environment: { type: string }
+        to_environment: { type: string }
+        configuration: { $ref: '#/components/schemas/ProjectEnvironmentConfigDiffResponse' }
+        workloads:
+          type: array
+          items: { $ref: '#/components/schemas/ProjectEnvironmentWorkloadDiffResponse' }
+        shared_resources:
+          type: array
+          items: { $ref: '#/components/schemas/ProjectEnvironmentSharedResourceResponse' }
+        generated_at: { type: string, format: date-time }
 
     UpdateProjectEnvironmentConfigRequest:
       description: Non-secret JSON configuration to append as a new environment version.
@@ -25485,12 +25815,25 @@ components:
         promotion_token: { type: string, minLength: 1 }
 
     CreateProjectEnvironmentRequest:
-      description: Request to register a named project environment.
+      description: Request to register or clone a named project environment.
       type: object
       required: [slug]
       properties:
-        slug: { type: string, pattern: '^[a-z0-9](?:[a-z0-9-]{0,31}[a-z0-9])?$' }
+        slug:
+          type: string
+          pattern: '^[a-z0-9](?:[a-z0-9-]{0,31}[a-z0-9])?$'
+          not: { const: default }
+          description: Canonical slug to assign to the new environment; `default` is reserved for application scope.
         protected: { type: boolean, default: false }
+        from_environment:
+          type: string
+          pattern: '^[a-z0-9](?:[a-z0-9-]{0,31}[a-z0-9])?$'
+          not: { const: default }
+          description: Source environment whose scoped configuration and values are copied.
+        share_resources:
+          type: boolean
+          default: false
+          description: Explicitly attach fresh target-scoped credentials to the source environment's managed database and object-storage resources; data remains shared.
 
     CreateProjectEnvironmentApprovalRequest:
       description: Request to approve one exact plan for a protected environment. Provide exactly one of plan_token or promotion_token.
