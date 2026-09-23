@@ -24,7 +24,7 @@ func newMeteredProxy(t *testing.T, m *Metrics, provider ServiceEndpointProvider,
 	}
 	return NewServiceProxy(ServiceProxyConfig{
 		Provider: provider,
-		Resolve: func(context.Context, string) (ServiceTarget, bool, error) {
+		Resolve: func(context.Context, string, string) (ServiceTarget, bool, error) {
 			return ServiceTarget{AppID: "app-orders"}, true, nil
 		},
 		Authorize: func(context.Context, string, string) (ServiceCaller, error) { return ServiceCaller{}, nil },
@@ -112,7 +112,7 @@ func TestServiceProxyMetricsOutcomes(t *testing.T) {
 func TestServiceProxyReportsBindingDenialSeparately(t *testing.T) {
 	m := NewMetrics()
 	proxy := NewServiceProxy(ServiceProxyConfig{
-		Resolve: func(context.Context, string) (ServiceTarget, bool, error) {
+		Resolve: func(context.Context, string, string) (ServiceTarget, bool, error) {
 			return ServiceTarget{AppID: "app-orders"}, true, nil
 		},
 		Authorize: func(context.Context, string, string) (ServiceCaller, error) {
@@ -135,7 +135,7 @@ func TestServiceProxyReportsBindingDenialSeparately(t *testing.T) {
 func TestServiceProxyReportsPreviewDenialSeparately(t *testing.T) {
 	m := NewMetrics()
 	proxy := NewServiceProxy(ServiceProxyConfig{
-		Resolve: func(context.Context, string) (ServiceTarget, bool, error) {
+		Resolve: func(context.Context, string, string) (ServiceTarget, bool, error) {
 			return ServiceTarget{AppID: "app-orders"}, true, nil
 		},
 		Authorize: func(context.Context, string, string) (ServiceCaller, error) {

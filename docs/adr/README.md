@@ -54,6 +54,7 @@ its baseline line in the same change (the gate fails on a stale entry).
 
 | ADR | Title | Status | Source |
 |---|---|---|---|
+| 219 | [Preview-scoped internal service resolution](219-preview-scoped-internal-service-resolution.md) | accepted | Same-account/project/PR workload lookup before the policy-controlled production fallback |
 | 218 | [Curated global organization activity timeline](218-global-organization-activity-timeline.md) | accepted | Organization-scoped safe activity projection, stable keyset API, and explicit producer mappings |
 | 213 | [Durable unified customer log events](213-durable-unified-log-events.md) | accepted foundation | Append-only tenant log ledger, stable cross-source cursor, redacted projections, and staged producer adapters |
 | 214 | [Distributed declarative response caching](214-distributed-declarative-response-cache.md) | accepted | Optional Redis L2, stale-while-revalidate, and shared invalidation for route-level response caching |

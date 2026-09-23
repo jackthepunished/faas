@@ -50,10 +50,21 @@ func newServiceProxyAuthorizer(store state.Store) gateway.ServiceProxyAuthorizer
 		if caller.AccountID == "" || caller.AccountID != target.AccountID {
 			return gateway.ServiceCaller{}, gateway.ErrServiceProxyDenied
 		}
-		// A project preview reaches production services because service names
-		// are not environment-scoped yet. Enforce the customer-owned project
-		// policy before endpoint lookup or wake so a denied call cannot consume
-		// production capacity or produce application side effects.
+		// A project PR preview may only call another preview selected from the
+		// same project and PR. The resolver already enforces this during name
+		// lookup; repeat the invariant here so alternate/out-of-tree resolver
+		// wiring cannot turn a generated preview slug into a cross-environment
+		// escape hatch.
+		projectPreviewToPreview := caller.PreviewOfSlug != "" && caller.ProjectID != "" && caller.PreviewPrNumber > 0 && target.PreviewOfSlug != ""
+		if projectPreviewToPreview {
+			if target.ProjectID != caller.ProjectID || target.PreviewPrNumber != caller.PreviewPrNumber {
+				return gateway.ServiceCaller{}, gateway.ErrServiceProxyDenied
+			}
+		}
+		// When no same-PR workload exists, the resolver falls back to the
+		// production service. Enforce the customer-owned project policy before
+		// endpoint lookup or wake so a denied call cannot consume production
+		// capacity or produce application side effects.
 		if caller.PreviewOfSlug != "" && target.PreviewOfSlug == "" {
 			projectID, err := previewCallerProjectID(ctx, store, caller)
 			if err != nil {
@@ -77,9 +88,15 @@ func newServiceProxyAuthorizer(store state.Store) gateway.ServiceProxyAuthorizer
 			}
 		}
 		if caller.Manifest.EffectiveServiceBindingPolicy() == api.ServiceBindingPolicyDeclared {
+			bindingTarget := target.Slug
+			if projectPreviewToPreview {
+				// Compose binds the logical workload name, not the generated
+				// pr-N slug. The environment check above makes this alias safe.
+				bindingTarget = target.PreviewOfSlug
+			}
 			declared := false
 			for _, binding := range caller.Manifest.ServiceBindings {
-				if strings.EqualFold(strings.TrimSpace(binding.Service), strings.TrimSpace(target.Slug)) {
+				if strings.EqualFold(strings.TrimSpace(binding.Service), strings.TrimSpace(bindingTarget)) {
 					declared = true
 					break
 				}
