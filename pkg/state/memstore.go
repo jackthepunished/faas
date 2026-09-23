@@ -4121,12 +4121,10 @@ func (m *MemStore) ListDeploymentsByNodeID(_ context.Context, nodeID string) ([]
 	return out, nil
 }
 
-// isInstanceStateLive reports whether the given instance state is
-// in the §6.2 invariant #1 set — {WAKING, COLD_BOOTING, RUNNING}.
-// The bash triple appears in:
-//   - pgstore.go (the predicate is a SQL IN clause)
-//   - memstore.go's ConcurrencyForDeployment (this file)
-//   - memstore.go's PerNodeLiveStats (PR #4)
+// isInstanceStateLive reports whether the given instance holds resident node
+// capacity for MemStore's per-node operator projections. The set is
+// {WAKING, COLD_BOOTING, RUNNING, DRAINING, WARM}; unlike concurrency,
+// warm VMs consume node RAM but do not occupy app concurrency.
 //
 // Extracted so the goconst lint rule (3+ literals) and the
 // state-machine spec (§6.1) share a single source of truth in the
@@ -4135,7 +4133,7 @@ func (m *MemStore) ListDeploymentsByNodeID(_ context.Context, nodeID string) ([]
 // in-memory twin's mirror.
 func isInstanceStateLive(state string) bool {
 	switch state {
-	case instanceStateRunning, instanceStateWaking, instanceStateColdBooting, string(StateWarm):
+	case instanceStateRunning, instanceStateWaking, instanceStateColdBooting, string(StateWarm), string(StateDraining):
 		return true
 	}
 	return false
@@ -4159,8 +4157,8 @@ const (
 )
 
 // ConcurrencyForDeployment mirrors PgStore.ConcurrencyForDeployment.
-// Reads the in-memory instances slice with the same predicate the
-// SQL uses (state IN {'waking','cold_booting','running'}).
+// Reads the in-memory instances slice with State.CountsForConcurrency,
+// including draining predecessors until their VMs are destroyed.
 func (m *MemStore) ConcurrencyForDeployment(_ context.Context, appID, deploymentID string) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -4169,7 +4167,7 @@ func (m *MemStore) ConcurrencyForDeployment(_ context.Context, appID, deployment
 		if inst.AppID != appID || inst.DeploymentID != deploymentID {
 			continue
 		}
-		if isInstanceStateLive(inst.State) {
+		if State(inst.State).CountsForConcurrency() {
 			n++
 		}
 	}
@@ -7007,7 +7005,7 @@ func (m *MemStore) CountLiveInstancesByDeployment(_ context.Context, deploymentI
 			continue
 		}
 		switch State(ins.State) {
-		case StateWaking, StateColdBooting, StateRunning:
+		case StateWaking, StateColdBooting, StateRunning, StateDraining:
 			n++
 		}
 	}
@@ -12248,7 +12246,7 @@ func (m *MemStore) ReadActiveInstanceForWakeID(_ context.Context, wakeID string)
 		if ins.WakeID != wakeID {
 			continue
 		}
-		if !isInstanceStateLive(ins.State) {
+		if State(ins.State) != StateWaking && State(ins.State) != StateColdBooting && State(ins.State) != StateRunning {
 			continue
 		}
 		if best == nil || ins.StartedAt.After(best.StartedAt) {
@@ -12427,7 +12425,7 @@ func (m *MemStore) ListAllInstances(_ context.Context) ([]Instance, error) {
 	var out []Instance
 	for _, ins := range m.instances {
 		switch ins.State {
-		case string(StateRunning), string(StateWaking), string(StateColdBooting), string(StateSnapshotting), string(StateWarm):
+		case string(StateRunning), string(StateWaking), string(StateColdBooting), string(StateSnapshotting), string(StateWarm), string(StateDraining):
 			out = append(out, ins)
 		}
 	}
@@ -12504,7 +12502,7 @@ func (m *MemStore) ListInstancesForAccountPaged(_ context.Context, accountID str
 			continue
 		}
 		switch State(ins.State) {
-		case StateWaking, StateColdBooting, StateRunning, StateSnapshotting, StateWarm:
+		case StateWaking, StateColdBooting, StateRunning, StateDraining, StateSnapshotting, StateWarm:
 		default:
 			continue
 		}
@@ -13600,7 +13598,7 @@ func (m *MemStore) ComputeNodeUsedMB(_ context.Context, nodeID string) (int64, e
 			continue
 		}
 		switch ins.State {
-		case "waking", "cold_booting", "running", "warm":
+		case "waking", "cold_booting", "running", "draining", "warm":
 			used += int64(ins.RAMMB + api.PerVMOverheadMB)
 		}
 	}
@@ -13638,7 +13636,7 @@ func (m *MemStore) ComputeNodeUsedCPUMillicoresByNode(_ context.Context, nodeIDs
 			continue
 		}
 		switch ins.State {
-		case "waking", "cold_booting", "running", "warm":
+		case "waking", "cold_booting", "running", "draining", "warm":
 			app, ok := m.apps[ins.AppID]
 			if !ok {
 				continue
@@ -14175,7 +14173,7 @@ func (m *MemStore) InstanceListByNodeForRecovery(_ context.Context, nodeID strin
 			continue
 		}
 		switch State(strings.ToLower(ins.State)) {
-		case StateRunning, StateColdBooting, StateWaking, StateSnapshotting, StateMigrating:
+		case StateRunning, StateColdBooting, StateWaking, StateDraining, StateSnapshotting, StateMigrating:
 			out = append(out, RecoveryInstance{
 				ID:           ins.ID,
 				State:        ins.State,
