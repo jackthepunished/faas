@@ -26,6 +26,9 @@ from .account_trace_lookup_error import AccountTraceLookupError
 from .account_trace_lookup_response import AccountTraceLookupResponse
 from .account_trace_match import AccountTraceMatch
 from .account_usage_response import AccountUsageResponse
+from .activity_actor_response import ActivityActorResponse
+from .activity_actor_response_type import ActivityActorResponseType
+from .activity_resource_response import ActivityResourceResponse
 from .add_tenant_hostname_request import AddTenantHostnameRequest
 from .add_trusted_signer_request import AddTrustedSignerRequest
 from .admin_refund_response import AdminRefundResponse
@@ -136,6 +139,9 @@ from .app_private_network_attachment import AppPrivateNetworkAttachment
 from .app_private_network_attachment_request import AppPrivateNetworkAttachmentRequest
 from .app_private_network_attachment_response import AppPrivateNetworkAttachmentResponse
 from .app_private_network_attachment_status import AppPrivateNetworkAttachmentStatus
+from .app_private_network_node_status import AppPrivateNetworkNodeStatus
+from .app_private_network_node_status_fabric_status import AppPrivateNetworkNodeStatusFabricStatus
+from .app_private_network_node_status_route_status import AppPrivateNetworkNodeStatusRouteStatus
 from .app_registry_credential_list_response import AppRegistryCredentialListResponse
 from .app_registry_credential_response import AppRegistryCredentialResponse
 from .app_response import AppResponse
@@ -156,15 +162,20 @@ from .app_secret_export_response import AppSecretExportResponse
 from .app_secret_list_response import AppSecretListResponse
 from .app_secret_list_response_secrets_by_scope import AppSecretListResponseSecretsByScope
 from .app_secret_response import AppSecretResponse
+from .app_secret_response_delivery_status import AppSecretResponseDeliveryStatus
+from .app_secret_response_last_delivery_error_code import AppSecretResponseLastDeliveryErrorCode
 from .app_security_finding import AppSecurityFinding
 from .app_security_finding_severity import AppSecurityFindingSeverity
 from .app_security_posture_response import AppSecurityPostureResponse
 from .app_security_posture_response_profile import AppSecurityPostureResponseProfile
 from .app_security_posture_response_security_policy import AppSecurityPostureResponseSecurityPolicy
+from .app_security_quarantine import AppSecurityQuarantine
+from .app_security_quarantine_reason import AppSecurityQuarantineReason
 from .app_security_request import AppSecurityRequest
 from .app_security_request_security_policy import AppSecurityRequestSecurityPolicy
 from .app_security_response import AppSecurityResponse
 from .app_security_response_security_policy import AppSecurityResponseSecurityPolicy
+from .app_service_binding import AppServiceBinding
 from .app_slo_response import AppSLOResponse
 from .app_slo_response_wake_queue_sample_status import AppSLOResponseWakeQueueSampleStatus
 from .app_slo_response_window import AppSLOResponseWindow
@@ -181,7 +192,6 @@ from .app_wake_timeline_response_trigger_class_histogram import AppWakeTimelineR
 from .app_wake_timeline_response_trigger_histogram import AppWakeTimelineResponseTriggerHistogram
 from .app_webhook_delivery_list_response import AppWebhookDeliveryListResponse
 from .app_webhook_delivery_response import AppWebhookDeliveryResponse
-from .app_webhook_delivery_response_event import AppWebhookDeliveryResponseEvent
 from .app_webhook_delivery_response_payload import AppWebhookDeliveryResponsePayload
 from .app_webhook_delivery_response_status import AppWebhookDeliveryResponseStatus
 from .app_webhook_response import AppWebhookResponse
@@ -303,6 +313,8 @@ from .create_deployment_request_tag_type_3_type_1 import CreateDeploymentRequest
 from .create_edge_rule_request import CreateEdgeRuleRequest
 from .create_edge_rule_request_kind import CreateEdgeRuleRequestKind
 from .create_edge_rule_request_validate_mode import CreateEdgeRuleRequestValidateMode
+from .create_inbound_webhook_endpoint_request import CreateInboundWebhookEndpointRequest
+from .create_inbound_webhook_endpoint_request_provider import CreateInboundWebhookEndpointRequestProvider
 from .create_job_request import CreateJobRequest
 from .create_job_request_env_overrides import CreateJobRequestEnvOverrides
 from .create_job_request_kind import CreateJobRequestKind
@@ -363,6 +375,9 @@ from .cron_run import CronRun
 from .cron_run_outcome import CronRunOutcome
 from .csrf_token_response import CSRFTokenResponse
 from .custom_domain_response import CustomDomainResponse
+from .custom_metric_list_response import CustomMetricListResponse
+from .custom_metric_request import CustomMetricRequest
+from .custom_metric_response import CustomMetricResponse
 from .custom_stage import CustomStage
 from .daily_usage_list_response import DailyUsageListResponse
 from .daily_usage_point import DailyUsagePoint
@@ -454,12 +469,19 @@ from .debug_timeline_event import DebugTimelineEvent
 from .debug_timeline_event_phase import DebugTimelineEventPhase
 from .declared_route import DeclaredRoute
 from .declared_route_methods_item import DeclaredRouteMethodsItem
-from .delayed_task_request import DelayedTaskRequest
-from .delayed_task_request_payload import DelayedTaskRequestPayload
+from .delayed_task_after_request import DelayedTaskAfterRequest
+from .delayed_task_after_request_headers import DelayedTaskAfterRequestHeaders
+from .delayed_task_after_request_payload import DelayedTaskAfterRequestPayload
+from .delayed_task_at_request import DelayedTaskAtRequest
+from .delayed_task_at_request_headers import DelayedTaskAtRequestHeaders
+from .delayed_task_at_request_payload import DelayedTaskAtRequestPayload
 from .delayed_task_response import DelayedTaskResponse
 from .delayed_task_response_state import DelayedTaskResponseState
 from .delete_account_session_body import DeleteAccountSessionBody
 from .delete_deployment_scope_exclusion_response_200 import DeleteDeploymentScopeExclusionResponse200
+from .deliver_app_event_request import DeliverAppEventRequest
+from .deliver_app_event_response import DeliverAppEventResponse
+from .deliver_app_event_response_status import DeliverAppEventResponseStatus
 from .deploy_dev_source_body import DeployDevSourceBody
 from .deploy_dev_source_body_runtime import DeployDevSourceBodyRuntime
 from .deploy_token_response import DeployTokenResponse
@@ -533,10 +555,12 @@ from .domain_doctor_report import DomainDoctorReport
 from .dry_run_app_open_api_body import DryRunAppOpenAPIBody
 from .dry_run_app_open_api_body_info import DryRunAppOpenAPIBodyInfo
 from .dry_run_app_open_api_body_paths import DryRunAppOpenAPIBodyPaths
+from .edge_rule_async_action import EdgeRuleAsyncAction
 from .edge_rule_budget_action import EdgeRuleBudgetAction
 from .edge_rule_cache_action import EdgeRuleCacheAction
 from .edge_rule_cache_action_methods_item import EdgeRuleCacheActionMethodsItem
 from .edge_rule_cache_action_vary_on_item import EdgeRuleCacheActionVaryOnItem
+from .edge_rule_circuit_breaker_action import EdgeRuleCircuitBreakerAction
 from .edge_rule_cors_action import EdgeRuleCORSAction
 from .edge_rule_geo_action import EdgeRuleGeoAction
 from .edge_rule_header_op import EdgeRuleHeaderOp
@@ -555,6 +579,7 @@ from .edge_rule_respond_action import EdgeRuleRespondAction
 from .edge_rule_response import EdgeRuleResponse
 from .edge_rule_response_kind import EdgeRuleResponseKind
 from .edge_rule_response_validate_mode import EdgeRuleResponseValidateMode
+from .edge_rule_retry_action import EdgeRuleRetryAction
 from .edge_rule_rewrite_action import EdgeRuleRewriteAction
 from .edge_rule_route_action import EdgeRuleRouteAction
 from .edge_rule_suggestion import EdgeRuleSuggestion
@@ -563,9 +588,12 @@ from .edge_rule_suggestion_kind import EdgeRuleSuggestionKind
 from .edge_rule_suggestion_methods_item import EdgeRuleSuggestionMethodsItem
 from .edge_rule_throttle_action import EdgeRuleThrottleAction
 from .edge_rule_throttle_action_key_by import EdgeRuleThrottleActionKeyBy
+from .edge_rule_throttle_action_missing_key_policy import EdgeRuleThrottleActionMissingKeyPolicy
 from .edge_rule_validate_action import EdgeRuleValidateAction
 from .edge_rule_validate_action_schema import EdgeRuleValidateActionSchema
 from .edge_rule_validate_action_validate_mode import EdgeRuleValidateActionValidateMode
+from .egress_circuit_breaker_policy import EgressCircuitBreakerPolicy
+from .egress_circuit_breaker_policy_state import EgressCircuitBreakerPolicyState
 from .enable_alert_preset_request import EnableAlertPresetRequest
 from .enable_alert_preset_request_action import EnableAlertPresetRequestAction
 from .env_diff_cell import EnvDiffCell
@@ -574,6 +602,12 @@ from .env_diff_response import EnvDiffResponse
 from .env_diff_row import EnvDiffRow
 from .env_diff_row_cells import EnvDiffRowCells
 from .error_new_webhook_payload import ErrorNewWebhookPayload
+from .event_delivery_list_response import EventDeliveryListResponse
+from .event_delivery_response import EventDeliveryResponse
+from .event_delivery_response_state import EventDeliveryResponseState
+from .event_subscription_list_response import EventSubscriptionListResponse
+from .event_subscription_response import EventSubscriptionResponse
+from .event_subscription_response_filter import EventSubscriptionResponseFilter
 from .execution_failure import ExecutionFailure
 from .execution_file import ExecutionFile
 from .execution_limit_request import ExecutionLimitRequest
@@ -629,6 +663,8 @@ from .git_hub_check_activity import GitHubCheckActivity
 from .git_hub_check_activity_status import GitHubCheckActivityStatus
 from .git_hub_deployment_policy import GitHubDeploymentPolicy
 from .git_hub_deployment_policy_patch import GitHubDeploymentPolicyPatch
+from .git_hub_deployment_policy_patch_preview_service_policy import GitHubDeploymentPolicyPatchPreviewServicePolicy
+from .git_hub_deployment_policy_preview_service_policy import GitHubDeploymentPolicyPreviewServicePolicy
 from .git_hub_install_activity import GitHubInstallActivity
 from .git_hub_install_mutation_request import GitHubInstallMutationRequest
 from .git_hub_install_status import GitHubInstallStatus
@@ -648,6 +684,11 @@ from .grace_window_response import GraceWindowResponse
 from .import_app_open_api_body import ImportAppOpenAPIBody
 from .import_app_open_api_body_info import ImportAppOpenAPIBodyInfo
 from .import_app_open_api_body_paths import ImportAppOpenAPIBodyPaths
+from .inbound_webhook_endpoint_response import InboundWebhookEndpointResponse
+from .inbound_webhook_endpoint_response_provider import InboundWebhookEndpointResponseProvider
+from .inbound_webhook_endpoint_response_signing_secret_masked import InboundWebhookEndpointResponseSigningSecretMasked
+from .inbound_webhook_receipt_response import InboundWebhookReceiptResponse
+from .inbound_webhook_receipt_response_status import InboundWebhookReceiptResponseStatus
 from .inject_workflow_event_request import InjectWorkflowEventRequest
 from .inject_workflow_event_response import InjectWorkflowEventResponse
 from .inject_workflow_event_response_status import InjectWorkflowEventResponseStatus
@@ -719,8 +760,10 @@ from .list_audit_log_response import ListAuditLogResponse
 from .list_bucket_objects_response_200 import ListBucketObjectsResponse200
 from .list_bucket_objects_response_200_items_item import ListBucketObjectsResponse200ItemsItem
 from .list_cron_runs_response import ListCronRunsResponse
+from .list_delayed_tasks_response import ListDelayedTasksResponse
 from .list_deploy_tokens_response import ListDeployTokensResponse
 from .list_deployment_audit_response import ListDeploymentAuditResponse
+from .list_event_deliveries_state import ListEventDeliveriesState
 from .list_executions_status import ListExecutionsStatus
 from .list_instances_response import ListInstancesResponse
 from .list_invocations_response import ListInvocationsResponse
@@ -729,6 +772,8 @@ from .list_job_tasks_response import ListJobTasksResponse
 from .list_jobs_response import ListJobsResponse
 from .list_operator_runtime_config_response_200 import ListOperatorRuntimeConfigResponse200
 from .list_operator_runtime_config_revisions_response_200 import ListOperatorRuntimeConfigRevisionsResponse200
+from .list_org_activity_actor_type import ListOrgActivityActorType
+from .list_org_activity_response import ListOrgActivityResponse
 from .list_org_api_keys_response import ListOrgAPIKeysResponse
 from .list_project_environment_promotions_status import ListProjectEnvironmentPromotionsStatus
 from .list_secrets_for_account_response import ListSecretsForAccountResponse
@@ -791,6 +836,13 @@ from .mfa_recover_response import MFARecoverResponse
 from .mfa_verify_request import MFAVerifyRequest
 from .mfa_verify_response import MFAVerifyResponse
 from .mirror_clean_condition import MirrorCleanCondition
+from .mirror_replay_batch_request import MirrorReplayBatchRequest
+from .mirror_replay_batch_response import MirrorReplayBatchResponse
+from .mirror_replay_invocation import MirrorReplayInvocation
+from .mirror_replay_invocation_status import MirrorReplayInvocationStatus
+from .mirror_replay_request_item import MirrorReplayRequestItem
+from .mirror_replay_request_item_headers import MirrorReplayRequestItemHeaders
+from .mirror_replay_request_item_method import MirrorReplayRequestItemMethod
 from .mirror_rule_list_response import MirrorRuleListResponse
 from .mirror_rule_response import MirrorRuleResponse
 from .mirror_summary_response import MirrorSummaryResponse
@@ -877,6 +929,8 @@ from .operator_runtime_config_revision import OperatorRuntimeConfigRevision
 from .operator_runtime_config_revision_scope import OperatorRuntimeConfigRevisionScope
 from .operator_runtime_config_source import OperatorRuntimeConfigSource
 from .operator_runtime_config_status import OperatorRuntimeConfigStatus
+from .org_activity_response import OrgActivityResponse
+from .org_activity_response_data import OrgActivityResponseData
 from .org_invitation_response import OrgInvitationResponse
 from .org_invitation_response_role import OrgInvitationResponseRole
 from .org_invitation_response_status import OrgInvitationResponseStatus
@@ -933,6 +987,7 @@ from .preflight_report import PreflightReport
 from .preflight_source import PreflightSource
 from .preflight_verdict import PreflightVerdict
 from .preview_created_webhook_payload import PreviewCreatedWebhookPayload
+from .preview_service_calls_policy import PreviewServiceCallsPolicy
 from .prewarm_intent_response import PrewarmIntentResponse
 from .prewarm_intent_response_status import PrewarmIntentResponseStatus
 from .prewarm_intent_response_trigger import PrewarmIntentResponseTrigger
@@ -942,6 +997,8 @@ from .private_network_firewall_rule import PrivateNetworkFirewallRule
 from .private_network_firewall_rule_direction import PrivateNetworkFirewallRuleDirection
 from .private_network_firewall_rule_protocol import PrivateNetworkFirewallRuleProtocol
 from .private_network_list_response import PrivateNetworkListResponse
+from .private_network_member import PrivateNetworkMember
+from .private_network_members_response import PrivateNetworkMembersResponse
 from .private_network_peering import PrivateNetworkPeering
 from .private_network_peering_list_response import PrivateNetworkPeeringListResponse
 from .private_network_peering_status import PrivateNetworkPeeringStatus
@@ -1068,8 +1125,12 @@ from .queue_send_request_payload import QueueSendRequestPayload
 from .queue_send_response import QueueSendResponse
 from .queue_state_response import QueueStateResponse
 from .queue_state_response_plan import QueueStateResponsePlan
+from .queue_workload_profile_request import QueueWorkloadProfileRequest
+from .queue_workload_profile_request_workload_class import QueueWorkloadProfileRequestWorkloadClass
+from .queue_workload_profile_response import QueueWorkloadProfileResponse
 from .quota_block import QuotaBlock
 from .raise_overage_cap_request import RaiseOverageCapRequest
+from .receive_inbound_webhook_body import ReceiveInboundWebhookBody
 from .record_dev_sync_request import RecordDevSyncRequest
 from .record_dev_sync_request_status import RecordDevSyncRequestStatus
 from .recover_rollout_request import RecoverRolloutRequest
@@ -1125,18 +1186,32 @@ from .rotate_org_api_key_response import RotateOrgAPIKeyResponse
 from .route_row import RouteRow
 from .scaling_policy import ScalingPolicy
 from .scaling_policy_concurrency_overflow import ScalingPolicyConcurrencyOverflow
+from .scaling_schedule import ScalingSchedule
 from .scaling_target import ScalingTarget
 from .scaling_target_metric import ScalingTargetMetric
 from .scan_result import ScanResult
 from .scan_result_status import ScanResultStatus
 from .scoped_app_env_response import ScopedAppEnvResponse
 from .scoped_app_secret_response import ScopedAppSecretResponse
+from .scoped_app_secret_response_delivery_status import ScopedAppSecretResponseDeliveryStatus
+from .scoped_app_secret_response_last_delivery_error_code import ScopedAppSecretResponseLastDeliveryErrorCode
 from .seat_usage_response import SeatUsageResponse
 from .seat_usage_response_plan import SeatUsageResponsePlan
 from .secret_finding import SecretFinding
 from .secret_finding_severity import SecretFindingSeverity
 from .secret_scan_result import SecretScanResult
+from .security_quarantine_recovery_request import SecurityQuarantineRecoveryRequest
+from .security_quarantine_recovery_response import SecurityQuarantineRecoveryResponse
+from .security_quarantine_recovery_response_status import SecurityQuarantineRecoveryResponseStatus
+from .send_app_message_request import SendAppMessageRequest
+from .send_app_message_request_data_content_type import SendAppMessageRequestDataContentType
+from .send_app_message_response import SendAppMessageResponse
+from .send_app_message_response_status import SendAppMessageResponseStatus
+from .service_binding_policy import ServiceBindingPolicy
 from .service_replicas import ServiceReplicas
+from .service_rollout_handoff_response import ServiceRolloutHandoffResponse
+from .service_rollout_handoff_response_action import ServiceRolloutHandoffResponseAction
+from .service_rollout_handoff_response_phase import ServiceRolloutHandoffResponsePhase
 from .session_info import SessionInfo
 from .session_list_response import SessionListResponse
 from .sessions_revoke_all_response import SessionsRevokeAllResponse
@@ -1151,6 +1226,14 @@ from .sidecar import Sidecar
 from .sidecar_cpu_millicores import SidecarCpuMillicores
 from .sidecar_disk_io_profile import SidecarDiskIoProfile
 from .sidecar_env import SidecarEnv
+from .sidecar_exec_probe import SidecarExecProbe
+from .sidecar_http_get_probe import SidecarHTTPGetProbe
+from .sidecar_preset import SidecarPreset
+from .sidecar_probe import SidecarProbe
+from .sidecar_tcp_socket_probe import SidecarTCPSocketProbe
+from .sidecar_timeline_response import SidecarTimelineResponse
+from .sidecar_timeline_status import SidecarTimelineStatus
+from .sidecar_timeline_status_status import SidecarTimelineStatusStatus
 from .sidecar_type import SidecarType
 from .slo_duration import SLODuration
 from .source_ref_deploy_request import SourceRefDeployRequest
@@ -1249,6 +1332,7 @@ from .update_deployment_request import UpdateDeploymentRequest
 from .update_deployment_traffic_request import UpdateDeploymentTrafficRequest
 from .update_edge_rule_request import UpdateEdgeRuleRequest
 from .update_edge_rule_request_validate_mode import UpdateEdgeRuleRequestValidateMode
+from .update_inbound_webhook_endpoint_request import UpdateInboundWebhookEndpointRequest
 from .update_job_request import UpdateJobRequest
 from .update_job_request_env_overrides import UpdateJobRequestEnvOverrides
 from .update_job_request_status import UpdateJobRequestStatus
@@ -1280,6 +1364,7 @@ from .update_trigger_request_broker_poison_strategy_type_3_type_1 import (
     UpdateTriggerRequestBrokerPoisonStrategyType3Type1,
 )
 from .update_trigger_request_config_type_0 import UpdateTriggerRequestConfigType0
+from .update_upstream_circuit_breaker_request import UpdateUpstreamCircuitBreakerRequest
 from .upload_deploy_options import UploadDeployOptions
 from .upload_session_response import UploadSessionResponse
 from .upload_session_response_status import UploadSessionResponseStatus
@@ -1302,6 +1387,8 @@ from .wake_timeline_json_row_kind import WakeTimelineJSONRowKind
 from .wake_timeline_json_row_tier import WakeTimelineJSONRowTier
 from .wake_timeline_json_row_trigger_class import WakeTimelineJSONRowTriggerClass
 from .wake_timeline_response import WakeTimelineResponse
+from .worker_scaling import WorkerScaling
+from .worker_scaling_metric import WorkerScalingMetric
 from .workflow_retry_spec import WorkflowRetrySpec
 from .workflow_retry_spec_backoff import WorkflowRetrySpecBackoff
 from .workflow_run_response import WorkflowRunResponse
@@ -1346,6 +1433,9 @@ __all__ = (
     "AccountTraceLookupResponse",
     "AccountTraceMatch",
     "AccountUsageResponse",
+    "ActivityActorResponse",
+    "ActivityActorResponseType",
+    "ActivityResourceResponse",
     "AddTenantHostnameRequest",
     "AddTrustedSignerRequest",
     "AdminRefundResponse",
@@ -1460,6 +1550,9 @@ __all__ = (
     "AppPrivateNetworkAttachmentRequest",
     "AppPrivateNetworkAttachmentResponse",
     "AppPrivateNetworkAttachmentStatus",
+    "AppPrivateNetworkNodeStatus",
+    "AppPrivateNetworkNodeStatusFabricStatus",
+    "AppPrivateNetworkNodeStatusRouteStatus",
     "AppRegistryCredentialListResponse",
     "AppRegistryCredentialResponse",
     "AppResponse",
@@ -1480,15 +1573,20 @@ __all__ = (
     "AppSecretListResponse",
     "AppSecretListResponseSecretsByScope",
     "AppSecretResponse",
+    "AppSecretResponseDeliveryStatus",
+    "AppSecretResponseLastDeliveryErrorCode",
     "AppSecurityFinding",
     "AppSecurityFindingSeverity",
     "AppSecurityPostureResponse",
     "AppSecurityPostureResponseProfile",
     "AppSecurityPostureResponseSecurityPolicy",
+    "AppSecurityQuarantine",
+    "AppSecurityQuarantineReason",
     "AppSecurityRequest",
     "AppSecurityRequestSecurityPolicy",
     "AppSecurityResponse",
     "AppSecurityResponseSecurityPolicy",
+    "AppServiceBinding",
     "AppSLOResponse",
     "AppSLOResponseWakeQueueSampleStatus",
     "AppSLOResponseWindow",
@@ -1508,7 +1606,6 @@ __all__ = (
     "AppWakeTimelineResponseTriggerHistogram",
     "AppWebhookDeliveryListResponse",
     "AppWebhookDeliveryResponse",
-    "AppWebhookDeliveryResponseEvent",
     "AppWebhookDeliveryResponsePayload",
     "AppWebhookDeliveryResponseStatus",
     "AppWebhookResponse",
@@ -1623,6 +1720,8 @@ __all__ = (
     "CreateEdgeRuleRequest",
     "CreateEdgeRuleRequestKind",
     "CreateEdgeRuleRequestValidateMode",
+    "CreateInboundWebhookEndpointRequest",
+    "CreateInboundWebhookEndpointRequestProvider",
     "CreateJobRequest",
     "CreateJobRequestEnvOverrides",
     "CreateJobRequestKind",
@@ -1675,6 +1774,9 @@ __all__ = (
     "CronRunOutcome",
     "CSRFTokenResponse",
     "CustomDomainResponse",
+    "CustomMetricListResponse",
+    "CustomMetricRequest",
+    "CustomMetricResponse",
     "CustomStage",
     "DailyUsageListResponse",
     "DailyUsagePoint",
@@ -1766,12 +1868,19 @@ __all__ = (
     "DebugTimelineEventPhase",
     "DeclaredRoute",
     "DeclaredRouteMethodsItem",
-    "DelayedTaskRequest",
-    "DelayedTaskRequestPayload",
+    "DelayedTaskAfterRequest",
+    "DelayedTaskAfterRequestHeaders",
+    "DelayedTaskAfterRequestPayload",
+    "DelayedTaskAtRequest",
+    "DelayedTaskAtRequestHeaders",
+    "DelayedTaskAtRequestPayload",
     "DelayedTaskResponse",
     "DelayedTaskResponseState",
     "DeleteAccountSessionBody",
     "DeleteDeploymentScopeExclusionResponse200",
+    "DeliverAppEventRequest",
+    "DeliverAppEventResponse",
+    "DeliverAppEventResponseStatus",
     "DeployDevSourceBody",
     "DeployDevSourceBodyRuntime",
     "DeploymentAuditResponse",
@@ -1845,10 +1954,12 @@ __all__ = (
     "DryRunAppOpenAPIBody",
     "DryRunAppOpenAPIBodyInfo",
     "DryRunAppOpenAPIBodyPaths",
+    "EdgeRuleAsyncAction",
     "EdgeRuleBudgetAction",
     "EdgeRuleCacheAction",
     "EdgeRuleCacheActionMethodsItem",
     "EdgeRuleCacheActionVaryOnItem",
+    "EdgeRuleCircuitBreakerAction",
     "EdgeRuleCORSAction",
     "EdgeRuleGeoAction",
     "EdgeRuleHeaderOp",
@@ -1867,6 +1978,7 @@ __all__ = (
     "EdgeRuleResponse",
     "EdgeRuleResponseKind",
     "EdgeRuleResponseValidateMode",
+    "EdgeRuleRetryAction",
     "EdgeRuleRewriteAction",
     "EdgeRuleRouteAction",
     "EdgeRuleSuggestion",
@@ -1875,9 +1987,12 @@ __all__ = (
     "EdgeRuleSuggestionMethodsItem",
     "EdgeRuleThrottleAction",
     "EdgeRuleThrottleActionKeyBy",
+    "EdgeRuleThrottleActionMissingKeyPolicy",
     "EdgeRuleValidateAction",
     "EdgeRuleValidateActionSchema",
     "EdgeRuleValidateActionValidateMode",
+    "EgressCircuitBreakerPolicy",
+    "EgressCircuitBreakerPolicyState",
     "EnableAlertPresetRequest",
     "EnableAlertPresetRequestAction",
     "EnvDiffCell",
@@ -1886,6 +2001,12 @@ __all__ = (
     "EnvDiffRow",
     "EnvDiffRowCells",
     "ErrorNewWebhookPayload",
+    "EventDeliveryListResponse",
+    "EventDeliveryResponse",
+    "EventDeliveryResponseState",
+    "EventSubscriptionListResponse",
+    "EventSubscriptionResponse",
+    "EventSubscriptionResponseFilter",
     "ExecutionFailure",
     "ExecutionFile",
     "ExecutionLimitRequest",
@@ -1943,6 +2064,8 @@ __all__ = (
     "GithubCheckUpdateRecordStatus",
     "GitHubDeploymentPolicy",
     "GitHubDeploymentPolicyPatch",
+    "GitHubDeploymentPolicyPatchPreviewServicePolicy",
+    "GitHubDeploymentPolicyPreviewServicePolicy",
     "GitHubInstallActivity",
     "GitHubInstallMutationRequest",
     "GitHubInstallStatus",
@@ -1960,6 +2083,11 @@ __all__ = (
     "ImportAppOpenAPIBody",
     "ImportAppOpenAPIBodyInfo",
     "ImportAppOpenAPIBodyPaths",
+    "InboundWebhookEndpointResponse",
+    "InboundWebhookEndpointResponseProvider",
+    "InboundWebhookEndpointResponseSigningSecretMasked",
+    "InboundWebhookReceiptResponse",
+    "InboundWebhookReceiptResponseStatus",
     "InjectWorkflowEventRequest",
     "InjectWorkflowEventResponse",
     "InjectWorkflowEventResponseStatus",
@@ -2031,8 +2159,10 @@ __all__ = (
     "ListBucketObjectsResponse200",
     "ListBucketObjectsResponse200ItemsItem",
     "ListCronRunsResponse",
+    "ListDelayedTasksResponse",
     "ListDeploymentAuditResponse",
     "ListDeployTokensResponse",
+    "ListEventDeliveriesState",
     "ListExecutionsStatus",
     "ListInstancesResponse",
     "ListInvocationsResponse",
@@ -2041,6 +2171,8 @@ __all__ = (
     "ListJobTasksResponse",
     "ListOperatorRuntimeConfigResponse200",
     "ListOperatorRuntimeConfigRevisionsResponse200",
+    "ListOrgActivityActorType",
+    "ListOrgActivityResponse",
     "ListOrgAPIKeysResponse",
     "ListProjectEnvironmentPromotionsStatus",
     "ListSecretsForAccountResponse",
@@ -2101,6 +2233,13 @@ __all__ = (
     "MFAVerifyRequest",
     "MFAVerifyResponse",
     "MirrorCleanCondition",
+    "MirrorReplayBatchRequest",
+    "MirrorReplayBatchResponse",
+    "MirrorReplayInvocation",
+    "MirrorReplayInvocationStatus",
+    "MirrorReplayRequestItem",
+    "MirrorReplayRequestItemHeaders",
+    "MirrorReplayRequestItemMethod",
     "MirrorRuleListResponse",
     "MirrorRuleResponse",
     "MirrorSummaryResponse",
@@ -2185,6 +2324,8 @@ __all__ = (
     "OperatorRuntimeConfigRevisionScope",
     "OperatorRuntimeConfigSource",
     "OperatorRuntimeConfigStatus",
+    "OrgActivityResponse",
+    "OrgActivityResponseData",
     "OrgInvitationResponse",
     "OrgInvitationResponseRole",
     "OrgInvitationResponseStatus",
@@ -2241,6 +2382,7 @@ __all__ = (
     "PreflightSource",
     "PreflightVerdict",
     "PreviewCreatedWebhookPayload",
+    "PreviewServiceCallsPolicy",
     "PrewarmIntentResponse",
     "PrewarmIntentResponseStatus",
     "PrewarmIntentResponseTrigger",
@@ -2250,6 +2392,8 @@ __all__ = (
     "PrivateNetworkFirewallRuleDirection",
     "PrivateNetworkFirewallRuleProtocol",
     "PrivateNetworkListResponse",
+    "PrivateNetworkMember",
+    "PrivateNetworkMembersResponse",
     "PrivateNetworkPeering",
     "PrivateNetworkPeeringListResponse",
     "PrivateNetworkPeeringStatus",
@@ -2358,8 +2502,12 @@ __all__ = (
     "QueueSendResponse",
     "QueueStateResponse",
     "QueueStateResponsePlan",
+    "QueueWorkloadProfileRequest",
+    "QueueWorkloadProfileRequestWorkloadClass",
+    "QueueWorkloadProfileResponse",
     "QuotaBlock",
     "RaiseOverageCapRequest",
+    "ReceiveInboundWebhookBody",
     "RecordDevSyncRequest",
     "RecordDevSyncRequestStatus",
     "RecoverRolloutRequest",
@@ -2413,18 +2561,32 @@ __all__ = (
     "RouteRow",
     "ScalingPolicy",
     "ScalingPolicyConcurrencyOverflow",
+    "ScalingSchedule",
     "ScalingTarget",
     "ScalingTargetMetric",
     "ScanResult",
     "ScanResultStatus",
     "ScopedAppEnvResponse",
     "ScopedAppSecretResponse",
+    "ScopedAppSecretResponseDeliveryStatus",
+    "ScopedAppSecretResponseLastDeliveryErrorCode",
     "SeatUsageResponse",
     "SeatUsageResponsePlan",
     "SecretFinding",
     "SecretFindingSeverity",
     "SecretScanResult",
+    "SecurityQuarantineRecoveryRequest",
+    "SecurityQuarantineRecoveryResponse",
+    "SecurityQuarantineRecoveryResponseStatus",
+    "SendAppMessageRequest",
+    "SendAppMessageRequestDataContentType",
+    "SendAppMessageResponse",
+    "SendAppMessageResponseStatus",
+    "ServiceBindingPolicy",
     "ServiceReplicas",
+    "ServiceRolloutHandoffResponse",
+    "ServiceRolloutHandoffResponseAction",
+    "ServiceRolloutHandoffResponsePhase",
     "SessionInfo",
     "SessionListResponse",
     "SessionsRevokeAllResponse",
@@ -2439,6 +2601,14 @@ __all__ = (
     "SidecarCpuMillicores",
     "SidecarDiskIoProfile",
     "SidecarEnv",
+    "SidecarExecProbe",
+    "SidecarHTTPGetProbe",
+    "SidecarPreset",
+    "SidecarProbe",
+    "SidecarTCPSocketProbe",
+    "SidecarTimelineResponse",
+    "SidecarTimelineStatus",
+    "SidecarTimelineStatusStatus",
     "SidecarType",
     "SLODuration",
     "SourceRefDeployRequest",
@@ -2537,6 +2707,7 @@ __all__ = (
     "UpdateDeploymentTrafficRequest",
     "UpdateEdgeRuleRequest",
     "UpdateEdgeRuleRequestValidateMode",
+    "UpdateInboundWebhookEndpointRequest",
     "UpdateJobRequest",
     "UpdateJobRequestEnvOverrides",
     "UpdateJobRequestStatus",
@@ -2560,6 +2731,7 @@ __all__ = (
     "UpdateTriggerRequestBrokerPoisonStrategyType2Type1",
     "UpdateTriggerRequestBrokerPoisonStrategyType3Type1",
     "UpdateTriggerRequestConfigType0",
+    "UpdateUpstreamCircuitBreakerRequest",
     "UploadDeployOptions",
     "UploadSessionResponse",
     "UploadSessionResponseStatus",
@@ -2582,6 +2754,8 @@ __all__ = (
     "WakeTimelineJSONRowTier",
     "WakeTimelineJSONRowTriggerClass",
     "WakeTimelineResponse",
+    "WorkerScaling",
+    "WorkerScalingMetric",
     "WorkflowRetrySpec",
     "WorkflowRetrySpecBackoff",
     "WorkflowRunResponse",

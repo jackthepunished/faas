@@ -182,6 +182,13 @@ func (s *stubVmmdClient) UpdateEgressAllowlist(context.Context, *vmmdpb.UpdateEg
 	return &vmmdpb.UpdateEgressAllowlistAck{}, nil
 }
 
+// UpdateEgressCircuit (ADR-201 §3) — the gateway hot path doesn't drive
+// circuit pushes; schedd's egress-circuit loop does. Returns success so the
+// gRPC VmmdClient interface stays satisfied. Mirrors UpdateEgressAllowlist.
+func (s *stubVmmdClient) UpdateEgressCircuit(context.Context, *vmmdpb.UpdateEgressCircuitRequest, ...grpc.CallOption) (*vmmdpb.UpdateEgressCircuitAck, error) {
+	return &vmmdpb.UpdateEgressCircuitAck{}, nil
+}
+
 // UpdateStaticEgressIP (ADR-119) — the gateway hot path
 // doesn't drive the in-place patch; schedd's egress_drift
 // subscriber does. Returns success so the gRPC VmmdClient
@@ -198,6 +205,10 @@ func (s *stubVmmdClient) UpdatePrivateNetwork(context.Context, *vmmdpb.UpdatePri
 
 func (s *stubVmmdClient) ReconcilePrivateNetworkFabric(context.Context, *vmmdpb.ReconcilePrivateNetworkFabricRequest, ...grpc.CallOption) (*vmmdpb.ReconcilePrivateNetworkFabricAck, error) {
 	return &vmmdpb.ReconcilePrivateNetworkFabricAck{}, nil
+}
+
+func (s *stubVmmdClient) RemovePrivateNetworkFabric(context.Context, *vmmdpb.RemovePrivateNetworkFabricRequest, ...grpc.CallOption) (*vmmdpb.RemovePrivateNetworkFabricAck, error) {
+	return &vmmdpb.RemovePrivateNetworkFabricAck{}, nil
 }
 
 // Logs (issue #254 / Move 4) — the gateway hot path never dials

@@ -41,14 +41,23 @@ const (
 // Record is one runtime log line. Timestamps are retained as time.Time so
 // both encodings can represent nanosecond precision without reparsing.
 type Record struct {
-	AppID        string    `json:"app_id"`
-	AccountID    string    `json:"account_id"`
-	DeploymentID string    `json:"deployment_id,omitempty"`
-	InstanceID   string    `json:"instance_id"`
-	Sequence     uint64    `json:"sequence"`
-	Stream       string    `json:"stream"`
-	Line         string    `json:"line"`
-	WrittenAt    time.Time `json:"written_at"`
+	AppID               string    `json:"app_id"`
+	AccountID           string    `json:"account_id"`
+	TenantID            string    `json:"tenant_id,omitempty"`
+	RequestID           string    `json:"request_id,omitempty"`
+	TraceID             string    `json:"trace_id,omitempty"`
+	DeploymentID        string    `json:"deployment_id,omitempty"`
+	InstanceID          string    `json:"instance_id"`
+	NodeID              string    `json:"node_id,omitempty"`
+	Region              string    `json:"region,omitempty"`
+	CommitSHA           string    `json:"commit_sha,omitempty"`
+	DeploymentTag       string    `json:"deployment_tag,omitempty"`
+	DeploymentCreatedAt string    `json:"deployment_created_at,omitempty"`
+	ImageDigest         string    `json:"image_digest,omitempty"`
+	Sequence            uint64    `json:"sequence"`
+	Stream              string    `json:"stream"`
+	Line                string    `json:"line"`
+	WrittenAt           time.Time `json:"written_at"`
 }
 
 // Config controls a Sender. AuthHeader is a single "Name: value" pair; its
@@ -262,7 +271,11 @@ func (s *Sender) runDurable(ctx context.Context) {
 			}
 			continue
 		}
-		s.deliverDurable(ctx, item)
+		if err := s.deliverDurable(ctx, item); err != nil {
+			if !waitForQueueWake(ctx, s.wake, time.Second) {
+				return
+			}
+		}
 		if ctx.Err() != nil {
 			return
 		}
@@ -290,16 +303,17 @@ func waitForQueueWake(ctx context.Context, wake <-chan struct{}, retry time.Dura
 	}
 }
 
-func (s *Sender) deliverDurable(ctx context.Context, item QueueItem) {
+// deliverDurable returns storage failures or cancellation so the worker can
+// back off instead of immediately retrying against a broken disk.
+func (s *Sender) deliverDurable(ctx context.Context, item QueueItem) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	record := item.Record
 	attempts := item.Attempts
 	var lastErr error
 	for attempts < s.cfg.MaxAttempts {
 		attempts++
-		if err := s.durable.MarkAttempt(item, attempts); err != nil {
-			s.queueStorageError(err)
-			return
-		}
 		if attempts > 1 {
 			if s.cfg.OnRetry != nil {
 				s.cfg.OnRetry(record, attempts)
@@ -309,15 +323,25 @@ func (s *Sender) deliverDurable(ctx context.Context, item QueueItem) {
 			select {
 			case <-ctx.Done():
 				timer.Stop()
-				return
+				return ctx.Err()
 			case <-timer.C:
 			}
+		}
+		// Shutdown during backoff has not attempted delivery. Persist the
+		// attempt only when the request is about to start, preserving retries
+		// across worker restarts and configuration changes.
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err := s.durable.MarkAttempt(item, attempts); err != nil {
+			s.queueStorageError(err)
+			return err
 		}
 		status, err := s.post(ctx, record)
 		if err == nil && status >= 200 && status < 300 {
 			if err := s.durable.Ack(item); err != nil {
 				s.queueStorageError(err)
-				return
+				return err
 			}
 			if s.cfg.OnDelivered != nil {
 				s.cfg.OnDelivered(record)
@@ -326,7 +350,7 @@ func (s *Sender) deliverDurable(ctx context.Context, item QueueItem) {
 				s.cfg.OnDeliveredLatency(record, time.Since(item.EnqueuedAt))
 			}
 			s.observeDurableQueue()
-			return
+			return nil
 		}
 		if err != nil {
 			lastErr = err
@@ -337,7 +361,7 @@ func (s *Sender) deliverDurable(ctx context.Context, item QueueItem) {
 			break
 		}
 		if ctx.Err() != nil {
-			return
+			return ctx.Err()
 		}
 	}
 	if lastErr == nil {
@@ -345,7 +369,7 @@ func (s *Sender) deliverDurable(ctx context.Context, item QueueItem) {
 	}
 	if err := s.durable.DeadLetter(item, attempts, lastErr); err != nil {
 		s.queueStorageError(err)
-		return
+		return err
 	}
 	if s.cfg.OnFailed != nil {
 		s.cfg.OnFailed(record, lastErr)
@@ -354,6 +378,7 @@ func (s *Sender) deliverDurable(ctx context.Context, item QueueItem) {
 		s.cfg.OnDeadLetter(record, lastErr)
 	}
 	s.observeDurableQueue()
+	return nil
 }
 
 func (s *Sender) deliver(ctx context.Context, item queuedRecord) {
@@ -553,8 +578,25 @@ func makeOTLPPayload(record Record) otlpLogsPayload {
 		{Key: "faas.stream", Value: otlpAnyValue{StringValue: record.Stream}},
 		{Key: "faas.sequence", Value: otlpAnyValue{StringValue: fmt.Sprint(record.Sequence)}},
 	}
-	if record.DeploymentID != "" {
-		attrs = append(attrs, otlpKeyValue{Key: "faas.deployment.id", Value: otlpAnyValue{StringValue: record.DeploymentID}})
+	optional := []struct {
+		key   string
+		value string
+	}{
+		{key: "faas.tenant.id", value: record.TenantID},
+		{key: "faas.request.id", value: record.RequestID},
+		{key: "faas.trace.id", value: record.TraceID},
+		{key: "faas.deployment.id", value: record.DeploymentID},
+		{key: "faas.node.id", value: record.NodeID},
+		{key: "faas.region", value: record.Region},
+		{key: "faas.commit.sha", value: record.CommitSHA},
+		{key: "faas.deployment.tag", value: record.DeploymentTag},
+		{key: "faas.deployment.created_at", value: record.DeploymentCreatedAt},
+		{key: "faas.image.digest", value: record.ImageDigest},
+	}
+	for _, field := range optional {
+		if field.value != "" {
+			attrs = append(attrs, otlpKeyValue{Key: field.key, Value: otlpAnyValue{StringValue: field.value}})
+		}
 	}
 	return otlpLogsPayload{ResourceLogs: []otlpResourceLogs{{
 		Resource: otlpResource{Attributes: []otlpKeyValue{{Key: "service.name", Value: otlpAnyValue{StringValue: "gregale"}}}},

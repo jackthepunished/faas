@@ -40,10 +40,13 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/db"
+	"github.com/onebox-faas/faas/pkg/safetext"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -91,12 +94,12 @@ func (s *server) recoverRollout(w http.ResponseWriter, r *http.Request, acct sta
 	if !ok {
 		return
 	}
-	// (5) Reason trim (allow empty). Length cap matches the
-	// other audit-reason fields (1024 chars); the CLI / API
-	// caller is trusted.
-	if len(req.Reason) > 1024 {
-		req.Reason = req.Reason[:1024]
-	}
+	// (5) Reason trim (allow empty). The cap is in BYTES, not characters —
+	// it stands in for a Postgres column width. Cutting with a byte slice
+	// would split a multi-byte rune and produce invalid UTF-8, which the
+	// text and jsonb writes downstream both reject (SQLSTATE 22021 / 22P02),
+	// rolling back the recovery this endpoint exists to perform.
+	req.Reason = safetext.Truncate(req.Reason, api.AuditReasonMaxBytes)
 	// (6) Atomic-tx recovery.
 	updated, auditID, err := s.store.RecoverRollout(r.Context(), app.ID, req.Action, req.Reason)
 	if err != nil {
@@ -113,7 +116,9 @@ func (s *server) recoverRollout(w http.ResponseWriter, r *http.Request, acct sta
 		case errors.Is(err, state.ErrRolloutStateInvalid):
 			api.WriteProblem(w, api.ErrRolloutStateInvalid(updated.RolloutState))
 		default:
-			api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, api.CodeInternal, "recover failed", err.Error()))
+			writeCustomerInternalProblem(w, r, s.log, "recover rollout",
+				"Gregale could not recover this rollout.",
+				"Retry the request in a moment; if it continues, contact support.", err)
 		}
 		return
 	}
@@ -132,9 +137,23 @@ func (s *server) recoverRollout(w http.ResponseWriter, r *http.Request, acct sta
 			"actor":            acct.ID,
 		})
 	}
-	// (8) 200 RolloutTransitionResponse. Caller can echo the
+	status := http.StatusOK
+	if state.IsServiceRollout(updated) && updated.ServiceRolloutHandoff.ActiveAbort() {
+		status = http.StatusAccepted
+		if s.notif != nil {
+			payload, _ := json.Marshal(map[string]any{
+				"kind": "service_rollout_abort", "status": string(updated.Status),
+				"app_id": app.ID, "deployment_id": updated.ID,
+			})
+			if err := s.notif.Notify(r.Context(), db.NotifyDeploymentChanged, string(payload)); err != nil {
+				s.log.Warn("apid: notify service rollout abort failed", "app", app.ID, "deployment", updated.ID, "err", err)
+			}
+		}
+	}
+	// (8) RolloutTransitionResponse. A service abort is asynchronous and
+	// therefore returns 202 while its durable handoff remains rolling_out.
 	// audit id on the operator's terminal.
-	writeJSON(w, http.StatusOK, api.RolloutTransitionResponse{
+	writeJSON(w, status, api.RolloutTransitionResponse{
 		Deployment: s.deploymentResponse(updated, app),
 		AuditID:    int64ToAuditIDString(auditID),
 	})

@@ -59,6 +59,9 @@ func UnitImaged() daemonunit.Unit {
 		ExecStart:  `/opt/faas/current/bin/imaged --config /etc/faas/imaged.toml`,
 		Restart:    "on-failure",
 		RestartSec: "2s",
+		// ADR-190: OCI pull/extract work runs off the runtime loop; the
+		// budget only needs to outlast a stop-the-world pause.
+		WatchdogSec: "300s",
 		// imaged reconciles every runtime base assigned to the node before
 		// sd_notify(READY=1). A new generation can require OCI downloads,
 		// extraction, content validation and vulnerability scans. The
@@ -81,7 +84,12 @@ func UnitImaged() daemonunit.Unit {
 		// is required after that ownership transfer so the unprivileged daemon
 		// can inspect and package customer-owned 0700 directory trees. The
 		// systemd filesystem sandbox still limits which host paths are writable.
-		AmbientCapabilities: []string{"CAP_CHOWN", "CAP_DAC_OVERRIDE"},
+		// CAP_FOWNER is required by the Grype scan path: debugfs restores
+		// the base ext4's root ownership on the extracted copy via
+		// CAP_CHOWN, so the chmod that makes it readable needs ownership
+		// or CAP_FOWNER. Without it every scan wrote the fail-closed
+		// CRITICAL=9999 sidecar and vmmd refused to boot any VM.
+		AmbientCapabilities: []string{"CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_FOWNER"},
 
 		CapabilityBoundingSet: []string{
 			"cap_chown",

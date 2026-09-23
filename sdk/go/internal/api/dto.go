@@ -49,6 +49,26 @@ type RetryPolicyDTO struct {
 	JitterSeconds float64 `json:"jitter_seconds,omitempty"`
 }
 
+type SendAppMessageRequest struct {
+	ID              string          `json:"id,omitempty"`
+	Source          string          `json:"source,omitempty"`
+	Type            string          `json:"type"`
+	Time            *time.Time      `json:"time,omitempty"`
+	DataContentType string          `json:"data_content_type,omitempty"`
+	Data            json.RawMessage `json:"data"`
+	QueueName       string          `json:"queue_name,omitempty"`
+	RetryPolicy     *RetryPolicyDTO `json:"retry_policy,omitempty"`
+}
+
+type SendAppMessageResponse struct {
+	ID        string `json:"id"`
+	EventID   string `json:"event_id"`
+	TargetApp string `json:"target_app"`
+	Status    string `json:"status"`
+	StatusURL string `json:"status_url"`
+	TraceID   string `json:"trace_id,omitempty"`
+}
+
 // CreateAppRequest creates an app or function.
 type CreateAppRequest struct {
 	Slug            string `json:"slug"`
@@ -377,6 +397,8 @@ type AppEffectiveLimits struct {
 	CPUWeight              int   `json:"cpu_weight"`
 	MaxInstances           int   `json:"max_instances"`
 	ConcurrencyPerInstance int   `json:"concurrency_per_instance"`
+	ConcurrencyQueueDepth  int   `json:"concurrency_queue_depth"`
+	ConcurrencyQueueWaitMS int64 `json:"concurrency_queue_wait_ms"`
 	AppRequestRateRPS      int   `json:"app_request_rate_rps"`
 	AppRequestBurst        int   `json:"app_request_burst"`
 	AccountRequestRateRPM  int   `json:"account_request_rate_rpm"`
@@ -390,6 +412,25 @@ type AppConfiguredResources struct {
 	MemoryMB      int `json:"memory_mb"`
 	CPUMillicores int `json:"cpu_millicores"`
 }
+
+type AppServiceBinding struct {
+	Binding string `json:"binding"`
+	Service string `json:"service"`
+}
+
+type ServiceBindingPolicy string
+
+const (
+	ServiceBindingPolicyAccount  ServiceBindingPolicy = "account"
+	ServiceBindingPolicyDeclared ServiceBindingPolicy = "declared"
+)
+
+type PreviewServiceCallsPolicy string
+
+const (
+	PreviewServiceCallsAllow PreviewServiceCallsPolicy = "allow"
+	PreviewServiceCallsDeny  PreviewServiceCallsPolicy = "deny"
+)
 
 // AppResponse is an app as returned by the API.
 // RepoResponse is one repository visible to the account's GitHub App
@@ -477,6 +518,14 @@ type AppResponse struct {
 	// The DTO reuses the existing api.AppManifest (defined in
 	// appmanifest.go) so the wire shape stays a single source of truth.
 	Manifest AppManifest `json:"manifest"`
+	// ServiceBindings are repository-declared discovery edges. They do not
+	// change authorization under the account policy and become the outbound
+	// allowlist under the declared policy.
+	ServiceBindings []AppServiceBinding `json:"service_bindings,omitempty"`
+	// ServiceBindingPolicy is the caller-side internal-service authorization
+	// policy returned by the API.
+	ServiceBindingPolicy      ServiceBindingPolicy      `json:"service_binding_policy,omitempty"`
+	PreviewServiceCallsPolicy PreviewServiceCallsPolicy `json:"preview_service_calls_policy,omitempty"`
 	// EgressAllowlist (ADR-031 + ADR-032, tier-2 of the network
 	// roadmap) is the per-app outbound CIDR allowlist. Each entry
 	// is the canonical CIDR string form: v4 ("1.2.3.0/24") or v6
@@ -1241,13 +1290,24 @@ type QueueReceiveResponse struct {
 	Result  json.RawMessage `json:"result,omitempty"`
 }
 
-// DelayedTaskResponse is the create/get shape for delayed tasks.
-// ScheduledAt is the customer-facing UTC dispatch time; State is
-// populated on get, omitted on create (always "pending" there).
+// DelayedTaskResponse is the create/get/list shape for delayed tasks.
 type DelayedTaskResponse struct {
-	ID          string    `json:"id"`
-	ScheduledAt time.Time `json:"scheduled_at"`
-	State       string    `json:"state,omitempty"`
+	ID          string          `json:"id"`
+	AppID       string          `json:"app_id,omitempty"`
+	ScheduledAt time.Time       `json:"scheduled_at"`
+	State       string          `json:"state"`
+	Method      string          `json:"method,omitempty"`
+	Path        string          `json:"path,omitempty"`
+	Attempts    int             `json:"attempts,omitempty"`
+	LastError   string          `json:"last_error,omitempty"`
+	Result      json.RawMessage `json:"result,omitempty"`
+	CreatedAt   time.Time       `json:"created_at,omitempty"`
+	CompletedAt *time.Time      `json:"completed_at,omitempty"`
+}
+
+type ListDelayedTasksResponse struct {
+	Tasks      []DelayedTaskResponse `json:"tasks"`
+	NextBefore string                `json:"next_before,omitempty"`
 }
 
 // ListInvocationsResponse lives in cmd/apid because pkg/api cannot
@@ -1274,8 +1334,20 @@ type QueueSendRequest struct {
 // ScheduledAt must be in the future (UTC); the handler rejects past
 // timestamps with invalid_scheduled_at.
 type DelayedTaskRequest struct {
-	Payload     json.RawMessage `json:"payload,omitempty"`
-	ScheduledAt time.Time       `json:"scheduled_at"`
+	Payload          json.RawMessage         `json:"payload,omitempty"`
+	ScheduledAt      time.Time               `json:"scheduled_at,omitzero"`
+	DelaySeconds     int64                   `json:"delay_seconds,omitempty"`
+	Headers          json.RawMessage         `json:"headers,omitempty"`
+	Method           string                  `json:"method,omitempty"`
+	Path             string                  `json:"path,omitempty"`
+	RetryPolicy      *RetryPolicyDTO         `json:"retry_policy,omitempty"`
+	RetentionSeconds *int                    `json:"retention_seconds,omitempty"`
+	Destinations     *InvocationDestinations `json:"destinations,omitempty"`
+}
+
+type InvocationDestinations struct {
+	OnSuccess string `json:"on_success,omitempty"`
+	OnFailure string `json:"on_failure,omitempty"`
 }
 
 // Invocation is the SDK-side mirror of state.Invocation. The wire
@@ -1518,6 +1590,42 @@ type OrgListResponse struct {
 	Orgs []OrgResponse `json:"orgs"`
 }
 
+// ActivityActorResponse is the captured identity shown beside one global
+// organization activity item.
+type ActivityActorResponse struct {
+	Type      string `json:"type"`
+	Label     string `json:"label"`
+	AccountID string `json:"account_id,omitempty"`
+}
+
+// ActivityResourceResponse identifies the primary affected infrastructure
+// object. ID can be absent for external resources such as domains.
+type ActivityResourceResponse struct {
+	Type  string `json:"type"`
+	ID    string `json:"id,omitempty"`
+	Label string `json:"label"`
+}
+
+// OrgActivityResponse is one display-ready organization activity fact.
+type OrgActivityResponse struct {
+	ID           string                   `json:"id"`
+	OccurredAt   string                   `json:"occurred_at"`
+	Kind         string                   `json:"kind"`
+	Summary      string                   `json:"summary"`
+	Actor        ActivityActorResponse    `json:"actor"`
+	Resource     ActivityResourceResponse `json:"resource"`
+	AppID        string                   `json:"app_id,omitempty"`
+	ProjectID    string                   `json:"project_id,omitempty"`
+	DeploymentID string                   `json:"deployment_id,omitempty"`
+	Data         json.RawMessage          `json:"data"`
+}
+
+// ListOrgActivityResponse is a newest-first keyset page.
+type ListOrgActivityResponse struct {
+	Items      []OrgActivityResponse `json:"items"`
+	NextBefore string                `json:"next_before,omitempty"`
+}
+
 // OrgMemberResponse is the wire shape for a single org membership row.
 type OrgMemberResponse struct {
 	AccountID string `json:"account_id"`
@@ -1648,6 +1756,21 @@ type CreateAppWebhookRequest struct {
 	EventFilter   []string `json:"event_filter,omitempty"`
 	RetryPolicy   string   `json:"retry_policy,omitempty"`
 	Enabled       *bool    `json:"enabled,omitempty"`
+}
+
+type DeliverAppEventRequest struct {
+	Destination string          `json:"destination"`
+	Type        string          `json:"type"`
+	Data        json.RawMessage `json:"data"`
+}
+
+type DeliverAppEventResponse struct {
+	ID          string `json:"id"`
+	WebhookID   string `json:"webhook_id"`
+	Destination string `json:"destination"`
+	Event       string `json:"event"`
+	Status      string `json:"status"`
+	StatusURL   string `json:"status_url"`
 }
 
 // UpdateAppWebhookRequest is the body of PATCH

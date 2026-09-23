@@ -18,16 +18,18 @@ The initial surface is intentionally small:
 - `gregale_private_network` manages a Gregale-owned provider-neutral private network, including reusable CIDR and protocol/port firewall policy.
 - `gregale_private_network_attachment` manages an app's provider-neutral private-network attachment and reconciliation state.
 - `gregale_private_network_peering` manages a provider-neutral peering between two Gregale private networks.
+- `gregale_project_environment` manages a project environment with guarded deletion.
+- `gregale_project_environment_config` manages versioned non-secret configuration for an existing project environment.
 - `data.gregale_app` reads an existing app for adoption and resource composition.
 - `data.gregale_deployment` reads an existing deployment for status and preview composition.
 - `data.gregale_latest_deployment` reads the newest deployment for an app without requiring its ID.
 - `data.gregale_private_network` reads an existing private network for attachment and peering composition.
-- `gregale_project_environment` reads a durable project environment without
+- `data.gregale_project_environment` reads a durable project environment without
   copying secrets into Terraform state.
 
-Project-environment creation and deletion are not exposed as a Terraform resource yet:
-the Gregale API currently has no safe delete operation for environments. This
-keeps Terraform destroy from silently leaving unmanaged remote state.
+Environment deletion is guarded by Gregale: production, protected environments,
+and environments with live releases cannot be deleted. Terraform therefore
+surfaces an actionable conflict instead of silently leaving serving state behind.
 
 ## Provider configuration
 
@@ -354,6 +356,19 @@ DNS and provisions TLS asynchronously; refresh the resource to observe
 
 ## Environment lookup
 
+Create and manage a non-production environment:
+
+```hcl
+resource "gregale_project_environment" "preview" {
+  project_slug = "orders"
+  slug         = "preview"
+  protected    = false
+}
+```
+
+`production` is created automatically and cannot be deleted. Set `protected = true`
+for any environment that should require an explicit unprotect before removal.
+
 ```hcl
 data "gregale_project_environment" "production" {
   project_slug = "orders"
@@ -369,3 +384,26 @@ The provider uses the same public REST contract as the CLI and sends
 idempotency keys for app, domain, alert, cron, environment variable, secret, and deployment writes. Application
 environment values, secret values, alert webhook secrets, managed secret values, and bearer tokens
 are not returned by the managed resources or recorded in state.
+
+## Project environment configuration
+
+Manage a durable environment's non-secret JSON configuration. The environment
+must already exist, and Gregale rejects secret-shaped keys; use
+`gregale_secret` for credentials. Configuration is canonicalized by Gregale,
+so `jsonencode` keeps Terraform plans stable. Destroying this resource resets
+the environment configuration to `{}`; it does not delete the environment.
+
+```hcl
+resource "gregale_project_environment_config" "production" {
+  project_slug = "orders"
+  environment  = "production"
+  values = jsonencode({
+    region   = "eu"
+    replicas = 2
+  })
+}
+
+output "config_version" {
+  value = gregale_project_environment_config.production.version
+}
+```

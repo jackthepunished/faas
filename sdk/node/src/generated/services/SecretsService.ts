@@ -48,9 +48,9 @@ export class SecretsService {
       errors: {
         401: `code: unauthorized`,
         404: `code: not_found`,
-        429: `429. Two response shapes:
-        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
-        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        429: `429 application/problem+json response. Authentication throttling uses
+        \`auth_rate_limited\`; plan and usage limits use their specific stable
+        codes such as \`plan_limit_concurrency\` and \`quota_exhausted\`.
         `,
       },
     });
@@ -58,7 +58,9 @@ export class SecretsService {
   /**
    * Set a sealed secret.
    * Seals the plaintext value against the host X25519 recipient and
-   * persists the ciphertext. The plaintext never lands in PG.
+   * persists the ciphertext. The plaintext never lands in PG. Existing
+   * snapshots are invalidated; running processes retain their current
+   * environment until a cold wake or `POST /restart?fresh=true`.
    *
    * @returns AppSecretResponse The stored sealed-secret envelope.
    * @throws ApiError
@@ -109,9 +111,9 @@ export class SecretsService {
         401: `code: unauthorized`,
         403: `code: plan_limit_secrets`,
         413: `code: secret_value_too_large`,
-        429: `429. Two response shapes:
-        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
-        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        429: `429 application/problem+json response. Authentication throttling uses
+        \`auth_rate_limited\`; plan and usage limits use their specific stable
+        codes such as \`plan_limit_concurrency\` and \`quota_exhausted\`.
         `,
       },
     });
@@ -159,9 +161,9 @@ export class SecretsService {
         400: `400 on DELETE /v1/apps/{slug}/secrets/{key}?scope=... — any of {secret_invalid_key, secret_not_found, env_scope_invalid, env_scope_reserved}.`,
         401: `code: unauthorized`,
         404: `code: not_found`,
-        429: `429. Two response shapes:
-        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
-        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        429: `429 application/problem+json response. Authentication throttling uses
+        \`auth_rate_limited\`; plan and usage limits use their specific stable
+        codes such as \`plan_limit_concurrency\` and \`quota_exhausted\`.
         `,
       },
     });
@@ -172,7 +174,8 @@ export class SecretsService {
    * recipient and stamps the kid column. Emits `secret.rotated`
    * audit kind when the row already had a value; emits `secret.set`
    * when the row was previously empty (first-time rotation). The
-   * same byte cap as PUT applies (`SecretValueMaxBytes`).
+   * same byte cap as PUT applies (`SecretValueMaxBytes`). Existing
+   * snapshots are invalidated after the write.
    *
    * @returns RotateAppSecretResponse The rotated sealed-secret envelope.
    * @throws ApiError
@@ -223,9 +226,9 @@ export class SecretsService {
         401: `code: unauthorized`,
         404: `code: not_found`,
         413: `code: secret_value_too_large`,
-        429: `429. Two response shapes:
-        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
-        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        429: `429 application/problem+json response. Authentication throttling uses
+        \`auth_rate_limited\`; plan and usage limits use their specific stable
+        codes such as \`plan_limit_concurrency\` and \`quota_exhausted\`.
         `,
         503: `code: capacity_unavailable — no host headroom (alerting; should be near-impossible).`,
       },
@@ -274,9 +277,9 @@ export class SecretsService {
       errors: {
         400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,
         401: `code: unauthorized`,
-        429: `429. Two response shapes:
-        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
-        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        429: `429 application/problem+json response. Authentication throttling uses
+        \`auth_rate_limited\`; plan and usage limits use their specific stable
+        codes such as \`plan_limit_concurrency\` and \`quota_exhausted\`.
         `,
       },
     });

@@ -6,6 +6,7 @@
 package s3gateway
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5" // #nosec G501 -- Content-MD5 is an S3 wire-integrity check.
 	"crypto/sha256"
@@ -36,6 +37,12 @@ import (
 const CredentialSecretNamespace = "object_s3_credential"
 
 const defaultMaxConcurrentPuts = 4
+
+const (
+	maxDeleteObjectsBodyBytes     = 2 << 20
+	maxCompleteMultipartBodyBytes = 4 << 20
+	maxObjectTaggingBodyBytes     = 16 << 10
+)
 
 type Store interface {
 	state.ObjectS3CredentialStore
@@ -207,6 +214,7 @@ type requestContext struct {
 	bucket     state.ObjectBucket
 	provider   objectstorage.Provider
 	signature  sigV4Request
+	streaming  *awsChunkedReader
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -219,10 +227,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.ToLower(r.Host) != h.host {
 		writeS3Error(w, http.StatusBadRequest, "InvalidRequest", "Use the configured Gregale S3 endpoint with path-style addressing.", r.URL.Path, requestID)
-		return
-	}
-	if strings.HasPrefix(r.Header.Get("X-Amz-Content-Sha256"), "STREAMING-") {
-		writeS3Error(w, http.StatusNotImplemented, "NotImplemented", "SigV4 streaming uploads are not implemented by Gregale yet.", r.URL.Path, requestID)
 		return
 	}
 	var parsed sigV4Request
@@ -254,13 +258,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeS3Error(w, http.StatusForbidden, "SignatureDoesNotMatch", "The request signature we calculated does not match the signature you provided.", r.URL.Path, requestID)
 		return
 	}
+	streaming, err := prepareAWSChunkedBody(r, parsed, secret, h.region, h.maxPutBytes)
+	if err != nil {
+		h.writeAWSChunkedError(w, r, requestID, err)
+		return
+	}
 	backend, err := h.registry.Resolve(bucket.BackendID, bucket.BackendFingerprint)
 	if err != nil {
 		writeS3Error(w, http.StatusServiceUnavailable, "ServiceUnavailable", "Gregale could not reach this bucket's storage placement.", r.URL.Path, requestID)
 		return
 	}
 	h.touchCredential(r.Context(), credential.ID)
-	request := requestContext{requestID: requestID, credential: credential, bucket: bucket, provider: backend.Provider, signature: parsed}
+	request := requestContext{requestID: requestID, credential: credential, bucket: bucket, provider: backend.Provider, signature: parsed, streaming: streaming}
 	h.route(w, r, request)
 }
 
@@ -283,6 +292,10 @@ func (h *Handler) route(w http.ResponseWriter, r *http.Request, req requestConte
 	bucketName, key, hasBucket, hasKey, err := parsePath(r.URL.EscapedPath())
 	if err != nil {
 		writeS3Error(w, http.StatusBadRequest, "InvalidURI", "Could not parse the specified URI.", r.URL.Path, req.requestID)
+		return
+	}
+	if hasUnsupportedS3Semantics(r) {
+		h.unsupported(w, r, req.requestID)
 		return
 	}
 	if !hasBucket {
@@ -349,6 +362,14 @@ func (h *Handler) routeBucket(w http.ResponseWriter, r *http.Request, req reques
 	}
 	if r.Method == http.MethodGet && query.Has("uploads") {
 		h.listMultipartUploads(w, r, req)
+		return
+	}
+	if r.Method == http.MethodPost && query.Has("delete") {
+		if !queryKeysOnly(query, "delete") {
+			h.unsupported(w, r, req.requestID)
+			return
+		}
+		h.deleteObjects(w, r, req)
 		return
 	}
 	if r.Method == http.MethodGet && query.Get("list-type") == "2" {
@@ -555,14 +576,26 @@ func (h *Handler) upload(w http.ResponseWriter, r *http.Request, req requestCont
 			h.log.Warn("S3 upload spool cleanup failed", "request_id", req.requestID)
 		}
 	}()
+	checksum, expectedChecksum, checksumErr := requestChecksum(r.Header)
+	if checksumErr != nil {
+		h.writeAWSChunkedError(w, r, req.requestID, checksumErr)
+		return
+	}
 	sha := sha256.New()
 	md5sum := md5.New() // #nosec G401 -- S3 Content-MD5 compatibility.
-	written, err := io.Copy(io.MultiWriter(file, sha, md5sum), io.LimitReader(r.Body, r.ContentLength+1))
+	writers := []io.Writer{file, sha, md5sum}
+	if checksum != nil {
+		writers = append(writers, checksum)
+	}
+	written, err := io.Copy(io.MultiWriter(writers...), io.LimitReader(r.Body, r.ContentLength+1))
 	if err != nil || written != r.ContentLength {
+		if err != nil && h.writeAWSChunkedError(w, r, req.requestID, err) {
+			return
+		}
 		writeS3Error(w, http.StatusBadRequest, "IncompleteBody", "You did not provide the number of bytes specified by Content-Length.", r.URL.Path, req.requestID)
 		return
 	}
-	if req.signature.PayloadHash != "UNSIGNED-PAYLOAD" {
+	if req.signature.PayloadHash != "UNSIGNED-PAYLOAD" && !isStreamingPayloadHash(req.signature.PayloadHash) {
 		actual := hex.EncodeToString(sha.Sum(nil))
 		if subtle.ConstantTimeCompare([]byte(actual), []byte(req.signature.PayloadHash)) != 1 {
 			writeS3Error(w, http.StatusBadRequest, "XAmzContentSHA256Mismatch", "The provided x-amz-content-sha256 does not match the request body.", r.URL.Path, req.requestID)
@@ -575,6 +608,10 @@ func (h *Handler) upload(w http.ResponseWriter, r *http.Request, req requestCont
 			writeS3Error(w, http.StatusBadRequest, "BadDigest", "The Content-MD5 you specified did not match what Gregale received.", r.URL.Path, req.requestID)
 			return
 		}
+	}
+	if checksum != nil && subtle.ConstantTimeCompare(expectedChecksum, checksum.Sum(nil)) != 1 {
+		writeS3Error(w, http.StatusBadRequest, "BadDigest", "The checksum you specified did not match what Gregale received.", r.URL.Path, req.requestID)
+		return
 	}
 	if _, err = file.Seek(0, io.SeekStart); err != nil || !h.admit(w, r, req, key, r.ContentLength, true) {
 		if err != nil {
@@ -619,6 +656,86 @@ func (h *Handler) upload(w http.ResponseWriter, r *http.Request, req requestCont
 		w.Header().Set("ETag", etag)
 	}
 	w.WriteHeader(http.StatusOK)
+}
+
+func (h *Handler) deleteObjects(w http.ResponseWriter, r *http.Request, req requestContext) {
+	if !h.require(w, req, state.ObjectBucketPermissionWrite, r.URL.Path) {
+		return
+	}
+	if r.ContentLength <= 0 || r.ContentLength > maxDeleteObjectsBodyBytes {
+		writeS3Error(w, http.StatusBadRequest, "MalformedXML", "The XML you provided was not well-formed or did not validate against the published schema.", r.URL.Path, req.requestID)
+		return
+	}
+	body, err := readVerifiedRequestBody(w, r, req.signature.PayloadHash, maxDeleteObjectsBodyBytes)
+	if err != nil {
+		if h.writeAWSChunkedError(w, r, req.requestID, err) {
+			return
+		}
+		writeS3Error(w, http.StatusBadRequest, "MalformedXML", "The XML you provided was not well-formed or did not validate against the published schema.", r.URL.Path, req.requestID)
+		return
+	}
+	checksum, _, checksumErr := requestChecksum(r.Header)
+	if checksumErr != nil {
+		h.writeAWSChunkedError(w, r, req.requestID, checksumErr)
+		return
+	}
+	if r.Header.Get("Content-MD5") == "" && checksum == nil && req.streaming == nil {
+		writeS3Error(w, http.StatusBadRequest, "MissingContentMD5", "Missing required Content-MD5 or x-amz-checksum header for this request.", r.URL.Path, req.requestID)
+		return
+	}
+
+	decoder := xml.NewDecoder(bytes.NewReader(body))
+	decoder.Strict = true
+	var request deleteObjectsRequest
+	if err := decoder.Decode(&request); err != nil || request.XMLName.Local != "Delete" || len(request.Objects) == 0 || len(request.Objects) > 1000 {
+		writeS3Error(w, http.StatusBadRequest, "MalformedXML", "The XML you provided was not well-formed or did not validate against the published schema.", r.URL.Path, req.requestID)
+		return
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		writeS3Error(w, http.StatusBadRequest, "MalformedXML", "The XML you provided was not well-formed or did not validate against the published schema.", r.URL.Path, req.requestID)
+		return
+	}
+	for _, object := range request.Objects {
+		if !objectstorage.ValidKey(object.Key) || object.VersionID != "" {
+			writeS3Error(w, http.StatusBadRequest, "InvalidRequest", "DeleteObjects contains an invalid key or unsupported version ID.", r.URL.Path, req.requestID)
+			return
+		}
+		if !h.admit(w, r, req, object.Key, 0, false) {
+			return
+		}
+	}
+
+	result := deleteObjectsResult{XMLNS: s3XMLNamespace}
+	for _, object := range request.Objects {
+		if !h.recordProviderRequest(w, r, req) {
+			return
+		}
+		err := req.provider.DeleteObject(r.Context(), req.bucket.PhysicalName, object.Key)
+		if err == nil || errors.Is(err, objectstorage.ErrNotFound) {
+			if !request.Quiet {
+				result.Deleted = append(result.Deleted, deletedObjectResult{Key: object.Key})
+			}
+			continue
+		}
+		code, message := "ServiceUnavailable", "Gregale could not reach this bucket's storage placement."
+		if errors.Is(err, objectstorage.ErrInvalid) {
+			code, message = "InvalidRequest", "The request is invalid."
+		} else if errors.Is(err, objectstorage.ErrUnsupported) {
+			code, message = "NotImplemented", "This S3 operation is not implemented by the storage provider."
+		}
+		result.Errors = append(result.Errors, deleteObjectError{Key: object.Key, Code: code, Message: message})
+	}
+	writeS3XML(w, http.StatusOK, req.requestID, result)
+}
+
+func (h *Handler) writeAWSChunkedError(w http.ResponseWriter, r *http.Request, requestID string, err error) bool {
+	var chunked *awsChunkedError
+	if !errors.As(err, &chunked) {
+		return false
+	}
+	writeS3Error(w, chunked.status, chunked.code, chunked.message, r.URL.Path, requestID)
+	return true
 }
 
 func (h *Handler) copyObject(w http.ResponseWriter, r *http.Request, req requestContext, destinationKey string) {
@@ -782,7 +899,7 @@ func objectMetadataFromHeaders(r *http.Request) (objectstorage.ObjectMetadata, e
 }
 
 func (h *Handler) download(w http.ResponseWriter, r *http.Request, req requestContext, key string) {
-	signed, err := req.provider.Presign(r.Context(), req.bucket.PhysicalName, objectstorage.SignRequest{Method: r.Method, Key: key, ExpiresIn: 60})
+	signed, err := objectstorage.PresignObjectRead(r.Context(), req.provider, req.bucket.PhysicalName, r.Method, key, 60)
 	if err != nil {
 		h.providerError(w, r, req, err, key)
 		return
@@ -809,6 +926,12 @@ func (h *Handler) download(w http.ResponseWriter, r *http.Request, req requestCo
 		return
 	}
 	defer h.closeResponseBody(response.Body, req.requestID)
+	if response.StatusCode == http.StatusNotModified || response.StatusCode == http.StatusPreconditionFailed {
+		copyObjectHeaders(w.Header(), response.Header)
+		w.Header().Del("Content-Length")
+		w.WriteHeader(response.StatusCode)
+		return
+	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		h.providerHTTPError(w, r, req, response.StatusCode, key)
 		return
@@ -841,8 +964,11 @@ func (h *Handler) objectTags(w http.ResponseWriter, r *http.Request, req request
 		if !h.require(w, req, state.ObjectBucketPermissionWrite, r.URL.Path) || !h.admit(w, r, req, key, 0, false) {
 			return
 		}
-		tags, err := decodeObjectTags(w, r)
+		tags, err := decodeObjectTags(w, r, req.signature.PayloadHash)
 		if err != nil {
+			if h.writeAWSChunkedError(w, r, req.requestID, err) {
+				return
+			}
 			writeS3Error(w, http.StatusBadRequest, "InvalidTag", "The object tags are invalid.", r.URL.Path, req.requestID)
 			return
 		}
@@ -868,11 +994,16 @@ func (h *Handler) objectTags(w http.ResponseWriter, r *http.Request, req request
 	}
 }
 
-func decodeObjectTags(w http.ResponseWriter, r *http.Request) (map[string]string, error) {
+func decodeObjectTags(w http.ResponseWriter, r *http.Request, payloadHash string) (map[string]string, error) {
 	if r.ContentLength > 16<<10 {
 		return nil, objectstorage.ErrInvalid
 	}
-	decoder := xml.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10))
+	bodyBytes, err := readVerifiedRequestBody(w, r, payloadHash, maxObjectTaggingBodyBytes)
+	if err != nil {
+		return nil, err
+	}
+	decoder := xml.NewDecoder(bytes.NewReader(bodyBytes))
+	decoder.Strict = true
 	var body objectTaggingRequest
 	if err := decoder.Decode(&body); err != nil {
 		return nil, objectstorage.ErrInvalid
@@ -895,6 +1026,69 @@ func decodeObjectTags(w http.ResponseWriter, r *http.Request) (map[string]string
 		return nil, err
 	}
 	return tags, nil
+}
+
+func readVerifiedRequestBody(w http.ResponseWriter, r *http.Request, payloadHash string, maxBytes int64) ([]byte, error) {
+	if r.ContentLength > maxBytes {
+		return nil, objectstorage.ErrInvalid
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBytes))
+	if err != nil {
+		return nil, err
+	}
+	if !isStreamingPayloadHash(payloadHash) && payloadHash != "UNSIGNED-PAYLOAD" {
+		sum := sha256.Sum256(body)
+		if subtle.ConstantTimeCompare([]byte(hex.EncodeToString(sum[:])), []byte(payloadHash)) != 1 {
+			return nil, contentSHA256Mismatch()
+		}
+	}
+	if expected := r.Header.Get("Content-MD5"); expected != "" {
+		decoded, decodeErr := base64.StdEncoding.DecodeString(expected)
+		sum := md5.Sum(body) // #nosec G401 -- S3 Content-MD5 compatibility.
+		if decodeErr != nil || len(decoded) != md5.Size || subtle.ConstantTimeCompare(decoded, sum[:]) != 1 {
+			return nil, badAWSChunkDigest()
+		}
+	}
+	if err := verifyRequestChecksum(r.Header, body); err != nil {
+		return nil, err
+	}
+	return body, nil
+}
+
+func hasUnsupportedS3Semantics(r *http.Request) bool {
+	if r.Header.Get("X-Amz-Copy-Source") == "" && (r.Header.Get("X-Amz-Metadata-Directive") != "" || r.Header.Get("X-Amz-Tagging-Directive") != "") {
+		return true
+	}
+	for name := range r.Header {
+		if unsupportedS3SemanticName(name) {
+			return true
+		}
+	}
+	for name := range r.URL.Query() {
+		if unsupportedS3SemanticName(name) {
+			return true
+		}
+	}
+	return false
+}
+
+func unsupportedS3SemanticName(name string) bool {
+	name = strings.ToLower(name)
+	return name == "x-amz-acl" ||
+		strings.HasPrefix(name, "x-amz-grant-") ||
+		strings.HasPrefix(name, "x-amz-server-side-encryption") ||
+		name == "x-amz-storage-class" ||
+		strings.HasPrefix(name, "x-amz-object-lock-") ||
+		name == "x-amz-website-redirect-location" ||
+		name == "x-amz-request-payer" ||
+		name == "x-amz-expected-bucket-owner" ||
+		name == "x-amz-source-expected-bucket-owner" ||
+		strings.HasPrefix(name, "x-amz-copy-source-if-") ||
+		name == "x-amz-copy-source-range" ||
+		name == "x-amz-checksum-mode" ||
+		name == "x-amz-checksum-algorithm" ||
+		name == "x-amz-bypass-governance-retention" ||
+		name == "x-amz-mfa"
 }
 
 // recordProviderRequest commits the outbound request attempt before it is

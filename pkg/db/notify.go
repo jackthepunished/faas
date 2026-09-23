@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -116,6 +117,23 @@ type EdgeRuleAckPayload struct {
 	Node       string `json:"node"`
 }
 
+// DeploymentRouteChangedPayload is the scheduler -> gateway handoff envelope
+// for a service rollout cutover. A gateway acknowledges only after both its
+// deployment weights and live target set reflect the authoritative database
+// state for AppID.
+type DeploymentRouteChangedPayload struct {
+	AppID        string `json:"app_id"`
+	DeploymentID string `json:"deployment_id"`
+	Generation   int64  `json:"generation"`
+}
+
+// DeploymentRouteAckPayload is emitted by each serving gateway after it has
+// applied DeploymentRouteChangedPayload locally.
+type DeploymentRouteAckPayload struct {
+	Generation int64  `json:"generation"`
+	Node       string `json:"node"`
+}
+
 func ParseEdgeRuleChangedPayload(raw string) (EdgeRuleChangedPayload, error) {
 	var payload EdgeRuleChangedPayload
 	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
@@ -134,6 +152,31 @@ func ParseEdgeRuleAckPayload(raw string) (EdgeRuleAckPayload, error) {
 	}
 	if payload.Generation <= 0 || strings.TrimSpace(payload.Phase) == "" || strings.TrimSpace(payload.Node) == "" {
 		return EdgeRuleAckPayload{}, errors.New("db: incomplete edge_rule_ack payload")
+	}
+	return payload, nil
+}
+
+func ParseDeploymentRouteChangedPayload(raw string) (DeploymentRouteChangedPayload, error) {
+	var payload DeploymentRouteChangedPayload
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return DeploymentRouteChangedPayload{}, fmt.Errorf("db: decode deployment_route_changed payload: %w", err)
+	}
+	payload.AppID = strings.TrimSpace(payload.AppID)
+	payload.DeploymentID = strings.TrimSpace(payload.DeploymentID)
+	if payload.AppID == "" || payload.DeploymentID == "" || payload.Generation <= 0 {
+		return DeploymentRouteChangedPayload{}, errors.New("db: incomplete deployment_route_changed payload")
+	}
+	return payload, nil
+}
+
+func ParseDeploymentRouteAckPayload(raw string) (DeploymentRouteAckPayload, error) {
+	var payload DeploymentRouteAckPayload
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return DeploymentRouteAckPayload{}, fmt.Errorf("db: decode deployment_route_ack payload: %w", err)
+	}
+	payload.Node = strings.TrimSpace(payload.Node)
+	if payload.Generation <= 0 || payload.Node == "" {
+		return DeploymentRouteAckPayload{}, errors.New("db: incomplete deployment_route_ack payload")
 	}
 	return payload, nil
 }
@@ -191,13 +234,40 @@ func MarshalAppChangedPayload(payload AppChangedPayload) ([]byte, error) {
 	return json.Marshal(payload)
 }
 
+// NotifyPayloadMaxBytes is the largest NOTIFY payload PostgreSQL accepts.
+//
+// The server's buffer is 8000 bytes including the NUL terminator, so the
+// usable maximum is 7999: a 7999-byte payload is accepted and an 8000-byte
+// one is rejected with "payload string too long". Both boundaries are
+// asserted against a real server in notify_payload_limit_test.go rather than
+// taken from the documentation, which says only "8000 bytes".
+const NotifyPayloadMaxBytes = 7999
+
+// ErrNotifyPayloadTooLarge reports a payload that cannot fit in a NOTIFY.
+//
+// This used to surface as a raw pgx error from deep inside a callsite that
+// had already discarded its context, on a Notify whose error most producers
+// deliberately ignore. Callers can now match it with errors.Is and decide,
+// and the message names the channel and the two sizes.
+var ErrNotifyPayloadTooLarge = errors.New("db: notify payload exceeds the PostgreSQL limit")
+
 // Notify publishes a payload on the given channel. Deploy handoff channels
 // first persist a replay row and publish an envelope in the same transaction;
-// all other channels retain the direct pg_notify path. Payloads are limited
-// to ~8 KB by Postgres — caller's responsibility.
+// all other channels retain the direct pg_notify path.
+//
+// Payloads over NotifyPayloadMaxBytes are rejected before the round trip.
+// The previous contract — "limited to ~8 KB by Postgres — caller's
+// responsibility" — was enforced by nothing: one channel capped its content
+// at 3 KiB, another switched to a pipe-delimited encoding to stay under the
+// limit, and the rest simply hoped. Each new channel re-litigated the
+// question, and an oversize payload failed as an opaque SQLSTATE at runtime.
 func Notify(ctx context.Context, pool *pgxpool.Pool, channel, payload string) error {
 	if IsDurableNotificationChannel(channel) {
 		return enqueueAndNotify(ctx, pool, channel, payload)
+	}
+	if len(payload) > NotifyPayloadMaxBytes {
+		return fmt.Errorf("%w: channel %s, %d bytes > %d",
+			ErrNotifyPayloadTooLarge, channel, len(payload), NotifyPayloadMaxBytes)
 	}
 	_, err := pool.Exec(ctx, "SELECT pg_notify($1, $2)", channel, payload)
 	if err != nil {
@@ -220,21 +290,45 @@ func enqueueAndNotify(ctx context.Context, pool *pgxpool.Pool, channel, payload 
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	if err := EnqueueDurableNotificationTx(ctx, tx, channel, payload); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("db: notify %s commit: %w", channel, err)
+	}
+	return nil
+}
+
+// EnqueueDurableNotificationTx binds a durable handoff to the producer's
+// mutation transaction. Callers must commit the transaction; a failed enqueue
+// therefore rolls the mutation back rather than losing its only replay cue.
+func EnqueueDurableNotificationTx(ctx context.Context, tx pgx.Tx, channel, payload string) error {
+	if tx == nil || !IsDurableNotificationChannel(channel) {
+		return fmt.Errorf("db: enqueue notification %s: transaction and durable channel required", channel)
+	}
 	var id int64
 	availableAt := time.Now().UTC().Add(notificationOutboxWakeDelay)
-	err = tx.QueryRow(ctx, `
+	err := tx.QueryRow(ctx, `
 		INSERT INTO notification_outbox (channel, payload, available_at)
 		VALUES ($1, $2, $3)
 		RETURNING id`, channel, payload, availableAt).Scan(&id)
 	if err != nil {
 		return fmt.Errorf("db: enqueue notification %s: %w", channel, err)
 	}
+	// The envelope adds ~50 bytes, so a payload that fitted on its own can
+	// overflow once wrapped. Skip only the wakeup in that case and still
+	// commit the row: RunNotificationOutbox polls on a ticker independently
+	// of NOTIFY, so the handoff is recovered on the next sweep with added
+	// latency rather than lost.
+	//
+	// Failing the Exec instead would roll back the whole transaction — the
+	// outbox row included — so the one mechanism built to survive a missed
+	// notification would be defeated by the notification being too large.
 	wire := wrapNotificationPayload(id, payload)
-	if _, err := tx.Exec(ctx, "SELECT pg_notify($1, $2)", channel, wire); err != nil {
-		return fmt.Errorf("db: notify %s: %w", channel, err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("db: notify %s commit: %w", channel, err)
+	if len(wire) <= NotifyPayloadMaxBytes {
+		if _, err := tx.Exec(ctx, "SELECT pg_notify($1, $2)", channel, wire); err != nil {
+			return fmt.Errorf("db: notify %s: %w", channel, err)
+		}
 	}
 	return nil
 }
@@ -295,6 +389,9 @@ func (p PoolNotifier) Notify(ctx context.Context, channel, payload string) error
 //	                         "lifecycle_changed":bool} // lifecycle fields changed
 //	NotifyAppWake           {"app_id":uuid,"wake_id":uuid}
 //	                         apid → schedd: durable explicit pre-warm request.
+//	NotifyRuntimeConfigRestart {"app_id":uuid,"wake_id":uuid}
+//	                         apid → schedd: durable destroy-without-snapshot
+//	                         followed by a cold wake.
 //	NotifyDeploymentChanged {"kind":"image|tarball|dockerfile|function|
 //	                         rollback|superseded",
 //	                         "app_id":uuid, "deployment_id":uuid,
@@ -450,14 +547,29 @@ const (
 	// the original rotation contract.
 	NotifySecretRotated = "secret_rotated"
 	NotifyAppWake       = "app_wake"
+	// NotifyRuntimeConfigRestart applies a changed environment or secret to a
+	// live app. It is deliberately separate from app_changed/restart: restoring
+	// or capturing process memory would preserve the previous environment.
+	NotifyRuntimeConfigRestart = "runtime_config_restart"
+	// NotifyInstanceFailureRelayed carries a vmmd liveness or workload-OOM
+	// report from the schedd that hosts an instance to the schedd that owns
+	// its app (issue #3359). vmmd always reports to its local schedd, but
+	// placement can run an instance on a peer node, and only the owner may
+	// write the app's instance state. Every schedd receives the broadcast and
+	// all but the owner discard it. Advisory: a missed delivery falls back to
+	// the owner's instance reconciliation.
+	// Payload: {"instance_id":uuid,"app_id":uuid,"kind":"liveness"|"workload_oom",
+	//           "reason":string,"peak_mb":int,"plan_mb":int}
+	NotifyInstanceFailureRelayed = "instance_failure_relayed"
 	// NotifyPrivateNetworkAttachmentChanged carries the durable cleanup
 	// event emitted when an app attachment is detached. Unlike the broad
 	// app_changed stream, this channel is replayed so a schedd restart or
 	// LISTEN gap cannot leave stale private routes on a live VM.
 	NotifyPrivateNetworkAttachmentChanged = "private_network_attachment_changed"
-	// NotifyPrivateNetworkChanged wakes schedd after a Gregale-owned peering
-	// mutation. The payload carries account/region identity so a deleted
-	// peering can withdraw routes even though its row is gone.
+	// NotifyPrivateNetworkChanged wakes schedd after a Gregale-owned network
+	// policy, peering, or deletion mutation. The payload carries account/region
+	// identity; deletion payloads also carry the immutable CIDR so node-local
+	// fabric teardown can converge after the network row is gone.
 	NotifyPrivateNetworkChanged = "private_network_changed"
 	NotifyDeploymentChanged     = "deployment_changed"
 	// NotifyDeploymentSmokeChallenge carries a short-lived, random challenge
@@ -691,6 +803,15 @@ const (
 	//   phase of an edge-rule convergence barrier. This channel is consumed
 	//   only by the mutation request that allocated the generation.
 	NotifyEdgeRuleAck = "edge_rule_ack"
+	// NotifyDeploymentRouteChanged {"app_id":uuid,
+	//   "deployment_id":uuid,"generation":int}
+	//   schedd -> gatewayd-internal: a readiness-gated service rollout has
+	//   published its candidate as the sole positive-weight generation.
+	NotifyDeploymentRouteChanged = "deployment_route_changed"
+	// NotifyDeploymentRouteAck {"generation":int,"node":string}
+	//   gatewayd-internal -> schedd: the named serving gateway refreshed both
+	//   deployment weights and live targets for the generation.
+	NotifyDeploymentRouteAck = "deployment_route_ack"
 	// NotifyCachePurge is emitted by the explicit per-app cache purge API.
 	// Payload: {"app_id":uuid,"path_glob":string}; an empty glob purges
 	// the app's complete response cache.
@@ -803,7 +924,8 @@ func Subscribe(ctx context.Context, pool *pgxpool.Pool, channels []string) (<-ch
 	if len(channels) == 0 {
 		return nil, func() {}, fmt.Errorf("db: Subscribe requires at least one channel")
 	}
-	conn, err := pool.Acquire(ctx)
+	// Session-scoped: see direct.go.
+	conn, err := DirectPool(pool).Acquire(ctx)
 	if err != nil {
 		return nil, func() {}, fmt.Errorf("db: acquire listener: %w", err)
 	}
@@ -870,8 +992,36 @@ func SubscribeWithReconnect(
 	if len(channels) == 0 {
 		return nil, fmt.Errorf("db: SubscribeWithReconnect: no channels")
 	}
-	inner, cancel, err := Subscribe(ctx, pool, channels)
+	// ADR-190: one LISTEN connection per pool. The hub keeps this
+	// function's contract (fail-fast initial acquire, LISTEN active on
+	// return, channel closes only on ctx cancel); FAAS_DB_NOTIFY_HUB=0
+	// falls through to the legacy connection-per-subscriber path.
+	if notifyHubEnabled() {
+		return hubFor(pool, log).subscribe(ctx, channels)
+	}
+	// Bound the INITIAL acquire only. On this path every subscriber parks
+	// its own connection, so a daemon whose pool is sized for the hub runs
+	// out partway through its subscriptions — and pgxpool.Acquire waits for
+	// a release that is never coming, because the connections are held by
+	// this daemon's own earlier subscribers. Unbounded, that is a hang
+	// before sd_notify(READY=1) with no error anywhere: the unit sits in
+	// `activating` until systemd's TimeoutStartSec kills it.
+	//
+	// The reconnect loop below deliberately keeps its unbounded ctx; a
+	// transient drop must retry forever. This deadline only converts an
+	// unsatisfiable boot into a named failure.
+	subCtx, subCancel := context.WithTimeout(ctx, legacySubscribeAcquireTimeout)
+	inner, cancel, err := Subscribe(subCtx, pool, channels)
+	subCancel()
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			return nil, fmt.Errorf(
+				"db: SubscribeWithReconnect(%v): could not acquire a LISTEN connection within %s. "+
+					"%s=0 is set, so every subscriber parks its own connection; this pool is almost "+
+					"certainly sized for the notify hub (see db.DaemonMaxConnectionsNotifyHubDisabled). "+
+					"Unset %s or raise the daemon's pool budget: %w",
+				channels, legacySubscribeAcquireTimeout, NotifyHubEnv, NotifyHubEnv, err)
+		}
 		return nil, fmt.Errorf("db: SubscribeWithReconnect initial Subscribe: %w", err)
 	}
 	const (

@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     from ..models.log_excerpt import LogExcerpt
     from ..models.scan_result import ScanResult
     from ..models.secret_scan_result import SecretScanResult
+    from ..models.service_rollout_handoff_response import ServiceRolloutHandoffResponse
     from ..models.workflow_spec import WorkflowSpec
 
 
@@ -82,6 +83,11 @@ class DeploymentResponse:
     stage_state: DeploymentResponseStageState | Unset = UNSET
     """Actual stage progress, including retry_requested_stage and retry_restart_reason when prerequisites must be
     rebuilt."""
+    revision: int | Unset = UNSET
+    """Per-app deployment revision (ADR-198), rendered as `v42`. Accepted in place of a deployment id wherever this
+    API takes one (e.g. `target_deployment_id` on rollback). This is the same N that appears in the
+    `deploy-{N}-{slug}` preview hostname. Omitted for rows created before the column existed; address those by id.
+   """
     build_id: None | str | Unset = UNSET
     build_cache_status: DeploymentResponseBuildCacheStatus | Unset = UNSET
     """Builderd cache decision for the associated build. Omitted until the build reaches its cache lookup."""
@@ -150,8 +156,8 @@ class DeploymentResponse:
         | None
         | Unset
     ) = UNSET
-    """Per-deployment parking reason (issue #554 / ADR-079 follow-up, migration 00157). Closed-set vocabulary
-    enforced at the schema layer via the deployments_parked_reason_check constraint. nil for never-parked
+    """Per-deployment parking reason (issue #554 / ADR-079 follow-up and scheduled image quarantine). Closed-set
+    vocabulary enforced at the schema layer via the deployments_parked_reason_check constraint. nil for never-parked
     deployments — surfaced as no field on the wire via omitempty."""
     parked_at: datetime.datetime | None | Unset = UNSET
     """Wall-clock timestamp the deployment was parked (set once, idempotent across schedd restart cycles). nil for
@@ -239,6 +245,8 @@ class DeploymentResponse:
     """Wall-clock timestamp at which the rollout was aborted."""
     rollout_aborted_reason: str | Unset = UNSET
     """Operator or orchestrator reason recorded when the rollout is aborted."""
+    service_rollout_handoff: ServiceRolloutHandoffResponse | Unset = UNSET
+    """Durable scheduler progress for a zero-downtime service rollout routing and request-drain handoff."""
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -264,6 +272,8 @@ class DeploymentResponse:
         stage_state: dict[str, Any] | Unset = UNSET
         if not isinstance(self.stage_state, Unset):
             stage_state = self.stage_state.to_dict()
+
+        revision = self.revision
 
         build_id: None | str | Unset
         if isinstance(self.build_id, Unset):
@@ -527,6 +537,10 @@ class DeploymentResponse:
 
         rollout_aborted_reason = self.rollout_aborted_reason
 
+        service_rollout_handoff: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.service_rollout_handoff, Unset):
+            service_rollout_handoff = self.service_rollout_handoff.to_dict()
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -541,6 +555,8 @@ class DeploymentResponse:
         )
         if stage_state is not UNSET:
             field_dict["stage_state"] = stage_state
+        if revision is not UNSET:
+            field_dict["revision"] = revision
         if build_id is not UNSET:
             field_dict["build_id"] = build_id
         if build_cache_status is not UNSET:
@@ -639,6 +655,8 @@ class DeploymentResponse:
             field_dict["rollout_aborted_at"] = rollout_aborted_at
         if rollout_aborted_reason is not UNSET:
             field_dict["rollout_aborted_reason"] = rollout_aborted_reason
+        if service_rollout_handoff is not UNSET:
+            field_dict["service_rollout_handoff"] = service_rollout_handoff
 
         return field_dict
 
@@ -653,6 +671,7 @@ class DeploymentResponse:
         from ..models.log_excerpt import LogExcerpt
         from ..models.scan_result import ScanResult
         from ..models.secret_scan_result import SecretScanResult
+        from ..models.service_rollout_handoff_response import ServiceRolloutHandoffResponse
         from ..models.workflow_spec import WorkflowSpec
 
         d = dict(src_dict)
@@ -674,6 +693,8 @@ class DeploymentResponse:
             stage_state = UNSET
         else:
             stage_state = DeploymentResponseStageState.from_dict(_stage_state)
+
+        revision = d.pop("revision", UNSET)
 
         def _parse_build_id(data: object) -> None | str | Unset:
             if data is None:
@@ -1161,6 +1182,13 @@ class DeploymentResponse:
 
         rollout_aborted_reason = d.pop("rollout_aborted_reason", UNSET)
 
+        _service_rollout_handoff = d.pop("service_rollout_handoff", UNSET)
+        service_rollout_handoff: ServiceRolloutHandoffResponse | Unset
+        if isinstance(_service_rollout_handoff, Unset):
+            service_rollout_handoff = UNSET
+        else:
+            service_rollout_handoff = ServiceRolloutHandoffResponse.from_dict(_service_rollout_handoff)
+
         deployment_response = cls(
             id=id,
             app_id=app_id,
@@ -1169,6 +1197,7 @@ class DeploymentResponse:
             status=status,
             created_at=created_at,
             stage_state=stage_state,
+            revision=revision,
             build_id=build_id,
             build_cache_status=build_cache_status,
             cache_key_sha256=cache_key_sha256,
@@ -1218,6 +1247,7 @@ class DeploymentResponse:
             rollout_completed_at=rollout_completed_at,
             rollout_aborted_at=rollout_aborted_at,
             rollout_aborted_reason=rollout_aborted_reason,
+            service_rollout_handoff=service_rollout_handoff,
         )
 
         deployment_response.additional_properties = d

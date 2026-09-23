@@ -255,6 +255,14 @@ spec-cited-tests-check: ## Require changed core-path tests to cite a spec sectio
 spec-cited-tests-check-test: ## Exercise the spec-cited-tests CI gate with synthetic pull request events
 	bash scripts/ci/check_spec_cited_tests_test.sh
 
+.PHONY: adr-number-uniqueness-check
+adr-number-uniqueness-check: ## Reject a NEWLY duplicated ADR number (ratchet over docs/adr/DUPLICATE_NUMBERS_BASELINE.txt)
+	bash scripts/ci/check_adr_number_uniqueness.sh
+
+.PHONY: adr-number-uniqueness-check-test
+adr-number-uniqueness-check-test: ## Exercise the ADR-number gate against synthetic ADR trees in both directions
+	bash scripts/ci/check_adr_number_uniqueness_test.sh
+
 .PHONY: migration-version-hygiene-check
 migration-version-hygiene-check: ## Reject hand-typed migration versions and versions already claimed by an open PR
 	bash scripts/ci/check_migration_version_hygiene.sh
@@ -262,6 +270,18 @@ migration-version-hygiene-check: ## Reject hand-typed migration versions and ver
 .PHONY: migration-version-hygiene-check-test
 migration-version-hygiene-check-test: ## Exercise the migration-version gate with synthetic pull request events
 	bash scripts/ci/check_migration_version_hygiene_test.sh
+
+.PHONY: text-encoding-check-test
+text-encoding-check-test: ## Exercise the text-encoding gate against fixture trees in both directions
+	bash scripts/ci/check_text_encoding_test.sh
+
+.PHONY: shell-quoting-check-test
+shell-quoting-check-test: ## Exercise the shell-quoting gate against fixture trees in both directions
+	python3 scripts/ci/check_shell_quoting_test.py
+
+.PHONY: canary-alert-test
+canary-alert-test: ## Exercise the synthetic-canary Alertmanager payload against a fixture receiver
+	bash scripts/ops/canary_alert_test.sh
 
 # coverage-floor: assert per-package coverage ≥ floor for each ship-blocking
 # package. Floors live in the `floors` dict inside the python heredoc below
@@ -512,9 +532,9 @@ metal-lima-m5: ## Run the M5 §14 deploy-to-park cold-boot acceptance on Lima (s
 	limactl shell --workdir "$(CURDIR)" faas-metal sudo env RUN_TARGET=./cmd/e2e/ ./deploy/lima/run-metal.sh -run 'TestDeployWakeMetal/deploy-then-parked'
 
 .PHONY: metal-lima-api-hosting
-metal-lima-api-hosting: ## Run API-hosting receipt, runtime-matrix, public-smoke, and park/wake acceptance (set FAAS_E2E_API_HOSTING_CATALOG=full for all catalog fixtures)
+metal-lima-api-hosting: ## Run API-hosting acceptance (full selects supported fixtures; qualify also runs candidates)
 	@limactl list -q 2>/dev/null | grep -qx faas-metal || limactl start deploy/lima/faas-metal.yaml --tty=false
-	limactl shell --workdir "$(CURDIR)" faas-metal sudo env RUN_TARGET=./cmd/e2e/ ./deploy/lima/run-metal.sh -run '^Test(BuildMetal|CatalogRuntimeParityMetal|SourceDeployWakeMetal)$$'
+	limactl shell --workdir "$(CURDIR)" faas-metal sudo env $(if $(filter full,$(FAAS_E2E_API_HOSTING_CATALOG)),FAAS_E2E_API_HOSTING_CATALOG=full) $(if $(filter qualify,$(FAAS_E2E_API_HOSTING_CATALOG)),FAAS_E2E_API_HOSTING_CATALOG=qualify) RUN_TARGET=./cmd/e2e/ ./deploy/lima/run-metal.sh -run '^Test(BuildMetal|CatalogRuntimeParityMetal|SourceDeployWakeMetal)$$'
 
 .PHONY: metal-soak
 metal-soak: ## Issue #587 PR-A.8: 30-min mixed WS/HTTP/Upgrade drain soak on Lima (1-node). Verifies gateway_drain_wait_seconds histogram + gateway_inflight_requests gauge end-to-end. Pre-req: make metal-lima green.
@@ -617,7 +637,7 @@ ha-write-redirect-drill: ## Tier A9 / ADR-089: standby write-redirect drill on t
 	  exit 0'
 
 .PHONY: lint
-lint: egress-check lint-incompatible-mods image-validate sealed-env-scope-check runbook-sql-check ## golangci-lint via go tool (matches CI version v2.4.0) + repository policy gates
+lint: egress-check lint-incompatible-mods image-validate sealed-env-scope-check runbook-sql-check text-encoding-check shell-quoting-check adr-number-uniqueness-check ## golangci-lint via go tool (matches CI version v2.4.0) + repository policy gates
 	@$(GO) tool golangci-lint run
 
 .PHONY: runbook-sql-check
@@ -699,6 +719,14 @@ otlp-unit-check: ## Verify every instrumented daemon loads the operator-owned OT
 .PHONY: sealed-env-scope-check
 sealed-env-scope-check: ## Static gate: /etc/faas/sealed.env is loaded only by faas-apid.service (issue #585, ADR-127)
 	@bash scripts/ci/check_sealed_env_scope.sh $(CURDIR)
+
+.PHONY: text-encoding-check
+text-encoding-check: ## Static gate: no JSON built with fmt %q, no free text truncated with a byte slice
+	@bash scripts/ci/check_text_encoding.sh $(CURDIR)
+
+.PHONY: shell-quoting-check
+shell-quoting-check: ## Static gate: no value interpolated into hand-written shell quotes (CodeQL go/unsafe-quoting)
+	@python3 scripts/ci/check_shell_quoting.py $(CURDIR)
 
 .PHONY: manifest-ansible
 manifest-ansible: ## Generate a manifest-owned Ansible inventory and host_vars tree (MANIFEST + ANSIBLE_GENERATED_DIR required)

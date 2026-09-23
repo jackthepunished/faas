@@ -21,8 +21,11 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/db"
+	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/state"
 	pkgtrace "github.com/onebox-faas/faas/pkg/trace"
 )
@@ -128,6 +131,11 @@ func (s *server) invokeAppAsync(w http.ResponseWriter, r *http.Request, acct sta
 		api.WriteProblem(w, destinationProblem)
 		return
 	}
+	invocationHeaders, err := pkgtrace.MergeHeaders(r.Context(), req.Headers)
+	if err != nil {
+		api.WriteProblem(w, api.ErrValidation("headers must be a JSON object of string values"))
+		return
+	}
 	inv, err := s.store.EnqueueInvocation(r.Context(), state.Invocation{
 		AppID:                  app.ID,
 		AccountID:              acct.ID,
@@ -135,9 +143,9 @@ func (s *server) invokeAppAsync(w http.ResponseWriter, r *http.Request, acct sta
 		Method:                 req.Method,
 		Path:                   req.Path,
 		Payload:                req.Payload,
-		Headers:                req.Headers,
+		Headers:                invocationHeaders,
 		DueAt:                  time.Now().UTC(),
-		RetryPolicyJSON:        effectiveInvocationRetryPolicy(app, req.RetryPolicy),
+		RetryPolicyJSON:        effectiveInvocationRetryPolicy(app, req.RetryPolicy, limits.MaxQueueAttempts),
 		DeadlineAt:             deadlineForRequest(req.DeadlineAt, acct),
 		ResultRetentionUntil:   retentionForRequest(req.RetentionSeconds, acct),
 		OnSuccessDestinationID: onSuccessDestination,
@@ -196,6 +204,11 @@ func (s *server) invokeApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	if acct.Plan == api.PlanFree {
 		timeout = 5 * time.Second
 	}
+	invocationHeaders, err := pkgtrace.MergeHeaders(r.Context(), req.Headers)
+	if err != nil {
+		api.WriteProblem(w, api.ErrValidation("headers must be a JSON object of string values"))
+		return
+	}
 	inv, err := s.store.EnqueueInvocation(r.Context(), state.Invocation{
 		AppID:     app.ID,
 		AccountID: acct.ID,
@@ -203,7 +216,7 @@ func (s *server) invokeApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		Method:    req.Method,
 		Path:      req.Path,
 		Payload:   req.Payload,
-		Headers:   req.Headers,
+		Headers:   invocationHeaders,
 		DueAt:     time.Now().UTC(),
 		// PR-B fixup (code-review #1185 findings #7 + #8): wire the
 		// customer's deadline / retry-policy / retention overrides
@@ -214,7 +227,7 @@ func (s *server) invokeApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		// value. RetryPolicy is the typed DTO; marshal to JSON for
 		// the JSONB column.
 		DeadlineAt:             deadlineForRequest(req.DeadlineAt, acct),
-		RetryPolicyJSON:        effectiveInvocationRetryPolicy(app, req.RetryPolicy),
+		RetryPolicyJSON:        effectiveInvocationRetryPolicy(app, req.RetryPolicy, limits.MaxQueueAttempts),
 		ResultRetentionUntil:   retentionForRequest(req.RetentionSeconds, acct),
 		OnSuccessDestinationID: onSuccessDestination,
 		OnFailureDestinationID: onFailureDestination,
@@ -310,53 +323,119 @@ func (s *server) queueSend(w http.ResponseWriter, r *http.Request, acct state.Ac
 		api.WriteProblem(w, api.ErrPlanFeatureGated("queues", acct.Plan))
 		return
 	}
-	n, err := s.store.CountPendingInvocations(r.Context(), app.ID, state.InvocationQueue)
-	if err != nil {
-		api.WriteProblem(w, api.ErrCapacity("count queue"))
-		return
-	}
-	if n >= limits.MaxQueueDepth {
-		api.WriteProblem(w, api.ErrPlanQueueDepth(limits.MaxQueueDepth, n))
-		return
-	}
 	var req queueSendRequest
 	if !decodeJSONLimit(w, r, &req, int64(limits.MaxSourceBytesPerInvocation)) {
 		return
 	}
-	if problem := validateInvocationRetryPolicy(req.RetryPolicy); problem != nil {
-		api.WriteProblem(w, problem)
-		return
-	}
-	queueName, problem := s.resolveQueueSendName(r.Context(), acct, app, req.QueueName)
+	inv, traceID, problem := s.enqueueAppMessage(r.Context(), acct, app, req.Payload, req.QueueName, req.RetryPolicy)
 	if problem != nil {
 		api.WriteProblem(w, problem)
 		return
 	}
-	traceHeaders, err := json.Marshal(pkgtrace.InjectHeaders(r.Context()))
-	if err != nil {
-		api.WriteProblem(w, api.ErrCapacity("encode queue trace context"))
+	writeJSON(w, http.StatusCreated, api.QueueSendResponse{
+		ID:      inv.ID,
+		TraceID: traceID,
+	})
+}
+
+// sendAppMessage is the ergonomic application-inbox facade. It deliberately
+// reuses InvocationQueue so queue depth, retry, dead-letter, replay, wake, and
+// trace behavior stay identical to `queues/send`.
+func (s *server) sendAppMessage(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	app, ok := s.loadApp(w, r, acct, r.PathValue("slug"))
+	if !ok {
 		return
 	}
-	inv, err := s.store.EnqueueInvocation(r.Context(), state.Invocation{
+	limits := api.MustLimitsFor(acct.Plan)
+	if limits.MaxQueueDepth == 0 {
+		api.WriteProblem(w, api.ErrPlanFeatureGated("queues", acct.Plan))
+		return
+	}
+	var req api.SendAppMessageRequest
+	if !decodeJSONLimit(w, r, &req, int64(limits.MaxSourceBytesPerInvocation)) {
+		return
+	}
+	if req.ID == "" {
+		req.ID = uuid.NewString()
+	}
+	if req.Source == "" {
+		req.Source = "gregale.send"
+	}
+	eventTime := time.Time{}
+	if req.Time != nil {
+		eventTime = *req.Time
+	}
+	envelope, err := (events.Envelope{
+		ID:              req.ID,
+		Source:          req.Source,
+		Type:            req.Type,
+		Time:            eventTime,
+		DataContentType: req.DataContentType,
+		Data:            req.Data,
+	}).Normalize(acct.ID, time.Now().UTC())
+	if err != nil {
+		api.WriteProblem(w, api.ErrValidation(err.Error()))
+		return
+	}
+	payload, err := json.Marshal(envelope)
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("encode application message"))
+		return
+	}
+	inv, traceID, problem := s.enqueueAppMessage(r.Context(), acct, app, payload, req.QueueName, req.RetryPolicy)
+	if problem != nil {
+		api.WriteProblem(w, problem)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, api.SendAppMessageResponse{
+		ID:        inv.ID,
+		EventID:   envelope.ID,
+		TargetApp: app.Slug,
+		Status:    string(inv.State),
+		StatusURL: "/v1/invocations/" + inv.ID,
+		TraceID:   traceID,
+	})
+}
+
+func (s *server) enqueueAppMessage(ctx context.Context, acct state.Account, app state.App, payload json.RawMessage, queueName string, retryPolicy *api.RetryPolicyDTO) (state.Invocation, string, *api.Problem) {
+	limits := api.MustLimitsFor(acct.Plan)
+	if limits.MaxQueueDepth == 0 {
+		return state.Invocation{}, "", api.ErrPlanFeatureGated("queues", acct.Plan)
+	}
+	n, err := s.store.CountPendingInvocations(ctx, app.ID, state.InvocationQueue)
+	if err != nil {
+		return state.Invocation{}, "", api.ErrCapacity("count queue")
+	}
+	if n >= limits.MaxQueueDepth {
+		return state.Invocation{}, "", api.ErrPlanQueueDepth(limits.MaxQueueDepth, n)
+	}
+	if problem := validateInvocationRetryPolicy(retryPolicy); problem != nil {
+		return state.Invocation{}, "", problem
+	}
+	resolvedQueueName, problem := s.resolveQueueSendName(ctx, acct, app, queueName)
+	if problem != nil {
+		return state.Invocation{}, "", problem
+	}
+	traceHeaders, err := pkgtrace.MergeHeaders(ctx, nil)
+	if err != nil {
+		return state.Invocation{}, "", api.ErrCapacity("encode queue trace context")
+	}
+	inv, err := s.store.EnqueueInvocation(ctx, state.Invocation{
 		AppID:           app.ID,
 		AccountID:       acct.ID,
 		Source:          state.InvocationQueue,
-		QueueName:       queueName,
-		Payload:         req.Payload,
+		QueueName:       resolvedQueueName,
+		Payload:         payload,
 		Headers:         traceHeaders,
 		DueAt:           time.Now().UTC(),
-		RetryPolicyJSON: effectiveInvocationRetryPolicy(app, req.RetryPolicy),
+		RetryPolicyJSON: effectiveInvocationRetryPolicy(app, retryPolicy, limits.MaxQueueAttempts),
 	})
 	if err != nil {
-		api.WriteProblem(w, api.ErrCapacity("enqueue queue send"))
-		return
+		return state.Invocation{}, "", api.ErrCapacity("enqueue application message")
 	}
 	var traceHeaderValues map[string]string
 	_ = json.Unmarshal(traceHeaders, &traceHeaderValues)
-	writeJSON(w, http.StatusCreated, api.QueueSendResponse{
-		ID:      inv.ID,
-		TraceID: traceHeaderValues[api.TraceIDHeader],
-	})
+	return inv, traceHeaderValues[api.TraceIDHeader], nil
 }
 
 // queueReceive long-polls on invocation_done scoped to this app; when
@@ -570,6 +649,10 @@ func (s *server) delayedTaskCreate(w http.ResponseWriter, r *http.Request, acct 
 	if !ok {
 		return
 	}
+	if !app.AcceptsRequestInvocations() {
+		api.WriteProblem(w, api.ErrInvocationWorkloadClass(string(app.WorkloadClass), app.Manifest.ExecutionMode))
+		return
+	}
 	limits := api.MustLimitsFor(acct.Plan)
 	if limits.MaxDelayedTasksPerApp == 0 {
 		api.WriteProblem(w, api.ErrPlanFeatureGated("delayed_tasks", acct.Plan))
@@ -589,27 +672,107 @@ func (s *server) delayedTaskCreate(w http.ResponseWriter, r *http.Request, acct 
 		return
 	}
 	now := time.Now().UTC()
-	if req.ScheduledAt.Before(now) {
-		api.WriteProblem(w, api.ErrInvalidScheduledAt())
+	sched, problem := delayedTaskSchedule(now, req)
+	if problem != nil {
+		api.WriteProblem(w, problem)
 		return
 	}
-	sched := req.ScheduledAt.UTC()
+	if problem := validateInvocationRetryPolicy(req.RetryPolicy); problem != nil {
+		api.WriteProblem(w, problem)
+		return
+	}
+	if req.RetentionSeconds != nil && *req.RetentionSeconds < 0 {
+		api.WriteProblem(w, api.ErrValidation("retention_seconds must be non-negative"))
+		return
+	}
+	if req.Method == "" {
+		req.Method = defaultInvokeMethod
+	}
+	if req.Path == "" {
+		req.Path = "/"
+	}
+	onSuccessDestination, onFailureDestination, destinationProblem := s.resolveInvocationDestinations(r.Context(), app.ID, acct.ID, req.Destinations)
+	if destinationProblem != nil {
+		api.WriteProblem(w, destinationProblem)
+		return
+	}
+	invocationHeaders, err := pkgtrace.MergeHeaders(r.Context(), req.Headers)
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("encode delayed task trace context"))
+		return
+	}
 	inv, err := s.store.EnqueueInvocation(r.Context(), state.Invocation{
-		AppID:       app.ID,
-		AccountID:   acct.ID,
-		Source:      state.InvocationDelayedTask,
-		Payload:     req.Payload,
-		DueAt:       sched,
-		ScheduledAt: &sched,
+		AppID:                  app.ID,
+		AccountID:              acct.ID,
+		Source:                 state.InvocationDelayedTask,
+		Method:                 req.Method,
+		Path:                   req.Path,
+		Payload:                req.Payload,
+		Headers:                invocationHeaders,
+		DueAt:                  sched,
+		ScheduledAt:            &sched,
+		DeadlineAt:             deadlineForRequestAt(sched, nil, acct),
+		RetryPolicyJSON:        effectiveInvocationRetryPolicy(app, req.RetryPolicy, limits.MaxQueueAttempts),
+		ResultRetentionUntil:   retentionForRequestAt(sched, req.RetentionSeconds, acct),
+		OnSuccessDestinationID: onSuccessDestination,
+		OnFailureDestinationID: onFailureDestination,
 	})
 	if err != nil {
 		api.WriteProblem(w, api.ErrCapacity("enqueue delayed task"))
 		return
 	}
-	writeJSON(w, http.StatusCreated, api.DelayedTaskResponse{
-		ID:          inv.ID,
-		ScheduledAt: sched,
-	})
+	writeJSON(w, http.StatusCreated, delayedTaskResponse(inv))
+}
+
+// delayedTaskSchedule validates the mutually-exclusive absolute and relative
+// scheduling forms and applies the platform's bounded scheduling horizon.
+func delayedTaskSchedule(now time.Time, req delayedTaskRequest) (time.Time, *api.Problem) {
+	hasAbsolute := !req.ScheduledAt.IsZero()
+	hasRelative := req.DelaySeconds != 0
+	if hasAbsolute == hasRelative {
+		return time.Time{}, api.ErrInvalidScheduledAt("exactly one of scheduled_at or delay_seconds is required")
+	}
+	if req.DelaySeconds < 0 || req.DelaySeconds > int64(api.MaxDelayedTaskDelaySeconds) {
+		return time.Time{}, api.ErrInvalidScheduledAt(fmt.Sprintf("delay_seconds must be between 1 and %d", api.MaxDelayedTaskDelaySeconds))
+	}
+	sched := req.ScheduledAt.UTC()
+	if hasRelative {
+		sched = now.Add(time.Duration(req.DelaySeconds) * time.Second)
+	}
+	if !sched.After(now) {
+		return time.Time{}, api.ErrInvalidScheduledAt()
+	}
+	if sched.After(now.Add(time.Duration(api.MaxDelayedTaskDelaySeconds) * time.Second)) {
+		return time.Time{}, api.ErrInvalidScheduledAt(fmt.Sprintf("scheduled_at cannot be more than %d days in the future", api.MaxDelayedTaskDelaySeconds/(24*60*60)))
+	}
+	return sched, nil
+}
+
+// delayedTaskList returns delayed tasks for one app, newest first.
+func (s *server) delayedTaskList(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	app, ok := s.loadApp(w, r, acct, r.PathValue("slug"))
+	if !ok {
+		return
+	}
+	limit := 20
+	if q := r.URL.Query().Get("limit"); q != "" {
+		if n, err := strconv.Atoi(q); err == nil && n > 0 && n <= 200 {
+			limit = n
+		}
+	}
+	rows, err := s.store.ListDelayedTasksForApp(r.Context(), app.ID, limit, r.URL.Query().Get("before"))
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("list delayed tasks"))
+		return
+	}
+	response := api.ListDelayedTasksResponse{Tasks: make([]api.DelayedTaskResponse, 0, len(rows))}
+	for _, inv := range rows {
+		response.Tasks = append(response.Tasks, delayedTaskResponse(inv))
+	}
+	if len(rows) == limit && len(rows) > 0 {
+		response.NextBefore = rows[len(rows)-1].ID
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 // delayedTaskGet is the read-only counterpart. Restricted to
@@ -622,11 +785,7 @@ func (s *server) delayedTaskGet(w http.ResponseWriter, r *http.Request, acct sta
 		api.WriteProblem(w, api.ErrInvocationNotFound(id))
 		return
 	}
-	writeJSON(w, http.StatusOK, api.DelayedTaskResponse{
-		ID:          inv.ID,
-		ScheduledAt: ptrTime(inv.ScheduledAt),
-		State:       string(inv.State),
-	})
+	writeJSON(w, http.StatusOK, delayedTaskResponse(inv))
 }
 
 // delayedTaskCancel moves a pending delayed_task row to cancelled and
@@ -648,11 +807,24 @@ func (s *server) delayedTaskCancel(w http.ResponseWriter, r *http.Request, acct 
 		api.WriteProblem(w, api.ErrCapacity("cancel delayed task"))
 		return
 	}
-	writeJSON(w, http.StatusOK, api.DelayedTaskResponse{
+	inv.State = result
+	writeJSON(w, http.StatusOK, delayedTaskResponse(inv))
+}
+
+func delayedTaskResponse(inv state.Invocation) api.DelayedTaskResponse {
+	return api.DelayedTaskResponse{
 		ID:          inv.ID,
+		AppID:       inv.AppID,
 		ScheduledAt: ptrTime(inv.ScheduledAt),
-		State:       string(result),
-	})
+		State:       string(inv.State),
+		Method:      inv.Method,
+		Path:        inv.Path,
+		Attempts:    inv.Attempts,
+		LastError:   inv.LastError,
+		Result:      inv.Result,
+		CreatedAt:   inv.CreatedAt,
+		CompletedAt: inv.CompletedAt,
+	}
 }
 
 // ptrTime is a tiny adapter so delayedTaskGet can format *time.Time
@@ -674,6 +846,10 @@ func (s *server) delayedTaskCancel(w http.ResponseWriter, r *http.Request, acct 
 // value, so nil is a defensive guard for a future PR that adds a
 // no-retention plan).
 func retentionForRequest(reqRetentionSeconds *int, acct state.Account) *time.Time {
+	return retentionForRequestAt(time.Now().UTC(), reqRetentionSeconds, acct)
+}
+
+func retentionForRequestAt(base time.Time, reqRetentionSeconds *int, acct state.Account) *time.Time {
 	limits := api.MustLimitsFor(acct.Plan)
 	if limits.MaxAsyncResultRetentionSeconds <= 0 {
 		return nil
@@ -684,7 +860,7 @@ func retentionForRequest(reqRetentionSeconds *int, acct state.Account) *time.Tim
 			seconds = *reqRetentionSeconds
 		}
 	}
-	t := time.Now().UTC().Add(time.Duration(seconds) * time.Second)
+	t := base.UTC().Add(time.Duration(seconds) * time.Second)
 	return &t
 }
 
@@ -693,11 +869,15 @@ func retentionForRequest(reqRetentionSeconds *int, acct state.Account) *time.Tim
 // An omitted deadline receives the plan default; a requested deadline beyond
 // the plan max is clamped to now + plan max.
 func deadlineForRequest(reqDeadline *time.Time, acct state.Account) *time.Time {
+	return deadlineForRequestAt(time.Now().UTC(), reqDeadline, acct)
+}
+
+func deadlineForRequestAt(base time.Time, reqDeadline *time.Time, acct state.Account) *time.Time {
 	limits := api.MustLimitsFor(acct.Plan)
 	if limits.MaxAsyncInvocationDeadlineSeconds <= 0 {
 		return nil
 	}
-	maxDeadline := time.Now().UTC().Add(time.Duration(limits.MaxAsyncInvocationDeadlineSeconds) * time.Second)
+	maxDeadline := base.UTC().Add(time.Duration(limits.MaxAsyncInvocationDeadlineSeconds) * time.Second)
 	if reqDeadline == nil {
 		return &maxDeadline
 	}
@@ -723,9 +903,9 @@ func validateInvocationRetryPolicy(policy *api.RetryPolicyDTO) *api.Problem {
 	if policy == nil {
 		return nil
 	}
-	if policy.MaxAttempts < 0 || policy.MaxAttempts > 25 {
+	if policy.MaxAttempts < 0 || policy.MaxAttempts > api.DurableRetryMaxAttempts {
 		return api.NewProblem(http.StatusUnprocessableEntity, api.CodeValidation,
-			"Invalid invocation retry policy", "max_attempts must be between 0 and 25")
+			"Invalid invocation retry policy", fmt.Sprintf("max_attempts must be between 0 and %d", api.DurableRetryMaxAttempts))
 	}
 	if policy.BaseSeconds < 0 || math.IsNaN(policy.BaseSeconds) || math.IsInf(policy.BaseSeconds, 0) {
 		return api.NewProblem(http.StatusUnprocessableEntity, api.CodeValidation,
@@ -746,11 +926,8 @@ func validateInvocationRetryPolicy(policy *api.RetryPolicyDTO) *api.Problem {
 	return nil
 }
 
-// marshalRetryPolicy (ADR-134 PR-B) converts the wire DTO into
-// the JSONB blob pgstore stores verbatim. Returns nil when the
-// customer didn't override — EnqueueInvocation's nullable column
-// then leaves retry_policy NULL and the drain falls back to the
-// plan default.
+// marshalRetryPolicy (ADR-134 PR-B) converts the wire DTO into the JSONB blob
+// pgstore stores verbatim.
 func marshalRetryPolicy(p *api.RetryPolicyDTO) json.RawMessage {
 	if p == nil {
 		return nil
@@ -766,17 +943,19 @@ func marshalRetryPolicy(p *api.RetryPolicyDTO) json.RawMessage {
 }
 
 // effectiveInvocationRetryPolicy applies deterministic precedence for an
-// invocation row: an explicit request override wins; otherwise the app-level
-// default is copied into the row. Queue binding consumers can replace this
-// value with their binding policy before dispatch.
-func effectiveInvocationRetryPolicy(app state.App, override *api.RetryPolicyDTO) json.RawMessage {
+// invocation row: an explicit request override wins, followed by the app
+// default, followed by the plan default. The materialized row is always
+// finite and plan-capped; the scheduler clamps it again at dispatch time so a
+// later plan downgrade cannot retain a larger budget.
+func effectiveInvocationRetryPolicy(app state.App, override *api.RetryPolicyDTO, planLimit int) json.RawMessage {
+	policy := api.RetryPolicyDTO{}
 	if override != nil {
-		return marshalRetryPolicy(override)
+		policy = *override
+	} else if len(app.RetryPolicyJSON) > 0 && string(app.RetryPolicyJSON) != "{}" {
+		_ = json.Unmarshal(app.RetryPolicyJSON, &policy)
 	}
-	if len(app.RetryPolicyJSON) == 0 || string(app.RetryPolicyJSON) == "{}" {
-		return nil
-	}
-	return append(json.RawMessage(nil), app.RetryPolicyJSON...)
+	policy.MaxAttempts = api.EffectiveRetryMaxAttempts(policy.MaxAttempts, planLimit)
+	return marshalRetryPolicy(&policy)
 }
 
 func ptrTime(t *time.Time) time.Time {
@@ -902,6 +1081,11 @@ func (s *server) replayInvocation(w http.ResponseWriter, r *http.Request, acct s
 	// lifecycle. LeaseExpiresAt / ReceivedAt / CompletedAt / Result /
 	// LastError / AckURL are nil on a fresh INSERT; the drain
 	// populates them as the row flows through dispatch.
+	invocationHeaders, err := pkgtrace.MergeHeaders(r.Context(), orig.Headers)
+	if err != nil {
+		api.WriteProblem(w, api.ErrValidation("original invocation headers must be a JSON object of string values"))
+		return
+	}
 	inv, err := s.store.EnqueueInvocation(r.Context(), state.Invocation{
 		AppID:                orig.AppID,
 		AccountID:            acct.ID,
@@ -909,8 +1093,9 @@ func (s *server) replayInvocation(w http.ResponseWriter, r *http.Request, acct s
 		Method:               orig.Method,
 		Path:                 orig.Path,
 		Payload:              orig.Payload,
-		Headers:              orig.Headers,
+		Headers:              invocationHeaders,
 		DueAt:                time.Now().UTC(),
+		RetryPolicyJSON:      effectiveInvocationRetryPolicy(app, nil, api.MustLimitsFor(acct.Plan).MaxQueueAttempts),
 		DeadlineAt:           deadlineForRequest(nil, acct),
 		ResultRetentionUntil: retentionForRequest(nil, acct),
 	})

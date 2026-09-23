@@ -380,6 +380,27 @@ func (h *Handler) snapshotTrustedPublishers(appID string) []cosign.TrustedPublis
 	return out
 }
 
+// checkImageSignature performs a non-mutating provenance check against the
+// current in-memory trust list. It is shared by the deploy gate and the live
+// signer-revocation reconciler; callers decide whether a failure should fail
+// a deployment or quarantine an already-live app.
+func (h *Handler) checkImageSignature(ctx context.Context, app state.App, ref string) (string, error) {
+	pubs := h.snapshotTrustedPublishers(app.ID)
+	if len(pubs) == 0 {
+		// Defence-in-depth: apid's pre-flight already gated this
+		// case, but if imaged is called outside the apid pipeline
+		// (a future admin CLI, a live revalidation), refuse the
+		// signature check rather than verify against an empty
+		// allowlist.
+		return "", fmt.Errorf("%w: require_signed=true but no trusted publishers configured", cosign.ErrSignatureInvalid)
+	}
+	if h == nil || h.oci == nil {
+		return "", errors.New("imaged: image signature verifier unavailable")
+	}
+	signer, _, err := cosign.VerifyImageSignature(ctx, &ociImageSignaturePuller{oci: h.oci}, ref, pubs)
+	return signer, err
+}
+
 // verifyImageSignature is the deploy-time verify hook (issue #472 /
 // ADR-054). Branches on apps.require_signed; if true, calls
 // pkg/cosign.VerifyImageSignature against the in-memory trust list
@@ -394,18 +415,7 @@ func (h *Handler) snapshotTrustedPublishers(appID string) []cosign.TrustedPublis
 // answers "request accepted but verify failed in imaged" without
 // re-deriving from deployment status.
 func (h *Handler) verifyImageSignature(ctx context.Context, app state.App, dep state.Deployment, ref string) error {
-	pubs := h.snapshotTrustedPublishers(app.ID)
-	if len(pubs) == 0 {
-		// Defence-in-depth: apid's pre-flight already gated this
-		// case, but if imaged is called outside the apid pipeline
-		// (a future admin CLI, a test harness), refuse the
-		// signature check rather than verify against an empty
-		// allowlist.
-		err := fmt.Errorf("%w: require_signed=true but no trusted publishers configured", cosign.ErrSignatureInvalid)
-		_ = h.markDeployFailed(ctx, dep.ID, err, "signature_invalid: no trusted publishers")
-		return err
-	}
-	signer, _, err := cosign.VerifyImageSignature(ctx, &ociImageSignaturePuller{oci: h.oci}, ref, pubs)
+	signer, err := h.checkImageSignature(ctx, app, ref)
 	if err == nil {
 		h.log.Info("image signature verified", "app", app.Slug, "deployment", dep.ID, "signer", signer, "ref", ref)
 		return nil
@@ -2995,14 +3005,15 @@ func (h *Handler) handleDeploymentActivation(ctx context.Context, snapshot snaps
 	} else if currentStage != state.StageReadiness && currentStage != "" {
 		h.log.Debug("mark live: stage already advanced", "deployment_id", dep.ID, "current_stage", currentStage)
 	}
-	if ready == nil && h.ops != nil && len(appended.StageState) > 0 {
+	if h.ops != nil && len(appended.StageState) > 0 {
 		var ss state.StageState
 		if json.Unmarshal(appended.StageState, &ss) == nil && len(ss.History) > 0 {
-			for i := len(ss.History) - 1; i >= 0; i-- {
-				stage := ss.History[i]
-				if stage.Name == state.StageSnapshotPrepare && stage.StartedAt != nil && stage.EndedAt != nil {
-					h.ops.ObserveAPIHostingPhase(hostingFlowForApp(app), "boot", wire.APIHostingOutcomeComplete, stage.EndedAt.Sub(*stage.StartedAt))
-					break
+			stage := ss.History[len(ss.History)-1]
+			if stage.Name == state.StageSnapshotPrepare && stage.StartedAt != nil && stage.EndedAt != nil {
+				duration := stage.EndedAt.Sub(*stage.StartedAt)
+				h.ops.ObserveDeployStageDuration(string(state.StageSnapshotPrepare), "completed", duration)
+				if ready == nil {
+					h.ops.ObserveAPIHostingPhase(hostingFlowForApp(app), "boot", wire.APIHostingOutcomeComplete, duration)
 				}
 			}
 		}
@@ -3019,17 +3030,19 @@ func (h *Handler) handleDeploymentActivation(ctx context.Context, snapshot snaps
 				"deployment_id", dep.ID, "stage", "readiness", "err", serr)
 		}
 	}
-	if ready == nil && h.ops != nil && len(closed.StageState) > 0 {
-		if len(closed.StageState) > 0 {
-			var ss state.StageState
-			if json.Unmarshal(closed.StageState, &ss) == nil && len(ss.History) > 0 {
-				last := ss.History[len(ss.History)-1]
-				if last.Name == state.StageReadiness && last.StartedAt != nil && last.EndedAt != nil {
-					h.ops.ObserveAPIHostingPhase(hostingFlowForApp(app), "readiness", wire.APIHostingOutcomeComplete, last.EndedAt.Sub(*last.StartedAt))
+	if h.ops != nil && len(closed.StageState) > 0 {
+		var ss state.StageState
+		if json.Unmarshal(closed.StageState, &ss) == nil && len(ss.History) > 0 {
+			last := ss.History[len(ss.History)-1]
+			if last.Name == state.StageReadiness && last.StartedAt != nil && last.EndedAt != nil {
+				duration := last.EndedAt.Sub(*last.StartedAt)
+				h.ops.ObserveDeployStageDuration(string(state.StageReadiness), "completed", duration)
+				if ready == nil {
+					h.ops.ObserveAPIHostingPhase(hostingFlowForApp(app), "readiness", wire.APIHostingOutcomeComplete, duration)
 				}
 			}
 		}
-		if state.IsDeveloperApp(app) {
+		if ready == nil && state.IsDeveloperApp(app) {
 			// The live notification is the route switch boundary for a
 			// developer environment. There is no customer-derived label.
 			h.ops.ObserveAPIHostingPhase(wire.APIHostingFlowDev, "route_switch", wire.APIHostingOutcomeComplete, 0)

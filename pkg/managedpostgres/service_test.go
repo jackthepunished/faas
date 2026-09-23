@@ -79,6 +79,7 @@ func testCapabilities() Capabilities {
 		PostgresMajors:          []int{16, 17},
 		ServiceClasses:          []ServiceClass{ClassDevelopment, ClassBurstable},
 		Availability:            []Availability{AvailabilitySingleZone},
+		CredentialAccess:        []CredentialAccess{CredentialReadWrite, CredentialReadOnly},
 		ScaleToZero:             true,
 		PooledConnections:       true,
 		PointInTimeRestore:      true,
@@ -300,6 +301,9 @@ func TestRestoreCreatesIndependentDurableTargetAndIsIdempotent(t *testing.T) {
 	if _, err := service.Delete(context.Background(), "account-a", source.ID); !errors.Is(err, ErrConflict) {
 		t.Fatalf("source delete with active restore = %v, want conflict", err)
 	}
+	if provider.deleteCalls != 0 {
+		t.Fatalf("source delete contacted provider with active restore %d times", provider.deleteCalls)
+	}
 	if _, err := service.Delete(context.Background(), "account-a", restored.ID); err != nil {
 		t.Fatalf("restore target delete: %v", err)
 	}
@@ -407,6 +411,30 @@ func TestDeleteSupportsAsynchronousProviders(t *testing.T) {
 	}
 }
 
+func TestDeleteRejectsActiveBindingBeforeProviderCall(t *testing.T) {
+	provider := &fakeProvider{capabilities: testCapabilities(), provisionStatus: ProviderStatusReady, deleteDone: true}
+	store := NewMemoryStore()
+	service := testService(t, testRegistry(t, provider, nil), store)
+	database, err := service.Create(context.Background(), CreateRequest{AccountID: "account-a", Name: "bound", Spec: testSpec()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	createdAt := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
+	if _, created, err := store.ReserveBinding(context.Background(), testBinding("account-a", database.ID, "app-a", "binding-a", createdAt)); err != nil || !created {
+		t.Fatalf("reserve binding: created=%v err=%v", created, err)
+	}
+	if _, err := service.Delete(context.Background(), "account-a", database.ID); !errors.Is(err, ErrConflict) {
+		t.Fatalf("Delete with active binding = %v, want ErrConflict", err)
+	}
+	if provider.deleteCalls != 0 {
+		t.Fatalf("provider delete calls = %d, want 0", provider.deleteCalls)
+	}
+	current, err := service.Get(context.Background(), "account-a", database.ID)
+	if err != nil || current.State != StateReady || current.LeaseToken != "" {
+		t.Fatalf("database changed after rejected delete: database=%+v err=%v", current, err)
+	}
+}
+
 func TestDeleteLetsProviderDiscoverAnUnpersistedUpstreamResource(t *testing.T) {
 	provider := &fakeProvider{capabilities: testCapabilities(), deleteDone: true}
 	registry := testRegistry(t, provider, nil)
@@ -453,6 +481,34 @@ func TestPlacementFingerprintFencesRepurposedBackend(t *testing.T) {
 	resolved, err := rotatedSecret.Resolve(oldBackend.ID, oldBackend.Fingerprint)
 	if err != nil || resolved.Fingerprint != oldBackend.Fingerprint {
 		t.Fatalf("credential rotation changed placement: %+v, %v", resolved, err)
+	}
+}
+
+func TestCapabilitiesValidateAndSupportCredentialAccess(t *testing.T) {
+	capabilities := testCapabilities()
+	for _, access := range []CredentialAccess{CredentialReadWrite, CredentialReadOnly} {
+		if err := capabilities.SupportsCredentialAccess(access); err != nil {
+			t.Fatalf("SupportsCredentialAccess(%q) = %v", access, err)
+		}
+	}
+	if err := capabilities.SupportsCredentialAccess(CredentialAccess("owner")); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("unknown credential access = %v, want ErrInvalid", err)
+	}
+
+	capabilities.CredentialAccess = []CredentialAccess{CredentialReadWrite}
+	if err := capabilities.SupportsCredentialAccess(CredentialReadOnly); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("unsupported credential access = %v, want ErrUnsupported", err)
+	}
+	if err := capabilities.Validate(); err != nil {
+		t.Fatalf("read-write-only capabilities = %v", err)
+	}
+	capabilities.CredentialAccess = []CredentialAccess{CredentialReadWrite, CredentialReadWrite}
+	if err := capabilities.Validate(); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("duplicate credential access = %v, want ErrInvalid", err)
+	}
+	capabilities.CredentialAccess = nil
+	if err := capabilities.Validate(); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("missing credential access = %v, want ErrInvalid", err)
 	}
 }
 

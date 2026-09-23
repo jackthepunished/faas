@@ -1,6 +1,7 @@
 package state_test
 
 import (
+	"encoding/json"
 	"errors"
 	"net/netip"
 	"testing"
@@ -8,8 +9,55 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/state"
 )
+
+func TestPgStorePrivateNetworkDeletionRollsBackWhenTeardownEnqueueFails(t *testing.T) {
+	s, pool, ctx := pgStoreWithPool(t)
+	acct, err := s.CreateAccount(ctx, "private-network-outbox-"+uuid.NewString()+"@example.com", api.PlanPro)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	network, err := s.CreatePrivateNetwork(ctx, state.PrivateNetwork{
+		AccountID: acct.ID, Name: "teardown", Region: "fra1",
+		CIDR: netip.MustParsePrefix("10.91.0.0/28"),
+	})
+	if err != nil {
+		t.Fatalf("CreatePrivateNetwork: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `alter table notification_outbox add constraint reject_private_network_teardown_test check (channel <> 'private_network_changed')`); err != nil {
+		t.Fatalf("install outbox failure: %v", err)
+	}
+	if err := s.DeletePrivateNetworkDurably(ctx, acct.ID, network.ID); err == nil {
+		t.Fatal("deletion succeeded despite failed teardown enqueue")
+	}
+	if got, err := s.GetPrivateNetwork(ctx, acct.ID, network.ID); err != nil || got.ID != network.ID {
+		t.Fatalf("network lost after enqueue failure: got=%+v err=%v", got, err)
+	}
+	if _, err := pool.Exec(ctx, `alter table notification_outbox drop constraint reject_private_network_teardown_test`); err != nil {
+		t.Fatalf("remove outbox failure: %v", err)
+	}
+	if err := s.DeletePrivateNetworkDurably(ctx, acct.ID, network.ID); err != nil {
+		t.Fatalf("DeletePrivateNetworkDurably: %v", err)
+	}
+	var payload string
+	if err := pool.QueryRow(ctx, `select payload from notification_outbox where channel = $1 order by id desc limit 1`, db.NotifyPrivateNetworkChanged).Scan(&payload); err != nil {
+		t.Fatalf("teardown outbox row: %v", err)
+	}
+	var event struct {
+		Kind      string `json:"kind"`
+		NetworkID string `json:"network_id"`
+		Region    string `json:"region"`
+		CIDR      string `json:"cidr"`
+	}
+	if err := json.Unmarshal([]byte(payload), &event); err != nil {
+		t.Fatalf("decode teardown payload: %v", err)
+	}
+	if event.Kind != "private_network_deleted" || event.NetworkID != network.ID || event.Region != "fra1" || event.CIDR != "10.91.0.0/28" {
+		t.Fatalf("teardown payload = %+v", event)
+	}
+}
 
 // TestPgStorePrivateNetworkAndAttachmentLifecycle covers the Postgres SQL
 // boundary for the Gregale-owned network fabric. The in-memory tests exercise
@@ -109,6 +157,10 @@ func TestPgStorePrivateNetworkAndAttachmentLifecycle(t *testing.T) {
 	replayed, err := s.AllocatePrivateNetworkAddress(ctx, accountID, network.ID, "app", "one")
 	if err != nil || replayed.ID != first.ID || replayed.Address != first.Address {
 		t.Fatalf("idempotent allocation = %+v, err=%v", replayed, err)
+	}
+	members, err := s.ListPrivateNetworkAddresses(ctx, accountID, network.ID)
+	if err != nil || len(members) != 1 || members[0].ID != first.ID || members[0].Address != first.Address {
+		t.Fatalf("ListPrivateNetworkAddresses = %+v, err=%v", members, err)
 	}
 	if _, err := s.AllocatePrivateNetworkAddress(ctx, uuid.NewString(), network.ID, "app", "other"); !errors.Is(err, state.ErrNotFound) {
 		t.Fatalf("cross-account allocation = %v, want not found", err)

@@ -6,9 +6,8 @@
   ADR-028 amendment (H2C inner leg, PR #750), ADR-080 (raw-bytes Upgrade
   bridge), ADR-091 D24 §6 (edge-rule `max_body_bytes_streaming` for the
   request-side cap), ADR-046 (per-instance egress metering)
-- **Successors:** ADR-102-followup (deferred — `apps_streaming_enabled_plan_check`
-  Postgres CHECK constraint via `NOT VALID + VALIDATE`, gated on
-  post-merge telemetry confirming zero Free+flag rows in production)
+- **Successors:** ADR-102-followup (database invariant shipped by
+  `20260922131114370_apps_streaming_plan_check.sql`)
 
 ## Context
 
@@ -133,10 +132,14 @@ returns the same status on POST vs PATCH. Telemetry collapsing on
 ### D6. SDK probe
 
 `GET /v1/apps/{slug}/streaming-cap` returns the resolved status, cap,
-and gate flags pre-flight. Mirrors `GET /v1/apps/{slug}/routes` at
+and gate flags pre-flight. With `host`, `path`, and `method` supplied,
+the probe also resolves the compiled gatewayd per-edge-rule response
+cap; if gatewayd is unavailable or no rule matches, it falls back to
+the plan cap. Mirrors `GET /v1/apps/{slug}/routes` at
 `api/openapi.yaml:1396-1429`. SDK method `GetAppStreamingStatus` in
 `pkg/api/client.go` mirrors `GetAppRoutes` at
-`pkg/api/client.go:1878-1881`.
+`pkg/api/client.go:1878-1881`, with
+`GetAppStreamingStatusForRequest` for route-aware callers.
 
 ### D7. CLI probe
 
@@ -160,12 +163,15 @@ streaming apps, zero pinned-SDK customers in the wild.
 If any of these queries returns nonzero at merge time, the
 responsible clauses (D5 for the first, D3 for the second/third) must
 be re-evaluated before the PR merges. The migration CHECK constraint
-(ADR-102-followup) is the durable guarantee that closes the gap
+in ADR-102-followup is the durable guarantee that closes the gap
 permanently.
 
 ```sql
 -- D5 risk
-SELECT count(*) FROM apps WHERE streaming_enabled = true AND plan = 'free';
+SELECT count(*)
+  FROM apps a
+  JOIN accounts ac ON ac.id = a.account_id
+ WHERE a.streaming_enabled = true AND ac.plan = 'free';
 -- D3 risk (raw)
 SELECT count(*) FROM access_log l JOIN apps a ON l.app_id = a.id
   WHERE a.streaming_enabled = true AND l.accept LIKE '%application/json%';
@@ -174,17 +180,23 @@ SELECT l.sdk_version, count(*) FROM access_log l
   WHERE l.accept LIKE '%application/json%' GROUP BY l.sdk_version;
 ```
 
+## Follow-up completed
+
+- **CHECK constraint** (`apps_streaming_enabled_plan_check`) — shipped in
+  `20260922131114370_apps_streaming_plan_check.sql` after the telemetry
+  window. Because `apps` stores `account_id` rather than a plan snapshot,
+  the migration uses a stable helper in the CHECK and a constraint trigger
+  to reject paid → Free downgrades while an app is still streaming-enabled.
+- **Response-cap validation** — the `s ≥ b` invariant for
+  `max_body_bytes_streaming` is enforced by `EdgeRuleLimitAction.Validate`
+  on both edge-rule create and update. The apid contract is pinned by
+  `TestEdgeRuleLimitStreamingCapValidation_CreateAndUpdate`; the gateway
+  clamp remains defense-in-depth for direct database writes.
+
 ## Deferred work
 
-- **CHECK constraint** (`apps_streaming_enabled_plan_check`) — ships
-  in ADR-102-followup after Stage 0 telemetry + post-merge telemetry
-  confirms zero Free+flag rows in production. Uses `NOT VALID +
-  VALIDATE` idiom per migration 00155 precedent.
 - **`accept-json-downgrade` enum variant deletion** — after one
   release cycle (~30 days post-merge). Advisory header drops with it.
-- **Per-endpoint response cap validation** at apid — verify the `s ≥
-  b` invariant from `pkg/api/dto.go:4188` applies to the response cap
-  at validate-time (not just runtime trust). Track in §17 gaps.
 
 ## References
 

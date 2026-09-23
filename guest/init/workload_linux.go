@@ -64,6 +64,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -100,11 +101,13 @@ type workloadSpec struct {
 	DependsOn     []api.WorkloadDependency `json:"depends_on,omitempty"`
 	Entrypoint    []string                 `json:"entrypoint,omitempty"`
 	Essential     bool                     `json:"essential"`
+	LivenessProbe *api.SidecarProbe        `json:"liveness_probe,omitempty"`
 	Name          string                   `json:"name"`
 	Port          int                      `json:"port"`
 	Ports         []api.WorkloadPort       `json:"ports,omitempty"`
 	RamMB         int                      `json:"ram_mb"`
 	ScratchMB     int                      `json:"scratch_mb,omitempty"`
+	StartupProbe  *api.SidecarProbe        `json:"startup_probe,omitempty"`
 	Type          string                   `json:"type"` // "main" | "init" | "sidecar"
 }
 
@@ -125,12 +128,27 @@ type workloadSpec struct {
 // manifest, not the compatibility stamp.
 const workloadRosterPath = "/etc/faas/workloads.json"
 
+// companionSharedDirectoryRoot is the task-local memory-volume namespace.
+// Every workload sees the same per-companion directories at the same absolute
+// paths; data is instance-scoped and disappears with the microVM.
+const companionSharedDirectoryRoot = "/tmp/gregale/companions"
+
+func companionSharedDirectory(name string) string {
+	return filepath.Join(companionSharedDirectoryRoot, name)
+}
+
 // workloadRoster mirrors the deployment-level roster shape.
 // Main is the canonical main-workload spec; Sidecars is the
 // per-sidecar array (nil/empty = legacy single-workload path).
 type workloadRoster struct {
 	Main     workloadSpec   `json:"main"`
 	Sidecars []workloadSpec `json:"sidecars"`
+}
+
+type workloadRuntime struct {
+	spec  workloadSpec
+	sup   *Supervisor
+	state *workloadDependencyState
 }
 
 // discoverRoster reads the workload roster from the merged
@@ -305,16 +323,21 @@ func runWorkloads(mainManifest api.AppManifest, roster workloadRoster, secrets, 
 		return err
 	}
 
-	type workloadRuntime struct {
-		spec  workloadSpec
-		sup   *Supervisor
-		state *workloadDependencyState
-	}
 	runtimes := make(map[string]*workloadRuntime, 1+len(roster.Sidecars))
 	mainSup := newSupervisorForMain(roster.Main, mainManifest, secrets, apiEnv, log, workloadEnv)
 	runtimes["main"] = &workloadRuntime{spec: roster.Main, sup: mainSup, state: newWorkloadDependencyState()}
 	for _, sc := range roster.Sidecars {
-		runtimes[sc.Name] = &workloadRuntime{spec: sc, sup: newSupervisorFor(sc, secrets, apiEnv, log, sidecarProxy, workloadEnv), state: newWorkloadDependencyState()}
+		sup := newSupervisorFor(sc, secrets, apiEnv, log, sidecarProxy, workloadEnv)
+		if baked, found, manifestErr := sidecarManifestForRuntime(sc.Name); manifestErr != nil {
+			return fmt.Errorf("workload %q: load sidecar runtime manifest: %w", sc.Name, manifestErr)
+		} else if found {
+			// Sidecar image metadata is immutable and stays outside the
+			// deployment roster. Project the OCI stop contract onto the
+			// supervisor before it can receive a shutdown signal.
+			sup.stopSignal = parseStopSignal(baked.StopSignal)
+			sup.stopGrace = stopGraceForManifest(baked.StopGracePeriod)
+		}
+		runtimes[sc.Name] = &workloadRuntime{spec: sc, sup: sup, state: newWorkloadDependencyState()}
 	}
 	orderedNames, err := workloadStartOrder(roster, deps)
 	if err != nil {
@@ -324,6 +347,14 @@ func runWorkloads(mainManifest api.AppManifest, roster workloadRoster, secrets, 
 		rt := rt
 		rt.sup.onStart = func() { close(rt.state.started) }
 		rt.sup.onHealthy = func() { close(rt.state.healthy) }
+		if rt.spec.Type == "sidecar" && sidecarProxy != nil {
+			name := rt.spec.Name
+			rt.sup.onHealth = func(status, reason string) {
+				if err := sidecarProxy.SendHealth(name, status, reason); err != nil {
+					log.Warn("runWorkloads: sidecar health send failed", "name", name, "status", status, "err", err)
+				}
+			}
+		}
 	}
 
 	// The characterization probe observes only the main workload's PID.
@@ -334,14 +365,90 @@ func runWorkloads(mainManifest api.AppManifest, roster workloadRoster, secrets, 
 	var wg sync.WaitGroup
 	var resultMu sync.Mutex
 	var mainErr error
-	stopAll := func() {
-		for _, rt := range runtimes {
-			rt.sup.RequestStop()
-			if err := rt.sup.ForwardSignal(syscall.SIGTERM); err != nil && !errors.Is(err, os.ErrProcessDone) {
-				log.Debug("runWorkloads: stop signal forwarding failed", "name", rt.spec.Name, "err", err)
+	var stopOnce sync.Once
+	stopAll := func(reason string) {
+		stopOnce.Do(func() {
+			log.Info("runWorkloads: stopping workload set", "reason", reason)
+			var stopWg sync.WaitGroup
+			for _, rt := range runtimes {
+				rt := rt
+				stopWg.Add(1)
+				go func() {
+					defer stopWg.Done()
+					sig := rt.sup.stopSignal
+					if sig == 0 {
+						sig = defaultStopSignal
+					}
+					grace := stopGraceForManifest(rt.sup.stopGrace)
+					if err := rt.sup.Stop(context.Background(), sig, grace); err != nil && !errors.Is(err, os.ErrProcessDone) {
+						log.Debug("runWorkloads: graceful stop failed", "name", rt.spec.Name, "signal", sig.String(), "grace", grace.String(), "err", err)
+					}
+				}()
+			}
+			stopWg.Wait()
+		})
+	}
+
+	// runWorkloads is the PID-1 path for multi-workload deployments. Install
+	// the same signal bridge as the legacy single-workload path so a shutdown
+	// reaches every main/sidecar process, not just the process tracked by the
+	// first supervisor.
+	sigCh := make(chan os.Signal, 8)
+	signal.Notify(sigCh,
+		defaultStopSignal,
+		syscall.SIGINT,
+		syscall.SIGQUIT,
+		syscall.SIGHUP,
+		syscall.SIGUSR1,
+		syscall.SIGUSR2,
+		syscall.SIGCHLD,
+	)
+	signalDone := make(chan struct{})
+	go func() {
+		defer close(signalDone)
+		for {
+			select {
+			case <-coordCtx.Done():
+				return
+			case sig := <-sigCh:
+				if sig == syscall.SIGCHLD {
+					reapOne(log)
+					continue
+				}
+				ss, ok := sig.(syscall.Signal)
+				if !ok {
+					continue
+				}
+				configuredStop := false
+				for _, rt := range runtimes {
+					if rt.sup.stopSignal == ss {
+						configuredStop = true
+						break
+					}
+				}
+				if ss == defaultStopSignal || configuredStop {
+					cancel()
+					stopAll("external-signal")
+					return
+				}
+				for _, rt := range runtimes {
+					if err := rt.sup.ForwardSignal(ss); err != nil && !errors.Is(err, os.ErrProcessDone) {
+						log.Debug("runWorkloads: signal forwarding failed", "name", rt.spec.Name, "signal", ss.String(), "err", err)
+					}
+				}
+				if ss == syscall.SIGINT || ss == syscall.SIGQUIT {
+					cancel()
+					stopAll("external-signal")
+					return
+				}
 			}
 		}
-	}
+	}()
+	defer func() {
+		cancel()
+		<-signalDone
+		signal.Stop(sigCh)
+	}()
 	for _, name := range orderedNames {
 		rt := runtimes[name]
 		name, rt := name, rt
@@ -358,7 +465,7 @@ func runWorkloads(mainManifest api.AppManifest, roster workloadRoster, secrets, 
 						}
 						resultMu.Unlock()
 						cancel()
-						stopAll()
+						stopAll("dependency-failure")
 					}
 					return
 				}
@@ -402,6 +509,9 @@ func runWorkloads(mainManifest api.AppManifest, roster workloadRoster, secrets, 
 				}
 			}
 			if runErr != nil {
+				if rt.spec.Type == "sidecar" && coordCtx.Err() == nil {
+					rt.sup.reportHealth("failed", runErr.Error())
+				}
 				critical := name == "main" || rt.spec.Essential
 				log.Error("runWorkloads: workload exited with error", "name", name, "essential", rt.spec.Essential, "err", runErr)
 				if critical {
@@ -411,7 +521,7 @@ func runWorkloads(mainManifest api.AppManifest, roster workloadRoster, secrets, 
 					}
 					resultMu.Unlock()
 					cancel()
-					stopAll()
+					stopAll("workload-exit")
 				}
 			}
 		}()
@@ -436,28 +546,46 @@ func hydrateSidecarPortMetadata(roster *workloadRoster) error {
 		if len(spec.Ports) > 0 || spec.Port != 0 {
 			continue
 		}
-		directRoot, err := fullRootfsSidecarRoot(spec.Name)
+		baked, found, err := sidecarManifestForRuntime(spec.Name)
 		if err != nil {
-			return fmt.Errorf("workload %q: resolve sidecar root: %w", spec.Name, err)
+			return fmt.Errorf("workload %q: load sidecar manifest: %w", spec.Name, err)
 		}
-		var baked api.AppManifest
-		if directRoot != "" {
-			baked, err = loadSidecarManifestAt(directRoot, spec.Name)
-		} else {
-			baked, err = loadSidecarManifest(spec.Name)
-		}
-		if err == nil {
+		if found {
 			spec.Ports = append([]api.WorkloadPort(nil), baked.Ports...)
 			if len(spec.Ports) == 0 && baked.Port != 0 {
 				spec.Ports = []api.WorkloadPort{{Port: baked.Port, Protocol: api.WorkloadPortTCP}}
 			}
-			continue
-		}
-		if !isNotExist(err) {
-			return fmt.Errorf("workload %q: load sidecar manifest: %w", spec.Name, err)
 		}
 	}
 	return nil
+}
+
+// sidecarManifestForRuntime loads the immutable image manifest used to
+// configure lifecycle semantics before a sidecar supervisor starts. A legacy
+// sidecar layer without a baked manifest is valid and returns found=false.
+func sidecarManifestForRuntime(name string) (api.AppManifest, bool, error) {
+	return sidecarManifestForRuntimeAt("/", name)
+}
+
+func sidecarManifestForRuntimeAt(root, name string) (api.AppManifest, bool, error) {
+	var zero api.AppManifest
+	directRoot, err := fullRootfsSidecarRootAt(root, name)
+	if err != nil {
+		return zero, false, fmt.Errorf("resolve sidecar root: %w", err)
+	}
+	var manifest api.AppManifest
+	if directRoot != "" {
+		manifest, err = loadSidecarManifestAt(directRoot, name)
+	} else {
+		manifest, err = loadSidecarManifestAt(root, name)
+	}
+	if isNotExist(err) {
+		return zero, false, nil
+	}
+	if err != nil {
+		return zero, false, err
+	}
+	return manifest, true, nil
 }
 
 // newSupervisorForMain builds the main workload's supervisor
@@ -469,7 +597,12 @@ func hydrateSidecarPortMetadata(roster *workloadRoster) error {
 // the merged env).
 func newSupervisorForMain(spec workloadSpec, manifest api.AppManifest, secrets, apiEnv map[string]string, log *slog.Logger, workloadEnvOpt ...map[string]string) *Supervisor {
 	policy, maxRestarts := supervisorPolicyFromManifest(manifest)
-	supRef := &Supervisor{Max: maxRestarts, Policy: policy}
+	supRef := &Supervisor{
+		Max:        maxRestarts,
+		Policy:     policy,
+		stopSignal: parseStopSignal(manifest.StopSignal),
+		stopGrace:  stopGraceForManifest(manifest.StopGracePeriod),
+	}
 	workloadEnv := firstWorkloadEnv(workloadEnvOpt)
 	supRef.Start = func() error {
 		return runAppWithRAMAndWorkloadEnv(manifest, secrets, apiEnv, supRef, spec.RamMB, workloadEnv, spec.CPUMillicores)
@@ -497,12 +630,18 @@ func newSupervisorFor(spec workloadSpec, secrets, apiEnv map[string]string, log 
 	if spec.Type == "init" || !spec.Essential {
 		maxRestarts = 0 // init and non-essential sidecars do not restart
 	}
-	supRef := &Supervisor{Max: maxRestarts, Policy: api.RestartPolicyOnFailure}
+	supRef := &Supervisor{
+		Max:        maxRestarts,
+		Policy:     api.RestartPolicyOnFailure,
+		stopSignal: defaultStopSignal,
+		stopGrace:  MaxAppManifestStopGracePeriodFallback,
+	}
 	workloadEnv := firstWorkloadEnv(workloadEnvOpt)
 	supRef.Start = func() error { return runSidecar(spec, secrets, apiEnv, workloadEnv, supRef) }
 	supRef.OnCrash = func(attempt int, err error) {
 		fmt.Fprintf(os.Stderr, "guest-init: sidecar %s crashed (restart %d/%d): %v\n",
 			spec.Name, attempt, maxRestarts, err)
+		supRef.reportHealth("restarting", fmt.Sprintf("restart_%d", attempt))
 		// PR-C §4: ship the sidecar_restart envelope so vmmd
 		// can increment <daemon>_sidecar_restart_total AND
 		// emit events.SidecarRestart. A send error is
@@ -580,6 +719,24 @@ func runSidecar(spec workloadSpec, secrets, apiEnv, workloadEnv map[string]strin
 		}
 	} else {
 		return fmt.Errorf("run sidecar %s: load baked manifest: %w", spec.Name, manifestErr)
+	}
+	// The startup probe gates dependency health. An explicit liveness probe is
+	// independent; when omitted, reuse the effective startup probe to preserve
+	// the historical OCI HEALTHCHECK monitoring behavior.
+	startupProbe := spec.StartupProbe
+	if startupProbe == nil && manifestErr == nil {
+		startupProbe = sidecarProbeFromHealthcheck(baked.Healthcheck)
+	}
+	livenessProbe := spec.LivenessProbe
+	if livenessProbe == nil {
+		livenessProbe = startupProbe
+	}
+	probePort := spec.Port
+	if probePort == 0 {
+		probePort = port
+	}
+	if probePort == 0 {
+		probePort = api.DefaultAppPort
 	}
 	// Per-sidecar deployment overrides are staged into the instance-scoped
 	// main upper by vmmd. They win over image defaults (and over the legacy
@@ -669,18 +826,55 @@ func runSidecar(spec workloadSpec, secrets, apiEnv, workloadEnv map[string]strin
 	}
 	if sup != nil {
 		sup.markStarted()
-		if sup.onHealthy != nil && manifestErr == nil {
+		if spec.Type == "sidecar" {
+			sup.reportHealth("starting", "process_started")
+		}
+		if sup.onHealthy != nil && startupProbe != nil {
 			uid := lookupUID(baked.EffectiveUser())
 			if directRoot != "" {
 				uid = lookupUIDInRoot(directRoot, baked.EffectiveUser())
 			}
-			if err := runStartupHealthcheck(baked, env, cmd.Dir, directRoot, uid, cmd.SysProcAttr, slog.Default()); err != nil {
+			if err := runStartupProbe(startupProbe, probePort, env, cmd.Dir, directRoot, uid, cmd.SysProcAttr, slog.Default()); err != nil {
+				if spec.Type == "sidecar" {
+					sup.reportHealth("unhealthy", err.Error())
+				}
 				_ = cmd.Process.Kill()
 				_ = cmd.Wait()
 				return fmt.Errorf("run sidecar %s: %w", spec.Name, err)
 			}
 		}
 		sup.markHealthy()
+		if spec.Type == "sidecar" {
+			sup.reportHealth("healthy", "startup_probe_passed")
+		}
+	}
+	var healthCancel context.CancelFunc
+	var healthDone <-chan struct{}
+	healthErrCh := make(chan error, 1)
+	if spec.Type == "sidecar" && !sidecarProbeDisabled(livenessProbe) {
+		healthCtx, cancelHealth := context.WithCancel(context.Background())
+		healthCancel = cancelHealth
+		done := make(chan struct{})
+		healthDone = done
+		go func() {
+			defer close(done)
+			uid := lookupUID(baked.EffectiveUser())
+			if directRoot != "" {
+				uid = lookupUIDInRoot(directRoot, baked.EffectiveUser())
+			}
+			monitorSidecarProbe(healthCtx, livenessProbe, probePort, env, cmd.Dir, directRoot, uid, cmd.SysProcAttr, func(err error) {
+				if sup != nil {
+					sup.reportHealth("unhealthy", err.Error())
+				}
+				select {
+				case healthErrCh <- err:
+				default:
+				}
+				if killErr := cmd.Process.Kill(); killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
+					slog.Default().Debug("runSidecar: healthcheck kill failed", "name", spec.Name, "err", killErr)
+				}
+			}, slog.Default())
+		}()
 	}
 	// Issue #463 / ADR-069 / PR-B AC #4: place the
 	// forked child into the cgroup leaf so the OOM
@@ -690,8 +884,18 @@ func runSidecar(spec workloadSpec, secrets, apiEnv, workloadEnv map[string]strin
 	if leaf != "" {
 		placeIntoLeaf(leaf, cmd.Process.Pid, slog.Default())
 	}
-	if err := cmd.Wait(); err != nil {
-		return fmt.Errorf("run sidecar %s: %w", spec.Name, err)
+	runErr := cmd.Wait()
+	if healthCancel != nil {
+		healthCancel()
+		<-healthDone
+	}
+	select {
+	case healthErr := <-healthErrCh:
+		return fmt.Errorf("run sidecar %s: %w", spec.Name, healthErr)
+	default:
+	}
+	if runErr != nil {
+		return fmt.Errorf("run sidecar %s: %w", spec.Name, runErr)
 	}
 	return nil
 }

@@ -22,6 +22,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/reqbudget"
+	"github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/wire"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -61,6 +62,7 @@ type fakeBackend struct {
 	// branch (PR scale-out readiness).
 	wakeMethodOut       WakeMethod
 	lastAdmitDeployment string
+	lastAdmitScope      string
 	lastAdmitTrigger    string
 	lastAdmitMax        int
 	// failNextPick forces the next Pick call to return !ok so the
@@ -211,7 +213,7 @@ func (b *fakeBackend) HealthyCount(_ string) int {
 	return 0
 }
 
-func (b *fakeBackend) Admit(ctx context.Context, _, deploymentID, _, trigger string, maxConcurrency int) (string, WakeMethod, bool, error) {
+func (b *fakeBackend) Admit(ctx context.Context, _, deploymentID, scope, trigger string, maxConcurrency int) (string, WakeMethod, bool, error) {
 	// Issue #168 fan-out invariant: the HealthyCount + addTarget pair
 	// must be serialized. The fakeBackend takes b.mu for the whole
 	// call so concurrent Admit callers cannot collectively exceed
@@ -221,6 +223,7 @@ func (b *fakeBackend) Admit(ctx context.Context, _, deploymentID, _, trigger str
 	defer b.mu.Unlock()
 	b.lastAdmitCorrelation, _ = wire.FromContext(ctx)
 	b.lastAdmitDeployment = deploymentID
+	b.lastAdmitScope = scope
 	b.lastAdmitTrigger = trigger
 	b.lastAdmitMax = maxConcurrency
 	if len(b.targets) >= maxConcurrency {
@@ -308,12 +311,12 @@ func TestColdStartReconcilesOnlyThroughWakeLeader(t *testing.T) {
 	h := NewHandlerWith(b, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	results := make(chan error, 2)
 	go func() {
-		_, _, _, err := h.coldStart(context.Background(), "app-1", "acct-1", "", 1, api.PlanFree, 0)
+		_, _, _, err := h.coldStart(context.Background(), "app-1", "acct-1", "", 1, api.PlanFree, 0, sched.TriggerGateway)
 		results <- err
 	}()
 	<-b.reconcileStart
 	go func() {
-		_, _, _, err := h.coldStart(context.Background(), "app-1", "acct-1", "", 1, api.PlanFree, 0)
+		_, _, _, err := h.coldStart(context.Background(), "app-1", "acct-1", "", 1, api.PlanFree, 0, sched.TriggerGateway)
 		results <- err
 	}()
 	deadline := time.Now().Add(time.Second)
@@ -733,17 +736,120 @@ func TestEdgeRuleThrottleReturns429(t *testing.T) {
 	}
 }
 
+type stubCountryReader struct {
+	country string
+	found   bool
+	err     error
+}
+
+func (s stubCountryReader) Lookup(net.IP) (string, bool, error) {
+	return s.country, s.found, s.err
+}
+
+func TestResolveThrottleDimension_CountryAndJWTClaim(t *testing.T) {
+	h := (&Handler{}).WithGeoReader(stubCountryReader{country: "tr", found: true})
+	req := httptest.NewRequest(http.MethodGet, "http://api.example.com/", nil)
+	req.Header.Set("X-Forwarded-For", "203.0.113.10")
+
+	value, ok, unavailable := h.resolveThrottleDimension(req, &EdgeRuleThrottleResolved{KeyBy: api.ThrottleKeyByCountry})
+	if value != "TR" || !ok || unavailable != "" {
+		t.Fatalf("country dimension = (%q, %v, %q), want (TR, true, empty)", value, ok, unavailable)
+	}
+
+	ctx := withAuthenticated(req.Context(), Authenticated{JWTClaims: map[string]string{"tenant_id": "tenant-42"}})
+	req = req.WithContext(ctx)
+	value, ok, unavailable = h.resolveThrottleDimension(req, &EdgeRuleThrottleResolved{
+		KeyBy: api.ThrottleKeyByJWTClaim, JWTClaimName: "tenant_id",
+	})
+	if value != "tenant-42" || !ok || unavailable != "" {
+		t.Fatalf("JWT claim dimension = (%q, %v, %q), want (tenant-42, true, empty)", value, ok, unavailable)
+	}
+}
+
+func TestEdgeRuleThrottle_MissingIdentityRejectsBeforeTokenConsume(t *testing.T) {
+	h := NewHandlerWith(&fakeBackend{}, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.edgeRules = stubEdgeRuleMatcher{throttle: &EdgeRuleThrottleResolved{
+		ID: "rule-strict", AccountID: "acct-1", AppID: "app-1",
+		RequestsPerSecond: 10, Burst: 20,
+		KeyBy: api.ThrottleKeyByJWTClaim, JWTClaimName: "tenant_id",
+		MaxKeysPerRule: 100, MissingKeyPolicy: api.ThrottleMissingKeyReject,
+	}}
+	req := httptest.NewRequest(http.MethodGet, "http://api.example.com/", nil)
+	rec := httptest.NewRecorder()
+	if handled := h.applyEdgeRuleThrottle(rec, req, App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro}); !handled {
+		t.Fatal("strict missing identity did not short-circuit")
+	}
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := h.routeLimiter.BucketCount(); got != 0 {
+		t.Errorf("parent route bucket count = %d, want 0 (rejected requests must not consume tokens)", got)
+	}
+}
+
+func TestEdgeRuleThrottle_MissingIdentitySharedBucket(t *testing.T) {
+	h := NewHandlerWith(&fakeBackend{}, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.edgeRules = stubEdgeRuleMatcher{throttle: &EdgeRuleThrottleResolved{
+		ID: "rule-shared", AccountID: "acct-1", AppID: "app-1",
+		RequestsPerSecond: 10, Burst: 20,
+		KeyBy: api.ThrottleKeyByAPIKey, MaxKeysPerRule: 100,
+		MissingKeyPolicy: api.ThrottleMissingKeyShared,
+	}}
+	req := httptest.NewRequest(http.MethodGet, "http://api.example.com/", nil)
+	rec := httptest.NewRecorder()
+	if handled := h.applyEdgeRuleThrottle(rec, req, App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro}); handled {
+		t.Fatalf("shared missing identity unexpectedly short-circuited: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	ruleKey := "app-1\x00rule-shared"
+	if !h.routeConsumerLimiter.ConsumerIsTracked(ruleKey, "__anonymous__") {
+		t.Fatal("missing identities were not placed in the shared anonymous bucket")
+	}
+}
+
+func TestEdgeRuleThrottle_DimensionalBucketsDoNotShareParentBurst(t *testing.T) {
+	h := NewHandlerWith(&fakeBackend{}, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.edgeRules = stubEdgeRuleMatcher{throttle: &EdgeRuleThrottleResolved{
+		ID: "rule-isolated", AccountID: "acct-1", AppID: "app-1",
+		RequestsPerSecond: 0.01, Burst: 1,
+		KeyBy: api.ThrottleKeyByConsumerID, MaxKeysPerRule: 100,
+		MissingKeyPolicy: api.ThrottleMissingKeyReject,
+	}}
+	app := App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro}
+	do := func(consumerID string) *httptest.ResponseRecorder {
+		t.Helper()
+		ctx := withAuthenticated(t.Context(), Authenticated{ConsumerID: consumerID})
+		req := httptest.NewRequest(http.MethodGet, "http://api.example.com/", nil).WithContext(ctx)
+		rec := httptest.NewRecorder()
+		h.applyEdgeRuleThrottle(rec, req, app)
+		return rec
+	}
+
+	if rec := do("consumer-a"); rec.Code == http.StatusTooManyRequests {
+		t.Fatalf("consumer A first request unexpectedly throttled: %s", rec.Body.String())
+	}
+	if rec := do("consumer-a"); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("consumer A second request status=%d, want 429", rec.Code)
+	}
+	if rec := do("consumer-b"); rec.Code == http.StatusTooManyRequests {
+		t.Fatalf("consumer B inherited consumer A's exhausted burst: %s", rec.Body.String())
+	}
+	if got := h.routeLimiter.BucketCount(); got != 0 {
+		t.Fatalf("shared parent buckets=%d, want 0 for a dimensional rule", got)
+	}
+	if got := h.routeConsumerLimiter.BucketCount(); got != 2 {
+		t.Fatalf("dimensional buckets=%d, want 2 independent consumer buckets", got)
+	}
+}
+
 // TestEdgeRuleThrottlePolicyHeader_PerConsumerCollapse — ADR-104
 // amendment 5 (issue #881 Phase 4 H1): when a per-consumer rule
 // (KeyBy="api_key") collapses the consumer into the __other__
-// bucket, the 429 path must emit
-// X-RouteRateLimit-Policy=per-consumer instead of the back-compat
-// "route" value. The collapse is driven by setting MaxKeysPerRule
+// bucket, the 429 path must emit per-consumer policy and read the numeric
+// headers from that collapsed bucket instead of the route-wide limiter. The
+// collapse is driven by setting MaxKeysPerRule
 // to 1 in the resolved rule and forcing the second distinct
 // consumer to land in __other__ via direct AllowWithConsumerKey
-// calls. The applier then consults routeConsumerLimiter.ConsumerIsTracked
-// to compute the policy — this is the single load-bearing assertion
-// for the new header.
+// calls.
 func TestEdgeRuleThrottlePolicyHeader_PerConsumerCollapse(t *testing.T) {
 	h, b, _ := newTestHandler(t)
 	b.setLegacyHot()
@@ -757,8 +863,7 @@ func TestEdgeRuleThrottlePolicyHeader_PerConsumerCollapse(t *testing.T) {
 	// Per-consumer rule with MaxKeysPerRule=1 → any second distinct
 	// API key collapses into the __other__ bucket (consumer-set
 	// exceeds cap=1). KeyBy="api_key" → ThrottleKeyByIsPerConsumer
-	// returns true → the 429 path emits "per-consumer" when the
-	// consumer has collapsed.
+	// returns true → the dimensional 429 path emits "per-consumer".
 	h.edgeRules = stubEdgeRuleMatcher{
 		throttle: &EdgeRuleThrottleResolved{
 			ID: "rule-collapse", AccountID: "acct-1", AppID: b.app.ID,
@@ -780,9 +885,8 @@ func TestEdgeRuleThrottlePolicyHeader_PerConsumerCollapse(t *testing.T) {
 	if !h.routeConsumerLimiter.AllowWithConsumerKey(ruleKey, "key-B", 1, 1, 1) {
 		t.Fatal("consumer B first allow should succeed (collapsed into __other__ bucket)")
 	}
-	// Defensive: pin the invariant the policy-header computation
-	// depends on. ConsumerIsTracked must return false for the
-	// over-cap consumer (the collapse signal).
+	// Defensive: pin the collapse invariant. ConsumerIsTracked must return
+	// false for the over-cap consumer.
 	if h.routeConsumerLimiter.ConsumerIsTracked(ruleKey, "key-A") != true {
 		t.Fatal("consumer A should be tracked (under cap)")
 	}
@@ -790,12 +894,9 @@ func TestEdgeRuleThrottlePolicyHeader_PerConsumerCollapse(t *testing.T) {
 		t.Fatal("consumer B should NOT be tracked (collapsed to __other__)")
 	}
 
-	// Drive the applier through ServeHTTP. The applier will:
-	//   1. Decrement the rule-level bucket (1 token) — first call.
-	//   2. Call AllowWithConsumerKey for "key-B" → returns false
-	//      (the __other__ bucket was already drained above).
-	//   3. Set allowed=false → emit 429 + check collapse via
-	//      ConsumerIsTracked("key-B") → false → policy="per-consumer".
+	// Drive the applier through ServeHTTP. It consults only the concrete
+	// __other__ bucket for key-B; that bucket was drained above, so the request
+	// is rejected without touching a shared route bucket.
 	//
 	// The applier uses resolveConsumerKey(KeyBy="api_key") which
 	// reads Authenticated.APIKeyID off the request context. Without
@@ -806,9 +907,7 @@ func TestEdgeRuleThrottlePolicyHeader_PerConsumerCollapse(t *testing.T) {
 	// applier hits the per-consumer branch deterministically.
 	ctx := withAuthenticated(t.Context(), Authenticated{APIKeyID: "key-B"})
 
-	// First request — drains rule bucket + drains __other__ bucket
-	// via the collapsed consumer. Will 429 because both buckets
-	// were pre-drained above.
+	// The request 429s because the __other__ bucket was pre-drained above.
 	req := httptest.NewRequest("GET", "http://jane-api.apps.dom/", nil).WithContext(ctx)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -816,11 +915,15 @@ func TestEdgeRuleThrottlePolicyHeader_PerConsumerCollapse(t *testing.T) {
 		t.Fatalf("collapsed per-consumer request should 429; got code=%d body=%s",
 			rec.Code, rec.Body.String())
 	}
-	// X-RouteRateLimit-Policy must be "per-consumer" because the
-	// applier consulted ConsumerIsTracked("key-B") which returned
-	// false (collapsed to __other__).
+	// X-RouteRateLimit-Policy names the authoritative dimensional family.
 	if got := rec.Header().Get("X-RouteRateLimit-Policy"); got != "per-consumer" {
 		t.Errorf("collapsed per-consumer 429 should carry X-RouteRateLimit-Policy=per-consumer; got %q", got)
+	}
+	if got := rec.Header().Get("X-RouteRateLimit-Limit"); got != "1" {
+		t.Errorf("collapsed per-consumer 429 limit=%q, want 1 from __other__ bucket", got)
+	}
+	if got := rec.Header().Get("X-RouteRateLimit-Remaining"); got != "0" {
+		t.Errorf("collapsed per-consumer 429 remaining=%q, want 0 from __other__ bucket", got)
 	}
 	// The existing x-faas-rate-limit-scope enum stays "route"
 	// (unchanged by H1).
@@ -876,9 +979,10 @@ func TestAccountRateLimitReturns429(t *testing.T) {
 
 // TestConcurrentColdRequestsRespectPlanWakeWaiterCap (issue #168) — at the
 // Free-plan cap of max_concurrency=1, concurrent cold requests still
-// coalesce to exactly ONE admit. The plan-derived wake waiter budget is four,
-// so excess followers receive bounded 503 responses instead of creating an
-// unbounded queue. Higher plans admit more; covered by
+// coalesce to exactly ONE admit. The plan-derived wake waiter budget is four.
+// Once the app is warm, its separate saturation queue is also bounded, so
+// excess followers receive typed 429s (or a bounded 503 on timeout) instead
+// of creating an unbounded queue. Higher plans admit more; covered by
 // TestCapThreeAdmitsThreeDistinctInstances.
 func TestConcurrentColdRequestsCoalesceToOneWake(t *testing.T) {
 	h, b, _ := newTestHandler(t)
@@ -899,10 +1003,10 @@ func TestConcurrentColdRequestsCoalesceToOneWake(t *testing.T) {
 			switch rec.Code {
 			case http.StatusOK:
 				successes.Add(1)
-			case http.StatusServiceUnavailable:
+			case http.StatusTooManyRequests, http.StatusServiceUnavailable:
 				rejected.Add(1)
 			default:
-				t.Errorf("status = %d, want 200 or bounded 503", rec.Code)
+				t.Errorf("status = %d, want 200, bounded 429, or bounded 503", rec.Code)
 			}
 		}()
 	}
@@ -911,7 +1015,7 @@ func TestConcurrentColdRequestsCoalesceToOneWake(t *testing.T) {
 		t.Errorf("50 concurrent cold requests should trigger 1 admit, got %d", got)
 	}
 	if got := successes.Load() + rejected.Load(); got != 50 {
-		t.Errorf("all concurrent cold requests should finish with 200 or bounded 503, got %d/50", got)
+		t.Errorf("all concurrent cold requests should finish with 200 or bounded overload response, got %d/50", got)
 	}
 }
 
@@ -2349,6 +2453,37 @@ func TestApplyEdgeRuleJWT_VerifierSuccess_EmitsApplySuccess(t *testing.T) {
 	}
 	if !strings.Contains(body, `gateway_edge_rule_match_total{kind="jwt",outcome="match"} 1`) {
 		t.Errorf("match_total{jwt,match} != 1; body:\n%s", body)
+	}
+}
+
+func TestApplyEdgeRuleJWT_PrioritizesMatchedThrottleClaim(t *testing.T) {
+	h := NewHandlerWith(&fakeBackend{}, NewMetrics(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h.edgeRules = stubEdgeRuleMatcher{
+		jwt: &EdgeRuleJWTResolved{
+			ID: "rule-jwt", AccountID: "acct-1", AppID: "app-1",
+			Issuer: "https://idp.example.com", JWKSURL: "https://idp.example.com/jwks",
+			Algorithms: []string{"RS256"},
+		},
+		throttle: &EdgeRuleThrottleResolved{
+			ID: "rule-throttle", AccountID: "acct-1", AppID: "app-1",
+			KeyBy: api.ThrottleKeyByJWTClaim, JWTClaimName: "tenant_id",
+		},
+	}
+	h.jwtVerifier = &countingJWTVerifier{onVerify: func(_ context.Context, _ string, rule *EdgeRuleJWTResolved) (*JWTClaims, error) {
+		if len(rule.ExtractClaims) != 1 || rule.ExtractClaims[0] != "tenant_id" {
+			t.Fatalf("ExtractClaims = %v, want [tenant_id]", rule.ExtractClaims)
+		}
+		return &JWTClaims{Subject: "user-1", Custom: map[string]string{"tenant_id": "tenant-42"}}, nil
+	}}
+
+	req := httptest.NewRequest(http.MethodGet, "http://api.example.com/", nil)
+	req.Header.Set("Authorization", "Bearer good")
+	rec := httptest.NewRecorder()
+	if handled := h.applyEdgeRuleJWT(rec, req, App{ID: "app-1", AccountID: "acct-1", Plan: api.PlanPro}); handled {
+		t.Fatalf("verified JWT unexpectedly short-circuited: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := authenticatedFrom(req.Context()).JWTClaims["tenant_id"]; got != "tenant-42" {
+		t.Fatalf("authenticated tenant_id = %q, want tenant-42", got)
 	}
 }
 

@@ -202,6 +202,33 @@ and provider headers are not span attributes. Customer code that opens its own
 database or storage client remains outside the platform-owned path and needs
 the runtime's OpenTelemetry instrumentation.
 
+Guest-to-guest HTTP calls through the node-local service proxy are represented
+as `managed_binding/service_proxy` client spans named `service.<name>`. Gregale
+records the bounded service name, target app ID, method, response status, and
+elapsed time; retries remain inside the same dependency span, with the existing
+guest-transport span beneath it. Paths, queries, headers, bodies, and caller
+credentials are not recorded. The proxy injects the dependency span's W3C
+context into the target guest request, so neither application needs an
+OpenTelemetry SDK for the service call and target execution to be visible.
+
+Authorized service-proxy spans are also sent through Gregale's trusted
+telemetry channel and attached to the matching retained request in the
+production debugger. This path is enabled by default and does not require a
+customer API key, a customer OTLP exporter, or an operator-configured external
+collector. `FAAS_OTEL_SPANS_WRITER_ENABLED=false` disables both the customer
+OTLP writer and this platform-owned retention path; `FAAS_OTEL_FLUSH_INTERVAL`
+controls their coalescing cadence (30 seconds by default).
+
+When the caller propagates its inbound `traceparent`, the service dependency is
+nested under that original request and appears in the same waterfall. When the
+header is absent, Gregale starts a separate service-call trace. It deliberately
+does not infer a parent from source instance and timing: an instance can process
+concurrent requests, so that heuristic could attach a payment or notification
+call to the wrong customer request. Because the durable debugger enriches an
+existing request row by trace ID, that separate trace is not shown under the
+original request; exact cross-service nesting still requires the caller to
+propagate the inbound W3C context.
+
 ## Event-triggered invocations
 
 Event-driven invocations preserve W3C trace context carried by a broker record's
@@ -250,7 +277,9 @@ kernel-level flow telemetry implementation and is not inferred from this span.
   the local trace ring, but customer-created child spans are not
   persisted by `GET /v1/traces/{trace_id}`. Export to the platform
   OTLP endpoint is required for customer spans to reach the
-  configured collector.
+  configured collector. This limitation applies to customer-created spans;
+  Gregale-owned service-proxy spans use the automatic retained path described
+  above.
 - **No head-based sampling override.** The platform samples
   100% for the first 100 root spans of every new deployment
   (acceptance #5), then falls back to the head ratio in

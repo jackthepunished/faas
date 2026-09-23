@@ -244,11 +244,23 @@ type ManifestView struct {
 
 // DeploymentItem is one row on the app detail page's deploy list.
 type DeploymentItem struct {
-	ID        string
-	Status    string
-	Kind      string
-	CreatedAt string
-	Error     string
+	ID string
+	// Revision (ADR-198) is the per-app deployment number rendered as `v42`.
+	// The deploy list leads with it because it is the handle a customer can
+	// carry into `gregale rollback --to` or an incident channel; the uuid
+	// stays on the row for the rows that predate the column (Revision 0),
+	// which the template renders as "—".
+	Revision              int
+	Status                string
+	Kind                  string
+	CreatedAt             string
+	RolloutState          string
+	ServiceHandoffAction  string
+	ServiceHandoffPhase   string
+	ServiceHandoffRetries int
+	ServiceHandoffMissing []string
+	ServiceHandoffError   string
+	Error                 string
 	// Issue #606 / SAFE-RELEASES-E.1: structured deployer
 	// attribution. All four fields are server-stamped from the
 	// HTTP request context (never client-supplied) and rendered
@@ -581,8 +593,10 @@ type FailedEventsData struct {
 	Events       []FailedEventPageItem
 	Apps         []AppListItem
 	SelectedApp  string
+	NextPageURL  string
 	ActionCSRF   string
 	Action       string
+	ActionCount  int
 	ErrorMessage string
 }
 
@@ -731,14 +745,16 @@ type MirrorPageItem struct {
 // MirrorSummaryPageItem mirrors api.MirrorSummaryResponse without exposing
 // API package types to dashboard templates.
 type MirrorSummaryPageItem struct {
-	TotalInvocations  int64
-	StatusDiffCount   int64
-	SchemaDiffCount   int64
-	BodyDiffCount     int64
-	MeanLatencyDiffMs int64
-	P99LatencyDiffMs  int64
-	CrashCount        int64
-	WindowLabel       string
+	TotalInvocations     int64
+	ChangedResponseCount int64
+	ChangedResponsePct   float64
+	StatusDiffCount      int64
+	SchemaDiffCount      int64
+	BodyDiffCount        int64
+	MeanLatencyDiffMs    int64
+	P99LatencyDiffMs     int64
+	CrashCount           int64
+	WindowLabel          string
 }
 
 // StorageData is the customer-facing projection for the per-app object
@@ -3118,23 +3134,39 @@ type OrgInvitationItem struct {
 }
 
 // OrgDetailData is the /dashboard/orgs/{slug} payload. The page
-// fetches members + invitations via the store directly (apid is
+// fetches members, invitations, and activity via the store directly (apid is
 // the dashboard's data layer — no reverse-call needed because
 // the dashboard and apid share the process per ADR-011 §"Surface
 // partition"). The seat chip lives on the embedded OrgListItem
 // (PR-8 review — duplicating SeatUsed/SeatLimit at the top level
 // created two sources of truth for the same value).
 //
-// Error is a non-empty string when one of the three lookups
+// Error is a non-empty string when one of the org roster lookups
 // failed non-fatally (the page still renders whatever rows came
 // back, with the error surfaced above the table as a banner).
+// ActivityError is separate so an unavailable timeline does not
+// hide otherwise-useful org membership and invitation data.
 // The full nil-out path is for the truly catastrophic case where
 // the org row itself is missing — the handler short-circuits to
 // 404 then.
 type OrgDetailData struct {
-	Org         OrgListItem
-	Members     []OrgMemberItem
-	Invitations []OrgInvitationItem
-	CallersRole string
-	Error       string
+	Org                OrgListItem
+	Members            []OrgMemberItem
+	Invitations        []OrgInvitationItem
+	Activity           []OrgActivityItem
+	ActivityKindPrefix string
+	ActivityActorType  string
+	ActivityNextURL    string
+	ActivityError      string
+	CallersRole        string
+	Error              string
+}
+
+// OrgActivityItem is one safe, display-ready row in the organization
+// activity timeline. The raw metadata payload intentionally stays out
+// of dashboard templates.
+type OrgActivityItem struct {
+	OccurredAt string
+	Kind       string
+	Summary    string
 }

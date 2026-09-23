@@ -199,6 +199,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// plan-gated to Hobby+. The limits surface reflects only
 			// what the create handler will accept (5 rules total).
 			EdgeRulesPerApp: 5, EdgeRulesJWTAllowed: false, EdgeRulesIPAllowed: false, EdgeRulesGeoPerApp: 1, EdgeRulesThrottlePerApp: 1, EdgeRulesCachePerApp: 0,
+			EdgeRulesRetryPerApp: 0, EdgeRulesCircuitBreakerPerApp: 0, EgressCircuitBreakersPerApp: 0,
 			// issue #975 #4 / Mega-Foundation #979-b — Free is the abuse-floor tier;
 			// the abstraction is the upsell. PR-B (#979-c) wires the writer.
 			CorsPresetsPerAccount: 0, CorsPresetsPerApp: 0, CorsPresetMaxOrigins: 0, CorsPresetMaxAllowMethods: 0, CorsPresetMaxNameLength: 64,
@@ -212,7 +213,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			DataPlacementHintsPerApp: 0,
 			// ADR-076 (#476): outbound webhooks — Free gated to 402
 			// (CodePlanWebhooksNotAllowed), same fail-closed shape.
-			WebhookPerApp: 0, WebhookPerAccount: 0, LogDrainPerApp: 0, LogDrainPerAccount: 0,
+			WebhookPerApp: 0, WebhookPerAccount: 0, InboundWebhookPerApp: 0, InboundWebhookPerAccount: 0, LogDrainPerApp: 0, LogDrainPerAccount: 0,
 			// ADR-0NN (#757): Free is gated off the Trigger primitive
 			// entirely. Handler returns 402 CodePlanTriggersNotAllowed
 			// before the store is touched; the 0/0/0/0/0/0/0 tuple
@@ -259,6 +260,14 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// — opt-in is a paid-tier feature (Cloud Run's
 			// `--no-allow-unauthenticated` shape).
 			RequireAuthn: false,
+			// ADR-199: Free unlocks traffic splitting and the canary
+			// ladder. The rollout concurrency grant keeps the cost
+			// bounded to +1 instance for the length of the rollout,
+			// so this does not move Free's steady-state RAM shape.
+			TrafficSplit: true,
+			// ADR-201: auto-rollback costs no extra runtime resources —
+			// the 5xx counters are already collected on every plan.
+			RollbackOn5xxAllowed: true,
 			// ADR-124: Free stays on http1/http2 (universal) but is
 			// gated off gRPC entirely — the abuse-floor tier doesn't
 			// host the gRPC service-migration use case that prompted
@@ -326,7 +335,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// rationale is unchanged). The bill auto-counts
 			// (pkg/meter/sampler.go:238-239) so the warm floor
 			// has a bounded cost.
-			MinInstancesAllowed: true, MaxInstancesAllowed: true,
+			MinInstancesAllowed: true, CustomMetricsAllowed: true, MaxInstancesAllowed: true,
 			// Issue #169 / #172: Hobby is gated on Pro+ for both RPS
 			// and CPU (2026-07-28: ADR-037 amendment — Hobby→Pro re-tier
 			// on ScaleUpTargetRPSAllowed). CPU-driven scaling is gated
@@ -353,6 +362,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// (EdgeRulesJWTAllowed / EdgeRulesIPAllowed) feeds the
 			// 402 response in handlers_edge_rules.go for Free.
 			EdgeRulesPerApp: 25, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true, EdgeRulesGeoPerApp: 5, EdgeRulesThrottlePerApp: 5, EdgeRulesCachePerApp: 1,
+			EdgeRulesRetryPerApp: 3, EdgeRulesCircuitBreakerPerApp: 3, EgressCircuitBreakersPerApp: 3,
 			// issue #975 #4 / Mega-Foundation #979-b — Hobby is the entry paid tier.
 			CorsPresetsPerAccount: 10, CorsPresetsPerApp: 5, CorsPresetMaxOrigins: 25, CorsPresetMaxAllowMethods: 8, CorsPresetMaxNameLength: 64,
 			// ADR-099 (#879): tenant surfaces — Hobby is the entry
@@ -369,7 +379,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			OrgMembersMax: 10, OrgPendingInvitationsMax: 5,
 			// ADR-076 (#476): Hobby gets 3 per-app and 10 per-account
 			// — mirrors the alert-rule ratio.
-			WebhookPerApp: 3, WebhookPerAccount: 10, LogDrainPerApp: 3, LogDrainPerAccount: 10,
+			WebhookPerApp: 3, WebhookPerAccount: 10, InboundWebhookPerApp: 3, InboundWebhookPerAccount: 10, LogDrainPerApp: 3, LogDrainPerAccount: 10,
 			// ADR-0NN (#757): Hobby unlocks the in-platform queue +
 			// sqs_compat kinds. Tight caps (50/30s/3) so a Hobby
 			// customer's fan-out can't saturate schedd's per-app
@@ -410,6 +420,11 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// Issue #560: Hobby is gated off for the same
 			// posture-change shape as Free.
 			RequireAuthn: false,
+			// ADR-199: Hobby unlocks traffic splitting and the canary
+			// ladder — see the Free row above for the rationale.
+			TrafficSplit: true,
+			// ADR-201: see the Free row above.
+			RollbackOn5xxAllowed: true,
 			// ADR-124: Hobby unlocks gRPC framing. Hobby is the
 			// smallest paid tier where the gRPC service-migration
 			// use case (issue #67) makes sense — Free stays
@@ -464,7 +479,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			EnvVarsMax: 64, EnvValueMaxBytes: 16384,
 			// Issue #462 / ADR-058: Pro unlocks warm-floor + max-instances
 			// ceiling (was min-instances only at the pre-#462 contract).
-			MinInstancesAllowed: true, MaxInstancesAllowed: true,
+			MinInstancesAllowed: true, CustomMetricsAllowed: true, MaxInstancesAllowed: true,
 			// ADR-044: see PlanFree.
 			CPUWeight: 8, CPUQuotaUS: 500_000, CPUPeriodUS: 500_000,
 			MaxQueueDepth: 25, MaxDelayedTasksPerApp: 50, MaxSourceBytesPerInvocation: 256 * 1024, AsyncInvokeAllowed: true,
@@ -503,6 +518,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// AND jwt|ip. Same surface as Hobby; the gate only
 			// flips the Free arm of the kind-switch.
 			EdgeRulesPerApp: 100, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true, EdgeRulesGeoPerApp: 25, EdgeRulesThrottlePerApp: 25, EdgeRulesCachePerApp: 5,
+			EdgeRulesRetryPerApp: 10, EdgeRulesCircuitBreakerPerApp: 10, EgressCircuitBreakersPerApp: 10,
 			// issue #975 #4 / Mega-Foundation #979-b — Pro is the typical SaaS tier.
 			CorsPresetsPerAccount: 50, CorsPresetsPerApp: 15, CorsPresetMaxOrigins: 100, CorsPresetMaxAllowMethods: 8, CorsPresetMaxNameLength: 64,
 			// ADR-099 (#879): tenant surfaces — Pro gets 5 surfaces
@@ -518,7 +534,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			OrgMembersMax: 50, OrgPendingInvitationsMax: 25,
 			// ADR-076 (#476): Pro gets 10 per-app and 30 per-account
 			// — mirrors the alert-rule ratio.
-			WebhookPerApp: 10, WebhookPerAccount: 30, LogDrainPerApp: 10, LogDrainPerAccount: 30,
+			WebhookPerApp: 10, WebhookPerAccount: 30, InboundWebhookPerApp: 10, InboundWebhookPerAccount: 30, LogDrainPerApp: 10, LogDrainPerAccount: 30,
 			// ADR-0NN (#757): Pro is the first tier where external
 			// broker kinds unlock (Kafka/NATS/Redis-streams). Caps jump
 			// to 10/50 + 500/5min/10 attempts so a Pro customer's
@@ -620,7 +636,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			EnvVarsMax: 256, EnvValueMaxBytes: 32768,
 			// Issue #462 / ADR-058: Scale unlocks warm-floor +
 			// max-instances ceiling (same as Pro).
-			MinInstancesAllowed: true, MaxInstancesAllowed: true,
+			MinInstancesAllowed: true, CustomMetricsAllowed: true, MaxInstancesAllowed: true,
 			// ADR-044: see PlanFree. Scale's 1000ms/100ms quota is the
 			// upper bound — 10 vCPU worth of compute at the per-instance
 			// level, gated by the §1 56 GB hard fence at the slice level.
@@ -663,6 +679,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			// bound the LRU + per-host matcher budget tolerates before
 			// per-host invalidation becomes load-bearing.
 			EdgeRulesPerApp: 500, EdgeRulesJWTAllowed: true, EdgeRulesIPAllowed: true, EdgeRulesGeoPerApp: 100, EdgeRulesThrottlePerApp: 100, EdgeRulesCachePerApp: 20,
+			EdgeRulesRetryPerApp: 25, EdgeRulesCircuitBreakerPerApp: 25, EgressCircuitBreakersPerApp: 50,
 			// issue #975 #4 / Mega-Foundation #979-b — Scale is the large-fleet tier.
 			CorsPresetsPerAccount: 250, CorsPresetsPerApp: 50, CorsPresetMaxOrigins: 500, CorsPresetMaxAllowMethods: 8, CorsPresetMaxNameLength: 64,
 			// ADR-099 (#879): tenant surfaces — Scale gets 25 surfaces
@@ -679,7 +696,7 @@ func TestPlanLimitsMatchSpec(t *testing.T) {
 			OrgMembersMax: 200, OrgPendingInvitationsMax: 100,
 			// ADR-076 (#476): Scale gets 25 per-app and 100 per-account
 			// — mirrors the alert-rule ratio.
-			WebhookPerApp: 25, WebhookPerAccount: 100, LogDrainPerApp: 25, LogDrainPerAccount: 100,
+			WebhookPerApp: 25, WebhookPerAccount: 100, InboundWebhookPerApp: 25, InboundWebhookPerAccount: 100, LogDrainPerApp: 25, LogDrainPerAccount: 100,
 			// ADR-0NN (#757): Scale is the upper tier — caps align with
 			// the SQL CHECK ceilings (5000 records / 5 min window /
 			// 25 attempts) so a Scale customer's SQS-compatible or
@@ -1863,24 +1880,27 @@ func TestPlanRequireAuthnDefault(t *testing.T) {
 }
 
 // TestPlanTrafficSplitAllowed pins the per-plan gate for the
-// traffic-splitting feature (issue #556 PR-A). Per-plan truth
-// table: Free=false (locked), Hobby=false (Hobby's value-prop is
-// "near-Free with a floor"; canary rollout adds RAM-billable
-// live deployments the Hobby plan doesn't subsidise),
-// Pro=true (the "Pro+ canary" issue body), Scale=true. apid's
-// createDeployment + updateDeploymentTraffic handlers consult
-// this gate so a Free/Hobby account PATCHing or supplying
-// traffic_percent on create sees the canonical 403
-// plan_traffic_split_not_allowed. Unknown plans must fail closed
-// (return false) — same fail-closed contract as the bearer /
-// basic gate tests above.
+// traffic-splitting feature (issue #556 PR-A, opened to every plan by
+// ADR-199).
+//
+// Every known plan is now true: a safe rollout is a correctness primitive
+// rather than a paid tier, and ADR-199's rollout concurrency grant is what
+// makes it actually work on a plan whose max_concurrency equals its
+// steady-state instance count (see
+// TestProperty_RolloutGrant_AllowsExactlyOneOverlap in pkg/sched).
+//
+// An UNKNOWN plan must still fail closed. That case is the point of this
+// test now that the four known plans agree: MustLimitsFor has no entry for
+// it, so the accessor must return false rather than inheriting the
+// zero-value-looks-like-Free behaviour. Same fail-closed contract as the
+// bearer / basic gate tests above.
 func TestPlanTrafficSplitAllowed(t *testing.T) {
 	cases := []struct {
 		plan Plan
 		want bool
 	}{
-		{PlanFree, false},
-		{PlanHobby, false},
+		{PlanFree, true},
+		{PlanHobby, true},
 		{PlanPro, true},
 		{PlanScale, true},
 		{Plan("unknown"), false},
@@ -1892,13 +1912,24 @@ func TestPlanTrafficSplitAllowed(t *testing.T) {
 	}
 }
 
+// TestPlanRollbackOn5xxAllowed pins the per-plan gate for the first-wake 5xx
+// auto-rollback opt-in (issue #961 / ADR-118, opened to every plan by
+// ADR-201).
+//
+// Every known plan is now true. Unlike TrafficSplit this never had a cost
+// argument to answer: the 5xx counters are already collected on every plan,
+// and rolling back is cheaper than leaving a bad revision serving.
+//
+// The UNKNOWN plan is the case that still carries weight now that the four
+// known plans agree: MustLimitsFor has no entry for it, so the accessor must
+// fail closed rather than inherit a zero-value default.
 func TestPlanRollbackOn5xxAllowed(t *testing.T) {
 	cases := []struct {
 		plan Plan
 		want bool
 	}{
-		{PlanFree, false},
-		{PlanHobby, false},
+		{PlanFree, true},
+		{PlanHobby, true},
 		{PlanPro, true},
 		{PlanScale, true},
 		{Plan("unknown"), false},
@@ -3310,5 +3341,27 @@ func TestFullRootfsAllowAutoDefault_PerPlan(t *testing.T) {
 		if !FullRootfsAllowAutoDefault[p] {
 			t.Errorf("FullRootfsAllowAutoDefault[%s] = false; want true", p)
 		}
+	}
+}
+
+func TestEffectiveRetryMaxAttempts(t *testing.T) {
+	tests := []struct {
+		name      string
+		requested int
+		planLimit int
+		want      int
+	}{
+		{name: "no-retry plan still permits original", requested: 0, planLimit: 0, want: 1},
+		{name: "inherits plan", requested: 0, planLimit: 10, want: 10},
+		{name: "request below plan", requested: 3, planLimit: 10, want: 3},
+		{name: "request above plan", requested: 20, planLimit: 10, want: 10},
+		{name: "absolute safety ceiling", requested: 0, planLimit: 100, want: DurableRetryMaxAttempts},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := EffectiveRetryMaxAttempts(tc.requested, tc.planLimit); got != tc.want {
+				t.Fatalf("EffectiveRetryMaxAttempts(%d, %d) = %d, want %d", tc.requested, tc.planLimit, got, tc.want)
+			}
+		})
 	}
 }

@@ -146,6 +146,13 @@ func (p *S3) DeleteObject(ctx context.Context, bucket, key string) error {
 }
 
 func (p *S3) CopyObject(ctx context.Context, bucket string, r CopyObjectRequest) (CopyObjectResult, error) {
+	return p.CopyObjectBetweenBuckets(ctx, bucket, bucket, r)
+}
+
+func (p *S3) CopyObjectBetweenBuckets(ctx context.Context, sourceBucket, destinationBucket string, r CopyObjectRequest) (CopyObjectResult, error) {
+	if sourceBucket == "" || destinationBucket == "" {
+		return CopyObjectResult{}, ErrInvalid
+	}
 	if !ValidKey(r.SourceKey) || !ValidKey(r.DestinationKey) {
 		return CopyObjectResult{}, ErrInvalid
 	}
@@ -172,8 +179,8 @@ func (p *S3) CopyObject(ctx context.Context, bucket string, r CopyObjectRequest)
 		return CopyObjectResult{}, err
 	}
 	in := &s3.CopyObjectInput{
-		Bucket:             aws.String(bucket),
-		CopySource:         aws.String(url.PathEscape(bucket + "/" + r.SourceKey)),
+		Bucket:             aws.String(destinationBucket),
+		CopySource:         aws.String(url.PathEscape(sourceBucket + "/" + r.SourceKey)),
 		Key:                aws.String(r.DestinationKey),
 		Metadata:           r.Metadata.Metadata,
 		ContentType:        stringPtrOrNil(r.Metadata.ContentType),
@@ -311,11 +318,11 @@ func (p *S3) Presign(ctx context.Context, bucket string, r SignRequest) (SignedR
 		}
 		result.Headers["Content-Type"] = contentType
 	case http.MethodGet:
-		out, err := p.signer.PresignGetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(r.Key), ResponseContentDisposition: aws.String("attachment"), ResponseContentType: aws.String("application/octet-stream")}, options)
+		out, err := p.presignGetObject(ctx, bucket, r.Key, options, true)
 		if err != nil {
 			return SignedRequest{}, ErrUnavailable
 		}
-		result.URL = out.URL
+		result.URL = out
 	default:
 		out, err := p.signer.PresignHeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String(r.Key)}, options)
 		if err != nil {
@@ -324,6 +331,46 @@ func (p *S3) Presign(ctx context.Context, bucket string, r SignRequest) (SignedR
 		result.URL = out.URL
 	}
 	return result, nil
+}
+
+func (p *S3) PresignObjectRead(ctx context.Context, bucket, method, key string, expiresIn int64) (SignedRequest, error) {
+	r := SignRequest{Method: method, Key: key, ExpiresIn: expiresIn}
+	if err := r.Validate(api.MaxObjectSinglePutBytes); err != nil || method != http.MethodGet && method != http.MethodHead {
+		return SignedRequest{}, ErrInvalid
+	}
+	ttl := time.Duration(expiresIn) * time.Second
+	if ttl == 0 {
+		ttl = 5 * time.Minute
+	}
+	options := func(o *s3.PresignOptions) { o.Expires = ttl }
+	result := SignedRequest{Method: method, Headers: map[string]string{}, ExpiresAt: time.Now().UTC().Add(ttl)}
+	if method == http.MethodGet {
+		out, err := p.presignGetObject(ctx, bucket, key, options, false)
+		if err != nil {
+			return SignedRequest{}, ErrUnavailable
+		}
+		result.URL = out
+		return result, nil
+	}
+	out, err := p.signer.PresignHeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)}, options)
+	if err != nil {
+		return SignedRequest{}, ErrUnavailable
+	}
+	result.URL = out.URL
+	return result, nil
+}
+
+func (p *S3) presignGetObject(ctx context.Context, bucket, key string, options func(*s3.PresignOptions), forceDownload bool) (string, error) {
+	in := &s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)}
+	if forceDownload {
+		in.ResponseContentDisposition = aws.String("attachment")
+		in.ResponseContentType = aws.String("application/octet-stream")
+	}
+	out, err := p.signer.PresignGetObject(ctx, in, options)
+	if err != nil {
+		return "", err
+	}
+	return out.URL, nil
 }
 
 func (p *S3) GetObjectTags(ctx context.Context, bucket, key string) (map[string]string, error) {
@@ -368,10 +415,8 @@ func (p *S3) DeleteObjectTags(ctx context.Context, bucket, key string) error {
 	return normalize(err)
 }
 
-const multipartSessionMetadata = "gregale-upload-id"
-
 func (p *S3) EnsureMultipartUpload(ctx context.Context, bucket string, r MultipartCreateRequest) (string, error) {
-	if r.SessionID == "" || len(r.SessionID) > 128 || !ValidKey(r.Key) || r.SizeBytes < 0 || r.SizeBytes > api.MaxObjectUploadBytes || ValidateContentType(r.ContentType) != nil {
+	if r.SessionID == "" || len(r.SessionID) > 128 || !ValidKey(r.Key) || r.SizeBytes < 0 || r.SizeBytes > api.MaxObjectUploadBytes || ValidateObjectMetadata(r.Metadata) != nil {
 		return "", ErrInvalid
 	}
 	// A Gregale bucket does not expose native provider credentials. Combined
@@ -411,14 +456,29 @@ func (p *S3) EnsureMultipartUpload(ctx context.Context, bucket string, r Multipa
 	if found != "" {
 		return found, nil
 	}
-	contentType := r.ContentType
+	contentType := r.Metadata.ContentType
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
-	out, err := p.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+	metadata := make(map[string]string, len(r.Metadata.Metadata)+1)
+	for key, value := range r.Metadata.Metadata {
+		metadata[key] = value
+	}
+	metadata[ReservedMultipartSessionMetadataKey] = r.SessionID
+	tagging, err := EncodeObjectTags(r.Metadata.Tags)
+	if err != nil {
+		return "", err
+	}
+	in := &s3.CreateMultipartUploadInput{
 		Bucket: aws.String(bucket), Key: aws.String(r.Key), ContentType: aws.String(contentType),
-		Metadata: map[string]string{multipartSessionMetadata: r.SessionID},
-	})
+		CacheControl: stringPtrOrNil(r.Metadata.CacheControl), ContentDisposition: stringPtrOrNil(r.Metadata.ContentDisposition),
+		ContentEncoding: stringPtrOrNil(r.Metadata.ContentEncoding), ContentLanguage: stringPtrOrNil(r.Metadata.ContentLanguage),
+		Metadata: metadata,
+	}
+	if tagging != "" {
+		in.Tagging = aws.String(tagging)
+	}
+	out, err := p.client.CreateMultipartUpload(ctx, in)
 	if err != nil {
 		return "", normalize(err)
 	}
@@ -520,7 +580,7 @@ func (p *S3) CompleteMultipartUpload(ctx context.Context, bucket string, r Multi
 	if headErr != nil {
 		return normalize(headErr)
 	}
-	if aws.ToInt64(head.ContentLength) != r.SizeBytes || head.Metadata[multipartSessionMetadata] != r.SessionID {
+	if aws.ToInt64(head.ContentLength) != r.SizeBytes || head.Metadata[ReservedMultipartSessionMetadataKey] != r.SessionID {
 		return ErrConflict
 	}
 	return nil

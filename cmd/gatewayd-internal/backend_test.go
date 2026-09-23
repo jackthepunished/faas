@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -19,6 +20,34 @@ import (
 )
 
 func testLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+
+func TestGatewayCompanionRoutesRequireIngressConsensus(t *testing.T) {
+	const roster = `[{"name":"proxy","type":"sidecar","port":8081,"primary_ingress":true},{"name":"metrics","type":"sidecar","port":9090}]`
+	routes, ingress, err := gatewayCompanionRoutes([]state.Deployment{
+		{ID: "a", TrafficPercent: 50, Sidecars: json.RawMessage(roster)},
+		{ID: "b", TrafficPercent: 50, Sidecars: json.RawMessage(roster)},
+	})
+	if err != nil || ingress != 8081 || len(routes) != 2 {
+		t.Fatalf("routes=%+v ingress=%d err=%v", routes, ingress, err)
+	}
+	_, _, err = gatewayCompanionRoutes([]state.Deployment{
+		{ID: "a", TrafficPercent: 50, Sidecars: json.RawMessage(roster)},
+		{ID: "b", TrafficPercent: 50, Sidecars: json.RawMessage(`[{"name":"proxy","type":"sidecar","port":8082,"primary_ingress":true}]`)},
+	})
+	if err == nil {
+		t.Fatal("mixed primary ingress rollout was accepted")
+	}
+}
+
+func TestGatewayCompanionRoutesIgnoreZeroTrafficRevision(t *testing.T) {
+	routes, ingress, err := gatewayCompanionRoutes([]state.Deployment{
+		{ID: "live", TrafficPercent: 100, Sidecars: json.RawMessage(`[{"name":"proxy","type":"sidecar","port":8081,"primary_ingress":true}]`)},
+		{ID: "parked", TrafficPercent: 0, Sidecars: json.RawMessage(`[]`)},
+	})
+	if err != nil || ingress != 8081 || len(routes) != 1 || routes[0].Name != "proxy" {
+		t.Fatalf("routes=%+v ingress=%d err=%v", routes, ingress, err)
+	}
+}
 
 // seedApp creates an account + app in the store and returns the app.
 func seedApp(t *testing.T, store state.Store, slug string, plan api.Plan) state.App {
@@ -52,6 +81,46 @@ func TestPgRouter_ResolveSlugHost(t *testing.T) {
 	}
 	if got.ID != app.ID || got.Plan != api.PlanPro {
 		t.Errorf("resolved = %+v, want id=%s plan=pro", got, app.ID)
+	}
+}
+
+func TestPgRouter_ResolveDeploymentPreviewPinsRevision(t *testing.T) {
+	store := state.NewMemStore()
+	app := seedApp(t, store, "orders", api.PlanPro)
+	deployment, err := store.CreateDeployment(context.Background(), state.Deployment{
+		AppID: app.ID, Status: state.DeployLive, Scope: "staging",
+	})
+	if err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+	host := gateway.BuildDeploymentPreviewURL(".gregale.dev", deployment.Revision, app.Slug)
+	router := pgRouter{
+		store: store, appsSuffix: ".gregale.dev", deploySuffix: ".gregale.dev",
+	}
+
+	resolved, ok, err := router.ResolveHost(context.Background(), host)
+	if err != nil || !ok {
+		t.Fatalf("ResolveHost(%q) ok=%v err=%v", host, ok, err)
+	}
+	if resolved.ID != app.ID || resolved.PinnedDeploymentID != deployment.ID || resolved.PinnedDeploymentScope != "staging" {
+		t.Fatalf("resolved = %+v, want app=%q deployment=%q scope=staging", resolved, app.ID, deployment.ID)
+	}
+}
+
+func TestPgRouter_DeploymentPreviewRejectsInactiveRevision(t *testing.T) {
+	store := state.NewMemStore()
+	app := seedApp(t, store, "orders-failed", api.PlanPro)
+	deployment, err := store.CreateDeployment(context.Background(), state.Deployment{
+		AppID: app.ID, Status: state.DeployFailed,
+	})
+	if err != nil {
+		t.Fatalf("CreateDeployment: %v", err)
+	}
+	host := gateway.BuildDeploymentPreviewURL(".gregale.dev", deployment.Revision, app.Slug)
+	router := pgRouter{store: store, deploySuffix: ".gregale.dev"}
+
+	if _, ok, err := router.ResolveHost(context.Background(), host); err != nil || ok {
+		t.Fatalf("inactive deployment route ok=%v err=%v, want false/nil", ok, err)
 	}
 }
 
@@ -175,6 +244,7 @@ type fakeInvalidator struct {
 	flushCnt      int
 	publicAuthCnt int
 	refreshed     []string // app_ids that received RefreshDeploymentWeights
+	refreshOrder  []string // route refresh ordering: targets must precede weights
 	resetCnt      int      // ResetEdgeRules call count (ADR-089 PR 3)
 	resetApps     []string // app_ids that received ResetApp (ADR-091 amendment)
 	// responseCacheByApp (ADR-122 §Decision) records app_ids
@@ -210,7 +280,8 @@ type fakeInvalidator struct {
 	// liveRefreshed records running-instance refreshes. Service
 	// replicas are admitted out-of-band by schedd and must be merged
 	// into an already-warm picker.
-	liveRefreshed []string
+	liveRefreshed  []string
+	liveRefreshErr error
 }
 
 func (f *fakeInvalidator) EvictInstance(appID, instanceID string) {
@@ -263,6 +334,7 @@ func (f *fakeInvalidator) InvalidateResponseCacheAll() {
 func (f *fakeInvalidator) RefreshDeploymentWeights(_ context.Context, appID string) error {
 	f.mu.Lock()
 	f.refreshed = append(f.refreshed, appID)
+	f.refreshOrder = append(f.refreshOrder, "weights")
 	f.mu.Unlock()
 	return nil
 }
@@ -275,8 +347,10 @@ func (f *fakeInvalidator) RefreshMirrorRules(_ context.Context, appID string) er
 func (f *fakeInvalidator) RefreshLiveTargets(_ context.Context, appID string) error {
 	f.mu.Lock()
 	f.liveRefreshed = append(f.liveRefreshed, appID)
+	f.refreshOrder = append(f.refreshOrder, "targets")
+	err := f.liveRefreshErr
 	f.mu.Unlock()
-	return nil
+	return err
 }
 func (f *fakeInvalidator) RequestCertForSurface(_ context.Context, surfaceID string) error {
 	f.mu.Lock()
@@ -329,6 +403,7 @@ func TestHandleInvalidation(t *testing.T) {
 	}
 }
 
+// adr: 122
 // TestHandleInvalidation_DeploymentChangedRefreshesWeights (issue #556 /
 // PR-B) — a db.NotifyDeploymentChanged event must trigger
 // RefreshDeploymentWeights on the picker so a `faas traffic set`
@@ -358,6 +433,53 @@ func TestHandleInvalidation_DeploymentChangedRefreshesWeights(t *testing.T) {
 	}
 	if len(f.responseCacheByApp) != 1 || f.responseCacheByApp[0] != "app-7" {
 		t.Errorf("responseCacheByApp = %v, want [app-7]", f.responseCacheByApp)
+	}
+	if len(f.resetApps) != 1 || f.resetApps[0] != "app-7" {
+		t.Errorf("resetApps = %v, want [app-7] for deployment companion-route refresh", f.resetApps)
+	}
+}
+
+func TestHandleDeploymentRouteInvalidationRefreshesWeightsAndTargets(t *testing.T) {
+	f := &fakeInvalidator{}
+	payload, applied := handleDeploymentRouteInvalidation(context.Background(), f,
+		`{"app_id":"app-7","deployment_id":"dep-3","generation":44}`, testLogger())
+	if !applied || payload.Generation != 44 {
+		t.Fatalf("route invalidation = (%+v, %v), want generation 44 applied", payload, applied)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.refreshed) != 1 || f.refreshed[0] != "app-7" {
+		t.Fatalf("weight refreshes = %v, want [app-7]", f.refreshed)
+	}
+	if len(f.liveRefreshed) != 1 || f.liveRefreshed[0] != "app-7" {
+		t.Fatalf("target refreshes = %v, want [app-7]", f.liveRefreshed)
+	}
+	if len(f.responseCacheByApp) != 1 || f.responseCacheByApp[0] != "app-7" {
+		t.Fatalf("response cache invalidations = %v, want [app-7]", f.responseCacheByApp)
+	}
+	if got := strings.Join(f.refreshOrder, ","); got != "targets,weights" {
+		t.Fatalf("route refresh order = %q, want targets,weights", got)
+	}
+}
+
+func TestHandleDeploymentRouteInvalidationRejectsMalformedPayload(t *testing.T) {
+	f := &fakeInvalidator{}
+	if _, applied := handleDeploymentRouteInvalidation(context.Background(), f,
+		`{"app_id":"app-7","deployment_id":"dep-3"}`, testLogger()); applied {
+		t.Fatal("route invalidation without a generation was applied")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.refreshed) != 0 || len(f.liveRefreshed) != 0 || len(f.responseCacheByApp) != 0 {
+		t.Fatalf("malformed invalidation mutated caches: %+v", f)
+	}
+}
+
+func TestHandleDeploymentRouteInvalidationDoesNotApplyPartialRefresh(t *testing.T) {
+	f := &fakeInvalidator{liveRefreshErr: errors.New("target refresh failed")}
+	if _, applied := handleDeploymentRouteInvalidation(context.Background(), f,
+		`{"app_id":"app-7","deployment_id":"dep-3","generation":44}`, testLogger()); applied {
+		t.Fatal("route invalidation was applied after target refresh failed")
 	}
 }
 
@@ -579,7 +701,7 @@ func TestHandleInvalidation_TenantSurfaceChanged(t *testing.T) {
 // node whose VM is mid-Park-then-destroy — the next request must
 // re-admit which lands on the destination's wake path.
 func TestHandleInvalidation_TerminalStatesEvict(t *testing.T) {
-	for _, state := range []string{"stopped", "failed", "parked", "snapshotting", "migrating"} {
+	for _, state := range []string{"stopped", "failed", "parked", "snapshotting", "migrating", "draining"} {
 		f := &fakeInvalidator{}
 		log := testLogger()
 		payload := `{"instance_id":"i-term","app_id":"app-9","state":"` + state + `"}`

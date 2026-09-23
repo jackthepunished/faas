@@ -28,6 +28,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -60,6 +61,11 @@ type githubdBridgeStore interface {
 // needs. The cmd/apid pgNotifier satisfies this; unit tests pass a stub.
 type githubdBridgeNotifier interface {
 	Notify(ctx context.Context, channel, payload string) error
+}
+
+type githubdBridgeActivityStore interface {
+	state.OrgActivityStore
+	OrgByPersonalAccount(context.Context, string) (state.Org, error)
 }
 
 // githubdBridge is the in-package server implementation of
@@ -391,11 +397,58 @@ func (g *githubdBridge) EnqueueBuild(ctx context.Context, req *githubdpb.Enqueue
 	g.log.Info("githubd bridge: build enqueued",
 		"build", res.BuildID, "deployment", res.DeploymentID, notifyAppField, app.ID,
 		"commit_sha", req.CommitSha, "repo", req.RepoFullName, "branch", req.Branch)
+	g.recordDeploymentActivity(ctx, acct, app, res, req)
 	return &githubdpb.EnqueueBuildResponse{
 		BuildId:      res.BuildID,
 		DeploymentId: res.DeploymentID,
 		AppId:        app.ID,
 	}, nil
+}
+
+func (g *githubdBridge) recordDeploymentActivity(ctx context.Context, acct state.Account, app state.App, res apidsource.EnqueueResult, req *githubdpb.EnqueueBuildRequest) {
+	store, ok := g.store.(githubdBridgeActivityStore)
+	if !ok {
+		return
+	}
+	var orgID uuid.UUID
+	var orgErr error
+	if app.OrgID != "" {
+		orgID, orgErr = uuid.Parse(app.OrgID)
+	} else {
+		org, err := store.OrgByPersonalAccount(ctx, acct.ID)
+		if err != nil {
+			g.log.Warn("githubd bridge: resolve activity organization", "deployment", res.DeploymentID, "err", err)
+			return
+		}
+		orgID, orgErr = uuid.Parse(org.ID)
+	}
+	appID, appErr := uuid.Parse(app.ID)
+	deploymentID, deploymentErr := uuid.Parse(res.DeploymentID)
+	if orgErr != nil || appErr != nil || deploymentErr != nil {
+		g.log.Warn("githubd bridge: invalid activity identifiers", "deployment", res.DeploymentID)
+		return
+	}
+	entry := state.OrgActivity{
+		OrgID: orgID, Kind: "app.deployed", ActorType: state.OrgActivityActorGitHub,
+		ActorLabel: "GitHub Actions", ResourceType: "app", ResourceID: app.ID,
+		ResourceLabel: app.Slug, AppID: &appID, DeploymentID: &deploymentID,
+		SourceType: "deployment", SourceID: res.DeploymentID,
+		Data: activityData(map[string]any{"source": "github", "repo": req.RepoFullName, "branch": req.Branch}),
+	}
+	if outbox, ok := g.store.(state.OrgActivityOutboxStore); ok {
+		id, err := outbox.EnqueueOrgActivityOutbox(ctx, entry)
+		if err == nil {
+			_, err = outbox.DeliverOrgActivityOutbox(ctx, id)
+		}
+		if err != nil {
+			g.log.Warn("githubd bridge: enqueue deployment activity", "deployment", res.DeploymentID, "err", err)
+		}
+		return
+	}
+	_, err := store.AppendOrgActivity(ctx, entry)
+	if err != nil {
+		g.log.Warn("githubd bridge: append deployment activity", "deployment", res.DeploymentID, "err", err)
+	}
 }
 
 // asGRPC maps a state.Store error (or any error wrapping a

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/sched"
 )
 
 // cacheRuleContextKey is the unexported context-key type the
@@ -150,6 +151,16 @@ func (h *Handler) startStaleWhileWakingRefresh(r *http.Request, app App, rule *E
 		Query:          snap.Query,
 		VaryHash:       snap.VaryHash,
 	}
+	h.startCacheRefresh(r, app, rule, key)
+}
+
+// startCacheRefresh coalesces refreshes by the complete cache key. It works
+// for both the cold-app stale-while-waking path and general
+// stale-while-revalidate hits against a warm app.
+func (h *Handler) startCacheRefresh(r *http.Request, app App, rule *EdgeRuleCacheResolved, key CacheKey) {
+	if h == nil || h.backend == nil || h.responseCache == nil || rule == nil || r == nil {
+		return
+	}
 	detached := context.WithoutCancel(r.Context())
 	request := r.Clone(detached)
 	request.Body = http.NoBody
@@ -157,9 +168,11 @@ func (h *Handler) startStaleWhileWakingRefresh(r *http.Request, app App, rule *E
 		_, _, _ = h.cacheRefresh.Do(key.String(), func() (any, error) {
 			ctx, cancel := context.WithTimeout(ctx, time.Duration(api.WakeQueueTTLSeconds)*time.Second)
 			defer cancel()
-			limits, _ := api.LimitsFor(app.Plan)
-			if _, _, _, err := h.ensureCapacity(ctx, app.ID, app.AccountID, app.Scope, limits.MaxConcurrency, app.Plan, app.AutoscaleTargetRPS, concurrencyConfigForApp(app)); err != nil {
-				return nil, err
+			if h.backend.HealthyCount(app.ID) == 0 {
+				limits, _ := api.LimitsFor(app.Plan)
+				if _, _, _, err := h.ensureCapacity(ctx, app.ID, app.AccountID, app.Scope, limits.MaxConcurrency, app.Plan, app.AutoscaleTargetRPS, sched.TriggerGateway, concurrencyConfigForApp(app)); err != nil {
+					return nil, err
+				}
 			}
 			h.refreshCacheFromWarmTarget(ctx, request, app, rule, key)
 			return nil, nil

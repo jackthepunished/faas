@@ -6,7 +6,9 @@ import (
 	"errors"
 	"math"
 	"sort"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -110,7 +112,7 @@ func classifyServiceReplicas(replicas []state.Instance) serviceReplicaStatus {
 			status.ready++
 		case state.StateWaking, state.StateColdBooting:
 			status.starting++
-		case state.StateSnapshotting, state.StateMigrating:
+		case state.StateDraining, state.StateSnapshotting, state.StateMigrating:
 			status.draining++
 		default:
 			status.unavailable++
@@ -155,7 +157,7 @@ func (e *Engine) observeServiceReplicaStatus(ctx context.Context, app state.App,
 			status.ready++
 		case state.StateWaking, state.StateColdBooting:
 			status.starting++
-		case state.StateSnapshotting, state.StateMigrating:
+		case state.StateDraining, state.StateSnapshotting, state.StateMigrating:
 			status.draining++
 		}
 	}
@@ -462,6 +464,9 @@ func (e *Engine) drainServiceDeploymentInstances(ctx context.Context, deployment
 			}
 			e.ledger.Release(fresh.ID)
 			e.transition(ctx, fresh.ID, fresh.AppID, state.StateStopped)
+		case state.StateDraining:
+			// Runtime-config refresh owns this non-routable row and its
+			// route/request drain barriers. Leave it to that durable handoff.
 		}
 	}
 }
@@ -514,11 +519,328 @@ func (e *Engine) drainDeploymentInstances(ctx context.Context, deploymentID stri
 		case state.StateSnapshotting:
 			// An in-flight snapshot is already releasing the serving slot;
 			// let it finish so the rollback cache remains valid.
+		case state.StateDraining:
+			// Runtime-config refresh owns this withdrawn row through teardown.
+		}
+	}
+}
+
+type serviceRouteSubscriber interface {
+	Subscribe(context.Context, []string) (<-chan db.Notification, error)
+}
+
+type serviceRouteGenerationStore interface {
+	NextDeploymentRouteGeneration(context.Context) (int64, error)
+}
+
+func servingGatewayNames(nodes []state.ComputeNode) map[string]struct{} {
+	expected := make(map[string]struct{})
+	for _, node := range nodes {
+		name := strings.TrimSpace(node.Name)
+		role := ""
+		if node.Role != nil {
+			role = strings.TrimSpace(*node.Role)
+		}
+		if name == "" || !node.Active || (role != "compute-only" && role != "compute-node") ||
+			node.GatewayTargetURL == nil || strings.TrimSpace(*node.GatewayTargetURL) == "" {
+			continue
+		}
+		expected[name] = struct{}{}
+	}
+	return expected
+}
+
+func serviceRouteFleetConfigured(nodes []state.ComputeNode, ownerNodeID string) bool {
+	if strings.TrimSpace(ownerNodeID) != "" {
+		return true
+	}
+	for _, node := range nodes {
+		name := strings.TrimSpace(node.Name)
+		if name != "" && name != state.DefaultLocalNodeName {
+			return true
+		}
+	}
+	return false
+}
+
+func sortedServiceGatewaySet(values map[string]struct{}) []string {
+	out := make([]string, 0, len(values))
+	for value := range values {
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (e *Engine) updateServiceRolloutHandoff(ctx context.Context, deploymentID string, mutate func(*state.ServiceRolloutHandoff)) {
+	dep, err := e.store.DeploymentByID(ctx, deploymentID)
+	if err != nil {
+		if !errors.Is(err, state.ErrNotFound) {
+			e.log.Warn("sched: load service rollout handoff", "deployment", deploymentID, "err", err)
+		}
+		return
+	}
+	handoff := dep.ServiceRolloutHandoff
+	mutate(&handoff)
+	now := time.Now().UTC()
+	handoff.UpdatedAt = &now
+	if _, err := e.store.UpdateServiceRolloutHandoff(ctx, deploymentID, handoff); err != nil &&
+		!errors.Is(err, state.ErrServiceRolloutInvalid) && !errors.Is(err, state.ErrNotFound) {
+		e.log.Warn("sched: persist service rollout handoff", "deployment", deploymentID, "phase", handoff.Phase, "err", err)
+	}
+}
+
+func (e *Engine) failServiceRolloutHandoff(ctx context.Context, deploymentID, phase, reason string, missing []string) {
+	e.updateServiceRolloutHandoff(ctx, deploymentID, func(h *state.ServiceRolloutHandoff) {
+		h.Phase = phase
+		h.LastError = reason
+		h.MissingGateways = append([]string(nil), missing...)
+	})
+}
+
+// waitForServiceRouteConvergence publishes a unique routing generation and
+// waits for every registered serving gateway to confirm that both its weight
+// table and live targets reflect the cutover. The caller has already retained
+// the predecessor as a live zero-weight generation, so every failure path is
+// safe: old requests continue while reconciliation retries.
+func (e *Engine) waitForServiceRouteConvergence(ctx context.Context, appID, deploymentID string) (acknowledgedAt time.Time, fleetBarrier bool, ok bool) {
+	return e.waitForServiceRouteConvergenceForRollout(ctx, appID, deploymentID, deploymentID, state.ServiceRolloutActionPromote)
+}
+
+func (e *Engine) waitForServiceRouteConvergenceForRollout(ctx context.Context, appID, rolloutID, deploymentID, action string) (acknowledgedAt time.Time, fleetBarrier bool, ok bool) {
+	started := time.Now()
+	nodes, err := e.store.ListComputeNodes(ctx, false)
+	if err != nil {
+		e.log.Warn("sched: list serving gateways for rollout", "app", appID, "deployment", deploymentID, "err", err)
+		e.failServiceRolloutHandoff(ctx, rolloutID, state.ServiceRolloutPhaseRouting, "list_serving_gateways_failed", nil)
+		e.ops.ObserveServiceRolloutHandoffPhase(action, state.ServiceRolloutPhaseRouting, "error", time.Since(started).Seconds())
+		return time.Time{}, false, false
+	}
+	expected := servingGatewayNames(nodes)
+	if len(expected) == 0 {
+		if serviceRouteFleetConfigured(nodes, e.ownerNodeID) {
+			e.log.Warn("sched: no active serving gateways registered for rollout", "app", appID, "deployment", deploymentID)
+			e.failServiceRolloutHandoff(ctx, rolloutID, state.ServiceRolloutPhaseRouting, "no_active_serving_gateways", nil)
+			e.ops.ObserveServiceRolloutHandoffPhase(action, state.ServiceRolloutPhaseRouting, "timeout", time.Since(started).Seconds())
+			return time.Time{}, true, false
+		}
+		// Legacy single-box and unit-test installs have no registered gateway
+		// identity. Preserve their existing notify path without pretending it
+		// provides a fleet acknowledgement or telemetry drain barrier.
+		e.emitServiceRolloutChange(ctx, appID, deploymentID, state.DeployLive)
+		now := time.Now().UTC()
+		e.updateServiceRolloutHandoff(ctx, rolloutID, func(h *state.ServiceRolloutHandoff) {
+			h.Phase = state.ServiceRolloutPhaseDraining
+			h.LastError = ""
+			h.AcknowledgedAt = &now
+		})
+		e.ops.ObserveServiceRolloutHandoffPhase(action, state.ServiceRolloutPhaseRouting, "success", time.Since(started).Seconds())
+		return now, false, true
+	}
+	expectedNames := sortedServiceGatewaySet(expected)
+	subscriber, available := e.notif.(serviceRouteSubscriber)
+	if !available {
+		e.log.Warn("sched: deployment route acknowledgement subscriber unavailable", "app", appID, "deployment", deploymentID)
+		e.failServiceRolloutHandoff(ctx, rolloutID, state.ServiceRolloutPhaseRouting, "route_ack_subscriber_unavailable", expectedNames)
+		e.ops.ObserveServiceRolloutHandoffPhase(action, state.ServiceRolloutPhaseRouting, "error", time.Since(started).Seconds())
+		return time.Time{}, true, false
+	}
+	allocator, available := e.store.(serviceRouteGenerationStore)
+	if !available {
+		e.log.Warn("sched: deployment route generation store unavailable", "app", appID, "deployment", deploymentID)
+		e.failServiceRolloutHandoff(ctx, rolloutID, state.ServiceRolloutPhaseRouting, "route_generation_store_unavailable", expectedNames)
+		e.ops.ObserveServiceRolloutHandoffPhase(action, state.ServiceRolloutPhaseRouting, "error", time.Since(started).Seconds())
+		return time.Time{}, true, false
+	}
+	generation, err := allocator.NextDeploymentRouteGeneration(ctx)
+	if err != nil {
+		e.log.Warn("sched: allocate deployment route generation", "app", appID, "deployment", deploymentID, "err", err)
+		e.failServiceRolloutHandoff(ctx, rolloutID, state.ServiceRolloutPhaseRouting, "route_generation_allocation_failed", expectedNames)
+		e.ops.ObserveServiceRolloutHandoffPhase(action, state.ServiceRolloutPhaseRouting, "error", time.Since(started).Seconds())
+		return time.Time{}, true, false
+	}
+	e.updateServiceRolloutHandoff(ctx, rolloutID, func(h *state.ServiceRolloutHandoff) {
+		h.Phase = state.ServiceRolloutPhaseRouting
+		h.Generation = generation
+		h.ExpectedGateways = append([]string(nil), expectedNames...)
+		h.AcknowledgedGateways = nil
+		h.MissingGateways = append([]string(nil), expectedNames...)
+		h.LastError = ""
+	})
+	payloadBytes, err := json.Marshal(db.DeploymentRouteChangedPayload{
+		AppID: appID, DeploymentID: deploymentID, Generation: generation,
+	})
+	if err != nil {
+		e.failServiceRolloutHandoff(ctx, rolloutID, state.ServiceRolloutPhaseRouting, "route_payload_encode_failed", expectedNames)
+		e.ops.ObserveServiceRolloutHandoffPhase(action, state.ServiceRolloutPhaseRouting, "error", time.Since(started).Seconds())
+		return time.Time{}, true, false
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, time.Duration(api.ServiceRouteConvergenceTimeoutSeconds)*time.Second)
+	defer cancel()
+	events, err := subscriber.Subscribe(waitCtx, []string{db.NotifyDeploymentRouteAck})
+	if err != nil {
+		e.log.Warn("sched: subscribe deployment route acknowledgements", "app", appID, "deployment", deploymentID, "generation", generation, "err", err)
+		e.failServiceRolloutHandoff(ctx, rolloutID, state.ServiceRolloutPhaseRouting, "route_ack_subscribe_failed", expectedNames)
+		e.ops.ObserveServiceRolloutHandoffPhase(action, state.ServiceRolloutPhaseRouting, "error", time.Since(started).Seconds())
+		return time.Time{}, true, false
+	}
+	payload := string(payloadBytes)
+	if err := e.Notifier().Notify(waitCtx, db.NotifyDeploymentRouteChanged, payload); err != nil {
+		e.log.Warn("sched: publish deployment route generation", "app", appID, "deployment", deploymentID, "generation", generation, "err", err)
+		e.failServiceRolloutHandoff(ctx, rolloutID, state.ServiceRolloutPhaseRouting, "route_publish_failed", expectedNames)
+		e.ops.ObserveServiceRolloutHandoffPhase(action, state.ServiceRolloutPhaseRouting, "error", time.Since(started).Seconds())
+		return time.Time{}, true, false
+	}
+	retry := time.NewTicker(time.Duration(api.ServiceRouteNotificationRetryMilliseconds) * time.Millisecond)
+	defer retry.Stop()
+	seen := make(map[string]struct{}, len(expected))
+	for len(seen) < len(expected) {
+		select {
+		case <-waitCtx.Done():
+			missing := make([]string, 0, len(expected)-len(seen))
+			for node := range expected {
+				if _, found := seen[node]; !found {
+					missing = append(missing, node)
+				}
+			}
+			sort.Strings(missing)
+			e.log.Warn("sched: deployment route convergence incomplete", "app", appID, "deployment", deploymentID, "generation", generation, "missing", strings.Join(missing, ","))
+			e.failServiceRolloutHandoff(ctx, rolloutID, state.ServiceRolloutPhaseRouting, "route_convergence_timeout", missing)
+			e.ops.ObserveServiceRolloutHandoffPhase(action, state.ServiceRolloutPhaseRouting, "timeout", time.Since(started).Seconds())
+			return time.Time{}, true, false
+		case event, open := <-events:
+			if !open {
+				e.failServiceRolloutHandoff(ctx, rolloutID, state.ServiceRolloutPhaseRouting, "route_ack_stream_closed", expectedNames)
+				e.ops.ObserveServiceRolloutHandoffPhase(action, state.ServiceRolloutPhaseRouting, "error", time.Since(started).Seconds())
+				return time.Time{}, true, false
+			}
+			ack, parseErr := db.ParseDeploymentRouteAckPayload(event.Payload)
+			if parseErr != nil || ack.Generation != generation {
+				continue
+			}
+			if _, wanted := expected[ack.Node]; wanted {
+				seen[ack.Node] = struct{}{}
+				missing := make(map[string]struct{}, len(expected)-len(seen))
+				for node := range expected {
+					if _, ok := seen[node]; !ok {
+						missing[node] = struct{}{}
+					}
+				}
+				acknowledged := sortedServiceGatewaySet(seen)
+				missingNames := sortedServiceGatewaySet(missing)
+				e.updateServiceRolloutHandoff(ctx, rolloutID, func(h *state.ServiceRolloutHandoff) {
+					h.AcknowledgedGateways = acknowledged
+					h.MissingGateways = missingNames
+				})
+			}
+		case <-retry.C:
+			_ = e.Notifier().Notify(waitCtx, db.NotifyDeploymentRouteChanged, payload)
+		}
+	}
+	now := time.Now().UTC()
+	e.updateServiceRolloutHandoff(ctx, rolloutID, func(h *state.ServiceRolloutHandoff) {
+		h.Phase = state.ServiceRolloutPhaseDraining
+		h.LastError = ""
+		h.MissingGateways = nil
+		h.AcknowledgedAt = &now
+	})
+	e.ops.ObserveServiceRolloutHandoffPhase(action, state.ServiceRolloutPhaseRouting, "success", time.Since(started).Seconds())
+	return now, true, true
+}
+
+// waitForServiceDeploymentDrain requires post-ack, fresh telemetry showing a
+// quiet zero-inflight window for every predecessor replica. Missing or stale
+// telemetry fails safe and keeps the predecessor resident.
+func (e *Engine) waitForServiceDeploymentDrain(ctx context.Context, appID, rolloutID, deploymentID, action string, acknowledgedAt time.Time) bool {
+	started := time.Now()
+	replicas, err := listServiceReplicas(ctx, e.store, appID, deploymentID)
+	if err != nil {
+		e.log.Warn("sched: list predecessor replicas for drain", "app", appID, "deployment", deploymentID, "err", err)
+		e.failServiceRolloutHandoff(ctx, rolloutID, state.ServiceRolloutPhaseDraining, "list_drain_replicas_failed", nil)
+		e.ops.ObserveServiceRolloutHandoffPhase(action, state.ServiceRolloutPhaseDraining, "error", time.Since(started).Seconds())
+		return false
+	}
+	ids := make([]string, 0, len(replicas))
+	for _, replica := range replicas {
+		if state.State(replica.State) == state.StateRunning {
+			ids = append(ids, replica.ID)
+		}
+	}
+	if len(ids) == 0 {
+		e.ops.ObserveServiceRolloutHandoffPhase(action, state.ServiceRolloutPhaseDraining, "success", time.Since(started).Seconds())
+		return true
+	}
+	drainCtx, cancel := context.WithTimeout(ctx, time.Duration(api.ServiceReplicaDrainTimeoutSeconds)*time.Second)
+	defer cancel()
+	quietFor := time.Duration(api.ServiceReplicaDrainQuietSeconds) * time.Second
+	zeroSince := make(map[string]time.Time, len(ids))
+	ticker := time.NewTicker(time.Duration(api.ServiceReplicaDrainPollMilliseconds) * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		now := time.Now()
+		allQuiet := true
+		for _, instanceID := range ids {
+			fresh, loadErr := e.store.InstanceByID(drainCtx, instanceID)
+			if errors.Is(loadErr, state.ErrNotFound) || (loadErr == nil && state.State(fresh.State) != state.StateRunning) {
+				continue
+			}
+			if loadErr != nil {
+				allQuiet = false
+				continue
+			}
+			inflight, receivedAt, observed := e.telemetryCache.LookupInflightRequests(instanceID, now)
+			if !observed || !receivedAt.After(acknowledgedAt) {
+				delete(zeroSince, instanceID)
+				allQuiet = false
+				continue
+			}
+			if inflight > 0 {
+				delete(zeroSince, instanceID)
+				allQuiet = false
+				continue
+			}
+			started, seenZero := zeroSince[instanceID]
+			if !seenZero {
+				zeroSince[instanceID] = receivedAt
+				allQuiet = false
+				continue
+			}
+			if receivedAt.Sub(started) < quietFor {
+				allQuiet = false
+			}
+		}
+		if allQuiet {
+			e.updateServiceRolloutHandoff(ctx, rolloutID, func(h *state.ServiceRolloutHandoff) { h.LastError = "" })
+			e.ops.ObserveServiceRolloutHandoffPhase(action, state.ServiceRolloutPhaseDraining, "success", time.Since(started).Seconds())
+			return true
+		}
+		select {
+		case <-drainCtx.Done():
+			e.log.Warn("sched: predecessor request drain incomplete", "app", appID, "deployment", deploymentID)
+			e.failServiceRolloutHandoff(ctx, rolloutID, state.ServiceRolloutPhaseDraining, "request_drain_timeout", nil)
+			e.ops.ObserveServiceRolloutHandoffPhase(action, state.ServiceRolloutPhaseDraining, "timeout", time.Since(started).Seconds())
+			return false
+		case <-ticker.C:
 		}
 	}
 }
 
 func (e *Engine) finishServiceRollout(ctx context.Context, app state.App, rollout, previous state.Deployment) bool {
+	if previous.ID != "" {
+		if _, err := e.store.BeginServiceRolloutCutover(ctx, rollout.ID); err != nil {
+			if !errors.Is(err, state.ErrServiceRolloutInvalid) && !errors.Is(err, state.ErrNotFound) {
+				e.log.Warn("sched: begin service rollout cutover", "app", app.ID, "deployment", rollout.ID, "err", err)
+			}
+			return false
+		}
+		acknowledgedAt, fleetBarrier, converged := e.waitForServiceRouteConvergenceForRollout(ctx, app.ID, rollout.ID, rollout.ID, state.ServiceRolloutActionPromote)
+		if !converged {
+			return false
+		}
+		if fleetBarrier && !e.waitForServiceDeploymentDrain(ctx, app.ID, rollout.ID, previous.ID, state.ServiceRolloutActionPromote, acknowledgedAt) {
+			return false
+		}
+	}
 	updated, err := e.store.FinalizeServiceRollout(ctx, rollout.ID)
 	if err != nil {
 		if !errors.Is(err, state.ErrServiceRolloutInvalid) && !errors.Is(err, state.ErrNotFound) {
@@ -530,6 +852,39 @@ func (e *Engine) finishServiceRollout(ctx context.Context, app state.App, rollou
 		e.drainServiceDeploymentInstances(ctx, previous.ID, true)
 	}
 	e.emitServiceRolloutChange(ctx, app.ID, updated.ID, updated.Status)
+	return true
+}
+
+func (e *Engine) reverseServiceRollout(ctx context.Context, app state.App, rollout state.Deployment) bool {
+	updated, err := e.store.BeginServiceRolloutAbort(ctx, rollout.ID)
+	if err != nil {
+		if !errors.Is(err, state.ErrServiceRolloutInvalid) && !errors.Is(err, state.ErrNotFound) {
+			e.log.Warn("sched: begin service rollout abort", "app", app.ID, "deployment", rollout.ID, "err", err)
+		}
+		return false
+	}
+	predecessorID := updated.ServiceRolloutHandoff.PredecessorDeploymentID
+	if predecessorID == "" {
+		e.failServiceRolloutHandoff(ctx, rollout.ID, state.ServiceRolloutPhaseRouting, "predecessor_missing", nil)
+		return false
+	}
+	acknowledgedAt, fleetBarrier, converged := e.waitForServiceRouteConvergenceForRollout(ctx, app.ID, rollout.ID, predecessorID, state.ServiceRolloutActionAbort)
+	if !converged {
+		return false
+	}
+	if fleetBarrier && !e.waitForServiceDeploymentDrain(ctx, app.ID, rollout.ID, rollout.ID, state.ServiceRolloutActionAbort, acknowledgedAt) {
+		return false
+	}
+	final, err := e.store.AbortServiceRollout(ctx, rollout.ID, updated.ServiceRolloutHandoff.Reason)
+	if err != nil {
+		if !errors.Is(err, state.ErrServiceRolloutInvalid) && !errors.Is(err, state.ErrNotFound) {
+			e.log.Warn("sched: finalize service rollout abort", "app", app.ID, "deployment", rollout.ID, "err", err)
+		}
+		return false
+	}
+	e.drainServiceDeploymentInstances(ctx, rollout.ID, false)
+	e.emitServiceRolloutChange(ctx, app.ID, predecessorID, state.DeployLive)
+	e.emitServiceRolloutChange(ctx, app.ID, final.ID, final.Status)
 	return true
 }
 
@@ -555,6 +910,10 @@ func (e *Engine) abortServiceRollout(ctx context.Context, app state.App, rollout
 // pass. The old generation keeps the remainder of the desired capacity until
 // the new generation proves readiness; the total temporary surge is one.
 func (e *Engine) reconcileServiceRollout(ctx context.Context, app state.App, rollout state.Deployment, deployments []state.Deployment) {
+	if rollout.ServiceRolloutHandoff.ActiveAbort() {
+		e.reverseServiceRollout(ctx, app, rollout)
+		return
+	}
 	desired := desiredServiceReplicas(app.Manifest)
 	previous := previousServiceDeployment(rollout, deployments)
 	replicas, err := listServiceReplicas(ctx, e.store, app.ID, rollout.ID)
@@ -584,21 +943,6 @@ func (e *Engine) reconcileServiceRollout(ctx context.Context, app state.App, rol
 		}
 		e.convergeServiceReplicasToTarget(ctx, previous.ID, oldTarget, false)
 		e.convergeServiceReplicasToTarget(ctx, rollout.ID, newTarget, true)
-		// max_concurrency is also the service app's replica ceiling. A
-		// rollout normally uses one bounded surge slot, but the API permits
-		// the common exact-fit shape (max_concurrency == desired). If the
-		// first replacement admission hit that ceiling, release one ready
-		// predecessor replica and retry. This keeps exact-fit services from
-		// hanging forever while retaining the predecessor's snapshot for a
-		// rollback if the replacement later fails.
-		if app.MaxConcurrency > 0 && e.ledger.Concurrency(app.ID) >= app.MaxConcurrency {
-			ready, readErr := listServiceReplicas(ctx, e.store, app.ID, rollout.ID)
-			if readErr == nil && classifyServiceReplicas(ready).managed() < newTarget {
-				if e.parkOneServiceReplica(ctx, app.ID, previous.ID) {
-					e.convergeServiceReplicasToTarget(ctx, rollout.ID, newTarget, true)
-				}
-			}
-		}
 	}
 	// Admission may synchronously reach RUNNING. Re-read so a fast boot can
 	// complete the rollout without waiting for a second notification.
@@ -624,9 +968,9 @@ func (e *Engine) ReconcileServiceDeployment(ctx context.Context, deploymentID st
 }
 
 // ReconcileServiceApp applies one globally consistent service allocation to
-// every live deployment of an app. Surplus is parked for all generations
-// before any deficit is admitted, which makes rollout capacity available even
-// when the predecessor currently occupies the entire app quota.
+// every live deployment of an app. Steady-state surplus is parked before a
+// deficit is admitted. Active rollout scopes are handled separately above and
+// never park healthy predecessor capacity merely to make candidate headroom.
 func (e *Engine) ReconcileServiceApp(ctx context.Context, appID string) {
 	ctx = detachedServiceContext(ctx)
 	reconcileMu := e.serviceAppMutex(appID)
@@ -908,6 +1252,15 @@ func workerStatePreference(ins state.Instance) int {
 // reconciler means an instance transition cannot accidentally collapse a
 // queue-sized worker fleet back to the singleton target.
 func (e *Engine) workerQueueDepth(ctx context.Context, app state.App) (int, error) {
+	if e.brokerLag != nil {
+		lag, ok, err := e.brokerLag.BrokerLag(ctx, app.ID)
+		if err != nil {
+			return 0, err
+		}
+		if ok {
+			return int(lag), nil
+		}
+	}
 	bindings, err := e.store.ListQueueBindingsForApp(ctx, app.AccountID, app.ID)
 	if err != nil {
 		return 0, err
@@ -964,22 +1317,28 @@ func (e *Engine) workerReplicaTarget(ctx context.Context, app state.App, overrid
 		return 0
 	}
 
-	desired := 1
+	minAllowed := 1
+	if app.Manifest.WorkerReplicas != nil && app.Manifest.WorkerReplicas.Min == 0 {
+		minAllowed = 0
+	}
+	desired := minAllowed
 	if override != nil {
 		desired = *override
-	} else if policy := app.ScalingPolicy; policy != nil && policy.Target != nil && policy.Target.Metric == "queue_depth" && policy.Target.Value > 0 {
+	} else if policy := app.ScalingPolicy; policy != nil && policy.Target != nil && (policy.Target.Metric == "queue_depth" || policy.Target.Metric == "queue_lag") && policy.Target.Value > 0 {
 		depth, depthErr := e.workerQueueDepth(ctx, app)
 		if depthErr != nil {
 			e.log.Warn("sched: read worker queue depth", "app", app.ID, "err", depthErr)
 		} else if depth > 0 {
 			desired = int(math.Ceil(float64(depth) / policy.Target.Value))
+		} else {
+			desired = 0
 		}
 		if policy.MinInstances > desired {
 			desired = policy.MinInstances
 		}
 	}
-	if desired < 1 {
-		desired = 1
+	if desired < minAllowed {
+		desired = minAllowed
 	}
 	if desired > max {
 		desired = max
@@ -1053,6 +1412,44 @@ func (e *Engine) ReconcileWorkerPool(ctx context.Context, appID string, desired 
 	return nil
 }
 
+// parseStopSignal parses a string signal representation (e.g. "SIGTERM", "TERM", "15",
+// "SIGINT", "INT", "2", "SIGQUIT", "SIGKILL", etc.) into a syscall.Signal.
+// Empty or unrecognised values fall back to SIGTERM.
+func parseStopSignal(s string) syscall.Signal {
+	s = strings.TrimSpace(strings.ToUpper(s))
+	switch s {
+	case "":
+		return syscall.SIGTERM
+	case "SIGTERM", "TERM", "15":
+		return syscall.SIGTERM
+	case "SIGINT", "INT", "2":
+		return syscall.SIGINT
+	case "SIGQUIT", "QUIT", "3":
+		return syscall.SIGQUIT
+	case "SIGHUP", "HUP", "1":
+		return syscall.SIGHUP
+	case "SIGUSR1", "USR1", "10":
+		return syscall.SIGUSR1
+	case "SIGUSR2", "USR2", "12":
+		return syscall.SIGUSR2
+	default:
+		return syscall.SIGTERM
+	}
+}
+
+// workerStopOptions returns StopOptions for a worker instance based on the app manifest.
+func (e *Engine) workerStopOptions(app state.App) StopOptions {
+	grace := app.Manifest.StopGracePeriodS
+	if grace <= 0 {
+		grace = 30
+	}
+	sig := parseStopSignal(app.Manifest.StopSignal)
+	return StopOptions{
+		Signal:       int32(sig),
+		GraceSeconds: int32(grace),
+	}
+}
+
 func (e *Engine) reconcileWorkerApp(ctx context.Context, appID string, desiredOverride *int) {
 	e.reconcileWorkerAppWithTrigger(ctx, appID, desiredOverride, TriggerWorkerSingleton)
 }
@@ -1109,6 +1506,7 @@ func (e *Engine) reconcileWorkerAppWithTrigger(ctx context.Context, appID string
 		return workers[i].StartedAt.Before(workers[j].StartedAt)
 	})
 
+	stopOpts := e.workerStopOptions(app)
 	kept := make(map[string]int, len(targets))
 	for _, ins := range workers {
 		_, wanted := targets[ins.DeploymentID]
@@ -1116,7 +1514,7 @@ func (e *Engine) reconcileWorkerAppWithTrigger(ctx context.Context, appID string
 			kept[ins.DeploymentID]++
 			continue
 		}
-		if err := e.stopManagedWorker(ctx, ins.ID); err != nil {
+		if err := e.stopManagedWorker(ctx, ins.ID, stopOpts); err != nil {
 			e.log.Warn("sched: drain surplus worker", "app", appID, "deployment", ins.DeploymentID, "instance", ins.ID, "err", err)
 		}
 	}
@@ -1148,7 +1546,7 @@ func (e *Engine) reconcileWorkerAppWithTrigger(ctx context.Context, appID string
 // stopManagedWorker removes one reconciler-owned worker without snapshots.
 // RUNNING rows take the graceful OCI stop path. In-flight rows are destroyed
 // under appMu so a concurrent boot cannot commit after the cleanup decision.
-func (e *Engine) stopManagedWorker(ctx context.Context, instanceID string) error {
+func (e *Engine) stopManagedWorker(ctx context.Context, instanceID string, opts ...StopOptions) error {
 	for attempt := 0; attempt < 2; attempt++ {
 		ins, err := e.store.InstanceByID(ctx, instanceID)
 		if err != nil {
@@ -1158,8 +1556,16 @@ func (e *Engine) stopManagedWorker(ctx context.Context, instanceID string) error
 			return err
 		}
 		if state.State(ins.State) == state.StateRunning {
-			_, err = e.StopInstance(ctx, instanceID, StopOptions{GraceSeconds: 30})
+			var stopOpts StopOptions
+			if len(opts) > 0 {
+				stopOpts = opts[0]
+			}
+			_, err = e.StopInstance(ctx, instanceID, stopOpts)
 			return err
+		}
+		if state.State(ins.State) == state.StateDraining {
+			// Runtime-config refresh owns this withdrawn row through teardown.
+			return nil
 		}
 		if !state.State(ins.State).CountsForRAM() {
 			return nil
@@ -1265,28 +1671,4 @@ func (e *Engine) parkSurplusServiceReplicas(ctx context.Context, replicas []stat
 		parked++
 	}
 	return parked
-}
-
-// parkOneServiceReplica releases one per-app concurrency slot for an
-// exact-fit rolling replacement. The caller has already confirmed that a
-// replacement admission could not fit under max_concurrency; only a RUNNING
-// predecessor is eligible because parking an in-flight wake would require a
-// different destroy path and would make the rollout's capacity accounting
-// ambiguous.
-func (e *Engine) parkOneServiceReplica(ctx context.Context, appID, deploymentID string) bool {
-	replicas, err := listServiceReplicas(ctx, e.store, appID, deploymentID)
-	if err != nil {
-		return false
-	}
-	for _, replica := range replicas {
-		if state.State(replica.State) != state.StateRunning {
-			continue
-		}
-		if err := e.Park(ctx, replica.ID); err != nil {
-			e.log.Warn("sched: park predecessor for exact-fit service rollout", "instance", replica.ID, "deployment", deploymentID, "err", err)
-			continue
-		}
-		return true
-	}
-	return false
 }

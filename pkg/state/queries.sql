@@ -1,3 +1,117 @@
+-- name: ReadAccountCreditConsumption :one
+-- An unqualified legacy row blocks the whole key; guessing could double-debit.
+SELECT coalesce(sum(-delta_cents) FILTER (WHERE provider = sqlc.arg(provider)::text), 0)::bigint AS consumed_cents,
+       coalesce(bool_or(delta_cents < 0) FILTER (WHERE provider = sqlc.arg(provider)), false)::boolean AS has_prior,
+       coalesce(bool_or(provider = ''), false)::boolean AS has_unqualified
+FROM credit_ledger
+WHERE account_id = sqlc.arg(account_id)::uuid
+  AND provider_invoice_id = sqlc.arg(provider_invoice_id)::text;
+
+-- name: ReverseAccountInvoiceCreditConsumption :execrows
+WITH consumed AS (
+    SELECT ledger.credit_id, sum(-ledger.delta_cents)::bigint AS cents
+    FROM credit_ledger AS ledger
+    JOIN account_credits AS credit
+      ON credit.id = ledger.credit_id AND credit.account_id = ledger.account_id
+    WHERE ledger.account_id = sqlc.arg(account_id)::uuid
+      AND ledger.provider_invoice_id = sqlc.arg(provider_invoice_id)::text
+      AND ledger.provider = sqlc.arg(provider)::text
+    GROUP BY ledger.credit_id
+    HAVING sum(-ledger.delta_cents) > 0
+), inserted AS (
+    INSERT INTO credit_ledger
+        (account_id, credit_id, delta_cents, reason, actor, provider, provider_invoice_id, refund_reversal_id)
+    SELECT sqlc.arg(account_id), credit_id, cents, 'provider refund failed',
+           'apid-refund-reversal', sqlc.arg(provider), sqlc.arg(provider_invoice_id), sqlc.arg(refund_id)::uuid
+    FROM consumed
+    ON CONFLICT (refund_reversal_id, credit_id) WHERE refund_reversal_id IS NOT NULL
+        DO NOTHING
+    RETURNING credit_id, delta_cents
+)
+UPDATE account_credits AS credit
+SET cents_remaining = credit.cents_remaining + inserted.delta_cents
+FROM inserted
+WHERE credit.id = inserted.credit_id AND credit.account_id = sqlc.arg(account_id);
+
+-- name: SumAccountCreditRefundReversal :one
+SELECT coalesce(sum(delta_cents), 0)::bigint AS reversed_cents
+FROM credit_ledger
+WHERE account_id = sqlc.arg(account_id)::uuid
+  AND refund_reversal_id = sqlc.arg(refund_id)::uuid;
+
+-- name: AppendAccountCreditLedgerEntry :exec
+INSERT INTO credit_ledger (account_id, credit_id, delta_cents, reason, actor, provider, provider_invoice_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7);
+
+-- name: ReserveAccountCreditConsumption :one
+INSERT INTO credit_ledger (account_id, credit_id, delta_cents, reason, actor, provider, provider_invoice_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
+ON CONFLICT (provider, provider_invoice_id, credit_id)
+    WHERE provider_invoice_id IS NOT NULL AND delta_cents < 0 DO NOTHING
+RETURNING id;
+
+-- name: LockInvoiceForRefund :one
+SELECT account_id, provider, provider_invoice_id, amount_paid_cents,
+       total_cents, amount_refunded_cents, amount_refund_pending_cents, credits_applied_cents
+FROM invoices WHERE id = $1 FOR UPDATE;
+
+-- name: LockCreditConsumption :exec
+-- Keep the historical broad lock key, also shared with refund compensation.
+SELECT pg_advisory_xact_lock(hashtextextended('consume-account-credit:' || sqlc.arg(provider_invoice_id)::text, 0));
+
+-- name: FindInvoiceIDsByProviderKey :many
+-- Two matches mean an invoice ID collides with another invoice's charge ID.
+SELECT id FROM invoices
+WHERE account_id = sqlc.arg(account_id)::uuid
+  AND provider = sqlc.arg(provider)::text
+  AND (provider_invoice_id = sqlc.arg(provider_key)::text
+       OR provider_charge_id = sqlc.arg(provider_key))
+LIMIT 2;
+
+-- name: RollupMirrorResults :execrows
+-- ADR-221: claiming and counting share one statement/transaction. SKIP LOCKED
+-- permits concurrent workers without counting the same result twice.
+WITH pending AS MATERIALIZED (
+    SELECT id FROM mirror_invocation_results
+    WHERE NOT rollup_counted
+      AND completed_at >= sqlc.arg(window_start)::timestamptz
+      AND completed_at < sqlc.arg(window_end)::timestamptz
+    ORDER BY id
+    FOR UPDATE SKIP LOCKED
+), counted AS (
+    UPDATE mirror_invocation_results AS result
+    SET rollup_counted = true
+    FROM pending
+    WHERE result.id = pending.id
+    RETURNING result.*
+)
+INSERT INTO mirror_invocation_summary (
+    rule_id, app_id, hour_bucket, total_invocations,
+    status_diff_count, schema_diff_count, body_diff_count, crash_count,
+    cap_at_max_count, sum_latency_ms, rolled_up_at
+)
+SELECT mirror_rule_id, app_id,
+    date_trunc('hour', completed_at AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',
+    count(*), count(*) FILTER (WHERE status_diff),
+    count(*) FILTER (WHERE schema_diff), count(*) FILTER (WHERE body_diff),
+    count(*) FILTER (WHERE crashed), 0, coalesce(sum(latency_ms), 0), now()
+FROM counted
+GROUP BY 1, 2, 3
+ORDER BY 1, 3
+ON CONFLICT (rule_id, hour_bucket) DO UPDATE SET
+    total_invocations = mirror_invocation_summary.total_invocations + EXCLUDED.total_invocations,
+    status_diff_count = mirror_invocation_summary.status_diff_count + EXCLUDED.status_diff_count,
+    schema_diff_count = mirror_invocation_summary.schema_diff_count + EXCLUDED.schema_diff_count,
+    body_diff_count = mirror_invocation_summary.body_diff_count + EXCLUDED.body_diff_count,
+    crash_count = mirror_invocation_summary.crash_count + EXCLUDED.crash_count,
+    cap_at_max_count = mirror_invocation_summary.cap_at_max_count + EXCLUDED.cap_at_max_count,
+    sum_latency_ms = mirror_invocation_summary.sum_latency_ms + EXCLUDED.sum_latency_ms,
+    rolled_up_at = now();
+
+-- name: SweepCountedMirrorResults :execrows
+DELETE FROM mirror_invocation_results
+WHERE completed_at < sqlc.arg(cutoff)::timestamptz AND rollup_counted;
+
 -- name: CreateAccount :one
 insert into accounts (id, email, plan, status, provider_customer_id)
 values (gen_random_uuid(), $1, $2, $3, null)
@@ -1060,16 +1174,26 @@ SELECT secret_value FROM github_webhook_secrets WHERE installation_id = $1;
 INSERT INTO app_errors (
     id, account_id, app_id, deployment_id, fingerprint,
     route, http_status, error_class, sample_message,
-    count, request_count, first_seen_at, last_seen_at
+    count, request_count, first_seen_at, last_seen_at,
+    last_instance_id, last_node_id, last_region, last_commit_sha,
+    last_deployment_tag, last_deployment_created_at, last_image_digest
 ) VALUES (
     $1, $2, $3, $4, $5,
     $6, $7, $8, $9,
-    1, 1, $10, $10
+    1, 1, $10, $10,
+    $11, $12, $13, $14, $15, $16, $17
 )
 ON CONFLICT (account_id, app_id, fingerprint) DO UPDATE SET
     count         = app_errors.count + 1,
     request_count = app_errors.request_count + 1,
-    last_seen_at  = greatest(app_errors.last_seen_at, $10)
+    last_seen_at  = greatest(app_errors.last_seen_at, $10),
+    last_instance_id = COALESCE(NULLIF(EXCLUDED.last_instance_id, ''), app_errors.last_instance_id),
+    last_node_id = COALESCE(NULLIF(EXCLUDED.last_node_id, ''), app_errors.last_node_id),
+    last_region = COALESCE(NULLIF(EXCLUDED.last_region, ''), app_errors.last_region),
+    last_commit_sha = COALESCE(NULLIF(EXCLUDED.last_commit_sha, ''), app_errors.last_commit_sha),
+    last_deployment_tag = COALESCE(NULLIF(EXCLUDED.last_deployment_tag, ''), app_errors.last_deployment_tag),
+    last_deployment_created_at = COALESCE(NULLIF(EXCLUDED.last_deployment_created_at, ''), app_errors.last_deployment_created_at),
+    last_image_digest = COALESCE(NULLIF(EXCLUDED.last_image_digest, ''), app_errors.last_image_digest)
 RETURNING (xmax = 0) AS inserted;
 
 -- name: InsertAppErrorRequest :exec
@@ -1080,11 +1204,12 @@ RETURNING (xmax = 0) AS inserted;
 INSERT INTO app_error_requests (
     id, account_id, app_id, fingerprint, request_id, received_at,
     route, http_status, error_class, sample_message,
-    deployment_id, headers_sample, redactions
+    deployment_id, headers_sample, redactions, instance_id, node_id,
+    region, commit_sha, deployment_tag, deployment_created_at, image_digest
 ) VALUES (
     $1, $2, $3, $4, $5, $6,
     $7, $8, $9, $10,
-    $11, $12, $13
+    $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
 );
 
 -- name: ListAppErrorGroups :many
@@ -1109,7 +1234,9 @@ INSERT INTO app_error_requests (
 SELECT
     id, fingerprint, error_class, route, http_status,
     count, request_count, first_seen_at, last_seen_at,
-    sample_message
+    sample_message, last_instance_id, last_node_id, last_region,
+    last_commit_sha, last_deployment_tag, last_deployment_created_at,
+    last_image_digest
 FROM app_errors
 WHERE account_id = sqlc.arg('account_id')
   AND app_id     = sqlc.arg('app_id')
@@ -1133,7 +1260,8 @@ LIMIT sqlc.arg('limit');
 -- leading (received_at) reference, breaking pagination.
 SELECT
     id, request_id, received_at, route, http_status,
-    error_class, sample_message, deployment_id
+    error_class, sample_message, deployment_id, instance_id, node_id,
+    region, commit_sha, deployment_tag, deployment_created_at, image_digest
 FROM app_error_requests
 WHERE account_id  = sqlc.arg('account_id')
   AND app_id      = sqlc.arg('app_id')
@@ -1151,7 +1279,8 @@ LIMIT sqlc.arg('limit');
 SELECT
     id, request_id, received_at, route, http_status,
     error_class, sample_message, deployment_id,
-    headers_sample, redactions
+    headers_sample, redactions, instance_id, node_id, region, commit_sha,
+    deployment_tag, deployment_created_at, image_digest
 FROM app_error_requests
 WHERE account_id  = $1
   AND app_id      = $2
@@ -1702,7 +1831,8 @@ INSERT INTO request_telemetry (
     account_id, app_id, deployment_id, route, method,
     status, latency_ms, cold_boot, trace_id, received_at, count,
     ua_family, referrer_host, country, wake_id, instance_id,
-    guest_duration_ms, guest_runtime, guest_outcome, guest_error_class, consumer_id
+    guest_duration_ms, guest_runtime, guest_outcome, guest_error_class, consumer_id,
+    node_id, region, commit_sha, deployment_tag, deployment_created_at, image_digest
 ) VALUES (
     $1, $2, $3, $4, $5,
     $6, $7, $8, $9, $10, $11,
@@ -1710,7 +1840,13 @@ INSERT INTO request_telemetry (
     COALESCE(NULLIF(sqlc.arg('guest_runtime')::text, ''), '__unknown__'),
     COALESCE(NULLIF(sqlc.arg('guest_outcome')::text, ''), 'missing'),
     COALESCE(sqlc.arg('guest_error_class')::text, ''),
-    sqlc.arg('consumer_id')::uuid
+    sqlc.arg('consumer_id')::uuid,
+    sqlc.arg('node_id')::text,
+    sqlc.arg('region')::text,
+    sqlc.arg('commit_sha')::text,
+    sqlc.arg('deployment_tag')::text,
+    sqlc.arg('deployment_created_at')::text,
+    sqlc.arg('image_digest')::text
 );
 
 -- name: ListRequestTelemetryByApp :many
@@ -1723,7 +1859,8 @@ INSERT INTO request_telemetry (
 SELECT id, deployment_id, route, method, status, latency_ms, count,
        cold_boot, trace_id, received_at, wake_id, instance_id,
        guest_duration_ms, guest_runtime, guest_outcome, guest_error_class,
-       consumer_id
+       consumer_id, node_id, region, commit_sha, deployment_tag,
+       deployment_created_at, image_digest
 FROM request_telemetry
 WHERE app_id = $1
   AND received_at >= $2
@@ -1808,7 +1945,8 @@ WHERE app_id = $1
 SELECT id, deployment_id, route, method, status, latency_ms, count,
        cold_boot, trace_id, received_at, spans_summary, wake_id, instance_id,
        guest_duration_ms, guest_runtime, guest_outcome, guest_error_class,
-       consumer_id
+       consumer_id, node_id, region, commit_sha, deployment_tag,
+       deployment_created_at, image_digest
 FROM request_telemetry
 WHERE app_id = sqlc.arg(app_id)
   AND (id::text = sqlc.arg(identifier)::text OR trace_id = sqlc.arg(identifier)::text)
@@ -2667,7 +2805,7 @@ WHERE lifecycle = 'active'
   AND NOT EXISTS (
       SELECT 1 FROM instances
       WHERE instances.node_id = compute_nodes.id
-        AND instances.state IN ('running', 'cold_booting', 'waking', 'snapshotting', 'migrating', 'warm')
+        AND instances.state IN ('running', 'cold_booting', 'waking', 'draining', 'snapshotting', 'migrating', 'warm')
   )
 ORDER BY name;
 
@@ -2683,7 +2821,7 @@ ORDER BY name;
 SELECT id, state, app_id, deployment_id, kind
 FROM instances
 WHERE node_id = $1
-  AND state IN ('running', 'cold_booting', 'waking', 'snapshotting', 'migrating', 'warm')
+  AND state IN ('running', 'cold_booting', 'waking', 'draining', 'snapshotting', 'migrating', 'warm')
 ORDER BY started_at;
 
 -- name: DeploymentRecordSnapshotMiss :exec
@@ -2960,8 +3098,8 @@ SELECT count(*) FROM object_buckets WHERE account_id = $1 AND state <> 'deleted'
 DELETE FROM object_buckets WHERE account_id = $1 AND state = 'deleted';
 
 -- name: ObjectBucketInsert :one
-INSERT INTO object_buckets (id, account_id, app_id, name, scope, region, backend_id, backend_fingerprint, physical_name, public_read, serve_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *;
+INSERT INTO object_buckets (id, account_id, app_id, name, scope, region, backend_id, backend_fingerprint, physical_name, public_read, serve_at, environment_clone_source_bucket_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *;
 
 -- name: ObjectBucketList :many
 SELECT * FROM object_buckets WHERE account_id = $1 AND app_id = $2 AND state <> 'deleted' ORDER BY created_at, id;
@@ -3184,8 +3322,8 @@ WHERE bucket_id=$1 AND state IN ('initiating','active','completing','aborting');
 
 -- name: ObjectMultipartInsert :one
 INSERT INTO object_storage_multipart_uploads
-(id,account_id,app_id,bucket_id,object_key,size_bytes,part_size_bytes,part_count,content_type,expires_at)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *;
+(id,account_id,app_id,bucket_id,object_key,size_bytes,part_size_bytes,part_count,content_type,object_metadata,expires_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *;
 
 -- name: ObjectMultipartGet :one
 SELECT * FROM object_storage_multipart_uploads
@@ -3657,3 +3795,62 @@ WHERE catalog_key = sqlc.arg(catalog_key);
 UPDATE runtime_snapshots
 SET state = 'retired', retired_at = sqlc.arg(retired_at)
 WHERE catalog_key = sqlc.arg(catalog_key) AND state = 'ready';
+
+-- name: ListEgressCircuitCandidates :many
+-- schedd's egress circuit-breaker feed (ADR-201 §3). Returns every
+-- opted-in upstream joined to its NEWEST probe verdict, which is the
+-- complete input the breaker loop needs for one reconcile pass.
+--
+-- Only circuit_breaker_enabled rows are considered, so the scan is
+-- served by data_upstreams_circuit_enabled_idx (a partial index) and
+-- stays proportional to the opt-in count rather than to the whole
+-- data_upstreams table, which grows with every captured env var on
+-- every app.
+--
+-- LEFT JOIN, not INNER: an opted-in upstream that has never been
+-- probed must still appear, carrying a NULL sampled_at. Dropping it
+-- here would make "never probed" indistinguishable from "row gone",
+-- and the loop needs the difference — it skips unprobed upstreams but
+-- must still count them as live candidates so their dedupe state is
+-- not retired out from under them.
+--
+-- DISTINCT ON picks one row per upstream: the probe table holds one
+-- sample per 30s per (host, region), so without it a single upstream
+-- would fan out to every sample in the retention window.
+--
+-- host is projected because schedd resolves it locally to write the
+-- nftables element. It never reaches a metric label, a log line, or
+-- the customer-facing API — those carry host_redacted_hash only
+-- (ADR-098 §11).
+SELECT DISTINCT ON (u.app_id, u.host_redacted_hash, u.port)
+    u.app_id,
+    u.host_redacted_hash,
+    u.host,
+    u.port,
+    u.circuit_breaker_failure_threshold,
+    u.circuit_breaker_min_samples,
+    u.circuit_breaker_open_seconds,
+    p.ok,
+    p.sampled_at
+FROM data_upstreams u
+LEFT JOIN data_upstream_probes p
+    ON p.host_redacted_hash = u.host_redacted_hash
+   AND p.sampled_at >= $1
+WHERE u.circuit_breaker_enabled
+ORDER BY u.app_id, u.host_redacted_hash, u.port, p.sampled_at DESC NULLS LAST;
+
+-- name: UpdateDataUpstreamCircuitBreaker :exec
+-- ADR-201 §3 per-upstream egress-breaker policy. Each field uses the
+-- COALESCE(sqlc.narg, existing) shape so a PATCH that omits a field
+-- leaves it untouched — the same partial-update convention the app
+-- PATCH paths use.
+--
+-- The threshold fields are deliberately NOT cleared when enabled flips
+-- to false: a customer toggling protection off should not silently lose
+-- their tuning, and re-enabling should restore what they configured.
+UPDATE data_upstreams
+SET circuit_breaker_enabled           = COALESCE(sqlc.narg('circuit_breaker_enabled')::boolean, circuit_breaker_enabled),
+    circuit_breaker_failure_threshold = COALESCE(sqlc.narg('circuit_breaker_failure_threshold')::double precision, circuit_breaker_failure_threshold),
+    circuit_breaker_min_samples       = COALESCE(sqlc.narg('circuit_breaker_min_samples')::integer, circuit_breaker_min_samples),
+    circuit_breaker_open_seconds      = COALESCE(sqlc.narg('circuit_breaker_open_seconds')::integer, circuit_breaker_open_seconds)
+WHERE id = $1 AND app_id = $2;

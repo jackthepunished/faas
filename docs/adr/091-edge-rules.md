@@ -385,8 +385,8 @@ PR-A/B/C — keep their cite numbers untouched.)
            on the 429 path (wire-only).** New sibling header of
            `X-RouteRateLimit-{Limit,Remaining,Reset}`. Values:
            `route` (back-compat default for `KeyBy ∈ {"", "none"}`)
-           or `per-consumer` (when the consumer collapsed into the
-           `__other__` bucket). The existing
+           or `per-consumer` (for every dimensional rule, whether its
+           concrete bucket is dedicated or the collapsed `__other__`). The existing
            `x-faas-rate-limit-scope` enum is untouched.
         3. **Dry-run preview on
            `GET /v1/apps/{slug}/throttle-suggestions`** (parameter
@@ -409,6 +409,21 @@ PR-A/B/C — keep their cite numbers untouched.)
         + 2 review-fix commits; pattern after PR #924 Mega-PR-A).
         Branch `feat-881-phase-3-per-consumer` carries the
         work; PR opens as DRAFT per mega-PR house style.
+      **Amendment 6 (ADR-104, 2026-09-22):** The throttle dimension
+        vocabulary adds `country`; verified top-level scalar JWT claims
+        are available for `jwt_claim` even when not listed in the JWT
+        rule's `required_claims`; `missing_key_policy=shared|reject`
+        controls absent authentication dimensions; and central mode
+        coordinates bounded deterministic dimension shards across
+        replicas. See ADR-104 amendment 6 for the security and collision
+        semantics. The host/path/method matcher remains the endpoint
+        dimension and no schema migration is required.
+      **Amendment 7 (ADR-104, 2026-09-22):** Dimensional rules no
+        longer consume a shared parent route bucket before their
+        dimensional bucket; the two modes are alternatives, preserving
+        isolation between identities. Central-store fallback is exposed by
+        `gateway_ratelimit_degraded_total` plus cooldown-bounded warning and
+        audit events. See ADR-104 amendment 7.
     - **D20.6 — CORS non-preflight e2e path.** PR 6 covers CORS
       preflight e2e; non-preflight stamp-the-Origin flow is
       unit-tested at `pkg/gateway/handler.go:1175-1220` and the e2e

@@ -27,6 +27,7 @@ type fakeGCSStore struct {
 	next                                                      string
 	object                                                    gcsObjectState
 	copyObjectErr                                             error
+	copySourceBucket, copyDestinationBucket                   string
 	reconciled                                                bool
 }
 
@@ -64,7 +65,8 @@ func (s *fakeGCSStore) UpdateObjectMetadata(_ context.Context, _, _ string, meta
 	return s.object, nil
 }
 
-func (s *fakeGCSStore) CopyObject(context.Context, string, string, string, ObjectMetadata, string) (gcsObjectState, error) {
+func (s *fakeGCSStore) CopyObject(_ context.Context, sourceBucket, destinationBucket, _, _ string, _ ObjectMetadata, _ string) (gcsObjectState, error) {
+	s.copySourceBucket, s.copyDestinationBucket = sourceBucket, destinationBucket
 	return s.object, s.copyObjectErr
 }
 
@@ -77,6 +79,21 @@ func testGCS(endpoint string, store gcsStore) *GCS {
 		origins: []string{"https://console.example.test"},
 		sign:    func(context.Context, []byte) ([]byte, error) { return []byte("test-signature"), nil },
 		now:     func() time.Time { return time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC) },
+	}
+}
+
+func TestGCSCopyObjectBetweenBuckets(t *testing.T) {
+	store := &fakeGCSStore{object: gcsObjectState{ETag: "copied"}}
+	provider := testGCS(gcsDefaultEndpoint, store)
+	copier, ok := Provider(provider).(CrossBucketObjectCopier)
+	if !ok {
+		t.Fatal("GCS provider does not expose cross-bucket CopyObject")
+	}
+	result, err := copier.CopyObjectBetweenBuckets(context.Background(), "source", "destination", CopyObjectRequest{
+		SourceKey: "a.txt", DestinationKey: "a.txt",
+	})
+	if err != nil || result.ETag != "copied" || store.copySourceBucket != "source" || store.copyDestinationBucket != "destination" {
+		t.Fatalf("cross-bucket copy result=%+v err=%v source=%q destination=%q", result, err, store.copySourceBucket, store.copyDestinationBucket)
 	}
 }
 
@@ -144,6 +161,14 @@ func TestGCSPresignBindsUploadAndMultipartShape(t *testing.T) {
 	query, _ := url.Parse(download.URL)
 	if query.Query().Get("response-content-disposition") != "attachment" || query.Query().Get("response-content-type") != "application/octet-stream" {
 		t.Fatal("unsafe download response", download.URL)
+	}
+	proxied, err := p.PresignObjectRead(context.Background(), "gregale-test", http.MethodGet, "hello", 60)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxiedURL, _ := url.Parse(proxied.URL)
+	if proxiedURL.Query().Has("response-content-disposition") || proxiedURL.Query().Has("response-content-type") {
+		t.Fatalf("proxied read overrides stored metadata: %s", proxied.URL)
 	}
 	head, err := p.Presign(context.Background(), "gregale-test", SignRequest{Method: http.MethodHead, Key: "hello", ExpiresIn: 60})
 	if err != nil {
@@ -232,7 +257,7 @@ func TestGCSMultipartOAuthProtocolAndCompletionRecovery(t *testing.T) {
 		case r.Method == http.MethodPost && r.URL.Query().Has("uploads"):
 			initiateCalls++
 			initiated = true
-			if r.URL.Path != "/gregale-test/folder/large.bin" || r.Header.Get("x-goog-meta-gregale-upload-id") != "session-1" || r.Header.Get("Content-Type") != "application/octet-stream" {
+			if r.URL.Path != "/gregale-test/folder/large.bin" || r.Header.Get("x-goog-meta-gregale-upload-id") != "session-1" || r.Header.Get("Content-Type") != "application/octet-stream" || r.Header.Get("x-goog-meta-owner") != "platform" || r.Header.Get("x-goog-meta-gregale-s3-tags") != "env=prod&team=core" || r.Header.Get("Cache-Control") != "public, max-age=60" || r.Header.Get("Content-Disposition") != `attachment; filename="large.bin"` || r.Header.Get("Content-Encoding") != "gzip" || r.Header.Get("Content-Language") != "en" {
 				t.Errorf("bad initiate request: %s %#v", r.URL.RequestURI(), r.Header)
 			}
 			_, _ = io.WriteString(w, `<InitiateMultipartUploadResult><UploadId>provider-id</UploadId></InitiateMultipartUploadResult>`)
@@ -259,15 +284,19 @@ func TestGCSMultipartOAuthProtocolAndCompletionRecovery(t *testing.T) {
 		}
 	}))
 	defer upstream.Close()
-	store := &fakeGCSStore{object: gcsObjectState{Size: 10, Metadata: map[string]string{multipartSessionMetadata: "session-1"}}}
+	store := &fakeGCSStore{object: gcsObjectState{Size: 10, Metadata: map[string]string{ReservedMultipartSessionMetadataKey: "session-1"}}}
 	p := testGCS(upstream.URL, store)
 	p.httpClient = upstream.Client()
 
-	id, err := p.EnsureMultipartUpload(context.Background(), "gregale-test", MultipartCreateRequest{SessionID: "session-1", Key: "folder/large.bin", SizeBytes: 10})
+	request := MultipartCreateRequest{
+		SessionID: "session-1", Key: "folder/large.bin", SizeBytes: 10,
+		Metadata: ObjectMetadata{ContentType: "application/octet-stream", CacheControl: "public, max-age=60", ContentDisposition: `attachment; filename="large.bin"`, ContentEncoding: "gzip", ContentLanguage: "en", Metadata: map[string]string{"owner": "platform"}, Tags: map[string]string{"env": "prod", "team": "core"}},
+	}
+	id, err := p.EnsureMultipartUpload(context.Background(), "gregale-test", request)
 	if err != nil || id != "provider-id" {
 		t.Fatal(id, err)
 	}
-	recovered, err := p.EnsureMultipartUpload(context.Background(), "gregale-test", MultipartCreateRequest{SessionID: "session-1", Key: "folder/large.bin", SizeBytes: 10})
+	recovered, err := p.EnsureMultipartUpload(context.Background(), "gregale-test", request)
 	if err != nil || recovered != id || initiateCalls != 1 {
 		t.Fatal("multipart initiation was not recoverable", recovered, err, initiateCalls)
 	}

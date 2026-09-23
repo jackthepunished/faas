@@ -731,6 +731,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	}
 	ops := wire.NewOpsMetrics("meterd")
 	requestTelemetryPartitions := newRequestTelemetryPartitionMetrics(ops.Registry(), deps.now)
+	logEventMaintenance := newLogEventMaintenanceMetrics(ops.Registry(), deps.now)
 	traceShutdown, traceErr := trace.InitTracerWithRegistry(ctx, "meterd", wire.Version, log, ops.Registry(), ops.MetricPrefix())
 	if traceErr != nil {
 		return fmt.Errorf("meterd: init tracing: %w", traceErr)
@@ -1001,6 +1002,9 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// and coerces to a fresh test registry; here we hand it the real one.
 	wire.BootStamps(ctx, "meterd", ops)
 	wire.RegisterDefaultOps(ops)
+	// ADR-190 follow-up: export this pool's live statistics so the
+	// DaemonMaxConnections cap above is measurable rather than arithmetic.
+	wire.RegisterPoolMetrics(ops, pool)
 	// Residency timer: emits the §12 "Resident GB per paying customer"
 	// gauge (ADR-031, PR #141). Wired into the loop alongside
 	// sample/quota/stripe/dunning so all five timers share the same
@@ -1217,6 +1221,8 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	partitionDB := poolAdapter{pool}
 	go meter.RequestTelemetryPartitionLoop(ctx, partitionDB, meter.RequestTelemetryPartitionInterval, log, requestTelemetryPartitions.observe)
 	go meter.RetentionLoopRequestTelemetry(ctx, partitionDB, meter.RequestTelemetryRetentionInterval, log)
+	go meter.LogEventPartitionLoop(ctx, partitionDB, meter.LogEventMaintenanceInterval, log, logEventMaintenance.observePartition)
+	go meter.LogEventRetentionLoop(ctx, partitionDB, meter.LogEventMaintenanceInterval, log, logEventMaintenance.observeRetention)
 
 	// SAFE-RELEASES production-leveling Stream D (issue #976 /
 	// ADR-122 post-merge audit): deployment_audit GC cron.
@@ -1348,6 +1354,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 
 	notifyStop := daemonunit.NotifyReadyWhen(ctx, meterdProbe.ReadyFunc())
 	defer notifyStop()
+	defer wire.StartWatchdog(ctx, wire.NewLiveness(), ops, log)()
 
 	select {
 	case <-ctx.Done():

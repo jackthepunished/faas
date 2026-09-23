@@ -41,7 +41,8 @@ import (
 var edgeRuleKindVocab = []string{
 	"route", "rewrite", "redirect", "headers", "cors", "jwt", "ip",
 	"validate", "limit", "geo", "maintenance", "throttle", "budget",
-	"cache", "respond",
+	"cache", "respond", "retry", "circuit_breaker",
+	"async",
 }
 
 // edgeRuleJWTAlgVocab is the closed `algorithm` set for kind=jwt.
@@ -103,7 +104,7 @@ func cmdEdgeRules(args []string) int {
 func cmdEdgeRulesList(args []string) int {
 	fs := newFlagSet("edge-rules list", flag.ContinueOnError)
 	slug := fs.String("app", "", "filter to a single app slug")
-	kind := fs.String("kind", "", "filter to a single kind (route|rewrite|redirect|headers|cors|jwt|ip|validate|limit|geo|throttle|budget|cache|respond)")
+	kind := fs.String("kind", "", "filter to a single kind (route|rewrite|redirect|headers|cors|jwt|ip|validate|limit|geo|throttle|budget|cache|respond|retry|circuit_breaker|async)")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
@@ -164,7 +165,7 @@ func cmdEdgeRulesList(args []string) int {
 func cmdEdgeRulesCreate(args []string) int {
 	fs := newFlagSet("edge-rules create", flag.ContinueOnError)
 	slug := fs.String("app", "", "app slug (required)")
-	kind := fs.String("kind", "", "rule kind: route|rewrite|redirect|headers|cors|jwt|ip|validate|limit|geo|throttle|budget|cache|respond (required)")
+	kind := fs.String("kind", "", "rule kind: route|rewrite|redirect|headers|cors|jwt|ip|validate|limit|geo|throttle|budget|cache|respond|retry|circuit_breaker|async (required)")
 	matchHost := fs.String("match-host", "", "host to match (required)")
 	matchPath := fs.String("match-path", "/", "path to match")
 	var matchMethods multiFlag
@@ -247,9 +248,10 @@ func cmdEdgeRulesCreate(args []string) int {
 	// acct.Plan is the authoritative gate).
 	throttleRPS := fs.Float64("throttle-requests-per-second", 0, "kind=throttle: refill rate (req/s; >0; <=plan.RateLimitRPS)")
 	throttleBurst := fs.Int("throttle-burst", 0, "kind=throttle: token-bucket burst (>0; <=plan.RateLimitBurst)")
-	throttleKeyBy := fs.String("throttle-key-by", "", "kind=throttle: bucket key (none|api_key|consumer_id|jwt_subject|jwt_claim)")
+	throttleKeyBy := fs.String("throttle-key-by", "", "kind=throttle: bucket key (none|api_key|consumer_id|jwt_subject|jwt_claim|country)")
 	throttleJWTClaim := fs.String("throttle-jwt-claim", "", "kind=throttle: JWT claim name when --throttle-key-by=jwt_claim")
 	throttleMaxKeys := fs.Int("throttle-max-keys-per-rule", 0, "kind=throttle: maximum distinct consumer buckets (0=plan default)")
+	throttleMissingKeyPolicy := fs.String("throttle-missing-key-policy", "", "kind=throttle: missing identity behavior (shared|reject; default shared)")
 
 	// cache (ADR-122 §Decision). Per-route TTL primitive.
 	// max-age-seconds is the fresh window (default 60); stale-
@@ -261,6 +263,7 @@ func cmdEdgeRulesCreate(args []string) int {
 	// structural checks so the user gets the same error locally.
 	var cacheVaryOn, cacheMethods multiFlag
 	cacheMaxAge := fs.Int("cache-max-age-seconds", 0, "kind=cache: fresh window in seconds (default 60; max 3600)")
+	cacheStaleWhileRevalidate := fs.Int("cache-stale-while-revalidate-seconds", 0, "kind=cache: serve stale while a background refresh runs (default 0; max 300)")
 	cacheStaleIfError := fs.Int("cache-stale-if-error-seconds", 0, "kind=cache: stale-on-error window in seconds (default 300; max 300)")
 	fs.Var(&cacheVaryOn, "cache-vary-on", "kind=cache: header to vary on (Accept-Language|Accept-Encoding; repeat)")
 	fs.Var(&cacheMethods, "cache-methods", "kind=cache: cacheable method (GET|HEAD; repeat; default GET,HEAD)")
@@ -272,6 +275,25 @@ func cmdEdgeRulesCreate(args []string) int {
 	// server-side when left empty.
 	budgetMs := fs.Int("budget-ms", 0, "kind=budget: per-request wall-clock budget in ms (>0; max 30000)")
 	budgetOverrideHeader := fs.String("budget-allow-override-header", "", "kind=budget: header that may override budget-ms per request (default x-faas-budget-ms)")
+
+	// retry (ADR-201 §1). Replay a request that died in transport
+	// against a different healthy instance. Only a TRANSPORT failure
+	// arms a replay — a guest that answered 5xx has served the
+	// request — so there is deliberately no "retry on status" flag.
+	retryMaxAttempts := fs.Int("retry-max-attempts", 0, "kind=retry: total attempts, NOT retries (2 = original + one replay; default 2; max 3)")
+	retryAllowNonIdempotent := fs.Bool("retry-allow-non-idempotent", false, "kind=retry: allow POST/PATCH replay only with Idempotency-Key; your handler MUST honor that key")
+	retryMinRemainingMs := fs.Int("retry-min-remaining-ms", 0, "kind=retry: skip the replay below this much remaining request budget (default 250; max 30000)")
+	retryBackoffMs := fs.Int("retry-backoff-ms", 0, "kind=retry: delay before a replay in ms (default 0; max 1000)")
+	retryBudgetPercent := fs.Int("retry-budget-percent", 0, "kind=retry: aggregate retries as percent of originals per window (default 10; max 100)")
+	retryBudgetMin := fs.Int("retry-budget-min-retries", 0, "kind=retry: low-traffic retries allowed per window (default 1; max 32)")
+
+	// circuit_breaker (ADR-201 §2). Tunes a breaker that already runs
+	// for every app on every plan; a rule only moves the thresholds.
+	circuitFailureThreshold := fs.Float64("circuit-failure-threshold", 0, "kind=circuit_breaker: failure RATIO that opens a closed breaker (default 0.5; (0,1])")
+	circuitMinRequests := fs.Int("circuit-min-requests", 0, "kind=circuit_breaker: observations needed before the ratio is consulted (default 5; at 1 a single blip opens the circuit)")
+	circuitWindowSeconds := fs.Int("circuit-window-seconds", 0, "kind=circuit_breaker: rolling failure window in seconds (default 10; max 300)")
+	circuitOpenSeconds := fs.Int("circuit-open-seconds", 0, "kind=circuit_breaker: first open interval before a half-open probe (default 5; max 3600)")
+	circuitMaxOpenSeconds := fs.Int("circuit-max-open-seconds", 0, "kind=circuit_breaker: ceiling the backoff grows toward (default 60; must be >= open-seconds)")
 
 	// maintenance (ADR-091 D20 / issue #881). Per-route 503 with a
 	// Retry-After. Both fields are optional — a bare maintenance rule
@@ -295,50 +317,63 @@ func cmdEdgeRulesCreate(args []string) int {
 		return printErr("Invalid --kind", fmt.Errorf("must be one of %s; got %q", strings.Join(edgeRuleKindVocab, ", "), *kind))
 	}
 	actionBytes, err := buildEdgeRuleAction(*kind, edgeRuleActionInputs{
-		RouteTarget:                *routeTarget,
-		RewriteFrom:                *rewriteFrom,
-		RewriteTo:                  *rewriteTo,
-		RedirectStatus:             *redirectStatus,
-		RedirectTo:                 *redirectTo,
-		RedirectHeaders:            redirectHeaders,
-		HeadersReqAdd:              headersReqAdd,
-		HeadersReqSet:              headersReqSet,
-		HeadersReqRm:               headersReqRm,
-		HeadersResAdd:              headersResAdd,
-		HeadersResSet:              headersResSet,
-		HeadersResRm:               headersResRm,
-		CORSOrigins:                corsOrigins,
-		CORSMethods:                corsMethods,
-		CORSHeaders:                corsHeaders,
-		CORSExpose:                 corsExpose,
-		CORSCreds:                  *corsCreds,
-		CORSMaxAge:                 *corsMaxAge,
-		JWTIssuer:                  *jwtIssuer,
-		JWTJWKS:                    *jwtJWKS,
-		JWTAudience:                jwtAudience,
-		JWTAlgorithms:              jwtAlgorithms,
-		JWTClaims:                  jwtClaims,
-		IPAllow:                    ipAllow,
-		IPDeny:                     ipDeny,
-		LimitMaxBodyBytes:          *limitMaxBodyBytes,
-		LimitMaxBodyBytesStreaming: *limitMaxBodyBytesStreaming,
-		GeoAllow:                   geoAllow,
-		GeoDeny:                    geoDeny,
-		ThrottleRPS:                *throttleRPS,
-		ThrottleBurst:              *throttleBurst,
-		ThrottleKeyBy:              *throttleKeyBy,
-		ThrottleJWTClaim:           *throttleJWTClaim,
-		ThrottleMaxKeys:            *throttleMaxKeys,
-		CacheMaxAgeSeconds:         *cacheMaxAge,
-		CacheStaleIfErrorSeconds:   *cacheStaleIfError,
-		CacheVaryOn:                cacheVaryOn,
-		CacheMethods:               cacheMethods,
-		BudgetMs:                   *budgetMs,
-		BudgetOverrideHeader:       *budgetOverrideHeader,
-		MaintenanceRetryAfter:      *maintenanceRetryAfter,
-		MaintenanceMessage:         *maintenanceMessage,
-		RespondStatus:              *respondStatus,
-		RespondBody:                *respondBody,
+		RouteTarget:                      *routeTarget,
+		RewriteFrom:                      *rewriteFrom,
+		RewriteTo:                        *rewriteTo,
+		RedirectStatus:                   *redirectStatus,
+		RedirectTo:                       *redirectTo,
+		RedirectHeaders:                  redirectHeaders,
+		HeadersReqAdd:                    headersReqAdd,
+		HeadersReqSet:                    headersReqSet,
+		HeadersReqRm:                     headersReqRm,
+		HeadersResAdd:                    headersResAdd,
+		HeadersResSet:                    headersResSet,
+		HeadersResRm:                     headersResRm,
+		CORSOrigins:                      corsOrigins,
+		CORSMethods:                      corsMethods,
+		CORSHeaders:                      corsHeaders,
+		CORSExpose:                       corsExpose,
+		CORSCreds:                        *corsCreds,
+		CORSMaxAge:                       *corsMaxAge,
+		JWTIssuer:                        *jwtIssuer,
+		JWTJWKS:                          *jwtJWKS,
+		JWTAudience:                      jwtAudience,
+		JWTAlgorithms:                    jwtAlgorithms,
+		JWTClaims:                        jwtClaims,
+		IPAllow:                          ipAllow,
+		IPDeny:                           ipDeny,
+		LimitMaxBodyBytes:                *limitMaxBodyBytes,
+		LimitMaxBodyBytesStreaming:       *limitMaxBodyBytesStreaming,
+		GeoAllow:                         geoAllow,
+		GeoDeny:                          geoDeny,
+		ThrottleRPS:                      *throttleRPS,
+		ThrottleBurst:                    *throttleBurst,
+		ThrottleKeyBy:                    *throttleKeyBy,
+		ThrottleJWTClaim:                 *throttleJWTClaim,
+		ThrottleMaxKeys:                  *throttleMaxKeys,
+		ThrottleMissingKeyPolicy:         *throttleMissingKeyPolicy,
+		CacheMaxAgeSeconds:               *cacheMaxAge,
+		CacheStaleWhileRevalidateSeconds: *cacheStaleWhileRevalidate,
+		CacheStaleIfErrorSeconds:         *cacheStaleIfError,
+		CacheVaryOn:                      cacheVaryOn,
+		CacheMethods:                     cacheMethods,
+		BudgetMs:                         *budgetMs,
+		BudgetOverrideHeader:             *budgetOverrideHeader,
+		RetryMaxAttempts:                 *retryMaxAttempts,
+		RetryAllowNonIdempotent:          *retryAllowNonIdempotent,
+		RetryMinRemainingMs:              *retryMinRemainingMs,
+		RetryBackoffMs:                   *retryBackoffMs,
+		RetryBudgetPercent:               *retryBudgetPercent,
+		RetryBudgetMinRetries:            *retryBudgetMin,
+		CircuitFailureThreshold:          *circuitFailureThreshold,
+		CircuitMinRequests:               *circuitMinRequests,
+		CircuitWindowSeconds:             *circuitWindowSeconds,
+		CircuitOpenSeconds:               *circuitOpenSeconds,
+		CircuitMaxOpenSeconds:            *circuitMaxOpenSeconds,
+		MaintenanceRetryAfter:            *maintenanceRetryAfter,
+		MaintenanceMessage:               *maintenanceMessage,
+		RespondStatus:                    *respondStatus,
+		RespondBody:                      *respondBody,
 	})
 	if err != nil {
 		return printErr("Invalid flags for --kind="+*kind, err)
@@ -474,15 +509,17 @@ func cmdEdgeRulesUpdate(args []string) int {
 	// here AND the validator rejects it server-side.
 	throttleRPS := fs.Float64("throttle-requests-per-second", 0, "kind=throttle: new refill rate (req/s; >0; <=plan.RateLimitRPS)")
 	throttleBurst := fs.Int("throttle-burst", 0, "kind=throttle: new token-bucket burst (>0; <=plan.RateLimitBurst)")
-	throttleKeyBy := fs.String("throttle-key-by", "", "kind=throttle: new bucket key (none|api_key|consumer_id|jwt_subject|jwt_claim)")
+	throttleKeyBy := fs.String("throttle-key-by", "", "kind=throttle: new bucket key (none|api_key|consumer_id|jwt_subject|jwt_claim|country)")
 	throttleJWTClaim := fs.String("throttle-jwt-claim", "", "kind=throttle: new JWT claim name when --throttle-key-by=jwt_claim")
 	throttleMaxKeys := fs.Int("throttle-max-keys-per-rule", 0, "kind=throttle: new maximum distinct consumer buckets (0=plan default)")
+	throttleMissingKeyPolicy := fs.String("throttle-missing-key-policy", "", "kind=throttle: new missing identity behavior (shared|reject)")
 
 	// cache (ADR-122 §Decision). Mirror of the create-side
 	// flags. Same closed-set + cap semantics — the CLI does
 	// structural checks, the server enforces the ceiling.
 	var cacheVaryOn, cacheMethods multiFlag
 	cacheMaxAge := fs.Int("cache-max-age-seconds", 0, "kind=cache: new fresh window in seconds (max 3600)")
+	cacheStaleWhileRevalidate := fs.Int("cache-stale-while-revalidate-seconds", 0, "kind=cache: new stale-while-revalidate window in seconds (max 300)")
 	cacheStaleIfError := fs.Int("cache-stale-if-error-seconds", 0, "kind=cache: new stale-on-error window in seconds (max 300)")
 	fs.Var(&cacheVaryOn, "cache-vary-on", "kind=cache: header to vary on (Accept-Language|Accept-Encoding; repeat)")
 	fs.Var(&cacheMethods, "cache-methods", "kind=cache: cacheable method (GET|HEAD; repeat)")
@@ -492,6 +529,26 @@ func cmdEdgeRulesUpdate(args []string) int {
 	// buildEdgeRuleAction for both paths.
 	budgetMs := fs.Int("budget-ms", 0, "kind=budget: new per-request wall-clock budget in ms (>0; max 30000)")
 	budgetOverrideHeader := fs.String("budget-allow-override-header", "", "kind=budget: header that may override budget-ms per request (default x-faas-budget-ms)")
+
+	// retry (ADR-201 §1). Replay a request that died in transport
+	// against a different healthy instance. Only a TRANSPORT failure
+	// arms a replay — a guest that answered 5xx has served the
+	// request — so there is deliberately no "retry on status" flag.
+	retryMaxAttempts := fs.Int("retry-max-attempts", 0, "kind=retry: total attempts, NOT retries (2 = original + one replay; default 2; max 3)")
+	retryAllowNonIdempotent := fs.Bool("retry-allow-non-idempotent", false, "kind=retry: allow POST/PATCH replay only with Idempotency-Key; your handler MUST honor that key")
+	retryMinRemainingMs := fs.Int("retry-min-remaining-ms", 0, "kind=retry: skip the replay below this much remaining request budget (default 250; max 30000)")
+	retryBackoffMs := fs.Int("retry-backoff-ms", 0, "kind=retry: delay before a replay in ms (default 0; max 1000)")
+	retryBudgetPercent := fs.Int("retry-budget-percent", 0, "kind=retry: aggregate retries as percent of originals per window (default 10; max 100)")
+	retryBudgetMin := fs.Int("retry-budget-min-retries", 0, "kind=retry: low-traffic retries allowed per window (default 1; max 32)")
+
+	// circuit_breaker (ADR-201 §2). Tunes a breaker that already runs
+	// for every app on every plan; a rule only moves the thresholds.
+	circuitFailureThreshold := fs.Float64("circuit-failure-threshold", 0, "kind=circuit_breaker: failure RATIO that opens a closed breaker (default 0.5; (0,1])")
+	circuitMinRequests := fs.Int("circuit-min-requests", 0, "kind=circuit_breaker: observations needed before the ratio is consulted (default 5; at 1 a single blip opens the circuit)")
+	circuitWindowSeconds := fs.Int("circuit-window-seconds", 0, "kind=circuit_breaker: rolling failure window in seconds (default 10; max 300)")
+	circuitOpenSeconds := fs.Int("circuit-open-seconds", 0, "kind=circuit_breaker: first open interval before a half-open probe (default 5; max 3600)")
+	circuitMaxOpenSeconds := fs.Int("circuit-max-open-seconds", 0, "kind=circuit_breaker: ceiling the backoff grows toward (default 60; must be >= open-seconds)")
+
 	maintenanceRetryAfter := fs.Int("maintenance-retry-after-seconds", 0, "kind=maintenance: new Retry-After hint in seconds (>=0; max 86400)")
 	maintenanceMessage := fs.String("maintenance-message", "", "kind=maintenance: new operator message (<=512 bytes)")
 	respondStatus := fs.Int("respond-status", 0, "kind=respond: new response status code (200..599)")
@@ -553,50 +610,63 @@ func cmdEdgeRulesUpdate(args []string) int {
 			return printErr("Invalid --kind", fmt.Errorf("must be one of %s; got %q", strings.Join(edgeRuleKindVocab, ", "), *kind))
 		}
 		actionBytes, err := buildEdgeRuleAction(*kind, edgeRuleActionInputs{
-			RouteTarget:                *routeTarget,
-			RewriteFrom:                *rewriteFrom,
-			RewriteTo:                  *rewriteTo,
-			RedirectStatus:             *redirectStatus,
-			RedirectTo:                 *redirectTo,
-			RedirectHeaders:            redirectHeaders,
-			HeadersReqAdd:              headersReqAdd,
-			HeadersReqSet:              headersReqSet,
-			HeadersReqRm:               headersReqRm,
-			HeadersResAdd:              headersResAdd,
-			HeadersResSet:              headersResSet,
-			HeadersResRm:               headersResRm,
-			CORSOrigins:                corsOrigins,
-			CORSMethods:                corsMethods,
-			CORSHeaders:                corsHeaders,
-			CORSExpose:                 corsExpose,
-			CORSCreds:                  *corsCreds,
-			CORSMaxAge:                 *corsMaxAge,
-			JWTIssuer:                  *jwtIssuer,
-			JWTJWKS:                    *jwtJWKS,
-			JWTAudience:                jwtAudience,
-			JWTAlgorithms:              jwtAlgorithms,
-			JWTClaims:                  jwtClaims,
-			IPAllow:                    ipAllow,
-			IPDeny:                     ipDeny,
-			LimitMaxBodyBytes:          *limitMaxBodyBytes,
-			LimitMaxBodyBytesStreaming: *limitMaxBodyBytesStreaming,
-			GeoAllow:                   geoAllow,
-			GeoDeny:                    geoDeny,
-			ThrottleRPS:                *throttleRPS,
-			ThrottleBurst:              *throttleBurst,
-			ThrottleKeyBy:              *throttleKeyBy,
-			ThrottleJWTClaim:           *throttleJWTClaim,
-			ThrottleMaxKeys:            *throttleMaxKeys,
-			CacheMaxAgeSeconds:         *cacheMaxAge,
-			CacheStaleIfErrorSeconds:   *cacheStaleIfError,
-			CacheVaryOn:                cacheVaryOn,
-			CacheMethods:               cacheMethods,
-			BudgetMs:                   *budgetMs,
-			BudgetOverrideHeader:       *budgetOverrideHeader,
-			MaintenanceRetryAfter:      *maintenanceRetryAfter,
-			MaintenanceMessage:         *maintenanceMessage,
-			RespondStatus:              *respondStatus,
-			RespondBody:                *respondBody,
+			RouteTarget:                      *routeTarget,
+			RewriteFrom:                      *rewriteFrom,
+			RewriteTo:                        *rewriteTo,
+			RedirectStatus:                   *redirectStatus,
+			RedirectTo:                       *redirectTo,
+			RedirectHeaders:                  redirectHeaders,
+			HeadersReqAdd:                    headersReqAdd,
+			HeadersReqSet:                    headersReqSet,
+			HeadersReqRm:                     headersReqRm,
+			HeadersResAdd:                    headersResAdd,
+			HeadersResSet:                    headersResSet,
+			HeadersResRm:                     headersResRm,
+			CORSOrigins:                      corsOrigins,
+			CORSMethods:                      corsMethods,
+			CORSHeaders:                      corsHeaders,
+			CORSExpose:                       corsExpose,
+			CORSCreds:                        *corsCreds,
+			CORSMaxAge:                       *corsMaxAge,
+			JWTIssuer:                        *jwtIssuer,
+			JWTJWKS:                          *jwtJWKS,
+			JWTAudience:                      jwtAudience,
+			JWTAlgorithms:                    jwtAlgorithms,
+			JWTClaims:                        jwtClaims,
+			IPAllow:                          ipAllow,
+			IPDeny:                           ipDeny,
+			LimitMaxBodyBytes:                *limitMaxBodyBytes,
+			LimitMaxBodyBytesStreaming:       *limitMaxBodyBytesStreaming,
+			GeoAllow:                         geoAllow,
+			GeoDeny:                          geoDeny,
+			ThrottleRPS:                      *throttleRPS,
+			ThrottleBurst:                    *throttleBurst,
+			ThrottleKeyBy:                    *throttleKeyBy,
+			ThrottleJWTClaim:                 *throttleJWTClaim,
+			ThrottleMaxKeys:                  *throttleMaxKeys,
+			ThrottleMissingKeyPolicy:         *throttleMissingKeyPolicy,
+			CacheMaxAgeSeconds:               *cacheMaxAge,
+			CacheStaleWhileRevalidateSeconds: *cacheStaleWhileRevalidate,
+			CacheStaleIfErrorSeconds:         *cacheStaleIfError,
+			CacheVaryOn:                      cacheVaryOn,
+			CacheMethods:                     cacheMethods,
+			BudgetMs:                         *budgetMs,
+			BudgetOverrideHeader:             *budgetOverrideHeader,
+			RetryMaxAttempts:                 *retryMaxAttempts,
+			RetryAllowNonIdempotent:          *retryAllowNonIdempotent,
+			RetryMinRemainingMs:              *retryMinRemainingMs,
+			RetryBackoffMs:                   *retryBackoffMs,
+			RetryBudgetPercent:               *retryBudgetPercent,
+			RetryBudgetMinRetries:            *retryBudgetMin,
+			CircuitFailureThreshold:          *circuitFailureThreshold,
+			CircuitMinRequests:               *circuitMinRequests,
+			CircuitWindowSeconds:             *circuitWindowSeconds,
+			CircuitOpenSeconds:               *circuitOpenSeconds,
+			CircuitMaxOpenSeconds:            *circuitMaxOpenSeconds,
+			MaintenanceRetryAfter:            *maintenanceRetryAfter,
+			MaintenanceMessage:               *maintenanceMessage,
+			RespondStatus:                    *respondStatus,
+			RespondBody:                      *respondBody,
 		})
 		if err != nil {
 			return printErr("Invalid flags for --kind="+*kind, err)
@@ -705,21 +775,23 @@ type edgeRuleActionInputs struct {
 	// ceiling check — the CLI does the structural checks only
 	// (positive rps, positive burst) so the local error mirrors
 	// the server's "0-rps is a leak" message.
-	ThrottleRPS      float64
-	ThrottleBurst    int
-	ThrottleKeyBy    string
-	ThrottleJWTClaim string
-	ThrottleMaxKeys  int
+	ThrottleRPS              float64
+	ThrottleBurst            int
+	ThrottleKeyBy            string
+	ThrottleJWTClaim         string
+	ThrottleMaxKeys          int
+	ThrottleMissingKeyPolicy string
 	// cache (ADR-122 §Decision). Per-route TTL primitive.
 	// MaxAgeSeconds defaults to 60 server-side when 0 is passed
 	// (the apid validator applies the default in
 	// pkg/api.EdgeRuleCacheAction.Validate). The CLI does the
 	// structural checks (positive, ≤ ResponseCacheMaxAgeMaxSeconds)
 	// so the local error mirrors the server's.
-	CacheMaxAgeSeconds       int
-	CacheStaleIfErrorSeconds int
-	CacheVaryOn              []string
-	CacheMethods             []string
+	CacheMaxAgeSeconds               int
+	CacheStaleWhileRevalidateSeconds int
+	CacheStaleIfErrorSeconds         int
+	CacheVaryOn                      []string
+	CacheMethods                     []string
 	// budget (ADR-093 §Decision). Per-request wall-clock deadline.
 	// BudgetMs is required-as-positive: pkg/api.EdgeRuleBudgetAction
 	// .Validate rejects 0 because a kind=budget rule with no budget
@@ -737,6 +809,23 @@ type edgeRuleActionInputs struct {
 	// respond (preview-only fixed JSON response)
 	RespondStatus int
 	RespondBody   string
+	// retry (ADR-201 §1). Replay against a different healthy instance.
+	// Every field is optional — a bare `--kind retry` rule is the valid
+	// "platform defaults" shape — so none is checked for presence.
+	RetryMaxAttempts        int
+	RetryAllowNonIdempotent bool
+	RetryMinRemainingMs     int
+	RetryBackoffMs          int
+	RetryBudgetPercent      int
+	RetryBudgetMinRetries   int
+	// circuit_breaker (ADR-201 §2). Instance health thresholds. Also all
+	// optional: the breaker runs with platform defaults whether or not a
+	// rule exists, so a bare rule is a no-op rather than an error.
+	CircuitFailureThreshold float64
+	CircuitMinRequests      int
+	CircuitWindowSeconds    int
+	CircuitOpenSeconds      int
+	CircuitMaxOpenSeconds   int
 }
 
 // buildEdgeRuleAction marshals the per-kind inputs into the matching
@@ -886,6 +975,7 @@ func buildEdgeRuleAction(kind string, in edgeRuleActionInputs) (json.RawMessage,
 			KeyBy:             in.ThrottleKeyBy,
 			JWTClaimName:      in.ThrottleJWTClaim,
 			MaxKeysPerRule:    in.ThrottleMaxKeys,
+			MissingKeyPolicy:  in.ThrottleMissingKeyPolicy,
 		}
 		// The server's EdgeRuleThrottleAction.Validate takes a
 		// ThrottleValidationContext (per-plan ceiling). The CLI has
@@ -925,6 +1015,9 @@ func buildEdgeRuleAction(kind string, in edgeRuleActionInputs) (json.RawMessage,
 		if in.CacheStaleIfErrorSeconds < 0 || in.CacheStaleIfErrorSeconds > api.ResponseCacheStaleIfErrorMaxSeconds {
 			return nil, fmt.Errorf("cache action: stale_if_error_seconds must be in [0, %d] (0 = use default 300); got %d", api.ResponseCacheStaleIfErrorMaxSeconds, in.CacheStaleIfErrorSeconds)
 		}
+		if in.CacheStaleWhileRevalidateSeconds < 0 || in.CacheStaleWhileRevalidateSeconds > api.ResponseCacheStaleWhileRevalidateMaxSeconds {
+			return nil, fmt.Errorf("cache action: stale_while_revalidate_seconds must be in [0, %d]; got %d", api.ResponseCacheStaleWhileRevalidateMaxSeconds, in.CacheStaleWhileRevalidateSeconds)
+		}
 		for _, v := range in.CacheVaryOn {
 			if !isCacheVaryOnVocab(v) {
 				return nil, fmt.Errorf("cache action: vary_on %q not in closed vocabulary (Accept-Language|Accept-Encoding)", v)
@@ -936,10 +1029,11 @@ func buildEdgeRuleAction(kind string, in edgeRuleActionInputs) (json.RawMessage,
 			}
 		}
 		a := api.EdgeRuleCacheAction{
-			MaxAgeSeconds:       in.CacheMaxAgeSeconds,
-			StaleIfErrorSeconds: in.CacheStaleIfErrorSeconds,
-			VaryOn:              in.CacheVaryOn,
-			Methods:             in.CacheMethods,
+			MaxAgeSeconds:               in.CacheMaxAgeSeconds,
+			StaleWhileRevalidateSeconds: in.CacheStaleWhileRevalidateSeconds,
+			StaleIfErrorSeconds:         in.CacheStaleIfErrorSeconds,
+			VaryOn:                      in.CacheVaryOn,
+			Methods:                     in.CacheMethods,
 		}
 		// CLI-side defaults for fields the user omitted
 		// (flag == 0). The server's EdgeRuleCacheAction.Validate
@@ -978,6 +1072,35 @@ func buildEdgeRuleAction(kind string, in edgeRuleActionInputs) (json.RawMessage,
 			return nil, errToError(err)
 		}
 		return marshalAction(a)
+	case "retry":
+		// ADR-201 §1. Every field is optional and the server applies
+		// defaults, so unlike kind=budget there is nothing to reject
+		// locally for absence — a bare rule means "platform defaults".
+		a := api.EdgeRuleRetryAction{
+			MaxAttempts:        in.RetryMaxAttempts,
+			AllowNonIdempotent: in.RetryAllowNonIdempotent,
+			MinRemainingMs:     in.RetryMinRemainingMs,
+			BackoffMs:          in.RetryBackoffMs,
+			BudgetPercent:      in.RetryBudgetPercent,
+			BudgetMinRetries:   in.RetryBudgetMinRetries,
+		}
+		if err := a.Validate(); err != nil {
+			return nil, errToError(err)
+		}
+		return marshalAction(a)
+	case "circuit_breaker":
+		// ADR-201 §2.
+		a := api.EdgeRuleCircuitBreakerAction{
+			FailureThreshold: in.CircuitFailureThreshold,
+			MinRequests:      in.CircuitMinRequests,
+			WindowSeconds:    in.CircuitWindowSeconds,
+			OpenSeconds:      in.CircuitOpenSeconds,
+			MaxOpenSeconds:   in.CircuitMaxOpenSeconds,
+		}
+		if err := a.Validate(); err != nil {
+			return nil, errToError(err)
+		}
+		return marshalAction(a)
 	case "maintenance":
 		// ADR-091 D20. Per-route 503 + Retry-After. Both fields are
 		// optional, so there is no presence check — only the range
@@ -998,6 +1121,12 @@ func buildEdgeRuleAction(kind string, in edgeRuleActionInputs) (json.RawMessage,
 		if in.RespondBody == "" {
 			a.Body = nil
 		}
+		if err := a.Validate(); err != nil {
+			return nil, errToError(err)
+		}
+		return marshalAction(a)
+	case "async":
+		a := api.EdgeRuleAsyncAction{}
 		if err := a.Validate(); err != nil {
 			return nil, errToError(err)
 		}
@@ -1184,15 +1313,17 @@ func anyKindFlagVisited(visited map[string]bool) bool {
 		"ip-allow", "ip-deny",
 		"limit-max-body-bytes", "limit-max-body-bytes-streaming",
 		"throttle-requests-per-second", "throttle-burst",
-		"throttle-key-by", "throttle-jwt-claim", "throttle-max-keys-per-rule",
+		"throttle-key-by", "throttle-jwt-claim", "throttle-max-keys-per-rule", "throttle-missing-key-policy",
 		// geo + cache were added to the create/update flag sets but
 		// never to this list, so `edge-rules update <id> --geo-allow X`
 		// silently skipped the action rebuild and sent a metadata-only
 		// PATCH. Kept alongside the budget/maintenance entries below.
 		"geo-allow", "geo-deny",
-		"cache-max-age-seconds", "cache-stale-if-error-seconds",
+		"cache-max-age-seconds", "cache-stale-while-revalidate-seconds", "cache-stale-if-error-seconds",
 		"cache-vary-on", "cache-methods",
 		"budget-ms", "budget-allow-override-header",
+		"retry-max-attempts", "retry-allow-non-idempotent", "retry-min-remaining-ms", "retry-backoff-ms",
+		"retry-budget-percent", "retry-budget-min-retries",
 		"maintenance-retry-after-seconds", "maintenance-message",
 		"respond-status", "respond-body",
 	}

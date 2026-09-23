@@ -35,6 +35,18 @@ type privateNetworkPeeringSweeperFake struct {
 	err       error
 }
 
+type privateNetworkPolicySweeperFake struct {
+	accountID string
+	networkID string
+	err       error
+}
+
+func (f *privateNetworkPolicySweeperFake) SweepNetwork(_ context.Context, accountID, networkID string) (privatenetwork.ReconcileSummary, error) {
+	f.accountID = accountID
+	f.networkID = networkID
+	return privatenetwork.ReconcileSummary{}, f.err
+}
+
 func (f *privateNetworkPeeringSweeperFake) SweepAccountRegion(_ context.Context, accountID, region string) (privatenetwork.PeeringReconcileSummary, error) {
 	f.accountID = accountID
 	f.region = region
@@ -50,8 +62,9 @@ type privateNetworkFabricCall struct {
 }
 
 type privateNetworkFabricRouterFake struct {
-	mu    sync.Mutex
-	calls []privateNetworkFabricCall
+	mu        sync.Mutex
+	calls     []privateNetworkFabricCall
+	teardowns []privateNetworkFabricCall
 }
 
 type privateNetworkFabricTransportCall struct {
@@ -84,6 +97,24 @@ func (f *privateNetworkFabricRouterFake) callsSnapshot() []privateNetworkFabricC
 	defer f.mu.Unlock()
 	out := make([]privateNetworkFabricCall, len(f.calls))
 	copy(out, f.calls)
+	return out
+}
+
+func (f *privateNetworkFabricRouterFake) RemovePrivateNetworkFabric(_ context.Context, nodeID, accountID, networkID, region string, cidr netip.Prefix) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.teardowns = append(f.teardowns, privateNetworkFabricCall{
+		nodeID: nodeID, accountID: accountID, networkID: networkID,
+		region: region, cidr: cidr,
+	})
+	return nil
+}
+
+func (f *privateNetworkFabricRouterFake) teardownsSnapshot() []privateNetworkFabricCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]privateNetworkFabricCall, len(f.teardowns))
+	copy(out, f.teardowns)
 	return out
 }
 
@@ -359,6 +390,61 @@ func TestPrivateNetworkFabricApplierPreparesActiveRegionalNodesWithoutLiveInstan
 	}
 }
 
+func TestPrivateNetworkFabricDeletionSubscriberTeardownsActiveRegionalNodes(t *testing.T) {
+	ctx := context.Background()
+	store := state.NewMemStore()
+	region := "fra1"
+	otherRegion := "hel1"
+	for _, node := range []state.ComputeNode{
+		{ID: "node-fra", Name: "node-fra", TargetURL: "tcp://10.42.0.2:50051", VPCPUs: 8, MemMB: 8192, MaxConcurrency: 4, AdmissionCeilingMB: 4096, Active: true, Region: &region},
+		{ID: "node-hel", Name: "node-hel", TargetURL: "tcp://10.42.0.3:50051", VPCPUs: 8, MemMB: 8192, MaxConcurrency: 4, AdmissionCeilingMB: 4096, Active: true, Region: &otherRegion},
+		{ID: "node-drained", Name: "node-drained", TargetURL: "tcp://10.42.0.4:50051", VPCPUs: 8, MemMB: 8192, MaxConcurrency: 4, AdmissionCeilingMB: 4096, Active: false, Region: &region},
+	} {
+		if _, err := store.CreateComputeNode(ctx, node); err != nil {
+			t.Fatalf("CreateComputeNode(%s): %v", node.Name, err)
+		}
+	}
+	router := &privateNetworkFabricRouterFake{}
+	subscriber := NewPrivateNetworkFabricDeletionSubscriber(NewPrivateNetworkFabricTeardown(store, router, nil), nil)
+	if err := subscriber.Handle(ctx, db.Notification{
+		Channel: db.NotifyPrivateNetworkChanged,
+		Payload: `{"kind":"private_network_deleted","account_id":"acct-private","network_id":"net-private","region":"fra1","cidr":"10.42.0.0/16"}`,
+	}); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	calls := router.teardownsSnapshot()
+	if len(calls) != 1 || calls[0].nodeID != "node-fra" {
+		t.Fatalf("teardown calls = %+v, want only node-fra", calls)
+	}
+	if calls[0].accountID != "acct-private" || calls[0].networkID != "net-private" || calls[0].region != region || calls[0].cidr != netip.MustParsePrefix("10.42.0.0/16") {
+		t.Fatalf("teardown call = %+v, want deleted network identity", calls[0])
+	}
+}
+
+func TestPrivateNetworkFabricDeletionSubscriberReturnsFailureForReplay(t *testing.T) {
+	store := state.NewMemStore()
+	region := "fra1"
+	if _, err := store.CreateComputeNode(context.Background(), state.ComputeNode{ID: "node-a", Name: "node-a", TargetURL: "tcp://10.42.0.2:50051", VPCPUs: 8, MemMB: 8192, MaxConcurrency: 4, AdmissionCeilingMB: 4096, Active: true, Region: &region}); err != nil {
+		t.Fatalf("CreateComputeNode: %v", err)
+	}
+	wantErr := errors.New("vmmd unavailable")
+	router := &privateNetworkFabricTeardownErrorFake{err: wantErr}
+	subscriber := NewPrivateNetworkFabricDeletionSubscriber(NewPrivateNetworkFabricTeardown(store, router, nil), nil)
+	err := subscriber.Handle(context.Background(), db.Notification{
+		Channel: db.NotifyPrivateNetworkChanged,
+		Payload: `{"kind":"private_network_deleted","account_id":"acct-private","network_id":"net-private","region":"fra1","cidr":"10.42.0.0/16"}`,
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Handle error = %v, want %v so outbox can retry", err, wantErr)
+	}
+}
+
+type privateNetworkFabricTeardownErrorFake struct{ err error }
+
+func (f *privateNetworkFabricTeardownErrorFake) RemovePrivateNetworkFabric(context.Context, string, string, string, string, netip.Prefix) error {
+	return f.err
+}
+
 func TestRegionalTransportPeersRequiresCompleteRegionalRoster(t *testing.T) {
 	region := "fra1"
 	other := "hel1"
@@ -472,6 +558,43 @@ func TestPrivateNetworkPeeringSubscriberSweepsAffectedRegion(t *testing.T) {
 	}
 	if sweeper.accountID != "acct-1" || sweeper.region != "fra1" {
 		t.Fatalf("sweep target = %q/%q, want acct-1/fra1", sweeper.accountID, sweeper.region)
+	}
+}
+
+func TestPrivateNetworkPolicySubscriberSweepsAffectedNetwork(t *testing.T) {
+	sweeper := &privateNetworkPolicySweeperFake{}
+	subscriber := NewPrivateNetworkPolicySubscriber(sweeper, nil)
+	err := subscriber.Handle(context.Background(), db.Notification{
+		Channel: db.NotifyPrivateNetworkChanged,
+		Payload: `{"kind":"private_network","account_id":"acct-1","network_id":"net-1","region":"fra1","status":"policy_updated"}`,
+	})
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if sweeper.accountID != "acct-1" || sweeper.networkID != "net-1" {
+		t.Fatalf("sweep target = %q/%q, want acct-1/net-1", sweeper.accountID, sweeper.networkID)
+	}
+}
+
+func TestPrivateNetworkPolicySubscriberRejectsIncompletePayload(t *testing.T) {
+	subscriber := NewPrivateNetworkPolicySubscriber(&privateNetworkPolicySweeperFake{}, nil)
+	if err := subscriber.Handle(context.Background(), db.Notification{
+		Channel: db.NotifyPrivateNetworkChanged,
+		Payload: `{"kind":"private_network","account_id":"acct-1"}`,
+	}); err == nil {
+		t.Fatal("Handle succeeded for payload without network_id")
+	}
+}
+
+func TestPrivateNetworkPolicySubscriberReturnsConvergenceFailureForReplay(t *testing.T) {
+	wantErr := errors.New("node policy update failed")
+	subscriber := NewPrivateNetworkPolicySubscriber(&privateNetworkPolicySweeperFake{err: wantErr}, nil)
+	err := subscriber.Handle(context.Background(), db.Notification{
+		Channel: db.NotifyPrivateNetworkChanged,
+		Payload: `{"kind":"private_network","account_id":"acct-1","network_id":"net-1","status":"policy_updated"}`,
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Handle error = %v, want %v so outbox can retry", err, wantErr)
 	}
 }
 

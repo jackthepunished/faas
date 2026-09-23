@@ -6,6 +6,7 @@ import type { AppLogDrainAnalyticsResponse } from '../models/AppLogDrainAnalytic
 import type { AppLogDrainHealthResponse } from '../models/AppLogDrainHealthResponse.js';
 import type { AppLogDrainResponse } from '../models/AppLogDrainResponse.js';
 import type { CreateAppLogDrainRequest } from '../models/CreateAppLogDrainRequest.js';
+import type { SidecarTimelineResponse } from '../models/SidecarTimelineResponse.js';
 import type { Trace } from '../models/Trace.js';
 import type { UpdateAppLogDrainRequest } from '../models/UpdateAppLogDrainRequest.js';
 import type { WakeTimelineResponse } from '../models/WakeTimelineResponse.js';
@@ -36,9 +37,9 @@ export class ObservabilityService {
         401: `code: unauthorized`,
         402: `code: plan_log_drains_not_allowed — the plan does not include customer runtime log destinations.`,
         404: `code: not_found`,
-        429: `429. Two response shapes:
-        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
-        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        429: `429 application/problem+json response. Authentication throttling uses
+        \`auth_rate_limited\`; plan and usage limits use their specific stable
+        codes such as \`plan_limit_concurrency\` and \`quota_exhausted\`.
         `,
       },
     });
@@ -79,9 +80,9 @@ export class ObservabilityService {
         403: `code: plan_log_drain_quota — per-app or per-account runtime log destination limit reached.`,
         404: `code: not_found`,
         409: `code: app_log_drain_invalid — malformed log-drain kind, URL, or auth header.`,
-        429: `429. Two response shapes:
-        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
-        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        429: `429 application/problem+json response. Authentication throttling uses
+        \`auth_rate_limited\`; plan and usage limits use their specific stable
+        codes such as \`plan_limit_concurrency\` and \`quota_exhausted\`.
         `,
       },
     });
@@ -115,9 +116,9 @@ export class ObservabilityService {
         401: `code: unauthorized`,
         402: `code: plan_log_drains_not_allowed — the plan does not include customer runtime log destinations.`,
         404: `code: not_found`,
-        429: `429. Two response shapes:
-        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
-        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        429: `429 application/problem+json response. Authentication throttling uses
+        \`auth_rate_limited\`; plan and usage limits use their specific stable
+        codes such as \`plan_limit_concurrency\` and \`quota_exhausted\`.
         `,
       },
     });
@@ -157,9 +158,9 @@ export class ObservabilityService {
         402: `code: plan_log_drains_not_allowed — the plan does not include customer runtime log destinations.`,
         404: `code: not_found`,
         409: `code: app_log_drain_invalid — malformed log-drain kind, URL, or auth header.`,
-        429: `429. Two response shapes:
-        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
-        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        429: `429 application/problem+json response. Authentication throttling uses
+        \`auth_rate_limited\`; plan and usage limits use their specific stable
+        codes such as \`plan_limit_concurrency\` and \`quota_exhausted\`.
         `,
       },
     });
@@ -193,9 +194,9 @@ export class ObservabilityService {
         401: `code: unauthorized`,
         402: `code: plan_log_drains_not_allowed — the plan does not include customer runtime log destinations.`,
         404: `code: not_found`,
-        429: `429. Two response shapes:
-        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
-        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        429: `429 application/problem+json response. Authentication throttling uses
+        \`auth_rate_limited\`; plan and usage limits use their specific stable
+        codes such as \`plan_limit_concurrency\` and \`quota_exhausted\`.
         `,
       },
     });
@@ -233,9 +234,9 @@ export class ObservabilityService {
         401: `code: unauthorized`,
         402: `code: plan_log_drains_not_allowed — the plan does not include customer runtime log destinations.`,
         404: `code: not_found`,
-        429: `429. Two response shapes:
-        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
-        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        429: `429 application/problem+json response. Authentication throttling uses
+        \`auth_rate_limited\`; plan and usage limits use their specific stable
+        codes such as \`plan_limit_concurrency\` and \`quota_exhausted\`.
         `,
       },
     });
@@ -284,9 +285,9 @@ export class ObservabilityService {
         401: `code: unauthorized`,
         402: `code: plan_log_drains_not_allowed — the plan does not include customer runtime log destinations.`,
         404: `code: not_found`,
-        429: `429. Two response shapes:
-        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
-        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        429: `429 application/problem+json response. Authentication throttling uses
+        \`auth_rate_limited\`; plan and usage limits use their specific stable
+        codes such as \`plan_limit_concurrency\` and \`quota_exhausted\`.
         `,
       },
     });
@@ -363,9 +364,70 @@ export class ObservabilityService {
         401: `code: unauthorized`,
         402: `code: plan_per_app_metrics_not_allowed — the account plan does not include per-app metrics or wake narratives; upgrade to Hobby or above.`,
         404: `No such app (slug) or wake_id is unknown.`,
-        429: `429. Two response shapes:
-        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
-        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        429: `429 application/problem+json response. Authentication throttling uses
+        \`auth_rate_limited\`; plan and usage limits use their specific stable
+        codes such as \`plan_limit_concurrency\` and \`quota_exhausted\`.
+        `,
+      },
+    });
+  }
+  /**
+   * List the lifecycle timeline for one sidecar.
+   * Oldest-first (forward narrative). Returns the sidecar's init-exit,
+   * restart, and health-transition frames. The `latest` field is the
+   * most recent `wake.sidecar_health` status (`starting`, `healthy`,
+   * `unhealthy`, `restarting`, or `failed`) when one is available.
+   *
+   * The endpoint is a sub-resource of `/v1/apps/{slug}` and uses the
+   * same MFA, scope, per-app rate-limit, and Hobby+ observability gates
+   * as the wake timeline. Cross-account rows are dropped by verifying
+   * every event's `data.app_id` against the slug's resolved app.
+   *
+   * @returns SidecarTimelineResponse Sidecar lifecycle frames and the latest health snapshot.
+   * @throws ApiError
+   */
+  public static listSidecarTimeline({
+    slug,
+    sidecarName,
+    since,
+    limit = 200,
+  }: {
+    /**
+     * App slug that owns this sidecar timeline (lowercase, kebab-case; per-account unique).
+     */
+    slug: string,
+    /**
+     * The sidecar name from the app deployment's sidecar set.
+     */
+    sidecarName: string,
+    /**
+     * Only return rows with `at > since` (RFC 3339).
+     */
+    since?: string,
+    /**
+     * Max frames to return. Values above 1000 are rejected.
+     */
+    limit?: number,
+  }): CancelablePromise<SidecarTimelineResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/v1/apps/{slug}/sidecars/{sidecar_name}/timeline',
+      path: {
+        'slug': slug,
+        'sidecar_name': sidecarName,
+      },
+      query: {
+        'since': since,
+        'limit': limit,
+      },
+      errors: {
+        400: `Malformed query parameter — \`since\` is not RFC 3339 or \`limit\` is out of range.`,
+        401: `code: unauthorized`,
+        402: `code: plan_per_app_metrics_not_allowed — the account plan does not include per-app metrics or wake narratives; upgrade to Hobby or above.`,
+        404: `No such app (slug) or sidecar timeline is unknown.`,
+        429: `429 application/problem+json response. Authentication throttling uses
+        \`auth_rate_limited\`; plan and usage limits use their specific stable
+        codes such as \`plan_limit_concurrency\` and \`quota_exhausted\`.
         `,
       },
     });

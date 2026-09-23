@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/tcpmetrics"
 )
 
 // EnabledListenerSource supplies the durable listener identities tcpd should
@@ -31,8 +32,22 @@ type Supervisor struct {
 	Forwarder       Forwarder
 	RefreshInterval time.Duration
 	MaxConnections  int
-	OnError         func(error)
-	Listen          func(network, address string) (net.Listener, error)
+	// MaxConnectionsPerAccount bounds concurrent sessions for one account on
+	// this gateway. Zero disables the account-scoped cap.
+	MaxConnectionsPerAccount int
+	Metrics                  *tcpmetrics.Metrics
+	OnError                  func(error)
+	// OnReady runs after the initial listener snapshot has been validated and
+	// every enabled public socket has been bound. Later reconciliation errors
+	// are reported through OnError without revoking initial readiness.
+	OnReady func()
+	Listen  func(network, address string) (net.Listener, error)
+
+	lifecycleMu sync.Mutex
+	drainCh     chan struct{}
+	drainOnce   sync.Once
+	serveDone   chan struct{}
+	serveCancel context.CancelFunc
 }
 
 type supervisedListener struct {
@@ -57,9 +72,39 @@ func (s *Supervisor) Serve(ctx context.Context) error {
 	if s.BindHost == "" {
 		s.BindHost = "0.0.0.0"
 	}
+	serveCtx, serveCancel := context.WithCancel(ctx)
+	drainCh := make(chan struct{})
+	serveDone := make(chan struct{})
+	s.lifecycleMu.Lock()
+	s.drainCh = drainCh
+	s.serveDone = serveDone
+	s.serveCancel = serveCancel
+	s.lifecycleMu.Unlock()
+	defer func() {
+		serveCancel()
+		close(serveDone)
+		s.lifecycleMu.Lock()
+		if s.serveDone == serveDone {
+			s.drainCh = nil
+			s.serveDone = nil
+			s.serveCancel = nil
+		}
+		s.lifecycleMu.Unlock()
+	}()
+	limiter := NewConnectionLimiter(s.MaxConnectionsPerAccount)
 
 	listeners := make(map[int]supervisedListener)
 	var mu sync.Mutex
+	var servers sync.WaitGroup
+	draining := make(chan struct{})
+	isDraining := func() bool {
+		select {
+		case <-draining:
+			return true
+		default:
+			return false
+		}
+	}
 	closeAll := func() {
 		mu.Lock()
 		current := make([]supervisedListener, 0, len(listeners))
@@ -73,10 +118,13 @@ func (s *Supervisor) Serve(ctx context.Context) error {
 			_ = entry.listener.Close()
 		}
 	}
-	defer closeAll()
+	defer func() {
+		closeAll()
+		servers.Wait()
+	}()
 
 	refresh := func() error {
-		rows, err := s.Source.ListEnabledTCPListeners(ctx)
+		rows, err := s.Source.ListEnabledTCPListeners(serveCtx)
 		if err != nil {
 			return fmt.Errorf("list enabled TCP listeners: %w", err)
 		}
@@ -119,15 +167,17 @@ func (s *Supervisor) Serve(ctx context.Context) error {
 			if err != nil {
 				return fmt.Errorf("bind TCP listener %d: %w", port, err)
 			}
-			childCtx, cancel := context.WithCancel(ctx)
+			childCtx, cancel := context.WithCancel(serveCtx)
 			server := &Server{
 				Listener:       listener,
 				Routes:         s.Routes,
 				Targets:        s.Targets,
 				Forwarder:      s.Forwarder,
+				Limiter:        limiter,
+				Metrics:        s.Metrics,
 				MaxConnections: s.MaxConnections,
 				OnError: func(err error) {
-					if s.OnError != nil {
+					if s.OnError != nil && !isDraining() {
 						s.OnError(fmt.Errorf("TCP port %d: %w", port, err))
 					}
 				},
@@ -135,8 +185,10 @@ func (s *Supervisor) Serve(ctx context.Context) error {
 			mu.Lock()
 			listeners[port] = supervisedListener{listener: listener, cancel: cancel}
 			mu.Unlock()
+			servers.Add(1)
 			go func(port int, route Route, srv *Server, childCtx context.Context) {
-				if err := srv.Serve(childCtx); err != nil && childCtx.Err() == nil && s.OnError != nil {
+				defer servers.Done()
+				if err := srv.Serve(childCtx); err != nil && childCtx.Err() == nil && s.OnError != nil && !isDraining() {
 					s.OnError(fmt.Errorf("serve TCP port %d (%s): %w", port, route.ListenerName, err))
 				}
 			}(port, route, server, childCtx)
@@ -147,17 +199,73 @@ func (s *Supervisor) Serve(ctx context.Context) error {
 	if err := refresh(); err != nil {
 		return err
 	}
+	if s.OnReady != nil {
+		s.OnReady()
+	}
 	ticker := time.NewTicker(s.RefreshInterval)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-ctx.Done():
+		case <-serveCtx.Done():
+			closeAll()
+			servers.Wait()
+			return nil
+		case <-drainCh:
+			close(draining)
+			closeListeners := func() {
+				mu.Lock()
+				current := make([]supervisedListener, 0, len(listeners))
+				for _, entry := range listeners {
+					current = append(current, entry)
+				}
+				mu.Unlock()
+				for _, entry := range current {
+					// Closing the listener stops new accepts but leaves each
+					// child context alive so existing sessions can finish.
+					_ = entry.listener.Close()
+				}
+			}
+			closeListeners()
+			servers.Wait()
 			return nil
 		case <-ticker.C:
 			if err := refresh(); err != nil && s.OnError != nil {
 				s.OnError(err)
 			}
 		}
+	}
+}
+
+// Drain stops accepting new connections and waits for the already accepted
+// sessions to finish. If ctx expires, the supervisor is canceled so active
+// sessions are closed and the method returns ctx.Err(). A supervisor that has
+// not started serving is treated as already drained.
+func (s *Supervisor) Drain(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	if ctx == nil {
+		return errors.New("tcpd supervisor drain requires a non-nil context")
+	}
+
+	s.lifecycleMu.Lock()
+	drainCh := s.drainCh
+	serveDone := s.serveDone
+	serveCancel := s.serveCancel
+	s.lifecycleMu.Unlock()
+	if drainCh == nil || serveDone == nil {
+		return nil
+	}
+	s.drainOnce.Do(func() { close(drainCh) })
+	select {
+	case <-serveDone:
+		return nil
+	case <-ctx.Done():
+		if serveCancel != nil {
+			serveCancel()
+		}
+		<-serveDone
+		return ctx.Err()
 	}
 }
 
@@ -175,6 +283,8 @@ func (s *Supervisor) validate() error {
 		return errors.New("tcpd supervisor has no forwarder")
 	case s.MaxConnections < 0:
 		return errors.New("tcpd supervisor max connections cannot be negative")
+	case s.MaxConnectionsPerAccount < 0:
+		return errors.New("tcpd supervisor max connections per account cannot be negative")
 	default:
 		return nil
 	}

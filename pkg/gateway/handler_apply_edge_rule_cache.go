@@ -46,6 +46,14 @@ func (h *Handler) applyEdgeRuleCache(w http.ResponseWriter, r *http.Request, app
 	if h == nil || h.responseCache == nil || h.edgeRules == nil {
 		return false, nil
 	}
+	// Deployment-preview URLs promise the exact immutable artifact named by
+	// the hostname. The response cache is currently populated before target
+	// selection and its v1 key is app-scoped, so consulting it here could replay
+	// a production sibling's body. Bypass both reads and writes until the cache
+	// key is deployment-aware end to end.
+	if app.PinnedDeploymentID != "" {
+		return false, nil
+	}
 	// Method gate is a cheap pre-flight: only {GET, HEAD} are
 	// cacheable per ADR-122 D3. We DO NOT count this as
 	// bypass_uncacheable here — that label only fires when a
@@ -149,6 +157,31 @@ func (h *Handler) applyEdgeRuleCache(w http.ResponseWriter, r *http.Request, app
 		// the wakes_avoided counter + the healthy-check that
 		// gates it; for now we just call observe with the
 		// cached status.
+		h.observe(r, entry.statusCode, app.ID, string(app.Plan), false, Target{})
+		return true, rule
+	case "stale_while_revalidate_eligible":
+		// Serve stale immediately and refresh the same cache key in the
+		// background. The refresh is singleflight-coalesced so concurrent
+		// callers do not stampede the origin.
+		h.metricsIncCacheOutcome(app.ID, "stale_while_revalidate_served")
+		w.Header().Del(wire.WakeHeader)
+		for k, vs := range entry.header {
+			if isHopByHopHeader(k) || isPerRequestPlatformHeader(k) {
+				continue
+			}
+			for _, v := range vs {
+				w.Header().Add(k, v)
+			}
+		}
+		w.Header().Set("x-faas-cache", "stale-while-revalidate")
+		w.Header().Set("X-From-Cache", "stale")
+		w.Header().Add("Warning", `110 - "Response is Stale"`)
+		w.Header().Set("Content-Length", itoaLen(entry.body))
+		w.WriteHeader(entry.statusCode)
+		_, _ = w.Write(entry.body)
+		rec.status = entry.statusCode
+		rec.Bytes = int64(len(entry.body))
+		h.startCacheRefresh(r, app, rule, key)
 		h.observe(r, entry.statusCode, app.ID, string(app.Plan), false, Target{})
 		return true, rule
 	case "stale_if_error_eligible":

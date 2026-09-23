@@ -42,22 +42,24 @@ const (
 	mfaFile               = "mfa.go"
 	sessionsFile          = "sessions.go" // IAM-3 (ADR-039)
 	errorsFile            = "errors.go"
-	wakeTLFile            = "wake_timeline.go"   // issue #517 PR-C / ADR-064
-	orgsFile              = "orgs.go"            // issue #190 / IAM-6 / ADR-061 PR 5
-	scanFile              = "dto_scan.go"        // issue #464 / ADR-055 — per-deploy grype CVE scan DTOs
-	webhooksFile          = "webhooks.go"        // issue #476 / ADR-076
-	realtimeFile          = "realtime.go"        // ADR-156 — managed realtime endpoint DTOs
-	logDrainsFile         = "logdrains.go"       // issue #1398 O4 — customer runtime log destinations
-	billingFile           = "billing.go"         // PR-P3 — admin reconcile + future billing DTOs
-	diffFile              = "diff.go"            // PR-1 of the deploy-diff cluster — DiffRequest / DiffResponse wire DTOs
-	upstreamsFile         = "upstreams.go"       // ADR-098 §9.A PR-B
-	triggerFile           = "trigger.go"         // issue #757 / ADR-100 — trigger primitive wire DTOs
-	oidcFile              = "oidc.go"            // ADR-101 / PR-A — OIDC / keyless deploy auth DTOs
-	envDiffFile           = "env_diff.go"        // ADR-117 PR-C — EnvDiffResponse / EnvDiffRow / EnvDiffCell wire DTOs
-	operatorConfigFile    = "operator_config.go" // ADR-132 — operator runtime configuration
-	obsFile               = "obs.go"             // Obs-Meta + Trace-IDs Mega-PR / C7 — operator obs backend DTOs + ObsHealthResponse
-	corsPresetsFile       = "cors_preset_dto.go" // issue #975 #4 PR-B / ADR-129 — CORS preset DTOs
-	uploadSessionFile     = "upload_session.go"  // issue #1182 §P1 PR-1 — resumable upload session DTOs
+	wakeTLFile            = "wake_timeline.go"    // issue #517 PR-C / ADR-064
+	sidecarTimelineFile   = "sidecar_timeline.go" // issue #463 / ADR-069 — sidecar lifecycle timeline DTOs
+	orgsFile              = "orgs.go"             // issue #190 / IAM-6 / ADR-061 PR 5
+	scanFile              = "dto_scan.go"         // issue #464 / ADR-055 — per-deploy grype CVE scan DTOs
+	webhooksFile          = "webhooks.go"         // issue #476 / ADR-076
+	inboundWebhooksFile   = "inbound_webhooks.go" // ADR-212 — durable provider webhook ingress DTOs
+	realtimeFile          = "realtime.go"         // ADR-156 — managed realtime endpoint DTOs
+	logDrainsFile         = "logdrains.go"        // issue #1398 O4 — customer runtime log destinations
+	billingFile           = "billing.go"          // PR-P3 — admin reconcile + future billing DTOs
+	diffFile              = "diff.go"             // PR-1 of the deploy-diff cluster — DiffRequest / DiffResponse wire DTOs
+	upstreamsFile         = "upstreams.go"        // ADR-098 §9.A PR-B
+	triggerFile           = "trigger.go"          // issue #757 / ADR-100 — trigger primitive wire DTOs
+	oidcFile              = "oidc.go"             // ADR-101 / PR-A — OIDC / keyless deploy auth DTOs
+	envDiffFile           = "env_diff.go"         // ADR-117 PR-C — EnvDiffResponse / EnvDiffRow / EnvDiffCell wire DTOs
+	operatorConfigFile    = "operator_config.go"  // ADR-132 — operator runtime configuration
+	obsFile               = "obs.go"              // Obs-Meta + Trace-IDs Mega-PR / C7 — operator obs backend DTOs + ObsHealthResponse
+	corsPresetsFile       = "cors_preset_dto.go"  // issue #975 #4 PR-B / ADR-129 — CORS preset DTOs
+	uploadSessionFile     = "upload_session.go"   // issue #1182 §P1 PR-1 — resumable upload session DTOs
 	managedPostgresFile   = "managed_postgres.go"
 	openapiContractFile   = "openapi_contract.go"
 	executionsFile        = "executions.go"      // ADR-171 — disposable one-shot execution DTOs
@@ -199,6 +201,10 @@ var routeExclude = map[string]bool{
 	// Unified Failed Events actions are dashboard-only form posts protected
 	// by the session cookie and CSRF token. The public SDK does not model
 	// browser form surfaces; mirror cmd/sdk-coverage/main.go::routeExclude.
+	"POST /dashboard/failed-events/discard-all":          true,
+	"POST /dashboard/failed-events/discard-selected":     true,
+	"POST /dashboard/failed-events/replay-all":           true,
+	"POST /dashboard/failed-events/replay-selected":      true,
 	"POST /dashboard/failed-events/{slug}/{id}/discard":  true,
 	"POST /dashboard/failed-events/{slug}/{id}/replay":   true,
 	"POST /dashboard/failed-events/account/{id}/discard": true,
@@ -314,6 +320,7 @@ var dtoExclude = map[string]bool{
 	"AppWebhookRow":                   true,
 	"AppWebhookDeliveryRow":           true,
 	"ListAppWebhookDeliveriesOptions": true,
+	"InboundWebhookEndpointRow":       true,
 	"AppLogDrainRow":                  true,
 	"QueueBindingRow":                 true,
 	// ADR-091 D20.5 amendment / issue #881 — per-route throttle
@@ -480,24 +487,33 @@ var codeExclude = map[string]bool{
 	"CodeCliAuthUnavailable": true, // /v1/cli-auth/* (anonymous)
 }
 
-// schemaSpecOnly lists schemas that exist in the spec but have no Go DTO.
-// Either inline anonymous structs in handlers, or pure-documentation shapes
-// (error envelopes that don't directly mirror a Go type).
+// schemaSpecOnly lists schemas that the struct-only DTO scanner cannot map
+// to a standalone Go struct: aliases, inline anonymous structs, or pure-
+// documentation shapes (such as error envelopes).
 var schemaSpecOnly = map[string]bool{
 	// Migration preflight verdict level is a typed string, not a struct, so
 	// the DTO scanner does not surface it. Same pattern as TriggerKind and
 	// ResourceProfile below.
 	"PreflightLevel": true,
+	// SidecarProbe is a source-compatible Go alias for AppManifestHealthcheck;
+	// the underlying fields are checked against the shared schema above.
+	"SidecarProbe": true,
 	// Status create is decoded into the shared Go request DTO, while the
 	// OpenAPI discriminator exposes stricter kind-specific SDK request shapes.
 	"AdminStatusIncidentCreateRequest":    true,
 	"AdminStatusMaintenanceCreateRequest": true,
-	"ChangePlanRequest":                   true, // inline {Plan string} in cmd/apid/handlers_ext.go
-	"CreateKeyRequest":                    true, // inline {Label string} in cmd/apid/handlers_ext.go
-	"RateLimitPlain":                      true, // documentation-only shape for the authlimiter 429
-	"Trace":                               true, // issue #555: gatewayd-public GET /v1/traces/{trace_id} response; gateway-internal type, not a pkg/api DTO
-	"TraceSpan":                           true, // issue #555: subtree of Trace; gateway-internal type
-	"RaiseOverageCapRequest":              true, // issue #561: inline {OverageCapCents *int64} in cmd/apid/handlers_ext.go
+	// Delayed-task create is decoded into api.DelayedTaskRequest. The two
+	// spec-only variants preserve the exactly-one schedule contract while
+	// giving generated SDKs concrete absolute/relative request types instead
+	// of the Python generator's untyped Any fallback for inline oneOf arms.
+	"DelayedTaskAtRequest":    true,
+	"DelayedTaskAfterRequest": true,
+	"ChangePlanRequest":       true, // inline {Plan string} in cmd/apid/handlers_ext.go
+	"CreateKeyRequest":        true, // inline {Label string} in cmd/apid/handlers_ext.go
+	"RateLimitPlain":          true, // documentation-only shape for the authlimiter 429
+	"Trace":                   true, // issue #555: gatewayd-public GET /v1/traces/{trace_id} response; gateway-internal type, not a pkg/api DTO
+	"TraceSpan":               true, // issue #555: subtree of Trace; gateway-internal type
+	"RaiseOverageCapRequest":  true, // issue #561: inline {OverageCapCents *int64} in cmd/apid/handlers_ext.go
 	// Issue #757 / ADR-100 — trigger-enum schemas. Each is the
 	// typed string from pkg/api/trigger.go (TriggerKind,
 	// TriggerRecordState, TriggerRoutedTo, TriggerDeadLetterReason).
@@ -515,10 +531,12 @@ var schemaSpecOnly = map[string]bool{
 	// Same pattern as TriggerKind above: the DTO scanner walks
 	// struct types only; a `type X string` definition isn't a
 	// struct so it doesn't surface as a scanner name.
-	"FilterCriteriaOp":   true,
-	"KafkaSASLMechanism": true,
-	"EnvDiffKind":        true, // ADR-117 PR-C: typed-string discriminator in pkg/api/env_diff.go (scanner only sees *ast.StructType)
-	"ResourceProfile":    true, // Named resource profile is a typed string; the scanner registers struct DTOs only.
+	"FilterCriteriaOp":          true,
+	"KafkaSASLMechanism":        true,
+	"EnvDiffKind":               true, // ADR-117 PR-C: typed-string discriminator in pkg/api/env_diff.go (scanner only sees *ast.StructType)
+	"ResourceProfile":           true, // Named resource profile is a typed string; the scanner registers struct DTOs only.
+	"ServiceBindingPolicy":      true, // Typed-string enum in pkg/api/service_bindings.go; the schema is still part of the wire contract.
+	"PreviewServiceCallsPolicy": true, // Typed-string enum in pkg/api/preview_service_calls.go; the schema is still part of the wire contract.
 }
 
 // findRepoRoot walks up from the working directory until it finds a go.mod.
@@ -911,6 +929,7 @@ func testSchemasParity(t *testing.T, root string, spec *specDoc) {
 
 	files := []string{
 		filepath.Join(root, "pkg", "api", dtoFile),
+		filepath.Join(root, "pkg", "api", "service_bindings.go"),
 		filepath.Join(root, "pkg", "api", "object_storage.go"),
 		filepath.Join(root, "pkg", "api", "object_storage_usage.go"),
 		filepath.Join(root, "pkg", "api", workflowFile),
@@ -926,9 +945,11 @@ func testSchemasParity(t *testing.T, root string, spec *specDoc) {
 		filepath.Join(root, "pkg", "api", sessionsFile),
 		filepath.Join(root, "pkg", "api", errorsFile),
 		filepath.Join(root, "pkg", "api", wakeTLFile),
+		filepath.Join(root, "pkg", "api", sidecarTimelineFile),
 		filepath.Join(root, "pkg", "api", orgsFile),
 		filepath.Join(root, "pkg", "api", scanFile),
 		filepath.Join(root, "pkg", "api", webhooksFile),
+		filepath.Join(root, "pkg", "api", inboundWebhooksFile),
 		filepath.Join(root, "pkg", "api", realtimeFile),
 		filepath.Join(root, "pkg", "api", logDrainsFile),
 		filepath.Join(root, "pkg", "api", billingFile),
@@ -1106,7 +1127,7 @@ func testErrorCodesParity(t *testing.T, root string, spec *specDoc) {
 
 	// Every code in code must have a corresponding response in spec
 	// whose status is StatusForCode(code) AND whose content includes
-	// application/problem+json (with the exception of plain-text 429s).
+	// application/problem+json.
 	// codes is pre-filtered by scanErrorCodes against codeExclude so
 	// non-public codes (CLI auth) never reach this loop.
 	var missing []string
@@ -1128,15 +1149,11 @@ func testErrorCodesParity(t *testing.T, root string, spec *specDoc) {
 		}
 	}
 
-	// Documented exception: 429 must declare BOTH application/problem+json
-	// (for code-driven 429s) AND text/plain (for the authlimiter). Hard
-	// fail if either is missing.
+	// Authentication throttling uses the same structured Problem contract as
+	// every other 429, so the shared response must retain problem+json.
 	if media, ok := spec.Responses["429"]; ok {
 		if !media["application/problem+json"] {
-			t.Errorf("429 must declare application/problem+json (for plan_limit_concurrency / quota_exhausted)")
-		}
-		if !media["text/plain"] {
-			t.Errorf("429 must declare text/plain (authlimiter middleware in pkg/middleware/authlimit.go)")
+			t.Errorf("429 must declare application/problem+json")
 		}
 	}
 }

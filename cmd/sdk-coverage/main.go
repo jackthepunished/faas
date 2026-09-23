@@ -50,6 +50,7 @@ var routeExclude = map[string]bool{
 	"GET /v1/account/dpa":                       true, // public markdown (no Bearer; SDK consumers don't render HTML)
 	"POST /v1/webhooks/stripe":                  true, // HMAC-signed webhook; outside the Bearer-auth surface
 	"POST /v1/webhooks/resend":                  true, // Svix-signed webhook (issue #246 / ADR-115); outside the Bearer-auth surface
+	"POST /v1/hooks/{token}":                    true, // ADR-212 provider-signed ingress; outside the Bearer-auth SDK
 	"GET /v1/openapi.yaml":                      true, // metadata
 	"GET /v1/openapi.json":                      true, // metadata
 	"GET /docs":                                 true, // anonymous Swagger UI metadata page
@@ -213,6 +214,10 @@ var routeExclude = map[string]bool{
 	// Unified Failed Events actions are dashboard-only form posts protected
 	// by the session cookie and CSRF token. The public SDK does not model
 	// browser form surfaces; these routes intentionally have no SDK twin.
+	"POST /dashboard/failed-events/discard-all":          true,
+	"POST /dashboard/failed-events/discard-selected":     true,
+	"POST /dashboard/failed-events/replay-all":           true,
+	"POST /dashboard/failed-events/replay-selected":      true,
 	"POST /dashboard/failed-events/{slug}/{id}/discard":  true,
 	"POST /dashboard/failed-events/{slug}/{id}/replay":   true,
 	"POST /dashboard/failed-events/account/{id}/discard": true,
@@ -271,6 +276,7 @@ var methodRouteMap = map[string]string{
 	// First-class queue bindings use a hyphenated path segment. Pin the
 	// noun-oriented Go SDK names instead of the fallback's literal
 	// "Queue-bindings" spelling.
+	"PUT /v1/apps/{slug}/queue-workload":             "ConfigureQueueWorkload",
 	"GET /v1/apps/{slug}/queue-bindings":             "ListQueueBindings",
 	"POST /v1/apps/{slug}/queue-bindings":            "CreateQueueBinding",
 	"GET /v1/apps/{slug}/queue-bindings/{id}":        "GetQueueBinding",
@@ -322,6 +328,8 @@ var methodRouteMap = map[string]string{
 	"GET /v1/projects/{slug}/environments/{environment}":            "GetProjectEnvironment",
 	"PATCH /v1/projects/{slug}/environments/{environment}":          "UpdateProjectEnvironment",
 	"GET /v1/projects/{slug}/environments/{environment}/releases":   "GetProjectEnvironmentReleases",
+	"GET /v1/projects/{slug}/environments/{environment}/state":      "GetProjectEnvironmentState",
+	"GET /v1/projects/{slug}/environments/{environment}/diff":       "GetProjectEnvironmentDiff",
 	"GET /v1/projects/{slug}/environments/{environment}/promotions": "ListProjectEnvironmentPromotions",
 	"GET /v1/projects/{slug}/delete-preview":                        "PreviewDeleteProject",
 	"DELETE /v1/projects/{slug}":                                    "DeleteProject",
@@ -354,53 +362,61 @@ var methodRouteMap = map[string]string{
 	// underscore survives title-case), so the explicit map drops the
 	// underscore and aligns with the SDK's Get*EgressAllowlistExtra
 	// method names.
-	"GET /v1/account/egress_allowlist_extra":                                                "GetEgressAllowlistExtra",
-	"PATCH /v1/account/egress_allowlist_extra":                                              "SetEgressAllowlistExtra",
-	"GET /v1/account/managed-postgres-usage":                                                "GetManagedPostgresUsage",
-	"GET /v1/account/usage":                                                                 "AccountUsage",
-	"GET /v1/postgres/databases":                                                            "ListManagedPostgresDatabases",
-	"POST /v1/postgres/databases":                                                           "CreateManagedPostgresDatabase",
-	"GET /v1/postgres/databases/{id}":                                                       "GetManagedPostgresDatabase",
-	"DELETE /v1/postgres/databases/{id}":                                                    "DeleteManagedPostgresDatabase",
-	"POST /v1/postgres/databases/{id}/restore":                                              "RestoreManagedPostgresDatabase",
-	"GET /v1/postgres/databases/{id}/bindings":                                              "ListManagedPostgresBindings",
-	"POST /v1/postgres/databases/{id}/bindings":                                             "CreateManagedPostgresBinding",
-	"GET /v1/postgres/bindings/{id}":                                                        "GetManagedPostgresBinding",
-	"DELETE /v1/postgres/bindings/{id}":                                                     "DeleteManagedPostgresBinding",
-	"GET /v1/apps/{slug}/logs":                                                              "StreamAppLogs",
-	"GET /v1/deployments/{id}/logs":                                                         "StreamDeploymentLogs",
-	"GET /v1/deployments/{id}/scan":                                                         "GetDeploymentScan",              // issue #464 / ADR-055; per-deploy grype CVE drill-down
-	"GET /v1/deployments/{id}/secret-scan":                                                  "GetDeploymentSecretScan",        // PR-A / ADR-101; per-deploy image-layer secret-scan audit row
-	"GET /v1/deployments/{id}/stages":                                                       "GetDeploymentStages",            // ADR-117 follow-on; post-stream closed-stage summary for `gregale deploys show <id>`
-	"GET /v1/deployments/{id}/audit":                                                        "ListDeploymentAudit",            // issue #976 / ADR-122 SAFE-RELEASES-E.2 + production-leveling Stream A; per-deployment audit timeline drill-down
-	"POST /v1/deployments/{id}/canary/advance":                                              "AdvanceCanary",                  // issue #976 / ADR-122; APID-owned atomic canary CAS + traffic + audit
-	"POST /v1/deployments/{id}/retry":                                                       "RetryDeploymentFromStage",       // ADR-117 §Production-ready follow-on C2; per-stage retry
-	"GET /v1/deployments/{id}/url":                                                          "GetDeploymentURL",               // issue #976 / ADR-122 SAFE-RELEASES-C.2; per-deployment preview URL (deploy-N.slug.gregale.dev)
-	"GET /v1/apps/{slug}/deployments/{deployment}/openapi":                                  "GetAppsDeploymentOpenAPIDoc",    // issue #975 item #1 / ADR-122 — captured OpenAPI doc per deployment
-	"PATCH /v1/apps/{slug}/deployments/{deployment}/openapi":                                "PatchAppsDeploymentOpenAPIDoc",  // manual upload; same store as cold-boot capture
-	"DELETE /v1/apps/{slug}/deployments/{deployment}/openapi":                               "DeleteAppsDeploymentOpenAPIDoc", // wipe the captured doc; re-captures on next cold boot
-	"GET /v1/apps/{slug}/env-diff":                                                          "GetAppEnvDiff",                  // ADR-117 PR-C: env vars + secrets × scopes matrix; matches operationId `getAppEnvDiff` (auto-derivation would produce `GetAppsSlugEnv-diff` because of the literal hyphen in the path segment — the explicit map drops the slug placeholder + the hyphen for Go SDK hygiene, mirroring the `GetAppMetrics` / `GetAppSLO` / `GetAppDataUpstream` precedent above)
-	"GET /v1/apps/{slug}/openapi":                                                           "GetAppOpenAPI",                  // issue #975 item #2 / ADR-126 — imported or auto-generated OpenAPI doc per app
-	"POST /v1/apps/{slug}/openapi":                                                          "ImportAppOpenAPI",               // manual upload (item #2 D2/D6); persists via UpsertAppOpenAPIDoc
-	"DELETE /v1/apps/{slug}/openapi":                                                        "DeleteAppOpenAPI",               // idempotent wipe of the imported doc (item #2 D5 emits pg_notify)
-	"POST /v1/apps/{slug}/openapi/dry-run":                                                  "DryRunAppOpenAPI",               // read-only edge-rule suggestions (item #2 D3)
-	"GET /v1/apps/{slug}/openapi/preview":                                                   "PreviewAppOpenAPIPolicy",        // read-only declared-vs-observed route-policy preview (roadmap item 11)
-	"POST /v1/apps/{slug}/openapi/apply":                                                    "ApplyAppOpenAPIPolicy",          // explicit plan/confirm policy apply
-	"GET /v1/apps/{slug}/openapi/diff":                                                      "DiffAppOpenAPIContract",         // ADR-121 production contract gate preview
-	"GET /v1/apps/{slug}/github":                                                            "GetGitHubConnection",
-	"GET /v1/apps/{slug}/github/deployment-policy":                                          "GetGitHubDeploymentPolicy",
-	"PATCH /v1/apps/{slug}/github/deployment-policy":                                        "PatchGitHubDeploymentPolicy",
-	"POST /v1/apps/{slug}/github/bind":                                                      "BindGitHubConnection",
-	"POST /v1/apps/{slug}/github/sync":                                                      "SyncGitHubConnection",
-	"DELETE /v1/apps/{slug}/github":                                                         "DisconnectGitHubConnection",
-	"GET /v1/deployments/{id}":                                                              "GetDeployment",
-	"PATCH /v1/deployments/{id}":                                                            "PatchDeployment", // ADR-072 / issue #557 closure; min_instances override
-	"DELETE /v1/deployments/{id}":                                                           "ClearDeployment", // ADR-124 PR-A; soft-delete (status untouched)
-	"GET /v1/deployments":                                                                   "ListDeployments",
-	"GET /v1/deployments/latest-by-app":                                                     "ListLatestDeploymentsByApp",
-	"POST /v1/deployments/{id}/reorder":                                                     "ReorderDeployment",        // ADR-124 PR-A; priority bump on pending deploy
-	"POST /v1/apps/{slug}/deployments/{id}/cancel":                                          "CancelDeployment",         // ADR-124 PR-A; status flip + cascade
-	"POST /v1/apps/{slug}/deployments/clear-obsolete":                                       "ClearObsoleteDeployments", // ADR-124 PR-A; bulk soft-delete terminal rows
+	"GET /v1/account/egress_allowlist_extra":                  "GetEgressAllowlistExtra",
+	"PATCH /v1/account/egress_allowlist_extra":                "SetEgressAllowlistExtra",
+	"GET /v1/account/managed-postgres-usage":                  "GetManagedPostgresUsage",
+	"GET /v1/account/usage":                                   "AccountUsage",
+	"GET /v1/postgres/databases":                              "ListManagedPostgresDatabases",
+	"POST /v1/postgres/databases":                             "CreateManagedPostgresDatabase",
+	"GET /v1/postgres/databases/{id}":                         "GetManagedPostgresDatabase",
+	"DELETE /v1/postgres/databases/{id}":                      "DeleteManagedPostgresDatabase",
+	"POST /v1/postgres/databases/{id}/restore":                "RestoreManagedPostgresDatabase",
+	"GET /v1/postgres/databases/{id}/bindings":                "ListManagedPostgresBindings",
+	"POST /v1/postgres/databases/{id}/bindings":               "CreateManagedPostgresBinding",
+	"GET /v1/postgres/bindings/{id}":                          "GetManagedPostgresBinding",
+	"DELETE /v1/postgres/bindings/{id}":                       "DeleteManagedPostgresBinding",
+	"GET /v1/apps/{slug}/logs":                                "StreamAppLogs",
+	"GET /v1/deployments/{id}/logs":                           "StreamDeploymentLogs",
+	"GET /v1/deployments/{id}/scan":                           "GetDeploymentScan",              // issue #464 / ADR-055; per-deploy grype CVE drill-down
+	"GET /v1/deployments/{id}/secret-scan":                    "GetDeploymentSecretScan",        // PR-A / ADR-101; per-deploy image-layer secret-scan audit row
+	"GET /v1/deployments/{id}/stages":                         "GetDeploymentStages",            // ADR-117 follow-on; post-stream closed-stage summary for `gregale deploys show <id>`
+	"GET /v1/deployments/{id}/audit":                          "ListDeploymentAudit",            // issue #976 / ADR-122 SAFE-RELEASES-E.2 + production-leveling Stream A; per-deployment audit timeline drill-down
+	"POST /v1/deployments/{id}/canary/advance":                "AdvanceCanary",                  // issue #976 / ADR-122; APID-owned atomic canary CAS + traffic + audit
+	"POST /v1/deployments/{id}/retry":                         "RetryDeploymentFromStage",       // ADR-117 §Production-ready follow-on C2; per-stage retry
+	"GET /v1/deployments/{id}/url":                            "GetDeploymentURL",               // issue #976 / ADR-122 SAFE-RELEASES-C.2; per-deployment preview URL (deploy-N.slug.gregale.dev)
+	"GET /v1/apps/{slug}/deployments/{deployment}/openapi":    "GetAppsDeploymentOpenAPIDoc",    // issue #975 item #1 / ADR-122 — captured OpenAPI doc per deployment
+	"PATCH /v1/apps/{slug}/deployments/{deployment}/openapi":  "PatchAppsDeploymentOpenAPIDoc",  // manual upload; same store as cold-boot capture
+	"DELETE /v1/apps/{slug}/deployments/{deployment}/openapi": "DeleteAppsDeploymentOpenAPIDoc", // wipe the captured doc; re-captures on next cold boot
+	"GET /v1/apps/{slug}/env-diff":                            "GetAppEnvDiff",                  // ADR-117 PR-C: env vars + secrets × scopes matrix; matches operationId `getAppEnvDiff` (auto-derivation would produce `GetAppsSlugEnv-diff` because of the literal hyphen in the path segment — the explicit map drops the slug placeholder + the hyphen for Go SDK hygiene, mirroring the `GetAppMetrics` / `GetAppSLO` / `GetAppDataUpstream` precedent above)
+	"GET /v1/apps/{slug}/openapi":                             "GetAppOpenAPI",                  // issue #975 item #2 / ADR-126 — imported or auto-generated OpenAPI doc per app
+	"POST /v1/apps/{slug}/openapi":                            "ImportAppOpenAPI",               // manual upload (item #2 D2/D6); persists via UpsertAppOpenAPIDoc
+	"DELETE /v1/apps/{slug}/openapi":                          "DeleteAppOpenAPI",               // idempotent wipe of the imported doc (item #2 D5 emits pg_notify)
+	"POST /v1/apps/{slug}/openapi/dry-run":                    "DryRunAppOpenAPI",               // read-only edge-rule suggestions (item #2 D3)
+	"GET /v1/apps/{slug}/openapi/preview":                     "PreviewAppOpenAPIPolicy",        // read-only declared-vs-observed route-policy preview (roadmap item 11)
+	"POST /v1/apps/{slug}/openapi/apply":                      "ApplyAppOpenAPIPolicy",          // explicit plan/confirm policy apply
+	"GET /v1/apps/{slug}/openapi/diff":                        "DiffAppOpenAPIContract",         // ADR-121 production contract gate preview
+	"GET /v1/apps/{slug}/github":                              "GetGitHubConnection",
+	"GET /v1/apps/{slug}/github/deployment-policy":            "GetGitHubDeploymentPolicy",
+	"PATCH /v1/apps/{slug}/github/deployment-policy":          "PatchGitHubDeploymentPolicy",
+	"POST /v1/apps/{slug}/github/bind":                        "BindGitHubConnection",
+	"POST /v1/apps/{slug}/github/sync":                        "SyncGitHubConnection",
+	"DELETE /v1/apps/{slug}/github":                           "DisconnectGitHubConnection",
+	"GET /v1/deployments/{id}":                                "GetDeployment",
+	"PATCH /v1/deployments/{id}":                              "PatchDeployment",                     // ADR-072 / issue #557 closure; min_instances override
+	"PATCH /v1/apps/{slug}/upstreams/{id}/circuit-breaker":    "UpdateAppDataUpstreamCircuitBreaker", // ADR-201 §3: same literal-hyphen case as env-diff above — auto-derivation yields `PatchAppsSlugUpstreamsIdCircuit-breaker`, which is not a legal Go identifier. Follows the spec operationId `updateAppDataUpstreamCircuitBreaker`.
+	"DELETE /v1/deployments/{id}":                             "ClearDeployment",                     // ADR-124 PR-A; soft-delete (status untouched)
+	"GET /v1/deployments":                                     "ListDeployments",
+	"GET /v1/deployments/latest-by-app":                       "ListLatestDeploymentsByApp",
+	"POST /v1/deployments/{id}/reorder":                       "ReorderDeployment",        // ADR-124 PR-A; priority bump on pending deploy
+	"POST /v1/apps/{slug}/deployments/{id}/cancel":            "CancelDeployment",         // ADR-124 PR-A; status flip + cascade
+	"POST /v1/apps/{slug}/deployments/clear-obsolete":         "ClearObsoleteDeployments", // ADR-124 PR-A; bulk soft-delete terminal rows
+	// ADR-202 custom application metrics. Auto-derivation would produce
+	// `GetAppsSlugCustom-metrics` because of the literal hyphen in the
+	// path segment, which is not a Go identifier. Same treatment as
+	// env-diff above: drop the slug placeholder and the hyphen.
+	"GET /v1/apps/{slug}/custom-metrics":           "GetAppCustomMetrics",
+	"PUT /v1/apps/{slug}/custom-metrics/{name}":    "PutAppCustomMetric",
+	"DELETE /v1/apps/{slug}/custom-metrics/{name}": "DeleteAppCustomMetric",
 	"GET /v1/apps":                                                                          "ListApps",
 	"POST /v1/apps":                                                                         "CreateApp",
 	"GET /v1/apps/{slug}/consumers":                                                         "ListAPIConsumers",
@@ -548,6 +564,16 @@ var methodRouteMap = map[string]string{
 	"POST /v1/apps/{slug}/webhooks/{id}/rotate-secret":          "RotateAppWebhookSecret",
 	"GET /v1/apps/{slug}/webhooks/{id}/deliveries":              "ListAppWebhookDeliveries",
 	"POST /v1/apps/{slug}/webhooks/{id}/deliveries/{did}/retry": "RetryAppWebhookDelivery",
+	"POST /v1/apps/{slug}/outbox":                               "DeliverAppEvent",
+
+	// ADR-212 — signature-verified durable inbound webhook configuration.
+	// The provider-facing /v1/hooks route is excluded above because it is not
+	// a bearer-auth SDK operation.
+	"GET /v1/apps/{slug}/inbound-webhooks":         "ListInboundWebhookEndpoints",
+	"POST /v1/apps/{slug}/inbound-webhooks":        "CreateInboundWebhookEndpoint",
+	"GET /v1/apps/{slug}/inbound-webhooks/{id}":    "GetInboundWebhookEndpoint",
+	"PATCH /v1/apps/{slug}/inbound-webhooks/{id}":  "UpdateInboundWebhookEndpoint",
+	"DELETE /v1/apps/{slug}/inbound-webhooks/{id}": "DeleteInboundWebhookEndpoint",
 
 	// ADR-156 — durable managed realtime endpoint configuration.
 	"GET /v1/apps/{slug}/realtime/endpoints":                                                             "ListManagedRealtimeEndpoints",
@@ -625,6 +651,7 @@ var methodRouteMap = map[string]string{
 	// conforms to the SDK's flat resource naming.
 	"POST /v1/apps/{slug}/invoke":                         "InvokeApp",
 	"POST /v1/apps/{slug}/invoke/async":                   "InvokeAppAsync",
+	"POST /v1/apps/{slug}/inbox":                          "SendAppMessage",
 	"POST /v1/apps/{slug}/queues/send":                    "QueueSend",
 	"POST /v1/apps/{slug}/queues/receive":                 "QueueReceive",
 	"POST /v1/apps/{slug}/queues/{id}/ack":                "AckQueueRow",
@@ -634,6 +661,8 @@ var methodRouteMap = map[string]string{
 	"POST /v1/apps/{slug}/queues/dead_letter/{id}/replay": "QueueDeadLetterReplay",
 	"POST /v1/apps/{slug}/dlq:replay_all":                 "PostAppsSlugDlqReplayAll",
 	"GET /v1/apps/{slug}/dlq":                             "GetAppsSlugDlq",
+	"GET /v1/apps/{slug}/event-subscriptions":             "ListAppsSlugEventSubscriptions",
+	"GET /v1/apps/{slug}/event-deliveries":                "ListAppsSlugEventDeliveries",
 	"DELETE /v1/apps/{slug}/dlq":                          "DeleteAppsSlugDlq",
 	"GET /v1/apps/{slug}/dlq/{id}":                        "GetAppsSlugDlqId",
 	"DELETE /v1/apps/{slug}/dlq/{id}":                     "DeleteAppsSlugDlqId",
@@ -645,6 +674,7 @@ var methodRouteMap = map[string]string{
 	"DELETE /v1/account/dlq/{id}":                         "DeleteAccountDlqId",
 	"POST /v1/account/dlq/{id}/replay":                    "PostAccountDlqIdReplay",
 	"POST /v1/apps/{slug}/delayed-tasks":                  "CreateDelayedTask",
+	"GET /v1/apps/{slug}/delayed-tasks":                   "ListDelayedTasks",
 	"GET /v1/delayed-tasks/{id}":                          "GetDelayedTask",
 	"DELETE /v1/delayed-tasks/{id}":                       "CancelDelayedTask",
 	"GET /v1/invocations":                                 "ListInvocations",
@@ -691,7 +721,8 @@ var methodRouteMap = map[string]string{
 	// (literal hyphens preserved in the path segment). The explicit
 	// map drops the path-separator noise and conforms to the SDK's
 	// flat verb naming.
-	"GET /v1/apps/{slug}/wakes/{wake_id}/timeline": "ListWakeTimeline",
+	"GET /v1/apps/{slug}/wakes/{wake_id}/timeline":         "ListWakeTimeline",
+	"GET /v1/apps/{slug}/sidecars/{sidecar_name}/timeline": "ListSidecarTimeline",
 
 	// ADR-050 Phase 3 — repo decomposition. The two routes take
 	// multipart bodies so the SDK verb is named after the action
@@ -884,6 +915,7 @@ var methodRouteMap = map[string]string{
 	"DELETE /v1/apps/{slug}/trusted_signers/{name}": "DeleteAppTrustedSigner",
 	"GET /v1/apps/{slug}/security":                  "GetAppSecurity",
 	"PATCH /v1/apps/{slug}/security":                "UpdateAppSecurity",
+	"POST /v1/apps/{slug}/security/recover":         "RecoverAppSecurityQuarantine",
 	// Per-app private-registry Basic Auth (issue #461 / ADR-062). The
 	// SDK natural verb auto-derives to "GetAppsSlugRegistry-credentials"
 	// (dash, not the safer "RegistryCredentials") because the spec path
@@ -911,6 +943,7 @@ var methodRouteMap = map[string]string{
 	"GET /v1/orgs":                               "ListOrgs",
 	"POST /v1/orgs":                              "CreateOrg",
 	"GET /v1/orgs/{slug}":                        "GetOrg",
+	"GET /v1/orgs/{slug}/activity":               "ListOrgActivity",
 	"PATCH /v1/orgs/{slug}":                      "PatchOrg",
 	"DELETE /v1/orgs/{slug}":                     "DeleteOrg",
 	"GET /v1/orgs/{slug}/members":                "ListOrgMembers",
@@ -1006,6 +1039,7 @@ var methodRouteMap = map[string]string{
 	"GET /v1/networks":                            "ListPrivateNetworks",
 	"POST /v1/networks":                           "CreatePrivateNetwork",
 	"GET /v1/networks/{id}":                       "GetPrivateNetwork",
+	"GET /v1/networks/{id}/members":               "ListPrivateNetworkMembers",
 	"PUT /v1/networks/{id}/policy":                "UpdatePrivateNetworkPolicy",
 	"DELETE /v1/networks/{id}":                    "DeletePrivateNetwork",
 	"GET /v1/networks/{id}/peerings":              "ListPrivateNetworkPeerings",

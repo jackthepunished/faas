@@ -1,3 +1,4 @@
+// adr: 211
 package gateway
 
 import (
@@ -48,6 +49,29 @@ func TestApplyEdgeRuleCache_BypassOnAuthorization(t *testing.T) {
 	}
 	if h.responseCache.Len() != 0 {
 		t.Fatalf("bypass path must not create cache entries; got %d", h.responseCache.Len())
+	}
+}
+
+func TestApplyEdgeRuleCache_BypassesDeploymentPreviewRoute(t *testing.T) {
+	now := time.Now()
+	cache := NewResponseCacheWithClock(DefaultResponseCacheMaxBytes, func() time.Time { return now })
+	h, _, _ := newTestHandler(t)
+	h.WithResponseCache(cache)
+	rule := EdgeRuleCacheResolved{ID: "rule-cache-1", PathGlob: "/catalog", MaxAgeSeconds: 60}
+	seedCacheRule(t, h, "deploy-42-jane-api.apps.dom", rule)
+	cache.Put(CacheKey{
+		AppID: "app-1", RuleID: rule.ID, Method: http.MethodGet,
+		NormalizedPath: "/catalog", VaryHash: hashStable(""),
+	}, http.StatusOK, nil, []byte("production"), now.Add(time.Minute), now.Add(time.Minute), rule.toStateEdgeRuleCacheAction())
+
+	req := httptest.NewRequest(http.MethodGet, "http://deploy-42-jane-api.apps.dom/catalog", nil)
+	w := httptest.NewRecorder()
+	rec := newTestStatusRecorder(w)
+	served, matched := h.applyEdgeRuleCache(w, req, App{
+		ID: "app-1", Plan: api.PlanPro, PinnedDeploymentID: "deployment-42",
+	}, rec)
+	if served || matched != nil || w.Body.Len() != 0 {
+		t.Fatalf("deployment preview consulted app cache: served=%v matched=%v body=%q", served, matched, w.Body.String())
 	}
 }
 
@@ -162,6 +186,59 @@ func TestApplyEdgeRuleCache_StaleNotServedOnMiss(t *testing.T) {
 	got, _ := h.applyEdgeRuleCache(w, req, app, rec)
 	if got {
 		t.Fatalf("stale entry must not be served on the normal hit path")
+	}
+}
+
+func TestApplyEdgeRuleCache_StaleWhileRevalidate(t *testing.T) {
+	now := time.Now()
+	cache := NewResponseCacheWithClock(DefaultResponseCacheMaxBytes, func() time.Time { return now })
+	h, _, _ := newTestHandler(t)
+	h.WithResponseCache(cache)
+	// The serve behavior is independent of the refresh transport. A nil backend
+	// makes the asynchronous refresh a deliberate no-op in this focused test.
+	h.backend = nil
+	rule := EdgeRuleCacheResolved{
+		ID:                          "rule-cache-swr",
+		PathGlob:                    "/products/42",
+		MaxAgeSeconds:               30,
+		StaleWhileRevalidateSeconds: 60,
+		StaleIfErrorSeconds:         300,
+	}
+	seedCacheRule(t, h, "shop.apps.dom", rule)
+	app := App{ID: "app-shop", Plan: api.PlanPro}
+	key := CacheKey{
+		AppID:          app.ID,
+		RuleID:         rule.ID,
+		Method:         "GET",
+		NormalizedPath: "/products/42",
+		VaryHash:       hashStable(""),
+	}
+	cache.PutWithWindows(
+		key,
+		http.StatusOK,
+		http.Header{"Content-Type": []string{"application/json"}},
+		[]byte(`{"id":42}`),
+		now.Add(-time.Second),
+		now.Add(59*time.Second),
+		now.Add(299*time.Second),
+		rule.toStateEdgeRuleCacheAction(),
+	)
+
+	req := httptest.NewRequest("GET", "http://shop.apps.dom/products/42", nil)
+	w := httptest.NewRecorder()
+	rec := newTestStatusRecorder(w)
+	served, _ := h.applyEdgeRuleCache(w, req, app, rec)
+	if !served {
+		t.Fatal("stale-while-revalidate entry was not served")
+	}
+	if got := w.Header().Get("x-faas-cache"); got != "stale-while-revalidate" {
+		t.Fatalf("x-faas-cache = %q, want stale-while-revalidate", got)
+	}
+	if got := w.Header().Get("Warning"); !strings.Contains(got, "110") {
+		t.Fatalf("Warning = %q, want stale response warning", got)
+	}
+	if got := w.Body.String(); got != `{"id":42}` {
+		t.Fatalf("body = %q, want cached product", got)
 	}
 }
 

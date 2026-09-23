@@ -25,7 +25,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -56,6 +58,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/audit"
 	authmw "github.com/onebox-faas/faas/pkg/auth/middleware"
 	"github.com/onebox-faas/faas/pkg/capdecl/runtimecheck"
+	"github.com/onebox-faas/faas/pkg/circuit"
 	"github.com/onebox-faas/faas/pkg/daemonunit"
 	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/events"
@@ -207,6 +210,32 @@ func streamingEnabledFromEnv() bool {
 		}
 	}
 	return false
+}
+
+// trafficResilienceEnabled resolves an ADR-201 operator gate. Reuses the
+// streaming flag's truthy vocabulary so every gateway kill switch answers to
+// the same values rather than each inventing its own.
+func trafficResilienceEnabled(name string) bool {
+	v := strings.ToLower(strings.TrimSpace(envOrGateway(name, streamingFlagFalse)))
+	for _, t := range streamingEnabledTruthy {
+		if v == t {
+			return true
+		}
+	}
+	return false
+}
+
+// egressBreakerGroup returns the ServiceProxy's health breaker (ADR-201 §2).
+//
+// Nil is NOT returned when the flag is off: NewServiceProxy installs
+// circuit.LegacyQuarantineConfig for a nil breaker, which reproduces the
+// fixed-TTL quarantine exactly. Returning nil here is therefore the
+// flag-off path, and returning a DefaultConfig group is the flag-on one.
+func egressBreakerGroup() *circuit.Group {
+	if !trafficResilienceEnabled("FAAS_GATEWAY_CIRCUIT_BREAKER") {
+		return nil
+	}
+	return circuit.NewGroup(circuit.DefaultConfig(), nil)
 }
 
 // rawStreamEnabledFromEnv (issue #676 / ADR-080 follow-up) resolves the
@@ -443,11 +472,10 @@ func (a *synthAdapter) InvokeWithStatus(ctx context.Context, appID string, inv s
 	return out, http.StatusOK, err
 }
 
-// replayMirror executes the debugger's metadata-only replay against the
-// selected ADR-125 mirror deployment. The request telemetry table never
-// stores raw bodies or credentials, so the mirror receives an empty body and
-// no customer headers; the durable result still records status and latency
-// against the original request's source measurements.
+// replayMirror executes either a metadata-only debugger replay or an
+// explicitly sanitized corpus item against the selected mirror deployment.
+// Only envelopes stamped by apid as sanitized may carry a body or customer
+// headers; legacy telemetry replays remain metadata-only.
 func (a *synthAdapter) replayMirror(ctx context.Context, appID string, inv state.Invocation) (state.Invocation, int, error) {
 	metadata, err := debugReplayMetadata(inv)
 	if err != nil {
@@ -469,29 +497,50 @@ func (a *synthAdapter) replayMirror(ctx context.Context, appID string, inv state
 	}
 	start := time.Now()
 	mirrorInv := inv
-	// Metadata is consumed at the gateway boundary and must never be sent to
-	// the customer's mirror deployment. The body is intentionally empty.
-	mirrorInv.Payload = nil
+	// Platform metadata is consumed at this boundary. A legacy telemetry
+	// replay is bodyless; only apid's sanitized batch endpoint stamps the
+	// marker that permits its bounded JSON body and filtered headers through.
+	sanitizedPayload := metadata[api.DebugReplaySanitizedPayloadHeader] == "true"
+	if !sanitizedPayload {
+		mirrorInv.Payload = nil
+	}
 	mirrorInv.Headers = nil
 	mirrorInv.InstanceID = target.InstanceID
+	forwardHeaders := make(map[string]string)
+	if sanitizedPayload {
+		forwardHeaders = sanitizedReplayForwardHeaders(rule, metadata)
+	}
 	// A retained trace id is safe correlation metadata, unlike customer
 	// headers. Re-attach it under the canonical platform trace header so the
 	// mirror request and its ledger row remain joinable without replaying
 	// authentication or other request credentials.
 	if traceID := strings.TrimSpace(metadata[api.DebugReplayTraceIDHeader]); traceID != "" {
-		mirrorInv.Headers, err = json.Marshal(map[string]string{middleware.TraceIDHeader: traceID})
+		forwardHeaders[middleware.TraceIDHeader] = traceID
+	}
+	if len(forwardHeaders) > 0 {
+		mirrorInv.Headers, err = json.Marshal(forwardHeaders)
 		if err != nil {
-			return inv, 0, fmt.Errorf("gateway synth: encode debug replay trace metadata: %w", err)
+			return inv, 0, fmt.Errorf("gateway synth: encode replay headers: %w", err)
 		}
 	}
-	out, statusCode, err := a.forwardInvocationWithStatus(ctx, target, mirrorInv)
+	out, statusCode, mirrorBody, err := a.forwardInvocationWithStatusAndBody(ctx, target, mirrorInv)
 	latencyMs := int(time.Since(start) / time.Millisecond)
 	if err != nil {
 		statusCode = 0
 	}
 	sourceStatus, _ := strconv.Atoi(metadata[api.DebugReplaySourceStatusHeader])
 	sourceLatency, _ := strconv.Atoi(metadata[api.DebugReplaySourceLatencyHeader])
-	statusDiff := sourceStatus != statusCode
+	statusDiff := sourceStatus != 0 && sourceStatus != statusCode
+	var sourceBodyHash []byte
+	if encodedHash := strings.TrimSpace(metadata[api.DebugReplaySourceBodyHashHeader]); encodedHash != "" {
+		sourceBodyHash, _ = hex.DecodeString(encodedHash)
+	}
+	var mirrorBodyHash []byte
+	if statusCode != 0 {
+		_, _, _, _, _, mirrorHash := gateway.ClassifyResultWithHashes(0, nil, statusCode, mirrorBody)
+		mirrorBodyHash = append([]byte(nil), mirrorHash[:]...)
+	}
+	bodyDiff := len(sourceBodyHash) == sha256.Size && !bytes.Equal(sourceBodyHash, mirrorBodyHash)
 	crashed := statusCode == 0 || statusCode >= http.StatusInternalServerError
 	result := api.DebugReplayComparison{
 		SourceDeploymentID: metadata[api.DebugReplayDeploymentIDHeader],
@@ -501,12 +550,18 @@ func (a *synthAdapter) replayMirror(ctx context.Context, appID string, inv state
 		SourceLatencyMS:    sourceLatency,
 		MirrorLatencyMS:    latencyMs,
 		StatusDiff:         statusDiff,
+		BodyDiff:           bodyDiff,
 		Crashed:            crashed,
 	}
 	if encoded, marshalErr := json.Marshal(result); marshalErr == nil {
 		out.Result = encoded
 	}
 	if a.store != nil {
+		var storedMirrorBodyHash, storedSourceBodyHash []byte
+		if rule.IncludeBody {
+			storedMirrorBodyHash = mirrorBodyHash
+			storedSourceBodyHash = sourceBodyHash
+		}
 		if storeErr := a.store.InsertMirrorResult(ctx, state.MirrorInvocationResult{
 			MirrorRuleID:       rule.ID,
 			AccountID:          rule.AccountID,
@@ -518,7 +573,13 @@ func (a *synthAdapter) replayMirror(ctx context.Context, appID string, inv state
 			SourceStatusCode:   sourceStatus,
 			LatencyMs:          latencyMs,
 			SourceLatencyMs:    sourceLatency,
+			BodyHash:           storedMirrorBodyHash,
+			SourceBodyHash:     storedSourceBodyHash,
+			SchemaHash:         mirrorBodyHash,
+			SourceSchemaHash:   sourceBodyHash,
 			StatusDiff:         statusDiff,
+			SchemaDiff:         bodyDiff,
+			BodyDiff:           bodyDiff,
 			Crashed:            crashed,
 			RequestID:          metadata[api.DebugReplayRequestIDHeader],
 			CompletedAt:        time.Now().UTC(),
@@ -530,6 +591,25 @@ func (a *synthAdapter) replayMirror(ctx context.Context, appID string, inv state
 		return out, statusCode, err
 	}
 	return out, statusCode, nil
+}
+
+func sanitizedReplayForwardHeaders(rule gateway.MirrorRuleRow, metadata map[string]string) map[string]string {
+	blocked := make(map[string]struct{}, len(api.MirrorAlwaysStrippedHeaders)+len(rule.RedactHeaders)+4)
+	for _, key := range append(append([]string(nil), api.MirrorAlwaysStrippedHeaders...), rule.RedactHeaders...) {
+		blocked[http.CanonicalHeaderKey(key)] = struct{}{}
+	}
+	for _, key := range []string{"Host", "Content-Length", "Transfer-Encoding", "Connection"} {
+		blocked[http.CanonicalHeaderKey(key)] = struct{}{}
+	}
+	out := make(map[string]string)
+	for key, value := range metadata {
+		canonical := http.CanonicalHeaderKey(key)
+		if _, drop := blocked[canonical]; drop || strings.HasPrefix(strings.ToLower(canonical), "x-faas-") {
+			continue
+		}
+		out[canonical] = value
+	}
+	return out
 }
 
 func (a *synthAdapter) lookupReplayRule(ctx context.Context, appID, ruleID string) (gateway.MirrorRuleRow, bool, error) {
@@ -638,8 +718,13 @@ func (a *synthAdapter) forwardInvocation(ctx context.Context, target gateway.Tar
 }
 
 func (a *synthAdapter) forwardInvocationWithStatus(ctx context.Context, target gateway.Target, inv state.Invocation) (state.Invocation, int, error) {
+	out, status, _, err := a.forwardInvocationWithStatusAndBody(ctx, target, inv)
+	return out, status, err
+}
+
+func (a *synthAdapter) forwardInvocationWithStatusAndBody(ctx context.Context, target gateway.Target, inv state.Invocation) (state.Invocation, int, []byte, error) {
 	if a.forward == nil {
-		return inv, 0, fmt.Errorf("gateway synth: invocation forwarder is not wired")
+		return inv, 0, nil, fmt.Errorf("gateway synth: invocation forwarder is not wired")
 	}
 
 	method := inv.Method
@@ -655,12 +740,12 @@ func (a *synthAdapter) forwardInvocationWithStatus(ctx context.Context, target g
 	}
 	req, err := http.NewRequestWithContext(ctx, method, path, bytes.NewReader(inv.Payload))
 	if err != nil {
-		return inv, 0, fmt.Errorf("gateway synth: build request: %w", err)
+		return inv, 0, nil, fmt.Errorf("gateway synth: build request: %w", err)
 	}
 	if len(inv.Headers) > 0 {
 		var headers map[string]string
 		if err := json.Unmarshal(inv.Headers, &headers); err != nil {
-			return inv, 0, fmt.Errorf("gateway synth: decode invocation headers: %w", err)
+			return inv, 0, nil, fmt.Errorf("gateway synth: decode invocation headers: %w", err)
 		}
 		for key, value := range headers {
 			req.Header.Set(key, value)
@@ -694,7 +779,7 @@ func (a *synthAdapter) forwardInvocationWithStatus(ctx context.Context, target g
 		} else {
 			encoded, err := json.Marshal(string(body))
 			if err != nil {
-				return inv, 0, fmt.Errorf("gateway synth: encode response: %w", err)
+				return inv, 0, nil, fmt.Errorf("gateway synth: encode response: %w", err)
 			}
 			inv.Result = encoded
 		}
@@ -709,7 +794,7 @@ func (a *synthAdapter) forwardInvocationWithStatus(ctx context.Context, target g
 	} else {
 		inv.State = state.InvocationDispatching
 	}
-	return inv, rec.Code, nil
+	return inv, rec.Code, append([]byte(nil), body...), nil
 }
 
 func isHandlerErrorResult(body []byte) bool {
@@ -971,6 +1056,20 @@ type runDeps struct {
 	// is dialed so the consumer goroutine shares the existing
 	// /run/faas/schedd.sock connection (no second dial).
 	warmHints *warmHintConsumer
+	// invalidationsReady is closed by watchInvalidations once its
+	// pg_notify LISTEN is actually established. It backs a /readyz signal
+	// so the daemon does not report ready while route invalidations are
+	// still unsubscribed.
+	//
+	// Without it, /readyz could return 200 between "control port bound" and
+	// "LISTEN registered". A deployment_changed / app_changed notify fired
+	// in that window is delivered to nobody, and the gateway serves 404 for
+	// the new route until some later refresh. In production that is an LB
+	// routing traffic at a gateway with a cold routing cache after a
+	// restart; in CI it is the TestE2E_NormalPath_* flake.
+	//
+	// nil in tests that do not construct the watcher.
+	invalidationsReady <-chan struct{}
 	// egressTLS is the server mTLS config the egress gRPC listener
 	// uses when meterd dials it from a remote compute node (ADR-052).
 	// nil in tests; production wires it in run() from
@@ -1038,6 +1137,25 @@ func defaultServer(addr string, handler http.Handler) *http.Server {
 // placeholder that was previously serving TEMPLATE_OK from this
 // package; the `prod` prefix was the placeholder-era workaround so
 // the two `run` symbols could coexist in `package main`).
+// readyWhenClosed flips signal ready once done closes, and never otherwise.
+//
+// Extracted so the ordering can be tested: the whole point of the
+// invalidation-subscription signal is that readiness is announced AFTER the
+// LISTEN exists, not when the goroutine watching for it starts. A version
+// that set the signal eagerly would reintroduce exactly the window this
+// closes and would still look correct at the call site.
+//
+// A cancelled ctx must NOT flip the signal: shutdown is not readiness.
+func readyWhenClosed(ctx context.Context, signal *gateway.ReadySignal, done <-chan struct{}) {
+	go func() {
+		select {
+		case <-done:
+			signal.Set(true, "")
+		case <-ctx.Done():
+		}
+	}()
+}
+
 func run(ctx context.Context, log *slog.Logger) error {
 	pool, err := db.OpenWithAppName(ctx, "", "faas-gatewayd-internal")
 	if err != nil {
@@ -1137,6 +1255,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	router := pgRouter{
 		store:                 pgStore,
 		appsSuffix:            appsSuffix(appsDomain),
+		deploySuffix:          wire.DeployWildcardSuffix,
 		tenantSurfacesEnabled: tenantSurfacesFlag.Load,
 	}
 	// ADR-025 axis 4: sticky-warm affinity cache. Built first so the
@@ -1153,6 +1272,18 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// so every configured cache rule silently fell through to a wake and all
 	// response-cache counters remained zero.
 	responseCache := gateway.NewResponseCache()
+	if redisURL := strings.TrimSpace(osGetenv("FAAS_GATEWAY_RESPONSE_CACHE_REDIS_URL")); redisURL != "" {
+		sharedCache, cacheErr := gateway.NewRedisResponseCache(ctx, redisURL)
+		if cacheErr != nil {
+			// Response caching is an optimization, never an availability
+			// dependency. Keep the local L1 active when Redis is unavailable.
+			log.Warn("distributed response cache unavailable; using local cache", "err", cacheErr)
+		} else {
+			responseCache.WithSharedStore(sharedCache)
+			log.Info("distributed response cache enabled")
+		}
+	}
+	defer func() { _ = responseCache.Close() }()
 	deps.responseCache = responseCache
 	backend := gateway.NewPGBackend(router, sched, log).
 		WithWarmHint(warmHintCache.HintFunc()).
@@ -1168,18 +1299,28 @@ func run(ctx context.Context, log *slog.Logger) error {
 			if err != nil {
 				return gateway.App{}, false, err
 			}
+			liveDeployments, err := pgStore.LiveDeployments(ctx, app.ID)
+			if err != nil && !errors.Is(err, state.ErrNotFound) {
+				return gateway.App{}, false, err
+			}
+			companionRoutes, primaryIngressPort, err := gatewayCompanionRoutes(liveDeployments)
+			if err != nil {
+				return gateway.App{}, false, err
+			}
 			favicon, robotsTxt, headWakes, crawlerPolicy, healthPath, healthPathWakes := edgeAnswersFromManifest(app.Manifest)
 			concurrencyOverflow := ""
 			maxQueueWaitMS := 0
+			maxQueueDepth := 0
 			wakeMaxQueueDepth := 0
 			wakeMaxQueueWaitSeconds := 0
 			if app.ScalingPolicy != nil {
 				concurrencyOverflow = app.ScalingPolicy.ConcurrencyOverflow
 				maxQueueWaitMS = app.ScalingPolicy.MaxQueueWaitMS
+				maxQueueDepth = app.ScalingPolicy.MaxQueueDepth
 				wakeMaxQueueDepth = app.ScalingPolicy.WakeMaxQueueDepth
 				wakeMaxQueueWaitSeconds = app.ScalingPolicy.WakeMaxQueueWaitSeconds
 			}
-			return gateway.App{ID: app.ID, AccountID: acct.ID, AccountStatus: string(acct.Status), Type: gateway.AppType(app.Type), Plan: acct.Plan, MaxConcurrency: app.MaxConcurrency, ConcurrencyOverflow: concurrencyOverflow, MaxQueueWaitMS: maxQueueWaitMS, WakeMaxQueueDepth: wakeMaxQueueDepth, WakeMaxQueueWaitSeconds: wakeMaxQueueWaitSeconds, AutoscaleTargetRPS: app.AutoscaleTargetRPS, IdleTimeoutS: app.IdleTimeoutS, RequestTimeoutS: app.Manifest.RequestTimeoutS, Slug: app.Slug, StreamingEnabled: app.StreamingEnabled, SessionAffinity: app.Manifest.SessionAffinity, NodeID: app.NodeID, Ports: gateway.PublicPortsFromWorkloadPorts(app.Manifest.Ports), RequireAuthn: app.RequireAuthn, ConsumerAuthMode: string(app.ConsumerAuthMode), CORSDefaultEnabled: app.CORSDefaultEnabled, CORSDefaultOrigins: app.CORSDefaultOrigins, Favicon: favicon, RobotsTxt: robotsTxt, HeadWakes: headWakes, CrawlerPolicy: crawlerPolicy, HealthPath: healthPath, HealthPathWakes: healthPathWakes, PublicAuth: gateway.PublicAuthConfig{Mode: app.PublicAuthMode, BasicSealed: app.PublicAuthBasicSealed, IPAllowlist: app.PublicAuthIPAllowlist}, RouteMetricsEnabled: app.RouteMetricsEnabled, MaintenanceMode: app.MaintenanceMode, OnlyAllowDeclaredRoutes: app.OnlyAllowDeclaredRoutes, DeclaredRoutes: gatewayDeclaredRoutes(app.DeclaredRoutes)}, true, nil
+			return gateway.App{ID: app.ID, AccountID: acct.ID, AccountStatus: string(acct.Status), Type: gateway.AppType(app.Type), Plan: acct.Plan, RequestInvocationsEnabled: app.AcceptsRequestInvocations(), MaxConcurrency: app.MaxConcurrency, ConcurrencyOverflow: concurrencyOverflow, MaxQueueWaitMS: maxQueueWaitMS, MaxQueueDepth: maxQueueDepth, WakeMaxQueueDepth: wakeMaxQueueDepth, WakeMaxQueueWaitSeconds: wakeMaxQueueWaitSeconds, AutoscaleTargetRPS: app.AutoscaleTargetRPS, IdleTimeoutS: app.IdleTimeoutS, RequestTimeoutS: app.Manifest.RequestTimeoutS, Slug: app.Slug, StreamingEnabled: app.StreamingEnabled, SessionAffinity: app.Manifest.SessionAffinity, NodeID: app.NodeID, Ports: gateway.PublicPortsFromWorkloadPorts(app.Manifest.Ports), Sidecars: companionRoutes, PrimaryIngressPort: primaryIngressPort, RequireAuthn: app.RequireAuthn, ConsumerAuthMode: string(app.ConsumerAuthMode), CORSDefaultEnabled: app.CORSDefaultEnabled, CORSDefaultOrigins: app.CORSDefaultOrigins, Favicon: favicon, RobotsTxt: robotsTxt, HeadWakes: headWakes, CrawlerPolicy: crawlerPolicy, HealthPath: healthPath, HealthPathWakes: healthPathWakes, PublicAuth: gateway.PublicAuthConfig{Mode: app.PublicAuthMode, BasicSealed: app.PublicAuthBasicSealed, IPAllowlist: app.PublicAuthIPAllowlist}, RouteMetricsEnabled: app.RouteMetricsEnabled, MaintenanceMode: app.MaintenanceMode, OnlyAllowDeclaredRoutes: app.OnlyAllowDeclaredRoutes, DeclaredRoutes: gatewayDeclaredRoutes(app.DeclaredRoutes)}, true, nil
 		}).
 		WithLiveTargetLoader(func(ctx context.Context, appID string) ([]gateway.Target, error) {
 			// An instances row can outlive its deployment. Restrict the
@@ -1287,7 +1428,9 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// stream (spec §4.1): an instance state change evicts the app's cached
 	// target so the next request re-resolves via an idempotent wake; an app or
 	// domain change flushes the host→app routes.
-	go watchInvalidations(ctx, pool, backend, log, osGetenv("FAAS_NODE_NAME"))
+	invalidationsReady := make(chan struct{})
+	go watchInvalidations(ctx, pool, backend, log, invalidationsReady, osGetenv("FAAS_NODE_NAME"))
+	deps.invalidationsReady = invalidationsReady
 
 	deps.backend = backend
 	// Flush per-instance last_request_at to schedd so its idle reaper sees
@@ -1514,6 +1657,10 @@ func run(ctx context.Context, log *slog.Logger) error {
 	// (certmagic, httpsec, :443/:80 ACME mux). This daemon stays
 	// plain HTTP on :8080; the resolved-TLS branch was removed in PR-A.
 	deps.metrics = gateway.NewMetrics()
+	// ADR-201: surface the closed-vocabulary retry/breaker series from
+	// process start so an operator alerting on `rate(...) == 0` is not
+	// reading a cold-start absence as a healthy zero.
+	deps.metrics.PreInstantiateTrafficResilience()
 	backend.WithMetrics(deps.metrics)
 	apps, err := pgStore.ListAllApps(ctx)
 	if err != nil {
@@ -1617,6 +1764,9 @@ func run(ctx context.Context, log *slog.Logger) error {
 	gatewayOps := wire.NewOpsMetrics("gatewayd")
 	wire.BootStamps(ctx, "gatewayd-internal", gatewayOps)
 	wire.RegisterDefaultOps(gatewayOps)
+	// ADR-190 follow-up: export this pool's live statistics so the
+	// DaemonMaxConnections cap above is measurable rather than arithmetic.
+	wire.RegisterPoolMetrics(gatewayOps, pool)
 	eventsPlatform := events.NewPlatform("gatewayd", pgStore, log, gatewayOps, nil)
 	deps.nodeCache = newNodeCache(pgStore, vmmdTLS, log, deps.metrics).WithEvents(eventsPlatform)
 	// Synthetic invocations share the same per-node HTTP→vmmd bridge as
@@ -1985,15 +2135,99 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		metricsRegisterer = deps.opsMetrics.Registry()
 		metricPrefix = deps.opsMetrics.MetricPrefix()
 	}
-	traceShutdown, traceErr := trace.InitTracerWithRegistry(ctx, "gatewayd-internal", wire.Version, log, metricsRegisterer, metricPrefix)
+
+	// Platform-owned service-proxy spans bypass the customer OTLP endpoint:
+	// gatewayd-internal already knows the authorized account, so it can retain
+	// those spans through apid's trusted writer without an SDK or customer API
+	// key. The exporter only does in-memory accumulation on Span.End.
+	var retainedSpansAcc *gateway.SpansAccumulator
+	var retainedSpansWriter *apidgrpc.SpansWriterClientImpl
+	var retainedSpansExporter *gateway.RetainedServiceSpansExporter
+	if osGetenv("FAAS_OTEL_SPANS_WRITER_ENABLED") != "false" {
+		retainedSpansAcc = gateway.NewSpansAccumulator()
+		spansWriterTarget := cfg.GetSpansWriterTarget(osGetenv)
+		spansWriterTLS, tlsErr := cfg.LoadAppErrorsTLS()
+		if tlsErr != nil {
+			return fmt.Errorf("gatewayd-internal: load retained spans writer TLS: %w", tlsErr)
+		}
+		var dialErr error
+		retainedSpansWriter, dialErr = apidgrpc.DialSpansWriter(ctx, spansWriterTarget, spansWriterTLS)
+		if dialErr != nil {
+			return fmt.Errorf("gatewayd-internal: dial apid spans writer at %q: %w", spansWriterTarget, dialErr)
+		}
+		retainedSpansExporter = gateway.NewRetainedServiceSpansExporter(retainedSpansAcc, log)
+	}
+
+	var traceShutdown func(context.Context) error
+	var traceErr error
+	if retainedSpansExporter != nil {
+		traceShutdown, traceErr = trace.InitTracerWithRegistryAndExporters(
+			ctx,
+			"gatewayd-internal",
+			wire.Version,
+			log,
+			metricsRegisterer,
+			metricPrefix,
+			retainedSpansExporter,
+		)
+	} else {
+		traceShutdown, traceErr = trace.InitTracerWithRegistry(ctx, "gatewayd-internal", wire.Version, log, metricsRegisterer, metricPrefix)
+	}
 	if traceErr != nil {
+		if retainedSpansWriter != nil {
+			_ = retainedSpansWriter.Close()
+		}
 		return fmt.Errorf("gatewayd-internal: init tracing: %w", traceErr)
+	}
+
+	var retainedFlushCancel context.CancelFunc
+	var retainedFlushDone <-chan struct{}
+	if retainedSpansAcc != nil && retainedSpansWriter != nil {
+		flushInterval := 30 * time.Second
+		if value := osGetenv("FAAS_OTEL_FLUSH_INTERVAL"); value != "" {
+			if parsed, parseErr := time.ParseDuration(value); parseErr == nil && parsed > 0 {
+				flushInterval = parsed
+			} else {
+				log.Warn("gatewayd-internal: invalid OTel flush interval; using default", "value", value)
+			}
+		}
+		flushCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+		flushDone := make(chan struct{})
+		retainedFlushCancel = cancel
+		retainedFlushDone = flushDone
+		go func() {
+			defer close(flushDone)
+			err := retainedSpansAcc.RunFlushLoop(flushCtx, gateway.FlushLoopConfig{
+				Interval: flushInterval,
+				WriteFn: func(writeCtx context.Context, traceID string, summaryJSON []byte, accountID string) (string, int64, error) {
+					return retainedSpansWriter.WriteSpansSummary(writeCtx, traceID, summaryJSON, accountID)
+				},
+				Log: log,
+				MaxSpansPerTrace: func(string) int {
+					return api.MustLimitsFor(api.PlanScale).DebugTelemetrySpansPerTrace
+				},
+			})
+			if err != nil {
+				log.Error("gatewayd-internal: retained spans flush loop exited", "err", err)
+			}
+		}()
 	}
 	defer func() {
 		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer cancel()
 		if err := traceShutdown(shutdownCtx); err != nil {
 			log.Warn("gatewayd-internal: trace shutdown failed", "err", err)
+		}
+		cancel()
+		if retainedFlushCancel != nil {
+			retainedFlushCancel()
+			select {
+			case <-retainedFlushDone:
+			case <-time.After(6 * time.Second):
+				log.Warn("gatewayd-internal: timed out draining retained spans")
+			}
+		}
+		if retainedSpansWriter != nil {
+			_ = retainedSpansWriter.Close()
 		}
 	}()
 
@@ -2002,7 +2236,14 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// harness path); production traffic terminates TLS at gatewayd-public
 	// and proxies to the unix socket bound in cmd/gatewayd-internal/.
 
-	handler := gateway.NewHandlerWith(deps.backend, deps.metrics, log)
+	retryBudget := gateway.NewRetryBudget(0, nil)
+	handler := gateway.NewHandlerWith(deps.backend, deps.metrics, log).WithRetryBudget(retryBudget)
+	if deps.pgStore != nil {
+		handler.WithMirrorResultStore(deps.pgStore)
+	}
+	if deps.pool != nil {
+		handler.WithConcurrencyQueueAdmission(state.NewPGConcurrencyQueueAdmission(deps.pool))
+	}
 	var realtimeControlProxy http.Handler
 	// Managed realtime is an opt-in data plane. When the local realtimed
 	// daemon socket is configured, reserve its namespace before ordinary
@@ -2055,6 +2296,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// — run()
 	// populates deps.streamingEnabled; tests inject the bit directly.
 	handler.WithStreamingEnabled(deps.streamingEnabled)
+	// ADR-201 §1. Two gates on purpose: FAAS_GATEWAY_RETRY turns the
+	// machinery on, and a kind=retry edge rule still has to permit a replay.
+	// An operator can therefore enable the flag fleet-wide and roll retry out
+	// per app, rather than changing every app's behaviour at once — which is
+	// why the default policy here is inert rather than a 2-attempt default.
+	handler.WithRetryEnabled(trafficResilienceEnabled("FAAS_GATEWAY_RETRY"))
+	handler.WithRetryObserver(deps.metrics)
 	// ADR-093: arm the per-process routeMetricsEnabled kill-switch on
 	// the Handler so routeSetFor can AND the operator flag against the
 	// per-app flag (apps.route_metrics_enabled). Same merge point as
@@ -2149,6 +2397,9 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		}
 		return resolved, ok
 	}, deps.edgeRulesAudit)
+	if deps.pgStore != nil {
+		handler.WithAsyncRouteEnqueuer(&asyncRouteEnqueuer{store: deps.pgStore})
+	}
 	// Issue #561 / ADR-091 PR 5 — arm the per-rule JWT verifier.
 	// nil-safe: deps.edgeJWKSAdapter nil falls through
 	// (applyEdgeRuleJWT short-circuits, matching pre-PR-5 + dev
@@ -2359,28 +2610,34 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			for i := range rows {
 				row := rows[i]
 				req := &apidpb.IncrementRequestTelemetryRequest{
-					EventId:          row.EventID.String(),
-					AccountId:        row.AccountID.String(),
-					AppId:            row.AppID.String(),
-					DeploymentId:     row.DeploymentID.String(),
-					RouteTemplate:    row.Route,
-					Method:           row.Method,
-					HttpStatus:       int32(row.Status),
-					LatencyMs:        int32(row.LatencyMS),
-					ColdBoot:         row.ColdBoot,
-					TraceId:          row.TraceID,
-					ReceivedAtUnixMs: row.ReceivedAt.UnixMilli(),
-					Count:            int32(row.Count),
-					UaFamily:         row.UAFamily,
-					ReferrerHost:     row.ReferrerHost,
-					Country:          row.Country,
-					WakeId:           row.WakeID,
-					InstanceId:       row.InstanceID,
-					GuestDurationMs:  int32(row.GuestDurationMS),
-					GuestRuntime:     row.GuestRuntime,
-					GuestOutcome:     row.GuestOutcome,
-					GuestErrorClass:  row.GuestErrorClass,
-					ConsumerId:       row.ConsumerID,
+					EventId:             row.EventID.String(),
+					AccountId:           row.AccountID.String(),
+					AppId:               row.AppID.String(),
+					DeploymentId:        row.DeploymentID.String(),
+					RouteTemplate:       row.Route,
+					Method:              row.Method,
+					HttpStatus:          int32(row.Status),
+					LatencyMs:           int32(row.LatencyMS),
+					ColdBoot:            row.ColdBoot,
+					TraceId:             row.TraceID,
+					ReceivedAtUnixMs:    row.ReceivedAt.UnixMilli(),
+					Count:               int32(row.Count),
+					UaFamily:            row.UAFamily,
+					ReferrerHost:        row.ReferrerHost,
+					Country:             row.Country,
+					WakeId:              row.WakeID,
+					InstanceId:          row.InstanceID,
+					GuestDurationMs:     int32(row.GuestDurationMS),
+					GuestRuntime:        row.GuestRuntime,
+					GuestOutcome:        row.GuestOutcome,
+					GuestErrorClass:     row.GuestErrorClass,
+					ConsumerId:          row.ConsumerID,
+					NodeId:              row.NodeID,
+					Region:              row.Region,
+					CommitSha:           row.CommitSHA,
+					DeploymentTag:       row.DeploymentTag,
+					DeploymentCreatedAt: row.DeploymentCreatedAt,
+					ImageDigest:         row.ImageDigest,
 				}
 				if row.Count < 1 {
 					req.Count = 1
@@ -2847,6 +3104,18 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		readyProbe.RegisterSignal(signal)
 		deps.warmHints.SetOnTouch(touch)
 	}
+	// Route-invalidation subscription readiness. Starts FALSE and flips true
+	// only once watchInvalidations has established its LISTEN, so /readyz
+	// finally means what the comment above has always claimed: the routing
+	// cache is subscribed, not merely that a port is bound.
+	//
+	// Deliberately fail-closed: if the boot subscribe errors, the channel is
+	// never closed and /readyz stays 503. A gateway that cannot hear route
+	// changes would serve a frozen routing table, which is worse than being
+	// drained out of rotation.
+	if deps.invalidationsReady != nil {
+		readyWhenClosed(ctx, readyProbe.Register(), deps.invalidationsReady)
+	}
 	readyProbe.SetReadyObserver(func(ready bool, reason string) {
 		if deps.opsMetrics != nil {
 			deps.opsMetrics.MarkReady("gatewayd-internal", ready, reason)
@@ -2902,7 +3171,8 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		controlMux.HandleFunc("/v1/internal/apps/", func(w http.ResponseWriter, r *http.Request) {
 			// Path-keyed: ServeMux's HandleFunc uses prefix
 			// match, so /v1/internal/apps/foo/routes and
-			// /v1/internal/apps/foo/service-endpoints both
+			// /v1/internal/apps/foo/service-endpoints and
+			// /v1/internal/apps/foo/streaming-cap all
 			// reach this dispatcher. Each reader validates its
 			// complete suffix before serving a response.
 			resolve := gateway.ResolveSlugFn(func(slug string) (string, bool) { //nolint:contextcheck // ADR-093 ResolveSlugFn signature is fixed; ctx captured from per-request r.Context().
@@ -2912,6 +3182,10 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 				}
 				return string(a.ID), true
 			})
+			if strings.HasSuffix(r.URL.Path, "/streaming-cap") {
+				internalStreamingCapHandler(deps.edgeRulesMatcher, resolve, log).ServeHTTP(w, r)
+				return
+			}
 			if strings.HasSuffix(r.URL.Path, "/service-endpoints") {
 				internalServiceEndpointsHandler(serviceEndpointProvider, resolve, log).ServeHTTP(w, r)
 				return
@@ -2927,38 +3201,30 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	if deps.pgStore != nil && serviceEndpointProvider != nil && deps.nodeCache != nil {
 		pgStore := deps.pgStore
 		serviceProxyConfig := gateway.ServiceProxyConfig{
-			Provider: serviceEndpointProvider,
-			Resolve: func(ctx context.Context, service string) (string, bool, error) {
-				app, err := pgStore.AppBySlug(ctx, service)
-				if errors.Is(err, state.ErrNotFound) {
-					return "", false, nil
-				}
-				if err != nil {
-					return "", false, fmt.Errorf("resolve service %q: %w", service, err)
-				}
-				return app.ID, app.ID != "", nil
-			},
-			Authorize: func(ctx context.Context, callerAppID, targetAppID string) error {
-				caller, err := pgStore.AppByID(ctx, callerAppID)
-				if errors.Is(err, state.ErrNotFound) {
-					return gateway.ErrServiceProxyDenied
-				}
-				if err != nil {
-					return fmt.Errorf("load caller app: %w", err)
-				}
-				target, err := pgStore.AppByID(ctx, targetAppID)
-				if errors.Is(err, state.ErrNotFound) {
-					return gateway.ErrServiceProxyDenied
-				}
-				if err != nil {
-					return fmt.Errorf("load target app: %w", err)
-				}
-				if caller.AccountID == "" || caller.AccountID != target.AccountID {
-					return gateway.ErrServiceProxyDenied
-				}
-				return nil
-			},
-			Forward: deps.nodeCache.Forwarding(),
+			Provider:   serviceEndpointProvider,
+			Resolve:    newServiceProxyResolver(pgStore),
+			Authorize:  newServiceProxyAuthorizer(pgStore),
+			Forward:    deps.nodeCache.Forwarding(),
+			RawForward: deps.nodeCache.RawForwarding(),
+			// ADR-196: a call to a parked internal service must hold and
+			// wake exactly like a public request does. Without this seam a
+			// scale-to-zero internal service 503s on every cold call, which
+			// forces customers to pin min_instances on every dependency and
+			// gives up the platform's central economic claim for precisely
+			// the workloads that are idle most of the time.
+			Wake: newServiceProxyWaker(pgStore, handler.EnsureServiceCapacity),
+			// ADR-201 §2. Nil Breaker installs the legacy fixed-TTL
+			// quarantine, so with the flag off this is byte-identical to the
+			// pre-ADR-201 behaviour.
+			Breaker:     egressBreakerGroup(),
+			Metrics:     deps.metrics,
+			RetryBudget: retryBudget,
+			// Prefer a replica on this node before crossing the network.
+			// Empty NodeName (legacy single-box) keeps flat round-robin.
+			LocalNodeID: cfg.NodeName,
+			// ADR-206. nil unless FAAS_SERVICE_CALLER_ASSERTIONS is on and a
+			// signing key is available, so the default path is unchanged.
+			MintCallerAssertion: newServiceCallerMinter(ctx, pgStore, cfg.NodeName, log),
 		}
 		controlMux.Handle("/v1/internal/services/", gateway.NewServiceProxy(serviceProxyConfig))
 		if strings.TrimSpace(cfg.ServiceProxyListen) != "" {
@@ -3141,6 +3407,21 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		} else {
 			srv := deps.newSrv(serviceProxyAddr, guestServiceProxy)
 			srv.Addr = serviceProxyAddr
+			// ADR-197: the guest listener must accept H2C prior-knowledge so
+			// a workload's gRPC client can reach a same-account service. The
+			// server factory builds the control listener's HTTP/1.1-only
+			// posture, which silently downgrades every internal gRPC call.
+			srv.Protocols = new(http.Protocols)
+			srv.Protocols.SetHTTP1(true)
+			srv.Protocols.SetUnencryptedHTTP2(true)
+			// Those same control-listener defaults carry a 30 s write
+			// deadline. http.Server starts WriteTimeout before the handler
+			// runs, so it bounds the whole exchange: it would cut a streaming
+			// gRPC response, a long-lived upgrade session, and any call held
+			// through a snapshot restore (ADR-196). Widen both to the
+			// customer request envelope the public listener uses.
+			srv.ReadTimeout = readTimeoutOrDefault(deps.readTimeout)
+			srv.WriteTimeout = writeTimeoutOrDefault(deps.writeTimeout)
 			addSrv(srv)
 			l, lerr := deps.listen("tcp", serviceProxyAddr)
 			if lerr != nil {
@@ -3210,6 +3491,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 
 	notifyStop := daemonunit.NotifyReadyWhen(ctx, readyProbe.ReadyFunc())
 	defer notifyStop()
+	defer wire.StartWatchdog(ctx, wire.NewLiveness(), deps.opsMetrics, log)()
 
 	select {
 	case err := <-errc:

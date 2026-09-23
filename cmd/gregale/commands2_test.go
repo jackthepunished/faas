@@ -216,7 +216,7 @@ func TestCmdAppConcurrencyPolicyPreservesExistingScalingFields(t *testing.T) {
 	t.Setenv("FAAS_API", srv.URL)
 	t.Setenv("FAAS_TOKEN", "fp_test_x")
 
-	if code := cmdApp([]string{constSlug, "--concurrency-overflow", "drop", "--max-queue-wait-ms", "1250"}); code != 0 {
+	if code := cmdApp([]string{constSlug, "--concurrency-overflow", "drop", "--max-queue-depth", "17", "--max-queue-wait", "1250ms"}); code != 0 {
 		t.Fatalf("cmdApp exit = %d, want 0", code)
 	}
 	if got.ScalingPolicy == nil {
@@ -229,8 +229,23 @@ func TestCmdAppConcurrencyPolicyPreservesExistingScalingFields(t *testing.T) {
 	if policy.Target == nil || policy.Target.Metric != "rps" || policy.Target.Value != 10 {
 		t.Fatalf("scaling_policy.target = %+v, existing target was not preserved", policy.Target)
 	}
-	if policy.ConcurrencyOverflow != api.ConcurrencyOverflowDrop || policy.MaxQueueWaitMS != 1250 {
-		t.Fatalf("scaling_policy concurrency fields = %+v, want drop/1250", policy)
+	if policy.ConcurrencyOverflow != api.ConcurrencyOverflowDrop || policy.MaxQueueDepth != 17 || policy.MaxQueueWaitMS != 1250 {
+		t.Fatalf("scaling_policy concurrency fields = %+v, want drop/17/1250", policy)
+	}
+}
+
+func TestCLIQueueWaitMilliseconds(t *testing.T) {
+	if got, set, err := cliQueueWaitMilliseconds(0, 1500*time.Millisecond, false, true); err != nil || !set || got != 1500 {
+		t.Fatalf("duration conversion = %d/%v/%v, want 1500/true/nil", got, set, err)
+	}
+	if got, set, err := cliQueueWaitMilliseconds(1250, 0, true, false); err != nil || !set || got != 1250 {
+		t.Fatalf("legacy millisecond conversion = %d/%v/%v, want 1250/true/nil", got, set, err)
+	}
+	if _, _, err := cliQueueWaitMilliseconds(1000, time.Second, true, true); err == nil {
+		t.Fatal("combining duration and millisecond flags should fail")
+	}
+	if _, _, err := cliQueueWaitMilliseconds(0, 500*time.Microsecond, false, true); err == nil {
+		t.Fatal("sub-millisecond duration should fail instead of silently becoming the plan default")
 	}
 }
 
@@ -487,9 +502,13 @@ func TestCmdTrafficStatusListsOnlyLiveDeploymentWeights(t *testing.T) {
 			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
 		}
 		writeJSONTest(w, api.DeploymentListResponse{Items: []api.DeploymentResponse{
-			{ID: "dep-live-a", Status: statusLive, TrafficPercent: 75},
+			// ADR-198: dep-live-b carries no revision on purpose — it
+			// stands in for a row written before the column existed, and
+			// pins that such a row still renders (as "-" plus its id)
+			// rather than showing a meaningless "v0".
+			{ID: "dep-live-a", Revision: 42, Status: statusLive, TrafficPercent: 75},
 			{ID: "dep-live-b", Status: statusLive, TrafficPercent: 25},
-			{ID: "dep-old", Status: "superseded", TrafficPercent: 0},
+			{ID: "dep-old", Revision: 41, Status: "superseded", TrafficPercent: 0},
 		}})
 	}))
 	defer srv.Close()
@@ -502,10 +521,21 @@ func TestCmdTrafficStatusListsOnlyLiveDeploymentWeights(t *testing.T) {
 		t.Fatalf("traffic status exit = %d", code)
 	}
 	output := out.String()
-	for _, want := range []string{"dep-live-a", "75%", "dep-live-b", "25%", "Total\t\t100%"} {
+	for _, want := range []string{
+		"REVISION", // ADR-198 column header
+		"v42",      // the revision handle, not just the uuid
+		"dep-live-a", "75%",
+		"-", "dep-live-b", "25%", // revision-less row falls back to the id
+		"Total\t\t\t100%",
+	} {
 		if !strings.Contains(output, want) {
 			t.Errorf("output missing %q: %s", want, output)
 		}
+	}
+	// A revision-less row must never render as "v0" — that would look like
+	// a real handle the customer could type back into `traffic set`.
+	if strings.Contains(output, "v0") {
+		t.Errorf("revision-less deployment rendered as v0: %s", output)
 	}
 	if strings.Contains(output, "dep-old") {
 		t.Fatalf("superseded deployment shown in traffic status: %s", output)
@@ -1201,6 +1231,41 @@ func TestCmdDeployTarball_PreservesExplicitTrafficPercent(t *testing.T) {
 				t.Fatalf("traffic_percent form value = %q, want %q", gotTraffic, percent)
 			}
 		})
+	}
+}
+
+func TestCmdDeployTarball_NoTrafficSendsExplicitZero(t *testing.T) {
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "package.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "index.js"), []byte("console.log('ok')"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var gotTraffic string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/apps" && r.Method == http.MethodPost:
+			writeJSONTest(w, api.AppResponse{ID: "app-id", Slug: "dark-source"})
+		case r.URL.Path == "/v1/apps/dark-source/deployments" && r.Method == http.MethodPost:
+			if err := r.ParseMultipartForm(32 << 20); err != nil {
+				t.Errorf("ParseMultipartForm: %v", err)
+			}
+			gotTraffic = r.FormValue("traffic_percent")
+			writeJSONTest(w, api.DeploymentResponse{ID: "dep-id", AppID: "app-id", Status: "pending", TrafficPercent: 0})
+		default:
+			http.Error(w, "unexpected route", http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	t.Setenv("FAAS_API", srv.URL)
+	t.Setenv("FAAS_TOKEN", "fp_live_x")
+
+	if code := cmdDeployTarball([]string{"--path", source, "--name", "dark-source", "--app", "--yes", "--no-wait", "--no-traffic"}); code != 0 {
+		t.Fatalf("cmdDeployTarball exit = %d, want 0", code)
+	}
+	if gotTraffic != "0" {
+		t.Fatalf("traffic_percent form value = %q, want explicit zero", gotTraffic)
 	}
 }
 

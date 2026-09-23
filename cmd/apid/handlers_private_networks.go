@@ -335,6 +335,7 @@ func (s *server) updatePrivateNetworkPolicy(w http.ResponseWriter, r *http.Reque
 		}
 		return
 	}
+	_ = s.notif.Notify(r.Context(), db.NotifyPrivateNetworkChanged, fmt.Sprintf(`{"kind":"private_network","account_id":"%s","network_id":"%s","region":"%s","status":"policy_updated"}`, acct.ID, updated.ID, updated.Region))
 	s.audit.Emit(r.Context(), "private_network.policy_updated", &acct.ID, map[string]any{"network_id": id, "allowed_cidrs": req.AllowedCIDRs, "firewall_rules": req.FirewallRules})
 	writeJSON(w, http.StatusOK, privateNetworkResponse(updated))
 }
@@ -361,6 +362,58 @@ func (s *server) getPrivateNetwork(w http.ResponseWriter, r *http.Request, acct 
 	writeJSON(w, http.StatusOK, privateNetworkResponse(network))
 }
 
+func (s *server) listPrivateNetworkMembers(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	baseStore, ok := s.privateNetworkFabricStore(w, r)
+	if !ok {
+		return
+	}
+	store, ok := baseStore.(state.PrivateNetworkAddressListStore)
+	if !ok {
+		api.WriteProblem(w, api.ErrPrivateNetworkNotEnabled())
+		return
+	}
+	id := strings.TrimSpace(r.PathValue("id"))
+	if err := api.ValidatePrivateNetworkIdentifier(id); err != nil {
+		api.WriteProblem(w, api.NewProblem(http.StatusNotFound, api.CodeNotFound, "Private network not found", "the requested network does not exist"))
+		return
+	}
+	network, err := store.GetPrivateNetwork(r.Context(), acct.ID, id)
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			api.WriteProblem(w, api.NewProblem(http.StatusNotFound, api.CodeNotFound, "Private network not found", "the requested network does not exist"))
+			return
+		}
+		api.WriteProblem(w, api.ErrCapacity("could not read private network"))
+		return
+	}
+	addresses, err := store.ListPrivateNetworkAddresses(r.Context(), acct.ID, id)
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("could not list private network members"))
+		return
+	}
+	members := make([]api.PrivateNetworkMember, 0, len(addresses))
+	for _, address := range addresses {
+		member := api.PrivateNetworkMember{
+			ID: address.ID, OwnerType: address.OwnerType, OwnerID: address.OwnerID,
+			Address: address.Address.String(),
+		}
+		if !address.CreatedAt.IsZero() {
+			createdAt := address.CreatedAt.UTC()
+			member.CreatedAt = &createdAt
+		}
+		members = append(members, member)
+	}
+	capacity := state.PrivateNetworkAddressCapacity(network.CIDR)
+	available := capacity - len(members)
+	if available < 0 {
+		available = 0
+	}
+	writeJSON(w, http.StatusOK, api.PrivateNetworkMembersResponse{
+		NetworkID: id, CIDR: network.CIDR.String(), Capacity: capacity,
+		Used: len(members), Available: available, Members: members,
+	})
+}
+
 func (s *server) deletePrivateNetwork(w http.ResponseWriter, r *http.Request, acct state.Account) {
 	store, ok := s.privateNetworkFabricStore(w, r)
 	if !ok {
@@ -371,7 +424,21 @@ func (s *server) deletePrivateNetwork(w http.ResponseWriter, r *http.Request, ac
 		api.WriteProblem(w, api.NewProblem(http.StatusNotFound, api.CodeNotFound, "Private network not found", "the requested network does not exist"))
 		return
 	}
-	err := store.DeletePrivateNetwork(r.Context(), acct.ID, id)
+	network, err := store.GetPrivateNetwork(r.Context(), acct.ID, id)
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			api.WriteProblem(w, api.NewProblem(http.StatusNotFound, api.CodeNotFound, "Private network not found", "the requested network does not exist"))
+			return
+		}
+		api.WriteProblem(w, api.ErrCapacity("could not read private network"))
+		return
+	}
+	durableStore, atomicDeletion := store.(state.PrivateNetworkDurableDeletionStore)
+	if atomicDeletion {
+		err = durableStore.DeletePrivateNetworkDurably(r.Context(), acct.ID, id)
+	} else {
+		err = store.DeletePrivateNetwork(r.Context(), acct.ID, id)
+	}
 	if err != nil {
 		switch {
 		case errors.Is(err, state.ErrNotFound):
@@ -382,6 +449,11 @@ func (s *server) deletePrivateNetwork(w http.ResponseWriter, r *http.Request, ac
 			api.WriteProblem(w, api.ErrCapacity("could not delete private network"))
 		}
 		return
+	}
+	if !atomicDeletion {
+		// MemStore and older test doubles keep their notifier seam. PgStore
+		// already committed the durable outbox row with the deletion.
+		_ = s.notif.Notify(r.Context(), db.NotifyPrivateNetworkChanged, fmt.Sprintf(`{"kind":"private_network_deleted","account_id":"%s","network_id":"%s","region":"%s","cidr":"%s"}`, acct.ID, network.ID, network.Region, network.CIDR.String()))
 	}
 	s.audit.Emit(r.Context(), "private_network.deleted", &acct.ID, map[string]any{"network_id": id})
 	w.WriteHeader(http.StatusNoContent)

@@ -177,6 +177,14 @@ a second POST. Deletion also searches by Gregale's stable resource ID when the
 opaque Neon ID was never persisted, closing the ambiguous-create cleanup path.
 Ambiguous duplicate names fail closed.
 
+Before any provider delete call, the PostgreSQL catalog takes an exclusive row
+lock and atomically rejects databases with an active binding or restore
+descendant. Binding reservations take a key-share lock on their target database,
+and restore reservations take the same lock on their source. Consequently, a
+concurrent reservation either commits first and blocks deletion, or observes the
+database in `deleting` and fails without creating a dependent. The provider is
+never contacted after a dependency conflict.
+
 Each app binding uses a deterministic Neon role. Repeating credential
 issuance retrieves the stored role password rather than resetting it. Revoking
 a binding deletes that role. The adapter returns credential material only in
@@ -186,9 +194,12 @@ endpoint hosts, or API keys.
 Neon currently supports `read_write` bindings only. The sink prefers a pooled
 endpoint and falls back to a direct endpoint. A `read_only` binding requires an
 adapter-provided read-only endpoint and therefore fails closed as unsupported
-with the initial Neon adapter. Provider-supplied root-certificate PEM also
-fails closed until the portable binding contract can deliver a separate sealed
-certificate file; it is never silently discarded.
+with the initial Neon adapter. Gregale checks the selected backend's declared
+credential modes before reserving a binding, so unsupported requests do not
+leave failed catalog rows or reach the provider and secret sink. Reconciliation
+repeats the check for bindings written by older releases. Provider-supplied
+root-certificate PEM also fails closed until the portable binding contract can
+deliver a separate sealed certificate file; it is never silently discarded.
 
 Neon's consumption-history API maps compute and network transfer directly to
 Gregale's `compute_unit_seconds` and `egress_bytes` meters. Neon reports root
@@ -270,10 +281,13 @@ Neon's adapter implements this using a deterministic point-in-time branch in
 the source project. The opaque target ID is encoded inside the adapter as
 `project_id/branch_id`; the provider-neutral catalog never interprets that
 format. Credentials, inspection, usage, and deletion route to the branch.
-Because Neon reports compute and consumption at project scope, the adapter
-does not claim per-target usage isolation for these shared-project restores;
-the control plane keeps them unavailable while usage guardrails are enabled
-until an allocation model is qualified.
+Neon reports consumption at project scope rather than per branch. With usage
+guardrails enabled, Gregale therefore collects that project aggregate once
+against the source database and skips direct usage collection for every restore
+descendant. This keeps account-level COGS ceilings effective without claiming
+per-target usage isolation; the usage collector exposes skipped descendants as
+`included_in_source` rather than as independently metered databases. Providers
+that can meter restores independently may instead declare that capability.
 If a create response is lost, branch-name discovery recovers the accepted
 branch without a second POST. Deleting a source is rejected while an active
 restore descendant exists, and deleting a restore target removes only its
@@ -322,7 +336,7 @@ databases:
   - database: orders       # logical database name or ID
     scope: production      # defaults to default
     env: DATABASE_URL      # defaults to DATABASE_URL
-    access: read_write     # or read_only
+    access: read_write     # read_only only when the selected backend supports it
 ```
 
 The `app` field can be supplied for a multi-app project manifest; when it is

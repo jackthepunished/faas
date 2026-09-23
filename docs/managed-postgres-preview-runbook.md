@@ -24,9 +24,13 @@ go run ./cmd/managed-postgres-qualify --check-config
 ```
 
 The JSON result contains stable check codes and a `readiness` object. Warnings
-such as `usage_policy_disabled` or `restore_usage_not_isolated` do not make the
+such as `usage_policy_disabled` or `restore_usage_unaccounted` do not make the
 provider call safe to skip; they remain launch blockers that must be resolved
-or explicitly documented before a staging canary.
+or explicitly documented before a staging canary. `restore_usage_not_isolated`
+documents that branch-level usage is not available. A provider that declares
+`RestoreUsageIncludedInSource` may nevertheless support guarded restores
+without per-target metering, provided its source usage response accounts for
+all descendants.
 
 Run the provider qualification with
 `FAAS_MANAGED_POSTGRES_QUALIFY_LIFECYCLE=true` and save its JSON output in an
@@ -81,9 +85,13 @@ malformed entries and never blocks database deletion or credential revocation.
 
 Restore is always restore-to-new-database. Confirm the source is `ready`, the
 requested timestamp is inside the source restore window, and the provider
-qualification report says restore usage is isolated. With the Neon adapter,
-shared-project restore branches remain unavailable while usage guardrails are
-enabled because provider consumption is project-scoped.
+qualification report declares a supported restore-accounting mode: isolated
+per-target usage or usage included in the source aggregate. Neon uses the
+source-aggregate mode because consumption is project-scoped. The collector
+records that aggregate once against the source and skips restore descendants,
+marking them `included_in_source`; this supports aggregate COGS guardrails but
+does not provide per-database restore cost attribution. Do not enable guarded
+restores for a provider whose qualification reports neither accounting mode.
 
 ## Account deletion
 

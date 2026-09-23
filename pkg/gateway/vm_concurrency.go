@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -9,6 +10,16 @@ import (
 )
 
 const vmConcurrencyRetryInterval = 10 * time.Millisecond
+
+const concurrencyQueueLeaseGrace = 5 * time.Second
+
+// ConcurrencyQueueAdmission owns the fleet-wide permit budget for requests
+// waiting on warm instance capacity. Implementations coordinate only permits;
+// request bodies and FIFO ordering remain local to the accepting gateway.
+type ConcurrencyQueueAdmission interface {
+	TryAcquireConcurrencyQueueLease(ctx context.Context, appID string, limit int, ttl time.Duration) (leaseID string, depth int, admitted bool, err error)
+	ReleaseConcurrencyQueueLease(ctx context.Context, appID, leaseID string) error
+}
 
 // effectiveAppConcurrencyLimit resolves the app's configured instance
 // ceiling against the plan ceiling. Keeping this calculation in one place
@@ -44,6 +55,24 @@ type vmConcurrencyManager struct {
 	mu      sync.Mutex
 	gates   map[string]*vmConcurrencyGate
 	onDelta func(plan string, delta int64)
+
+	queueMu      sync.Mutex
+	queues       map[string]*concurrencyWaitQueue
+	onQueueDepth func(appID, plan string, depth int)
+	admission    ConcurrencyQueueAdmission
+}
+
+type concurrencyWaitQueue struct {
+	plan    string
+	tickets []*concurrencyWaitTicket
+}
+
+type concurrencyWaitTicket struct {
+	manager *vmConcurrencyManager
+	appID   string
+	ready   chan struct{}
+	left    bool
+	leaseID string
 }
 
 type vmConcurrencyGate struct {
@@ -58,8 +87,163 @@ type vmConcurrencyGate struct {
 func newVMConcurrencyManager(onDelta func(plan string, delta int64)) *vmConcurrencyManager {
 	return &vmConcurrencyManager{
 		gates:   make(map[string]*vmConcurrencyGate),
+		queues:  make(map[string]*concurrencyWaitQueue),
 		onDelta: onDelta,
 	}
+}
+
+func (m *vmConcurrencyManager) setQueueDepthSink(sink func(appID, plan string, depth int)) {
+	if m == nil {
+		return
+	}
+	m.queueMu.Lock()
+	m.onQueueDepth = sink
+	m.queueMu.Unlock()
+}
+
+func (m *vmConcurrencyManager) setQueueAdmission(admission ConcurrencyQueueAdmission) {
+	if m == nil {
+		return
+	}
+	m.queueMu.Lock()
+	m.admission = admission
+	m.queueMu.Unlock()
+}
+
+// enterQueue appends one request to the per-app FIFO warm-capacity queue.
+// The returned ticket becomes runnable only when it reaches the head. This
+// avoids the notify-all race in which newer requests can repeatedly beat an
+// older waiter to a released VM slot.
+func (m *vmConcurrencyManager) enterQueue(ctx context.Context, appID, plan string, limit int, maxWait time.Duration) (*concurrencyWaitTicket, int, bool, error) {
+	if m == nil || appID == "" || limit <= 0 {
+		return nil, 0, false, nil
+	}
+	m.queueMu.Lock()
+	admission := m.admission
+	m.queueMu.Unlock()
+	leaseID := ""
+	globalDepth := 0
+	if admission != nil {
+		var err error
+		var admitted bool
+		leaseID, globalDepth, admitted, err = admission.TryAcquireConcurrencyQueueLease(ctx, appID, limit, maxWait+concurrencyQueueLeaseGrace)
+		if err != nil {
+			return nil, 0, false, err
+		}
+		if !admitted || leaseID == "" {
+			return nil, globalDepth, false, nil
+		}
+	}
+	m.queueMu.Lock()
+	q := m.queues[appID]
+	if q == nil {
+		q = &concurrencyWaitQueue{plan: plan}
+		m.queues[appID] = q
+	}
+	if len(q.tickets) >= limit {
+		depth := len(q.tickets)
+		m.queueMu.Unlock()
+		if admission != nil && leaseID != "" {
+			_ = releaseConcurrencyQueueLease(ctx, admission, appID, leaseID)
+		}
+		return nil, depth, false, nil
+	}
+	ticket := &concurrencyWaitTicket{manager: m, appID: appID, ready: make(chan struct{}), leaseID: leaseID}
+	q.tickets = append(q.tickets, ticket)
+	depth := len(q.tickets)
+	if depth == 1 {
+		close(ticket.ready)
+	}
+	sink := m.onQueueDepth
+	m.queueMu.Unlock()
+	if sink != nil {
+		sink(appID, plan, depth)
+	}
+	if globalDepth > depth {
+		depth = globalDepth
+	}
+	return ticket, depth, true, nil
+}
+
+func (t *concurrencyWaitTicket) wait(ctx context.Context) error {
+	if t == nil {
+		return ErrConcurrencyQueueFull
+	}
+	select {
+	case <-t.ready:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (t *concurrencyWaitTicket) leave(ctx context.Context) error {
+	if t == nil || t.manager == nil {
+		return nil
+	}
+	m := t.manager
+	m.queueMu.Lock()
+	if t.left {
+		m.queueMu.Unlock()
+		return nil
+	}
+	t.left = true
+	admission := m.admission
+	leaseID := t.leaseID
+	q := m.queues[t.appID]
+	if q == nil {
+		m.queueMu.Unlock()
+		return releaseConcurrencyQueueLease(ctx, admission, t.appID, leaseID)
+	}
+	idx := -1
+	for i, candidate := range q.tickets {
+		if candidate == t {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		m.queueMu.Unlock()
+		return releaseConcurrencyQueueLease(ctx, admission, t.appID, leaseID)
+	}
+	wasHead := idx == 0
+	copy(q.tickets[idx:], q.tickets[idx+1:])
+	q.tickets[len(q.tickets)-1] = nil
+	q.tickets = q.tickets[:len(q.tickets)-1]
+	depth := len(q.tickets)
+	plan := q.plan
+	if depth == 0 {
+		delete(m.queues, t.appID)
+	} else if wasHead {
+		close(q.tickets[0].ready)
+	}
+	sink := m.onQueueDepth
+	m.queueMu.Unlock()
+	if sink != nil {
+		sink(t.appID, plan, depth)
+	}
+	return releaseConcurrencyQueueLease(ctx, admission, t.appID, leaseID)
+}
+
+func releaseConcurrencyQueueLease(ctx context.Context, admission ConcurrencyQueueAdmission, appID, leaseID string) error {
+	if admission == nil || leaseID == "" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+	defer cancel()
+	return admission.ReleaseConcurrencyQueueLease(ctx, appID, leaseID)
+}
+
+func (m *vmConcurrencyManager) queueDepth(appID string) int {
+	if m == nil {
+		return 0
+	}
+	m.queueMu.Lock()
+	defer m.queueMu.Unlock()
+	if q := m.queues[appID]; q != nil {
+		return len(q.tickets)
+	}
+	return 0
 }
 
 func newVMConcurrencyGate(limit int) *vmConcurrencyGate {
@@ -274,9 +458,31 @@ func (h *Handler) acquireVMTarget(ctx context.Context, app App, pick PickResult,
 	if candidate, release, ok := tryReadyTarget(); ok {
 		return candidate, release, false, nil
 	}
+	policy := ConcurrencyAdmissionPolicyForApp(app.Plan, app.ConcurrencyOverflow, app.MaxQueueWaitMS, app.MaxQueueDepth)
 	if app.ConcurrencyOverflow == api.ConcurrencyOverflowDrop {
-		policy := WakeAdmissionPolicyForApp(app.Plan, app.ConcurrencyOverflow, app.MaxQueueWaitMS)
 		return pick, nil, true, &WakeConcurrencyDropError{RetryAfter: policy.MaxWait}
+	}
+	ticket, depth, ok, queueErr := h.vmConcurrency.enterQueue(ctx, app.ID, string(app.Plan), policy.MaxWaiters, policy.MaxWait)
+	if queueErr != nil {
+		return pick, nil, true, &ConcurrencyQueueAdmissionError{Err: queueErr, RetryAfter: policy.MaxWait}
+	}
+	if !ok {
+		return pick, nil, true, &ConcurrencyQueueFullError{Depth: depth, Limit: policy.MaxWaiters, RetryAfter: policy.MaxWait}
+	}
+	queuedAt := time.Now()
+	defer func() {
+		if err := ticket.leave(ctx); err != nil && h.log != nil {
+			h.log.Warn("gateway: release fleet concurrency queue lease", "app_id", app.ID, "err", err)
+		}
+	}()
+	if err := ticket.wait(ctx); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return pick, nil, true, &ConcurrencyQueueWaitTimeoutError{Waited: time.Since(queuedAt), RetryAfter: policy.MaxWait}
+		}
+		return pick, nil, true, err
+	}
+	if candidate, release, ok := tryReadyTarget(); ok {
+		return candidate, release, true, nil
 	}
 
 	ticker := time.NewTicker(vmConcurrencyRetryInterval)
@@ -288,6 +494,9 @@ func (h *Handler) acquireVMTarget(ctx context.Context, app App, pick PickResult,
 				return candidate, release, true, nil
 			}
 		case <-ctx.Done():
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return pick, nil, true, &ConcurrencyQueueWaitTimeoutError{Waited: time.Since(queuedAt), RetryAfter: policy.MaxWait}
+			}
 			return pick, nil, true, ctx.Err()
 		}
 	}

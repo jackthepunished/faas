@@ -2,13 +2,14 @@ asyncapi: 3.0.0
 id: urn:gregale:events
 info:
   title: Gregale event contracts
-  version: 1.2.0
+  version: 1.4.0
   description: |
     Gregale delivers selected app lifecycle and billing events to an app's
-    configured webhook subscriptions, accepts external events for durable
-    workflow runs, and exposes per-app FIFO queue operations. Outbound webhook
-    messages use CloudEvents 1.0 structured JSON over HTTP POST and are signed
-    with the webhook secret; workflow and queue operations use the public API's
+    configured webhook subscriptions, accepts tenant-scoped events for the
+    internal content-based router, accepts external events for durable workflow
+    runs, and exposes per-app FIFO queue operations. Outbound webhook messages
+    use CloudEvents 1.0 structured JSON over HTTP POST and are signed with the
+    webhook secret; ingress, workflow, and queue operations use the public API's
     authenticated JSON endpoints.
   license:
     name: Apache-2.0
@@ -56,6 +57,14 @@ channels:
     messages:
       usageStatementFinalized:
         $ref: '#/components/messages/UsageStatementFinalized'
+  internalEventPublish:
+    address: /v1/events:publish
+    description: Publish one tenant-scoped event for asynchronous content-based fanout.
+    servers:
+      - $ref: '#/servers/api'
+    messages:
+      internalEventPublish:
+        $ref: '#/components/messages/InternalEventPublish'
   workflowExternalEvent:
     address: /v1/workflows/runs/{id}/events
     description: Accept an external event for a non-terminal durable workflow run.
@@ -82,6 +91,32 @@ channels:
     messages:
       queueSend:
         $ref: '#/components/messages/QueueSend'
+  applicationInbox:
+    address: /v1/apps/{slug}/inbox
+    description: Reliably enqueue a CloudEvents-wrapped message for a Gregale application.
+    parameters:
+      slug:
+        description: Target application slug.
+        examples:
+          - billing
+    servers:
+      - $ref: '#/servers/api'
+    messages:
+      applicationInbox:
+        $ref: '#/components/messages/ApplicationInbox'
+  applicationOutbox:
+    address: /v1/apps/{slug}/outbox
+    description: Reliably enqueue a custom event for a registered webhook destination.
+    parameters:
+      slug:
+        description: Source application slug that owns the destination.
+        examples:
+          - checkout-api
+    servers:
+      - $ref: '#/servers/api'
+    messages:
+      applicationOutbox:
+        $ref: '#/components/messages/ApplicationOutbox'
   queueReceive:
     address: /v1/apps/{slug}/queues/receive
     description: Long-poll for the next completed queue invocation; acknowledgement is informational.
@@ -146,6 +181,23 @@ operations:
       http:
         method: POST
         bindingVersion: '0.3.0'
+  receiveInternalEventPublish:
+    action: receive
+    channel:
+      $ref: '#/channels/internalEventPublish'
+    summary: Accept a tenant-scoped event for internal routing.
+    description: |
+      Gregale stamps the CloudEvents specversion, occurrence time when omitted,
+      and account ownership before persisting the event for asynchronous
+      matching and delivery. The endpoint returns after durable acceptance.
+    messages:
+      - $ref: '#/channels/internalEventPublish/messages/internalEventPublish'
+    security:
+      - bearerAuth: []
+    bindings:
+      http:
+        method: POST
+        bindingVersion: '0.3.0'
   receiveWorkflowExternalEvent:
     action: receive
     channel:
@@ -171,6 +223,34 @@ operations:
     description: The request returns the newly-created queue invocation identifier.
     messages:
       - $ref: '#/channels/queueSend/messages/queueSend'
+    security:
+      - bearerAuth: []
+    bindings:
+      http:
+        method: POST
+        bindingVersion: '0.3.0'
+  receiveApplicationInbox:
+    action: receive
+    channel:
+      $ref: '#/channels/applicationInbox'
+    summary: Accept work for another Gregale application.
+    description: Uses the durable invocation queue with at-least-once delivery, retry, DLQ, and replay.
+    messages:
+      - $ref: '#/channels/applicationInbox/messages/applicationInbox'
+    security:
+      - bearerAuth: []
+    bindings:
+      http:
+        method: POST
+        bindingVersion: '0.3.0'
+  receiveApplicationOutbox:
+    action: receive
+    channel:
+      $ref: '#/channels/applicationOutbox'
+    summary: Accept a custom event for signed webhook delivery.
+    description: Uses the registered destination's signing, timeout, retry, delivery-history, DLQ, and replay configuration.
+    messages:
+      - $ref: '#/channels/applicationOutbox/messages/applicationOutbox'
     security:
       - bearerAuth: []
     bindings:
@@ -253,6 +333,16 @@ components:
           headers:
             $ref: '#/components/schemas/WebhookHeaders'
           bindingVersion: '0.3.0'
+    InternalEventPublish:
+      name: event.published
+      title: Internal event publish
+      summary: A tenant-scoped event accepted for asynchronous router fanout.
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/InternalEventPublishPayload'
+      bindings:
+        http:
+          bindingVersion: '0.3.0'
     WorkflowExternalEvent:
       name: workflow.external_event
       title: Workflow external event
@@ -272,6 +362,30 @@ components:
       contentType: application/json
       payload:
         $ref: '#/components/schemas/QueueSendPayload'
+      bindings:
+        http:
+          headers:
+            $ref: '#/components/schemas/QueueRequestHeaders'
+          bindingVersion: '0.3.0'
+    ApplicationInbox:
+      name: application.inbox
+      title: Application inbox send
+      summary: A CloudEvents-compatible message queued for an application.
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/ApplicationInboxPayload'
+      bindings:
+        http:
+          headers:
+            $ref: '#/components/schemas/QueueRequestHeaders'
+          bindingVersion: '0.3.0'
+    ApplicationOutbox:
+      name: application.outbox
+      title: Application outbox delivery
+      summary: A custom event queued for a registered webhook.
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/ApplicationOutboxPayload'
       bindings:
         http:
           headers:
@@ -299,6 +413,48 @@ components:
             $ref: '#/components/schemas/QueueRequestHeaders'
           bindingVersion: '0.3.0'
   schemas:
+    InternalEventPublishPayload:
+      type: object
+      description: |
+        Caller-authored body for the internal event router. Gregale normalizes
+        this request into a CloudEvents-shaped envelope and stamps the
+        authenticated account as the tenancy extension.
+      additionalProperties: false
+      required:
+        - id
+        - source
+        - type
+        - data
+      properties:
+        id:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: Caller-chosen idempotent event identifier.
+        source:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: Logical producer or service that emitted the event.
+        type:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: Event type used by subscription matching.
+        time:
+          type: string
+          format: date-time
+          description: Event occurrence time; Gregale stamps it when omitted.
+        data_content_type:
+          type: string
+          enum: [application/json]
+          default: application/json
+        data:
+          description: JSON event payload.
+        account_id:
+          type: string
+          format: uuid
+          description: Optional tenancy assertion; must match the bearer account.
     WorkflowEventHeaders:
       type: object
       description: Optional request headers for workflow event delivery.
@@ -337,6 +493,38 @@ components:
           type: object
           additionalProperties: true
           description: JSON object delivered to the queue invocation.
+    ApplicationInboxPayload:
+      type: object
+      additionalProperties: false
+      required: [type, data]
+      properties:
+        id: { type: string, minLength: 1, maxLength: 256, description: Generated when omitted. }
+        source: { type: string, minLength: 1, maxLength: 256, default: gregale.send }
+        type: { type: string, minLength: 1, maxLength: 256 }
+        time: { type: string, format: date-time }
+        data_content_type: { type: string, enum: [application/json], default: application/json }
+        data: { description: Any valid JSON value. }
+        queue_name: { type: string, pattern: '^[a-z][a-z0-9-]{0,62}$' }
+        retry_policy:
+          type: object
+          additionalProperties: false
+          properties:
+            max_attempts: { type: integer }
+            base_seconds: { type: number }
+            max_seconds: { type: number }
+            jitter_seconds: { type: number }
+    ApplicationOutboxPayload:
+      type: object
+      additionalProperties: false
+      required: [destination, type, data]
+      properties:
+        destination:
+          type: string
+          minLength: 1
+          maxLength: 2048
+          description: Registered webhook id or exact registered URL.
+        type: { type: string, minLength: 1, maxLength: 256 }
+        data: { description: Any valid JSON value. }
     QueueReceivePayload:
       type: object
       description: Body returned when the queue receive long-poll finds a completed invocation.

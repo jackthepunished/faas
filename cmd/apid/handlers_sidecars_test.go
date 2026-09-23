@@ -102,6 +102,12 @@ func TestBuildDeploymentForInsert_PreservesRollbackOn5xx(t *testing.T) {
 	}
 }
 
+// adr: 200
+//
+// ADR-200 opened first-wake 5xx auto-rollback to every plan, so Free and
+// Hobby no longer collect plan_rollback_on_5xx_not_allowed here. The gate that
+// remains is the fail-closed one: an unrecognised plan has no MustLimitsFor
+// entry and must be refused rather than inheriting a permissive zero value.
 func TestValidateDeploymentRollbackOptionsPlanGate(t *testing.T) {
 	trueValue := true
 	falseValue := false
@@ -111,12 +117,13 @@ func TestValidateDeploymentRollbackOptionsPlanGate(t *testing.T) {
 		value *bool
 		code  string
 	}{
-		{name: "free true is gated", plan: api.PlanFree, value: &trueValue, code: api.CodePlanRollbackOn5xxNotAllowed},
-		{name: "hobby true is gated", plan: api.PlanHobby, value: &trueValue, code: api.CodePlanRollbackOn5xxNotAllowed},
+		{name: "free true is allowed", plan: api.PlanFree, value: &trueValue},
+		{name: "hobby true is allowed", plan: api.PlanHobby, value: &trueValue},
 		{name: "pro true is allowed", plan: api.PlanPro, value: &trueValue},
 		{name: "scale true is allowed", plan: api.PlanScale, value: &trueValue},
 		{name: "free false is allowed", plan: api.PlanFree, value: &falseValue},
 		{name: "omitted is allowed", plan: api.PlanFree},
+		{name: "unknown plan fails closed", plan: api.Plan("unknown"), value: &trueValue, code: api.CodePlanRollbackOn5xxNotAllowed},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -213,5 +220,30 @@ func TestValidateAndPlanSidecars_EmptySidecarsNoop(t *testing.T) {
 	req := &api.CreateDeploymentRequest{}
 	if p := validateAndPlanSidecars(req, acct, limits); p != nil {
 		t.Errorf("validateAndPlanSidecars: expected nil on empty sidecars, got %+v", p)
+	}
+}
+
+func TestValidateAndPlanSidecars_ResolvesManagedCompanion(t *testing.T) {
+	req := &api.CreateDeploymentRequest{Companions: api.Companions{{
+		Name: "otel-collector", Preset: "opentelemetry", Type: api.SidecarTypeSidecar, Port: 4318,
+	}}}
+	p := validateAndPlanSidecarsWithImages(req, state.Account{Plan: api.PlanFree}, testSidecarLimits(), map[string]string{
+		"opentelemetry": goodSidecarImage,
+	})
+	if p != nil {
+		t.Fatalf("validate managed companion: %+v", p)
+	}
+	if len(req.Companions) != 0 || len(req.Sidecars) != 1 || req.Sidecars[0].Image != goodSidecarImage {
+		t.Fatalf("normalized request = %+v", req)
+	}
+}
+
+func TestValidateAndPlanSidecars_ManagedCompanionUnavailable(t *testing.T) {
+	req := &api.CreateDeploymentRequest{Companions: api.Companions{{
+		Name: "otel-collector", Preset: "opentelemetry", Type: api.SidecarTypeSidecar, Port: 4318,
+	}}}
+	p := validateAndPlanSidecarsWithImages(req, state.Account{Plan: api.PlanFree}, testSidecarLimits(), nil)
+	if p == nil || p.Code != api.CodeCompanionPresetUnavailable || p.Status != 503 {
+		t.Fatalf("problem = %+v, want 503/%s", p, api.CodeCompanionPresetUnavailable)
 	}
 }

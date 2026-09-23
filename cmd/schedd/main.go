@@ -416,13 +416,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		}()
 	}
 
-	// Snapshots load only on the Firecracker version that made them (ADR-005);
-	// detect it so the engine restores compatible snapshots and cold boots the
-	// rest.
-	fcVersion, err := deps.detectFC(ctx)
-	if err != nil {
-		log.Warn("could not detect firecracker version; treating all snapshots as stale", "err", err)
-	}
+	fcVersion := resolveFCVersion(ctx, os.Getenv(fcVersionPinEnv), deps.detectFC, log)
 
 	// Issue #95 / ADR-025: dial vmmd through the location-transparent
 	// helper. tcp/dns targets require the vmmd_tls_* cluster; nil TLS on
@@ -562,6 +556,9 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	ops := wire.NewOpsMetrics("schedd")
 	wire.BootStamps(ctx, "schedd", ops)
 	wire.RegisterDefaultOps(ops)
+	// ADR-190 follow-up: export this pool's live statistics so the
+	// DaemonMaxConnections cap above is measurable rather than arithmetic.
+	wire.RegisterPoolMetrics(ops, pool)
 	heartbeatRetentionMetrics := heartbeatretention.NewMetrics(ops.Registry(), ops.MetricPrefix())
 	heartbeatRetention := heartbeatretention.New(store, log, heartbeatRetentionMetrics)
 	go heartbeatRetention.Run(ctx)
@@ -663,6 +660,54 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			log.Error("schedd: runtime config watcher exited", "err", err)
 		}
 	}()
+
+	// ADR-201 §3: egress circuit breaker. Off unless the operator sets
+	// FAAS_EGRESS_CIRCUIT_BREAKER, and additionally inert unless the
+	// ADR-098 probe is running — without probe rows the breaker has no
+	// health signal at all, so enabling one without the other would be a
+	// silent no-op that looks like protection. That combination is a
+	// startup error rather than a warning, per the ADR's rollout section.
+	if os.Getenv("FAAS_EGRESS_CIRCUIT_BREAKER") != "" {
+		if os.Getenv("FAAS_UPSTREAM_PROBE") == "" {
+			log.Error("schedd: FAAS_EGRESS_CIRCUIT_BREAKER is set but FAAS_UPSTREAM_PROBE is not; " +
+				"the breaker has no health signal without the ADR-098 probe")
+			return fmt.Errorf("schedd: FAAS_EGRESS_CIRCUIT_BREAKER requires FAAS_UPSTREAM_PROBE")
+		}
+		applier := sched.NewRoutedEgressCircuitApplier(
+			vmmRouter,
+			sched.NewStoreEgressCircuitNodeLister(store),
+		)
+		// The resolver is the node's own DNS. schedd resolves the upstream
+		// locally so the plaintext host never crosses the vmmd wire — the
+		// RPC carries a resolved address, and every label and log line
+		// carries only host_redacted_hash (ADR-098 §11).
+		resolver := func(ctx context.Context, host string) (string, error) {
+			addrs, err := net.DefaultResolver.LookupHost(ctx, host)
+			if err != nil {
+				return "", err
+			}
+			if len(addrs) == 0 {
+				return "", fmt.Errorf("schedd: egress circuit: no address for upstream")
+			}
+			return addrs[0], nil
+		}
+		egressBreaker := sched.NewEgressCircuitBreaker(applier, resolver, log).WithMetrics(ops)
+		egressLoop := sched.NewEgressCircuitLoop(
+			egressBreaker,
+			sched.NewStoreEgressCircuitCandidateReader(store, 10*time.Minute, time.Now),
+			api.UpstreamAffinityTTL, // one probe cadence
+			0,                       // default: four intervals
+			log,
+		)
+		// One pass before the first tick so a schedd restart re-derives
+		// breaker state from the probe history instead of starting blind
+		// with every circuit closed.
+		if err := egressLoop.Tick(ctx); err != nil {
+			log.Warn("schedd: initial egress circuit reconcile failed", "err", err)
+		}
+		go egressLoop.Run(ctx)
+		log.Info("schedd: egress circuit breaker enabled", "interval", egressLoop.Interval())
+	}
 
 	// Issue #555 PR-6 — per-deployment 100% sampling window.
 	//
@@ -1034,7 +1079,9 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// Gregale-owned networks use the durable network store directly, while the
 	// legacy operator registry remains available for external/provider attachments.
 	var privateNetworkSubscriber *sched.PrivateNetworkAttachmentSubscriber
+	var privateNetworkPolicySubscriber *sched.PrivateNetworkPolicySubscriber
 	var privateNetworkPeeringSubscriber *sched.PrivateNetworkPeeringSubscriber
+	var privateNetworkFabricDeletionSubscriber *sched.PrivateNetworkFabricDeletionSubscriber
 	if api.PrivateNetworkEnabled() {
 		reconcileStore, ok := any(store).(state.AppPrivateNetworkAttachmentReconcileStore)
 		if !ok {
@@ -1076,6 +1123,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 					connector = nil
 				} else {
 					fabricApplier = sched.NewPrivateNetworkFabricApplier(store, fabricRouter, log)
+					teardownRouter, teardownOK := any(vmmRouter).(sched.PrivateNetworkFabricTeardownRouter)
+					if !teardownOK {
+						log.Warn("schedd: Gregale network fabric teardown unavailable; vmmd router lacks teardown capability")
+					} else {
+						teardown := sched.NewPrivateNetworkFabricTeardown(store, teardownRouter, log)
+						privateNetworkFabricDeletionSubscriber = sched.NewPrivateNetworkFabricDeletionSubscriber(teardown, log)
+					}
 				}
 			}
 			if connector == nil {
@@ -1095,6 +1149,13 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 				}
 				reconciler, reconErr := privatenetwork.NewReconciler(reconcileStore, connector, applier, privatenetwork.ReconcilerOptions{
 					Logger: log,
+					RecordObservation: func(ctx context.Context, obs privatenetwork.ReconcileObservation) error {
+						healthStore, ok := any(store).(state.PrivateNetworkAttachmentHealthStore)
+						if !ok {
+							return nil
+						}
+						return privatenetwork.PersistNodeObservations(ctx, healthStore, obs)
+					},
 					Fabric: fabricApplier,
 					Observe: func(obs privatenetwork.ReconcileObservation) {
 						privateNetworkMetrics.Observe(obs)
@@ -1155,6 +1216,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 				// keeps both the operator-managed registry and Gregale's own
 				// network fabric on the same provider-neutral path.
 				privateNetworkSubscriber = sched.NewPrivateNetworkAttachmentSubscriber(applier, log).WithNotificationPool(pool)
+				privateNetworkPolicySubscriber = sched.NewPrivateNetworkPolicySubscriber(reconciler, log)
 				log.Info("schedd: private network reconciler enabled", "configured_networks", configuredCount, "gregale_fabric", api.PrivateNetworkFabricEnabled())
 			}
 		}
@@ -1512,10 +1574,16 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// populated by the persistent capacity stream and projected locally at the
 	// poller's 200 ms cadence; a meterd call before the first stream frame
 	// returns an empty list.
-	scheddgrpc.NewWithStats(engine, reader, ops, log).
-		WithPeerNodeResolver(nodeVerifier).
+	grpcHandler := scheddgrpc.NewWithStats(engine, reader, ops, log).
 		WithOwner(scheddgrpc.OwnerNodeID(ownerNodeID), store).
-		Register(gsrv)
+		WithForeignReportRelay(engine)
+	// An empty NodeName is the single-box, Unix-socket posture. Passing a
+	// typed nil *PGNodeVerifier as the resolver still creates a non-nil
+	// interface and would require mTLS peer identity on that Unix socket.
+	if nodeVerifier != nil {
+		grpcHandler.WithPeerNodeResolver(nodeVerifier)
+	}
+	grpcHandler.Register(gsrv)
 
 	// Serve goroutine — must run AFTER Register or grpc fatals.
 	serveErr := make(chan error, 1)
@@ -1565,10 +1633,17 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// pool.MaxConns=16 (which leaves the async-invoke drain's
 	// BeginTx into starvation under e2e query bursts).
 	appDeleteSub := sched.NewAppDeleteSubscriber(engine, log)
+	// ADR-190: the loop beats this registry on every iteration; the
+	// systemd watchdog (started next to NotifyReadyWhen below) stops
+	// pinging when the beat is older than sched.MainLoopBudget.
+	liveness := wire.NewLiveness()
 	loop := sched.NewLoop(pool, engine, log).
+		WithLiveness(liveness).
 		WithAppDeleteSubscriber(appDeleteSub).
 		WithPrivateNetworkAttachmentSubscriber(privateNetworkSubscriber).
+		WithPrivateNetworkPolicySubscriber(privateNetworkPolicySubscriber).
 		WithPrivateNetworkPeeringSubscriber(privateNetworkPeeringSubscriber).
+		WithPrivateNetworkFabricDeletionSubscriber(privateNetworkFabricDeletionSubscriber).
 		WithTriggerSecretIdentities(hostAgeIdentities).
 		WithJobsDispatched(jobsDispatched).
 		WithFlowCounter(sched.NewNodeAwareFlowCounter(engine.NodeTelemetryCache(), flowcount.NewReader(wire.ExecRunner{}))).
@@ -1577,6 +1652,11 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		// from terminal_at and obsolete PARKED history from parked_at after
 		// cfg.RetentionDuration (default api.DefaultInstanceRetention).
 		WithRetention(sched.NewRetention(store, log).WithRetention(time.Duration(cfg.RetentionDuration))).
+		// Failed Events projection retention shares the hourly retention ticker;
+		// source rows and append-only audit events remain untouched.
+		WithDeadLetterRetention(sched.NewDeadLetterRetention(store, log).
+			WithRetention(time.Duration(cfg.DeadLetterRetentionDuration)).
+			WithOpsMetrics(ops)).
 		// ADR-134 PR-B / EPIC #1278: expire async invocations and route
 		// deadline-breached rows through their configured failure destination.
 		WithInvocationsRetention(sched.NewInvocationsRetention(store, log)).
@@ -1689,6 +1769,22 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		engine.ReconcileDeadNodeInstances,
 		time.Duration(dnrInterval)*time.Second,
 		log))
+	// ADR-191: the divergence sweep's sibling. The dead-node reconciler
+	// above repairs rows on nodes that went silent; this one repairs
+	// rows on nodes that are reporting but did not mention the VM. It
+	// reads the same instance-stats reader the autoscaler consumes, so
+	// a schedd without that reader wired simply never ticks.
+	//
+	// Ships report-only: FAAS_SCHEDD_RECONCILE_ENFORCE must be "1"
+	// before any row is written.
+	divergence := sched.NewInstanceDivergenceReconciler(engine, autoscaleReader, log)
+	loop.WithInstanceDivergence(sched.NewDeadNodeReconciler(
+		divergence.Reconcile,
+		time.Duration(api.InstanceDivergenceIntervalSeconds)*time.Second,
+		log))
+	log.Info("schedd: instance divergence sweep wired",
+		"interval_s", api.InstanceDivergenceIntervalSeconds,
+		"enforce", sched.DivergenceEnforceEnabled())
 	// Issue #171: share a single HTTPPromScraper between the gateway
 	// scrape path for the RPS scale-up trigger and the aggressive-
 	// reaper signal mirror.
@@ -1736,6 +1832,11 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			Interval:                cfg.ScaleUpInterval,
 			QueueStatsReader:        store,
 			QueueBindingStatsReader: store,
+			// ADR-202: the store IS the custom-metric reader — pushes
+			// land in app_custom_metrics via apid, and the trigger reads
+			// them back. Without this a declared `custom` target
+			// validates and never scales.
+			CustomMetricReader: store,
 		},
 	)
 	targetsTrigger.WithOwnerNodeID(ownerNodeID)
@@ -1825,20 +1926,12 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			"window_s", api.ScaleUpWindowSeconds,
 			"aggressive", cfg.ReaperAggressive)
 	}
-	if scraper != nil {
-		// Issue #72 / ADR-124 / ADR-125 PR-A3 commit 4: mirror
-		// invocation_summary rollup + ledger retention sweep.
-		// Runs on the same interval as the scale-up triggers so
-		// a single shared dial governs the schedd's housekeeping
-		// cadence. Errors are logged Warn inside RollupLoop and
-		// retried on the next tick — a persistent failure
-		// surfaces as a flood of WARN logs an operator can alert
-		// on.
-		go mirrorRollup.RollupLoop(ctx, mirrorPoolAdapter{pool: pool}, mirrorRollup.DefaultRollupInterval, log)
-		log.Info("mirror rollup + ledger sweep enabled",
-			"interval", mirrorRollup.DefaultRollupInterval,
-			"retention", mirrorRollup.DefaultLedgerRetention)
-	}
+	// Issue #72 / ADR-221: mirror recovery and retention need only Postgres.
+	// Disabling the optional gateway metrics scrape must not disable them.
+	go mirrorRollup.RollupLoop(ctx, pool, mirrorRollup.DefaultRollupInterval, log)
+	log.Info("mirror rollup + ledger sweep enabled",
+		"interval", mirrorRollup.DefaultRollupInterval,
+		"retention", mirrorRollup.DefaultLedgerRetention)
 	// Cron dispatch path: route synthetic requests through gatewayd-internal's
 	// internal listener so metering + rate limits apply identically
 	// to user traffic (spec §4.4, M7). Multi-box schedd uses the
@@ -2004,20 +2097,20 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// worker only sees rows that remain pending after the wakeup grace period.
 	go func() {
 		err := db.RunNotificationOutbox(ctx, pool, "schedd",
-			[]string{db.NotifyAppWake, db.NotifySnapshotPrime}, loop.HandleDurableNotification, log)
+			[]string{db.NotifyAppWake, db.NotifyRuntimeConfigRestart, db.NotifySnapshotPrime}, loop.HandleDurableNotification, log)
 		if err != nil && !errors.Is(err, context.Canceled) && ctx.Err() == nil {
 			log.Warn("schedd: durable notification replay exited", "err", err)
 		}
 	}()
-	if privateNetworkSubscriber != nil || privateNetworkPeeringSubscriber != nil {
-		// Detach cleanup has its own durable channel because the attachment
-		// row is deleted and peering withdrawal carries the affected region so
-		// it can converge even after the peering row is gone.
+	if privateNetworkSubscriber != nil || privateNetworkPolicySubscriber != nil || privateNetworkPeeringSubscriber != nil || privateNetworkFabricDeletionSubscriber != nil {
+		// Private-network mutations have their own durable channel because an
+		// attachment policy update must converge immediately, while a peering
+		// withdrawal carries the affected region after its row is gone.
 		go func() {
 			err := db.RunNotificationOutbox(ctx, pool, "schedd-private-network",
 				[]string{db.NotifyPrivateNetworkAttachmentChanged, db.NotifyPrivateNetworkChanged}, loop.HandleDurableNotification, log)
 			if err != nil && !errors.Is(err, context.Canceled) && ctx.Err() == nil {
-				log.Warn("schedd: private network detach replay exited", "err", err)
+				log.Warn("schedd: private network mutation replay exited", "err", err)
 			}
 		}()
 	}
@@ -2192,6 +2285,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	}()
 	notifyStop := daemonunit.NotifyReadyWhen(ctx, scheddProbe.ReadyFunc())
 	defer notifyStop()
+	defer wire.StartWatchdog(ctx, liveness, ops, log)()
 
 	select {
 	case <-ctx.Done():
@@ -2597,21 +2691,4 @@ type schedTargetsLedger struct {
 // ledger's Concurrency accessor (pkg/sched/admission.go).
 func (s schedTargetsLedger) Concurrency(appID string) int {
 	return s.ledger.Concurrency(appID)
-}
-
-// mirrorPoolAdapter (issue #72 / ADR-124 / ADR-125 PR-A3 commit 4)
-// bridges *pgxpool.Pool.Exec's pgconn.CommandTag return into the
-// int64-shaped execer interface pkg/mirror expects. Mirrors the
-// canonical cmd/meterd/main.go::poolAdapter shape (the meter
-// rollup uses the same seam). Avoids importing pgxpool into
-// pkg/mirror and keeps the rollup unit-testable without a
-// Postgres dependency.
-type mirrorPoolAdapter struct{ pool *pgxpool.Pool }
-
-func (a mirrorPoolAdapter) Exec(ctx context.Context, sql string, args ...any) (int64, error) {
-	tag, err := a.pool.Exec(ctx, sql, args...)
-	if err != nil {
-		return 0, err
-	}
-	return tag.RowsAffected(), nil
 }

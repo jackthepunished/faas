@@ -6,6 +6,37 @@ separate files here. This directory holds ADRs made *after* the spec.
 
 Any deviation from the spec requires a new ADR here first (spec §3, CLAUDE.md).
 
+## Picking a number
+
+ADR numbers are hand-picked, so two concurrent PRs routinely claim the same one
+and whichever merges second keeps it. The renumber trail through the table
+below ("renumbered 066→067→068→069", "through 6 hops") is what that costs.
+
+`make adr-number-uniqueness-check` (also part of `make lint` and CI) fails on
+any **newly** duplicated number. The 71 numbers already duplicated on `main` are
+frozen in [`DUPLICATE_NUMBERS_BASELINE.txt`](DUPLICATE_NUMBERS_BASELINE.txt);
+the gate holds that set and stops it growing. Never add a line to that file.
+
+Before claiming a number, check both the directory **and** open PRs — a PR can
+claim a number between your check and your merge:
+
+```bash
+ls docs/adr/
+gh pr list --state open --limit 80 --json title \
+  --jq '.[] | select(.title|test("ADR-")) | .title'
+```
+
+Re-check after any rebase. If you do have to renumber, scope the rename to the
+references *your branch* introduced: shared files (`api/openapi.yaml`,
+`pkg/api/dto.go`, `pkg/api/limits.go`) document many ADRs at once, so a blanket
+`sed` silently rewrites other people's.
+
+Retro-fixing the existing duplicates is deliberately out of scope for the gate.
+The number is embedded in `// adr: NNN` citation lines that
+`scripts/ci/check_spec_cited_tests.sh` reads, plus metric help strings and
+runbooks — ADR-190 alone had 67 references. Renumber one ADR per PR, and delete
+its baseline line in the same change (the gate fails on a stale entry).
+
 ## Format
 
 ```
@@ -23,6 +54,24 @@ Any deviation from the spec requires a new ADR here first (spec §3, CLAUDE.md).
 
 | ADR | Title | Status | Source |
 |---|---|---|---|
+| 221 | [Replay-safe mirror rollups](221-replay-safe-mirror-rollups.md) | proposed | Atomic contribution receipts, UTC hourly buckets, retention safety, and coordinated legacy-writer cutover |
+| 220 | [Provider-scoped credit receipts](220-provider-scoped-credit-receipts.md) | proposed | Match invoice identity, isolate credit replay and compensation, fail closed on unresolved legacy provider evidence |
+| 219 | [Preview-scoped internal service resolution](219-preview-scoped-internal-service-resolution.md) | accepted | Same-account/project/PR workload lookup before the policy-controlled production fallback |
+| 218 | [Curated global organization activity timeline](218-global-organization-activity-timeline.md) | accepted | Organization-scoped safe activity projection, stable keyset API, and explicit producer mappings |
+| 217 | [Application inbox and outbox facades](217-application-inbox-outbox.md) | accepted | Explicit app-to-app queue delivery and custom signed webhook delivery over the existing invocation and webhook ledgers |
+| 214 | [Distributed declarative response caching](214-distributed-declarative-response-cache.md) | accepted | Optional Redis L2, stale-while-revalidate, and shared invalidation for route-level response caching |
+| 213 | [Durable unified customer log events](213-durable-unified-log-events.md) | accepted foundation | Append-only tenant log ledger, stable cross-source cursor, redacted projections, and staged producer adapters |
+| 211 | [Effective project-environment state and safe diffs](211-effective-environment-state.md) | accepted | Canonical environment snapshot; unified release/config/variable/secret/binding diff; app-global resources explicit |
+| 210 | [Runtime secret delivery and status](210-runtime-secret-delivery.md) | accepted | Snapshot-safe restart and version-fenced delivery outcomes for app secrets |
+| 208 | [Acknowledged routing handoff for zero-downtime service rollouts](208-zero-downtime-service-rollout-handoff.md) | accepted | Two-phase route publication, serving-gateway acknowledgements, and post-ack per-instance request draining before predecessor retirement |
+| 212 | [Durable inbound webhook ingress](212-durable-inbound-webhook-ingress.md) | accepted | Provider-signed Stripe callbacks persist a deduplicated invocation before `202`, then reuse the scheduler wake, retry, and DLQ path |
+| 207 | [Bounded builder cache affinity](207-bounded-builder-cache-affinity.md) | accepted | Prefer the latest successful builder briefly so production rebuilds reuse node-local caches without sacrificing availability |
+| 216 | [Application companions without exposing an orchestration API](216-application-companions.md) | accepted | Preferred companion API, managed presets, task-local shared memory, and rollout-safe primary ingress |
+| 200 | [First-wake 5xx auto-rollback on every plan](200-auto-rollback-on-every-plan.md) | accepted | Health-driven rollback for the first wake of a new deployment, on every plan |
+| 201 | [Traffic resilience as a platform primitive](201-traffic-as-a-platform-primitive.md) | accepted | `kind=retry` + `kind=circuit_breaker` over instance health, and an nftables egress breaker driven by ADR-098 probe outcomes |
+| 215 | [Durable async routes](215-durable-async-routes.md) | accepted | `kind=async` turns a matched public request into the existing durable invocation lifecycle and returns `202` without waking the app |
+| 193 | [Transactional per-node RAM reservation](193-transactional-node-reservation.md) | accepted | Invariant §6.2-2 enforced at the instances INSERT; ADR-062 retired NodeLedger's single-process premise |
+| 192 | [Wake hot path: single pre-boot staging session and full attribution](192-wake-hot-path-staging-and-attribution.md) | accepted | One loop-mount per wake for drive1 files; Manager.Wake phases and `stage_pre_boot_files_ms` on `wake.restore_breakdown` |
 | 190 | [Production BuildKit dependency cache](190-production-buildkit-cache.md) | accepted | Reuse app-scoped Railpack and Dockerfile records across production source edits |
 | 186 | [Reusable private-network firewall policy](186-private-network-firewall-policy.md) | accepted | Network-level CIDR baseline layered over provider-neutral private-network reconciliation |
 | 187 | [Protocol-aware private-network firewall rules](187-private-network-firewall-rules.md) | accepted | Provider-neutral TCP/UDP/ICMP allow rules with fail-closed private-network enforcement |
@@ -93,7 +142,7 @@ Any deviation from the spec requires a new ADR here first (spec §3, CLAUDE.md).
 | 051 | Characterization boot: observed workload classification + in-guest port normalization | accepted | ADR-050 Phase 4 |
 | 052 | Adding a function runtime: 7-layer additive procedure | accepted | Tier 1 PR 1+2 worked example |
 | 053 | Deploy-time overrides for OCI image deploys (entrypoint/cmd/env/port/healthcheck) | accepted | issue #460 (PR A ships contract; PR B imaged layer injection; PR C port plumbing) |
-| 059 | Customer-configurable scaling policy (4-PR: persistence + inflight signal + engine cooldown + worker carve-out) | proposed | issue #462 / PR #493 / #501 / #507 / #512 |
+| 059 | Customer-configurable scaling policy (persistence, inflight signal, cooldown, worker carve-out, and bounded warm-saturation queue) | proposed; amended 2026-09-22 | issue #462 / PR #493 / #501 / #507 / #512; warm-queue amendment |
 | 060 | Per-app GB-h floor for `min_instances > 0` (meterd synthetic rows + UUID v5 lineage) | proposed | issue #515 (follow-up to #462) |
 | 061 | Organizations, memberships, and unpriced seats (IAM-6: account→org split, path-scoped APIs, automatic personal org) | proposed | issue #190 (PR 1 / PR 2+ staged rollout) |
 | 062 | Tier A per-node schedd + schedd-side async placement claim | proposed | Phase 2 / Gate A |
@@ -123,7 +172,7 @@ Any deviation from the spec requires a new ADR here first (spec §3, CLAUDE.md).
 | 098 | Wake single-flight coordinator on `sched.Engine` — `pkg/sched/wake_coord.go` (NEW) mirrors `pkg/gateway/gate.go` state machine (`done`/`waiters`/`completed`) but lives on the engine; leaf-lock rule `wakeCoord.mu` acquired+released **before** `e.lockApp(appID)`; new additive `schedd.EnsureWake` gRPC method (`api/proto/onebox/faas/schedd/v1/schedd.proto`, mirror WakeResponse tag layout 1–7); all five wake producers (gateway, cron `loop.go:1969`, floor `floor/trigger.go`, scaleup `scaleup/trigger.go`, targets `targets/trigger.go`) route through `Engine.EnsureWake`; `pkg/gateway/WakeGate` retains its role as in-process pre-filter (a cache in front of the authority); one `defer` closure at leader entry + `sync.Once` `finish()` covers all five completion sites (`engine.go:1435, 1818, 1823, 1830-1831, ~1892`); new `pkg/db.NotifyAppDelete` pg-notify channel + `pkg/sched/app_delete_subscriber.go` (modeled on `pkg/sched/deletion_subscriber.go`) calls `Engine.wakeCoord.Forget(appID)`; detached-ctx contract on leader's `ensure` (`context.Background()` + `WakeQueueTTLSeconds=30` at `pkg/api/limits.go:1567`); 4 invariants preserved (cold boot truth §4.6, wake never depends on snapshot ADR-005, identical inner net ADR-009, admission ceiling §6.2-2); migration 00221 adds `instances.request_count BIGINT NOT NULL DEFAULT 0` for the warm-snapshot 5th promotion gate (gate #5 at `engine.go:3876`, between MinMs `:3870-3875` and `warmKeysFor` `:3880`) | accepted | PR #854 (slot 095 collision with PR-preview #851 / issue #272 → renumbered 095 → 098 post-merge; supersedes nothing; closes the §6.2-1 single-flight correctness gap that ADR-070 introduced for the gatewayd-public/gatewayd-internal split; complements ADR-074's warm-snapshot ops close-out by adding the missing per-app request-count gate) |
 | 100 | Tenant surfaces: multi-tenant hostname routing under one Gregale-managed cert (issue #879) — `tenant_surfaces` + `tenant_hostnames` tables; one surface binds to one app (D1) and groups N verified hostnames under one cert; `cert_kind` ∈ {'per_host_san' (v1 default), 'per_host' (fallback), 'shared_wildcard' (deferred follow-up ADR)}; `CertIssuer.RequestCertForSurface` re-mints on every surface mutation (D3); routing branch in `pgRouter.ResolveHost` ordered `slugFor` → `SurfaceByHostname` → `DomainByName` (D4); quota in `pkg/api/limits.go` only — `TenantSurfacesPerAccount` (Free 0 / Hobby 1 / Pro 5 / Scale 25), `TenantHostnamesPerSurface` (10/50/250/1000), `TenantSurfacesAllowed` bool (D5); reverses ADR-028 line 182-184 "Multi-tenant gatewayd routing policies" deferral for the SaaS surface model; PR-cluster outlined in `docs/adr/100-pr-cluster-outline.md` (PR-0 docs+fence+limits+CLI typo / PR-A schema+state+cert engine / PR-B surface parser+routing / PR-C HTTP API+CLI+E2E); feature-flagged `FAAS_TENANT_SURFACES_ENABLED` (default OFF through v1.10) | proposed | issue #879 (slot 100 free per precheck after ADR-099 was claimed by the jobs ADR; PR-0 fence at `migrations/00238_reserve_slot.sql`, PR-A target at `migrations/00243_tenant_surfaces.sql`; supersedes nothing; closes the SaaS-segment gap that the Cloudflare / Vercel / Netlify benchmarks treat as a primitive) |
 | 101 | Imaged-layer secret scan: post-build OCI secrets gate (PR-A of the secret-scan cluster, follow-up to PR #873 / secret-scan v2) — `pkg/imaged/secretscan.go` + `pkg/imaged/handler.go::runDeployLayerSecretScan` + `WithSecretScanRun` setter mirrors `WithGrypeRun`; loud-fail posture (D1) mirrors `errStatefulViolation` (G13 closure) — `errImageSecretDetected` sentinel + `markDeployFailed` + error_code free-text `'image_secret_detected'` on the unconstrained `deployments.error_code` column (D7); placement post-`SetDeploymentRootfs` pre-`pending→snapshotting` (D2) reuses `stageScanExt4`; reuses v2 columns (D3) — `secret_findings jsonb` + `secret_scanned_at timestamptz` already on the row from migration 00264; sidecar coverage scans each sidecar ext4 (D4) with `layer="sidecar-<slug>"` label; functions NOT scanned (D5) — already scanned at apid source-tree time; v2 apid-side audit-row gap NOT closed (D6) — structural (422 fires BEFORE CreateDeployment) and deferred to a follow-up with a new schema; new wire surfaces — `GET /v1/deployments/{id}/secret-scan` (drill-down, 404 on IDOR + scan-pending), `DeploymentResponse.SecretScan *SecretScanResult`, `SecretFinding.Layer`, `SecretScanResult.ImageDigest`, `CodeImageSecretDetected`, `pkg/api.GetDeploymentSecretScan` SDK method, `gregale deployment <id> --show-secret-scan` flag (D8 mirrors `--show-scan`); ZERO migration (free-text error_code + v2 columns); zero-caller `UpsertDeploymentSecretFindings` seam becomes the load-bearing audit-row writer for the imaged side | proposed | issue #873 follow-up (the v2 next-direction handoff); no new migration; supersedes nothing; closes the build-step adversary pivot that v2 source-tree scanning couldn't reach |
-| 104 | Per-consumer throttle keying (issue #881 Phase 3) — per-rule opt-in `key_by ∈ {"none","api_key","consumer_id","jwt_subject","jwt_claim"}` extends `EdgeRuleThrottleAction` (ADR-091 D20.5 amendment 4) with `KeyBy`/`JWTClaimName`/`MaxKeysPerRule`; bounded per-rule consumer set (`max_keys_per_rule` Free 100 / Hobby 1000 / Pro 5000 / Scale 10000) with non-evicting `__other__` collapse when the cap is exceeded; new `Authenticated` context carrier + `routeConsumerLimiter` LRU (cap `EdgeRuleConsumerCacheCap=100_000`) + `Limiter.AllowWithConsumerKey`; PR-cluster outline in `/Users/poyrazk/.claude/plans/serialized-greeting-fairy.md` (mega-PR PR-0 ADR+fence / PR-1 apid+state / PR-2 gateway+hot-path+metrics / PR-3 CLI+e2e+docs); slot fence dropped during rebase-merge onto origin/main (PR #909 rebase onto main #936) — origin/main's 00266+00267 fences for the issue #911 manifest cluster take precedence per ADR-041 cross-PR fence pattern; Phase 3's real DDL is purely additive on the jsonb `EdgeRuleAction` column (no CHECK constraint widening needed); supersedes nothing; closes the per-consumer follow-up to ADR-091 D20.5 (issue #881 Phase 3) — orthogonal to ADR-040's wake-path policy which is preserved verbatim | accepted | issue #881 Phase 3 (slot 104 free per precheck after ADR-100 (tenant-surfaces) and ADR-099 (jobs) claimed 099/100; supersedes nothing; closes the per-API-key / per-JWT-claim follow-up that ADR-091 D20.5 amendment 3 explicitly deferred to "Phase 3 — needs the ADR-040 policy question settled") |
+| 104 | Dimensional throttle keying (issue #881 Phase 3 + amendment 6) — per-rule opt-in `key_by ∈ {"none","api_key","consumer_id","jwt_subject","jwt_claim","country"}` extends `EdgeRuleThrottleAction` with bounded request-concept buckets; `missing_key_policy ∈ {"shared","reject"}` prevents credential omission bypass; verified scalar JWT claims are available independently of `required_claims`; central mode maps dimensions into bounded deterministic UUID shards without storing raw claims or widening `pg_ratelimit_counters`; local mode retains the non-evicting `__other__` collapse; no DDL because the action is jsonb and central subjects remain UUIDs | accepted | issue #881 Phase 3; amendment 6 (2026-09-22) enables country, arbitrary scalar JWT claims, strict missing identities, and cross-replica dimensional enforcement |
 | 110 | Declarative split-box deployment manifest (issue #911) — versioned YAML at `deploy/manifest/splitbox.yaml` + typed schema at `pkg/manifest/`; SemVer schema_version (1.0.0); canonical validation path consumed by the validator (`gregalectl manifest validate`), the renderer (PR-2), the release bundle installer (PR-3), the doctor (PR-4), and the metal harness (PR-6); TOML table-placement catalog at `pkg/manifest/toml_check.go` is the source of truth for which key belongs to which table (closes the duplicated `tls_*_path` inside `[compute_node]` bug at `deploy/ansible/roles/vmmd_service/files/vmmd.toml.example` lines 33-40 — the canonical top-level `tls_cert_path` / `tls_key_path` / `tls_ca_path` cluster); PR-0 reserves migration slots 00266 + 00267 (no-op bodies) for PR-3a; `cgroups.controllers` must include `memory` (issue #911 load-bearing invariant); `deploy/controlplane/bootstrap.sh` retired in PR-1 (Phase 1 tombstone 2026-08-15; Phase 2 deletion after PR-X `gregalectl secrets init` lands); PR-cluster outlined in plan file `/Users/poyrazk/.claude/plans/crispy-hopping-sphinx.md` (PR-0/3a/5/4/2/1/3/X/6); scale-out tier-1 residual (PR #937) extended the catalog with `compute_node.{host_bridge_cidr, overlay_cidr, overlay_interface}` (Gaps #3 + #5) and added the `egress.danger_accept_rfc1918_lateral_movement` + `egress.overlay_exceptions` manifest-level knob (Gap #4) | accepted (revised 2026-08-16) | issue #911 (PR-0 fence at `migrations/00266_reserve_slot.sql` + `migrations/00267_reserve_slot.sql`; PR-3a target at `00266_compute_nodes_release.sql` + `00267_release_bundles.sql`; supersedes nothing; closes the GCP split-box drift that the 10-hour live debugging session exposed) |
 | 111 | Gregale Compute Image (issue #911 post-cutover) — versioned, immutable, per-cloud Packer-built host image named `gregale-compute-{role}-{fc_release}-{kernel_version}-{git_sha}` (`{role}` ∈ `control-plane\|compute-only` per ADR-092); content-addressed by tag; first-boot user-data runs the cutover runbook's 6-step init chain (`gregalectl {pki,host-age,sign-keys,node-key,backup} init` + `release install --git-sha $MANIFEST_GIT_SHA`) idempotently; rollout (`make upgrade-node IMAGE_TAG=…`) is gated per-daemon by the existing `Lifecycle.Probe`/`ProbeTarget` health gate consumed by `gregalectl doctor --deep` (PR #921 / ADR-110 PR-4); `make bootstrap*` stays as the installer path for dev boxes, CI, and the image-seed build; image content is immutable from the operator's perspective (no sealed.env / host.age / TLS leaves / cosign keys baked); PR-cluster outlined in plan file `/Users/poyrazk/.claude/plans/crispy-hopping-sphinx.md` (PR-0 #927 ADR + PR-1 #928 Packer scaffolding + PR-2 #929 hcloud/amazon-ebs builders + PR-3 #930 first-boot user-data + PR-4 #931 upgrade-node rolling + health-gate) | proposed | issue #911 post-cutover (closes 3 of 10 tier-1 ship-blockers from the M8 launch-readiness audit; zero migration; zero new schema; supersedes nothing; closes the `apt install firecracker` + `make bzImage` drift class that Mega-PR-C closed 10 instances of) |
 
@@ -202,6 +251,16 @@ note instead of the banner.
 ## Fleet security decisions
 
 - [ADR-178: dedicated fleet sealed-secret domain](178-fleet-sealed-secret-domain.md)
+
+## Daemon durability decisions
+
+- [ADR-190: daemon durability primitives](190-daemon-durability-primitives.md) — default gRPC deadlines, liveness-gated systemd watchdog, last-known-good route tier, one LISTEN connection per daemon
+- [ADR-191: scheduler divergence reconciliation and bounded loop dispatch](191-scheduler-divergence-and-bounded-dispatch.md) — repair rows the owning vmmd is not reporting (report-only first), and move every long-running notification handler onto one bounded pool
+
+Note: two ADRs carry the number 190 (`190-production-buildkit-cache.md` merged
+first; `190-daemon-durability-primitives.md` picked the same number
+concurrently). The log above already contains several such pairs (157, 158, 167,
+168). A renumber plus a CI uniqueness gate is worth its own PR.
 
 ## Snapshot restore optimization decisions
 

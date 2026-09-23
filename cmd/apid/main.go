@@ -695,6 +695,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 		go srv.runObjectStorageAccounting(ctx)
 		go srv.runManagedPostgresReconciler(ctx)
 		go srv.runManagedPostgresBindingReconciler(ctx)
+		go srv.runProjectEnvironmentCleanupReconciler(ctx)
 		go srv.runManagedPostgresUsageCollector(ctx)
 		go srv.runManagedRealtimeEndpointReconciler(ctx)
 		go srv.runManagedRealtimeOwnerReaper(ctx)
@@ -915,6 +916,13 @@ func run(ctx context.Context, log *slog.Logger) error {
 			go func() {
 				if err := runAuditOutbox(ctx, srv.store, log, srv.eventsPlatform); err != nil && ctx.Err() == nil {
 					log.Error("audit: durable outbox exited", "err", err)
+				}
+			}()
+		}
+		if _, ok := srv.store.(state.OrgActivityOutboxStore); ok {
+			go func() {
+				if err := runOrgActivityOutbox(ctx, srv.store, log); err != nil && ctx.Err() == nil {
+					log.Error("activity: durable outbox exited", "err", err)
 				}
 			}()
 		}
@@ -1368,6 +1376,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	}
 	srv := newServerWithDeps(store, log, cfg.GetAppsDomain(deps.getenv), deps.notif(), stripeSecret, mailer, githubd, sessions, nil, deps.loginTTL, dpaPathFromEnv(deps.getenv)).
 		WithCLIAuthURLBase(cfg.GetCLIAuthURLBase(deps.getenv)).
+		WithCompanionImages(cfg.CompanionImages).
 		WithWorkflowRuntimeEnabled(workflowsEnabledFromEnv(deps.getenv)).
 		WithExecutionAPIEnabled(executionAPIEnabledFromEnv(deps.getenv)).
 		WithGitHubDeploysAvailable(githubDeploysAvailabilityProbe(deps.getenv))
@@ -1506,6 +1515,9 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// unset (the daemon stays up; only the listener is skipped below).
 	wire.BootStamps(ctx, "apid", ops)
 	wire.RegisterDefaultOps(ops)
+	// ADR-190 follow-up: export this pool's live statistics so the
+	// DaemonMaxConnections cap above is measurable rather than arithmetic.
+	wire.RegisterPoolMetrics(ops, deps.pool)
 	// Issue #1182 §P1 PR-1: wire the 5 apid_upload_session_*
 	// counters from (*OpsMetrics) into the package-level state the
 	// upload handlers read via uploadSessionCreatedTotal() etc.
@@ -2144,7 +2156,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 			return fmt.Errorf("apid: app errors TLS: %w", tlsErr)
 		}
 		appErrRotator.Set(appErrTLS)
-		appErrSrv, appErrLis, err = runAppErrorsServer(ctx, appErrTarget, appErrTLS, srv.store, srv.ops, log)
+		appErrSrv, appErrLis, err = runAppErrorsServer(ctx, appErrTarget, appErrTLS, srv.store, srv.ops, sharedLimiter, log)
 		if err != nil {
 			_ = l.Close()
 			return fmt.Errorf("apid: app errors server: %w", err)
@@ -2255,6 +2267,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// fully constructed.
 	notifyStop := daemonunit.NotifyReadyWhen(ctx, apidProbe.ReadyFunc())
 	defer notifyStop()
+	defer wire.StartWatchdog(ctx, wire.NewLiveness(), ops, log)()
 	errc := make(chan error, 1)
 	go func() {
 		log.Info("apid listening", "addr", listenBind)
@@ -2710,7 +2723,7 @@ func isUnixSocketPath(target string) bool {
 // Returns the server (caller calls Serve) and the listener. Errors
 // here are non-fatal: the caller logs and continues without the
 // app_errors gRPC server (the apid HTTP listener still serves).
-func runAppErrorsServer(ctx context.Context, target string, tlsCfg *tls.Config, store state.Store, ops *wire.OpsMetrics, log *slog.Logger) (*grpc.Server, net.Listener, error) {
+func runAppErrorsServer(ctx context.Context, target string, tlsCfg *tls.Config, store state.Store, ops *wire.OpsMetrics, limiter *peraccount.Limiter, log *slog.Logger) (*grpc.Server, net.Listener, error) {
 	if !isUnixSocketPath(target) && tlsCfg == nil {
 		return nil, nil, fmt.Errorf("app errors: target %q is non-unix but app_errors_tls_* is empty (mTLS is required)", target)
 	}
@@ -2735,7 +2748,13 @@ func runAppErrorsServer(ctx context.Context, target string, tlsCfg *tls.Config, 
 	// request_telemetry.sock server below, preserving the separate DAC
 	// boundaries for the legacy Unix sockets.
 	if !isUnixSocketPath(target) && os.Getenv("FAAS_REQUEST_TELEMETRY_ENABLED") != "false" {
-		registerRequestTelemetryReceiver(srv, store, ops, nil, true)
+		registerRequestTelemetryReceiver(srv, store, ops, limiter, true)
+	}
+	// gatewayd-internal's platform-owned spans use the same private mTLS
+	// listener in split-box deployments. The dedicated Unix socket remains the
+	// single-box path and is registered by runSpansWriterServer.
+	if !isUnixSocketPath(target) && os.Getenv("FAAS_OTEL_SPANS_WRITER_ENABLED") != "false" {
+		registerSpansWriterReceiver(srv, store, ops, limiter, true)
 	}
 	return srv, lis, nil
 }

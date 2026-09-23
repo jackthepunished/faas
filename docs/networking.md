@@ -28,6 +28,13 @@ compute node; each replay replaces the complete effective CIDR set, so stale
 peering destinations are withdrawn. A network referenced by a peering cannot
 be deleted until that peering is removed.
 
+`GET /v1/networks/{id}/members` provides the account-scoped member inventory:
+each stable address reservation includes its owner type, opaque owner ID, and
+address. The response also reports allocatable capacity, used addresses, and
+remaining addresses; network, gateway, and broadcast addresses are excluded
+from capacity. This is an inventory read only and does not probe workloads or
+call DigitalOcean.
+
 The fabric slice persists the network definition and reserves stable member
 addresses (network+1 is reserved as the gateway; allocation starts at
 network+2). When the fabric flag is enabled, schedd first asks every vmmd
@@ -56,7 +63,7 @@ means Gregale has observed a successful RTT within the last 15 minutes; it is
 not a new connectivity test.
 
 Same-account apps can call one another as
-`http://APP_ID.svc.gregale:10080`. For external VPC resources, Pro and Scale
+`http://APP_SLUG.svc.gregale:10080`. For external VPC resources, Pro and Scale
 customers can record a provider-neutral attachment intent with `network attach`.
 The API accepts non-overlapping RFC1918 IPv4 ranges (up to 16 on Pro and 64 on
 Scale), returns `pending`, and keeps traffic blocked until a provider connector
@@ -98,8 +105,9 @@ and TCP/UDP rules carry ports such as `443` or `8000-8080`. Rule CIDRs are
 sources for ingress and destinations for egress; an omitted list means the
 whole network CIDR. An attachment policy may only narrow the CIDR baseline,
 never broaden it. Updating the network policy is asynchronous: schedd
-replays the effective policy to every live node, and nftables keeps traffic
-blocked until each update succeeds. Empty rule lists preserve the legacy
+replays the effective policy to every live node immediately after the durable
+mutation wakeup, with the periodic sweep as a recovery backstop, and nftables
+keeps traffic blocked until each update succeeds. Empty rule lists preserve the legacy
 CIDR-only behavior; the PUT body replaces both lists, so include a list when
 you intend to retain an existing restriction.
 
@@ -108,6 +116,12 @@ per-node convergence observation in its reconciliation logs. A partial node
 failure keeps the attachment in `error` and is retried by the next sweep;
 successful nodes are still reported so operators can identify the unhealthy
 box without guessing from aggregate status.
+
+The attachment read endpoint also exposes the last durable per-node result in
+`attachment.nodes`. Each row separates `fabric_status` from `route_status`,
+includes bounded failure detail, and carries `observed_at`. A node can have a
+ready bridge while route policy is still failing; this projection is the
+operator view of that partial convergence and is replaced on the next replay.
 
 For multi-node Gregale networks, vmmd can add a provider-neutral VXLAN link
 over an operator-managed encrypted overlay (Tailscale, WireGuard, or another
@@ -145,6 +159,136 @@ keeps cloud credentials out of the control plane while the provider adapter is
 rolled out; a future connector can replace the registry without changing the
 customer-facing attachment contract.
 
+## Internal services
+
+Apps in the same account reach one another by name, on every plan. There is no
+VPC, subnet, security group, internal load balancer, service registry, or DNS
+record to configure:
+
+```text
+public-api  ──►  auth
+            ├─►  billing
+            └─►  recommendation
+```
+
+Each dependency is an ordinary app. From `public-api`, call them as:
+
+```text
+http://auth.svc.gregale:10080
+http://billing.svc.gregale:10080
+http://recommendation.svc.gregale:10080
+```
+
+The name is the project workload name (or the app slug for a standalone app).
+Declare the edges with `depends_on` and Gregale injects the URLs for you, so
+nothing hard-codes a hostname:
+
+```yaml
+services:
+  public-api:
+    depends_on: [auth, billing, recommendation]
+    x-gregale-service-policy: declared
+```
+
+`public-api` then starts with `GREGALE_SERVICE_AUTH_URL`,
+`GREGALE_SERVICE_BILLING_URL`, and `GREGALE_SERVICE_RECOMMENDATION_URL` in its
+environment. The dependency graph is validated before anything deploys —
+unknown names, self-edges, and ambiguous names are rejected.
+
+The same declared edges are exposed as service bindings by the app API and by
+`gregale bindings public-api`, alongside database, object-storage, and queue
+bindings. The default `account` policy keeps the backwards-compatible behavior:
+omitting an edge does not deny same-account traffic. Opt into the `declared`
+policy with `x-gregale-service-policy: declared`; the gateway then returns 403
+for calls to services that are not listed in `depends_on`. The CLI reports
+those service bindings as `enforced`.
+
+Calls are authorized by the platform, not by your code. The caller is
+identified from the network identity of the calling VM, so a guest cannot
+claim to be another app, and the proxy only permits calls between apps in the
+same account. Cross-account calls are refused.
+
+### Preview-to-production service policy
+
+A pull-request preview first resolves a service to a preview workload in the
+same account, project, and PR. It never selects a preview from another PR,
+project, or account. The target preview's protocol and WebSocket settings are
+used exactly as they are on the public edge.
+
+Preview provisioning currently creates **one app**, derived from the app the
+PR touches, rather than cloning the whole project. A same-PR dependency may
+therefore be absent. In that case the gateway considers the production app
+and applies the project's production-dependency policy.
+
+New projects default to `preview_service_policy: deny`. A denied call returns
+`403 application/problem+json` with code
+`preview_production_dependency_denied` before the proxy discovers or wakes the
+target. Projects that existed when this policy shipped were migration-backed
+to `allow_marked`, preserving their live behaviour. Opt an existing project
+into isolation with:
+
+```bash
+gregale github setup public-api --preview-service-policy deny
+```
+
+Set `allow_marked` only when the production dependency is designed to receive
+preview traffic. A preview of `public-api` calling `billing` then reaches
+production `billing`, and any side effects are real.
+
+In `allow_marked` mode, a production service can independently refuse preview
+calls with `x-gregale-preview-calls: deny` on its Compose service:
+
+```yaml
+services:
+  billing:
+    build: ./billing
+    x-gregale-preview-calls: deny
+```
+
+The gateway checks the target's policy before waking or forwarding it and
+returns 403 to a preview caller. The target policy defaults to `allow`, so it
+preserves existing behavior; the project-level `preview_service_policy` can
+still deny all preview-to-production calls. The app API and scan plan show the
+effective `preview_service_calls_policy`, and target-policy rejections count
+under `gateway_service_call_total{outcome="preview_denied"}`.
+
+Every forwarded request from a preview app carries these markers, whether the
+selected target is another preview or an allowed production dependency:
+
+```text
+X-Faas-Caller-Env: preview
+X-Faas-Caller-Preview-Of: public-api
+```
+
+Both headers are platform-owned: anything a workload sends under those names is
+stripped before the hop, so the marker cannot be forged. Production callers
+carry neither header, so a service that ignores them is unaffected.
+
+Use them to skip irreversible work, tag writes as test data, or refuse the call
+outright. Operators can compare isolated traffic in
+`gateway_service_preview_to_preview_total` with allowed production fallbacks
+in `gateway_service_preview_to_production_total`; policy rejections use
+`gateway_service_call_total{outcome="preview_denied"}`.
+
+### Verifying the caller (preview)
+
+By default a service learns who called it from platform-set headers. Operators
+who need the target to verify that claim itself can enable signed caller
+assertions with `FAAS_SERVICE_CALLER_ASSERTIONS=1` on each node.
+
+Every internal call then carries `X-Faas-Caller-Assertion`: a short-lived
+(30 s) EdDSA JWT stating `sub` = calling app id, `aud` = receiving app id,
+plus the account and calling instance. The audience binding is what stops a
+service replaying an assertion it received against a sibling service.
+
+The header is platform-owned and stripped from anything a workload sends, so it
+cannot be forged. It is additive: nothing rejects a call for lacking one, and a
+signing failure forwards the call unsigned rather than dropping it.
+
+Guest-reachable key publication and a runtime verification helper are not
+shipped yet, so this is currently useful for operators wiring their own
+verification. Leave the flag off otherwise.
+
 ## Internal-only ingress
 
 Pro and Scale apps can be hidden from the public edge while remaining reachable
@@ -158,6 +302,33 @@ gregale app APP_ID --visibility public
 
 Internal apps do not receive a public platform-subdomain or verified custom
 domain route. Service discovery continues to resolve them through
-`APP_ID.svc.gregale:10080`, where the service proxy enforces caller identity
+`APP_SLUG.svc.gregale:10080`, where the service proxy enforces caller identity
 and same-account authorization. Visibility changes are audited and invalidate
 the gateway route cache.
+
+Internal services scale to zero like any other app. A service call to a parked
+target is held at the node-local proxy while the snapshot is restored, then
+forwarded — the same wake-blocking contract the public edge offers (ADR-196).
+The restore is coalesced with any concurrent public request for that app, so a
+burst of internal callers costs one restore rather than one per caller. Set
+client timeouts above the platform wake budget plus your own handler time, and
+note that a fully cold chain (`public-api` → `auth` → `billing`) pays each
+restore in sequence. `min_instances` remains available to trade resident RAM
+for first-call latency, but it is no longer required for an internal
+dependency to be reachable.
+
+When a wake cannot produce a replica, the proxy answers `503`. A saturated
+wake queue carries `Retry-After`; a target at its plan concurrency ceiling
+reports `service has no healthy replicas`. Internal wakes appear in the wake
+timeline with trigger `service.mesh`, distinct from public `gateway` traffic.
+
+Internal calls honour the target's wire protocol (ADR-197). An app configured
+`app_protocol: grpc` or `http2` is reached over the H2C guest bridge, and the
+node-local listener accepts H2C prior knowledge, so a workload can use an
+ordinary gRPC client against `http://APP_SLUG.svc.gregale:10080`. Response
+trailers — including `grpc-status` — are preserved across the hop.
+`Connection: Upgrade` requests (WebSocket and friends) take the verbatim-bytes
+bridge and are neither buffered nor retried; they require the target app to
+have WebSockets enabled and return `501` otherwise. Non-HTTP raw TCP between
+services is not part of the discovery contract: address those listeners
+through named ports instead.

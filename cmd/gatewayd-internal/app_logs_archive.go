@@ -74,6 +74,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/apislogs"
 	mwauth "github.com/onebox-faas/faas/pkg/auth/middleware"
 	"github.com/onebox-faas/faas/pkg/logarchive"
+	"github.com/onebox-faas/faas/pkg/scheddgrpc"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
@@ -175,7 +176,7 @@ func (h *ArchiveLogsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// cmd/gatewayd-internal/run.go (PR-B-3). Bailout returns
 		// to the mux, which routes the request to the live
 		// sibling.
-		http.Error(w, "archive handler requires ?archive=1 (live stream is a separate handler)", http.StatusInternalServerError)
+		api.WriteProblem(w, api.ErrAppLogsUnavailable())
 		return
 	}
 	slug := r.URL.Query().Get("slug")
@@ -199,11 +200,8 @@ func (h *ArchiveLogsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // query-param validation, then the S3 fetch + SSE pump.
 //
 // The S3 client nil-check surfaces as 503 + a stable code
-// (`log_archive_unconfigured`) so a Free-tier customer who has
-// somehow pre-provisioned the unsealed envelope but not the
-// bucket sees a clear "ask the operator to finish the bootstrap"
-// message rather than a 500 stack trace. The same code surfaces
-// in dev boxes that haven't unsealed the creds envelope.
+// (`log_archive_unconfigured`) with customer-safe retry guidance. Wiring
+// details stay in daemon logs rather than leaking through the public API.
 func (h *ArchiveLogsHandler) stream(w http.ResponseWriter, r *http.Request, acct state.Account, slug string) {
 	app, ok := h.Auth.LoadApp(w, r, acct, slug)
 	if !ok {
@@ -217,29 +215,22 @@ func (h *ArchiveLogsHandler) stream(w http.ResponseWriter, r *http.Request, acct
 		return
 	}
 	if h.S3 == nil || h.Bucket == "" {
-		api.WriteProblem(w, api.NewProblem(http.StatusServiceUnavailable, "log_archive_unconfigured",
-			"Log archive is enabled on this plan but not configured on the gatewayd-internal host. Ask the operator to unseal archive-creds.json and restart faas-gatewayd-internal.",
-			"the S3 client is not wired (FAAS_LOG_ARCHIVE_* env vars unset or unseal incomplete)"))
+		api.WriteProblem(w, api.ErrLogArchiveUnavailable())
 		return
 	}
 	instance := r.URL.Query().Get("instance")
 	day := r.URL.Query().Get("date")
 	if instance == "" || day == "" {
-		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, "log_archive_invalid_query",
-			"the ?archive=1 path requires ?instance=<id> and ?date=YYYY-MM-DD",
-			"missing one or both query parameters"))
+		api.WriteProblem(w, api.ErrLogArchiveInvalidQuery("Both instance and date are required for archived logs."))
 		return
 	}
 	if !archiveInstanceRegex.MatchString(instance) {
-		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, "log_archive_invalid_query",
-			"the ?instance= value must match [A-Za-z0-9._-]{1,128}",
-			fmt.Sprintf("got %q", instance)))
+		api.WriteProblem(w, api.ErrLogArchiveInvalidQuery(
+			fmt.Sprintf("Instance %q must contain only letters, numbers, dots, underscores, or dashes.", instance)))
 		return
 	}
 	if !archiveDateRegex.MatchString(day) {
-		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, "log_archive_invalid_query",
-			"the ?date= value must be YYYY-MM-DD",
-			fmt.Sprintf("got %q", day)))
+		api.WriteProblem(w, api.ErrLogArchiveInvalidQuery(fmt.Sprintf("Date %q must use YYYY-MM-DD format.", day)))
 		return
 	}
 	// Per-plan retention cap (issue #562 risk #7): a Hobby
@@ -252,15 +243,12 @@ func (h *ArchiveLogsHandler) stream(w http.ResponseWriter, r *http.Request, acct
 	// malicious or curious customer probe history the plan
 	// doesn't cover.
 	if !h.withinRetention(acct.Plan, day) {
-		api.WriteProblem(w, api.NewProblem(http.StatusForbidden, "log_archive_retention_exceeded",
-			fmt.Sprintf("the %s plan caps log archive retention at %d days",
-				acct.Plan, acct.Plan.LogArchiveRetentionDaysMax()),
-			fmt.Sprintf("?date=%s is outside the per-plan window", day)))
+		api.WriteProblem(w, api.ErrLogArchiveRetentionExceeded(acct.Plan, day))
 		return
 	}
 	apislogs.StartSSE(w)
 	flusher, _ := w.(http.Flusher)
-	h.serveArchive(r.Context(), w, flusher, app.ID, instance, day)
+	h.serveArchiveWithAccount(r.Context(), w, flusher, app.ID, acct.ID, instance, day)
 }
 
 // streamUnauth is the whitebox seam. Mirrors stream()'s body
@@ -282,41 +270,31 @@ func (h *ArchiveLogsHandler) streamUnauth(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if h.S3 == nil || h.Bucket == "" {
-		api.WriteProblem(w, api.NewProblem(http.StatusServiceUnavailable, "log_archive_unconfigured",
-			"Log archive is enabled on this plan but not configured on the gatewayd-internal host. Ask the operator to unseal archive-creds.json and restart faas-gatewayd-internal.",
-			"the S3 client is not wired (FAAS_LOG_ARCHIVE_* env vars unset or unseal incomplete)"))
+		api.WriteProblem(w, api.ErrLogArchiveUnavailable())
 		return
 	}
 	instance := r.URL.Query().Get("instance")
 	day := r.URL.Query().Get("date")
 	if instance == "" || day == "" {
-		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, "log_archive_invalid_query",
-			"the ?archive=1 path requires ?instance=<id> and ?date=YYYY-MM-DD",
-			"missing one or both query parameters"))
+		api.WriteProblem(w, api.ErrLogArchiveInvalidQuery("Both instance and date are required for archived logs."))
 		return
 	}
 	if !archiveInstanceRegex.MatchString(instance) {
-		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, "log_archive_invalid_query",
-			"the ?instance= value must match [A-Za-z0-9._-]{1,128}",
-			fmt.Sprintf("got %q", instance)))
+		api.WriteProblem(w, api.ErrLogArchiveInvalidQuery(
+			fmt.Sprintf("Instance %q must contain only letters, numbers, dots, underscores, or dashes.", instance)))
 		return
 	}
 	if !archiveDateRegex.MatchString(day) {
-		api.WriteProblem(w, api.NewProblem(http.StatusBadRequest, "log_archive_invalid_query",
-			"the ?date= value must be YYYY-MM-DD",
-			fmt.Sprintf("got %q", day)))
+		api.WriteProblem(w, api.ErrLogArchiveInvalidQuery(fmt.Sprintf("Date %q must use YYYY-MM-DD format.", day)))
 		return
 	}
 	if !h.withinRetention(acct.Plan, day) {
-		api.WriteProblem(w, api.NewProblem(http.StatusForbidden, "log_archive_retention_exceeded",
-			fmt.Sprintf("the %s plan caps log archive retention at %d days",
-				acct.Plan, acct.Plan.LogArchiveRetentionDaysMax()),
-			fmt.Sprintf("?date=%s is outside the per-plan window", day)))
+		api.WriteProblem(w, api.ErrLogArchiveRetentionExceeded(acct.Plan, day))
 		return
 	}
 	apislogs.StartSSE(w)
 	flusher, _ := w.(http.Flusher)
-	h.serveArchive(r.Context(), w, flusher, appID, instance, day)
+	h.serveArchiveWithAccount(r.Context(), w, flusher, appID, acct.ID, instance, day)
 }
 
 // withinRetention reports whether day is inside the per-plan
@@ -362,8 +340,9 @@ func (h *ArchiveLogsHandler) withinRetention(plan api.Plan, day string) bool {
 // pipe-through-the-gzip-reader if any single-day archive ever
 // exceeds the stdlib heap budget; the wire shape stays the
 // same.
-func (h *ArchiveLogsHandler) serveArchive(ctx_ context.Context, w http.ResponseWriter, flusher http.Flusher, appID, instance, day string) {
+func (h *ArchiveLogsHandler) serveArchiveWithAccount(ctx_ context.Context, w http.ResponseWriter, flusher http.Flusher, appID, accountID, instance, day string) {
 	key := archiveObjectKey(instance, day)
+	identity := resolveRuntimeLogIdentity(ctx_, h.Store, scheddgrpc.LogFrame{InstanceID: instance}, accountID, appID, "", make(map[string]api.PlatformIdentity))
 	backstop := h.Backstop
 	if backstop <= 0 {
 		backstop = defaultAppLogsBackstop
@@ -428,7 +407,7 @@ func (h *ArchiveLogsHandler) serveArchive(ctx_ context.Context, w http.ResponseW
 		if !scanner.Scan() {
 			break
 		}
-		if !renderArchiveLine(w, flusher, appID, instance, scanner.Bytes(), h.Ops) {
+		if !renderArchiveLineWithIdentity(w, flusher, appID, instance, scanner.Bytes(), identity, h.Ops) {
 			// Malformed JSON line — the producer side
 			// shouldn't generate these, but a third-party
 			// tool writing into the bucket could. Render
@@ -482,7 +461,7 @@ func archiveObjectKey(instance, day string) string {
 //
 // Returns false on a malformed JSON line so the caller can
 // surface a degraded terminal.
-func renderArchiveLine(w http.ResponseWriter, flusher http.Flusher, appID, instance string, raw []byte, ops *wire.OpsMetrics) bool {
+func renderArchiveLineWithIdentity(w http.ResponseWriter, flusher http.Flusher, appID, instance string, raw []byte, identity api.PlatformIdentity, ops *wire.OpsMetrics) bool {
 	var line struct {
 		Seq       int64     `json:"seq"`
 		Stream    string    `json:"stream"`
@@ -502,6 +481,27 @@ func renderArchiveLine(w http.ResponseWriter, flusher http.Flusher, appID, insta
 	}
 	if line.Level != "" {
 		payloadMap["level"] = line.Level
+	}
+	if identity.DeploymentID != "" {
+		payloadMap["deployment_id"] = identity.DeploymentID
+	}
+	if identity.NodeID != "" {
+		payloadMap["node_id"] = identity.NodeID
+	}
+	if identity.Region != "" {
+		payloadMap["region"] = identity.Region
+	}
+	if identity.CommitSHA != "" {
+		payloadMap["commit_sha"] = identity.CommitSHA
+	}
+	if identity.DeploymentTag != "" {
+		payloadMap["deployment_tag"] = identity.DeploymentTag
+	}
+	if identity.DeploymentCreatedAt != "" {
+		payloadMap["deployment_created_at"] = identity.DeploymentCreatedAt
+	}
+	if identity.ImageDigest != "" {
+		payloadMap["image_digest"] = identity.ImageDigest
 	}
 	payload, _ := json.Marshal(payloadMap)
 	_, _ = fmt.Fprintf(w, "event: log\ndata: %s\n\n", payload)

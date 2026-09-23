@@ -64,6 +64,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -100,7 +101,10 @@ type Harness struct {
 	// SignKeyPath is the PRIVATE half of the cosign keypair whose public half
 	// schedd verifies with. imaged must sign with this exact key; see
 	// writeScheddSignPub.
-	SignKeyPath             string
+	SignKeyPath string
+	// GatewayURL addresses gatewayd-internal directly. Prefer EdgeURL for a
+	// customer-shaped request; reach for this only when a test is
+	// deliberately bypassing the public hop.
 	GatewayURL              string
 	GatewayControlURL       string // /metrics + /healthz, loopback only
 	GatewayPublicURL        string
@@ -112,6 +116,11 @@ type Harness struct {
 	// schedd config instead of silently falling back to another pair.
 	gatewayPublicAddr  string
 	gatewayControlAddr string
+	// Keep the gateway ports held between configuration and daemon startup.
+	// freeTCPAddr closes its probe immediately, leaving a long race while the
+	// harness boots apid and schedd before gatewayd (notably on CI).
+	gatewayPublicReservation  net.Listener
+	gatewayControlReservation net.Listener
 	// RecoveryHMACKeyHex is a per-test 64-char hex string (32 bytes
 	// when decoded) that the harness injects as FAAS_MFA_RECOVERY_HMAC_KEY
 	// into every daemon's environment. Required because apid's
@@ -195,6 +204,7 @@ func Start(t *testing.T, pool *pgxpool.Pool, which Which) *Harness {
 	currentHarness = h
 	if which&Gatewayd != 0 {
 		reserveGatewayAddresses(t, h)
+		t.Cleanup(h.releaseGatewayAddressReservations)
 	}
 	if which&GatewaySynthStub != 0 {
 		startGatewaySynthStub(t, h)
@@ -317,64 +327,7 @@ kernel_path = %q
 	}
 
 	if which&Imaged != 0 {
-		// guest/init lives at repo root in dev; tests don't run a real guest,
-		// but imaged still wants the path. Use a placeholder file so its
-		// existence check passes — the metal test will overwrite with the
-		// real binary if it needs to.
-		guestInit := os.Getenv("FAAS_GUEST_INIT")
-		if guestInit == "" {
-			guestInit = filepath.Join(tmp, "init")
-			if err := os.WriteFile(guestInit, []byte("#!/bin/sh\n"), 0o755); err != nil {
-				t.Fatalf("e2etest: write placeholder guest init: %v", err)
-			}
-		}
-		env := imagedEnv(t, dbURL, guestInit, appsRoot, tmp)
-		// imaged must sign with the same keypair schedd verifies against
-		// (FAAS_SIGN_PUB). Without this it falls back to the host's
-		// /etc/faas/secrets/sign.key and every snapshot prime fails with
-		// sig_invalid.
-		if h.SignKeyPath != "" {
-			env = append(env, "FAAS_SIGN_KEY="+h.SignKeyPath)
-		}
-		// Optional builder-base override (Lima / CI without ghcr creds). When
-		// FAAS_TEST_BUILDER_BASE_REF is set, imaged pulls the base from there
-		// instead of the production ghcr.io/poyrazk/builder-base:latest
-		// (which 403s anonymously). FAAS_TEST_DEPLOY_BASE_REF, if set,
-		// overrides the per-runtime base ref used by aboveBaseLayers at
-		// deploy time so it also dials the stub registry. Default behavior
-		// is unchanged.
-		if ref := os.Getenv("FAAS_TEST_BUILDER_BASE_REF"); ref != "" {
-			env = append(env, "FAAS_BUILDER_BASE_REF="+ref)
-			if path := os.Getenv("FAAS_TEST_BUILDER_BASE_PATH"); path != "" {
-				env = append(env, "FAAS_BUILDER_BASE_PATH="+path)
-			}
-		}
-		if dbr := os.Getenv("FAAS_TEST_DEPLOY_BASE_REF"); dbr != "" {
-			env = append(env, "FAAS_TEST_DEPLOY_BASE_REF="+dbr)
-		}
-		if os.Getenv("FAAS_E2E_API_HOSTING_SMOKE") == "1" && h.GatewayURL != "" {
-			env = append(env, "FAAS_API_HOSTING_SMOKE_URL="+h.GatewayURL)
-			env = append(env, "FAAS_APPS_DOMAIN="+testDomain)
-		}
-		h.procs = append(h.procs, startProc(t, bin, "imaged", env))
-		// imaged is not ready when its process is up. It stages the builder
-		// base first — 70s on faas-acceptance-1 in smoke run 35157946150 —
-		// and only then subscribes to deployment_changed. Start used to return
-		// here immediately, the test POSTed a deployment into a LISTEN that
-		// did not exist yet, and imaged's catch-up sweep only looks at
-		// deployments older than two hours: the image deploy sat in `pending`
-		// until the test gave up, in every image-deploy test. Wait for the
-		// subscription itself, not the process.
-		imagedStart := time.Now()
-		if err := h.waitImagedListens(3 * time.Minute); err != nil {
-			// Say why: an imaged that exited (metrics port taken, base
-			// staging failed) is otherwise reported only as "never
-			// subscribed", with its last words lost — smoke run
-			// 35217250297.
-			dumpProcs(t)
-			t.Fatalf("e2etest: imaged did not subscribe to its notify channels: %v", err)
-		}
-		t.Logf("e2etest: imaged subscribed after %s", time.Since(imagedStart).Round(time.Millisecond))
+		startImaged(t, h, bin, dbURL, tmp, appsRoot, nil)
 	}
 
 	if which&Meterd != 0 {
@@ -757,6 +710,7 @@ func StartWithEnv(t *testing.T, pool *pgxpool.Pool, which Which, extraEnv []stri
 	currentHarness = h
 	if which&Gatewayd != 0 {
 		reserveGatewayAddresses(t, h)
+		t.Cleanup(h.releaseGatewayAddressReservations)
 	}
 	if which&GatewaySynthStub != 0 {
 		startGatewaySynthStub(t, h)
@@ -841,6 +795,17 @@ func StartWithEnv(t *testing.T, pool *pgxpool.Pool, which Which, extraEnv []stri
 		// socket (/run/faas/schedd.sock). Re-point the row at the
 		// per-test socket so synth dispatch can find schedd.
 		setDefaultLocalScheddTarget(t, pool, sockPath, h.VMMDSock)
+	}
+	// StartWithEnv implements a subset of Start's daemons. It used to ignore
+	// the rest SILENTLY: a test could ask for imaged, get no imaged, no error,
+	// and a deployment that simply never moved. Refuse instead, so the next
+	// caller learns in one second rather than after a three-minute poll.
+	if unsupported := which &^ (APID | Schedd | Imaged | Gatewayd | GatewaydPublic | Meterd | GatewaySynthStub); unsupported != 0 {
+		t.Fatalf("e2etest: StartWithEnv cannot start daemon mask %b (VMMD and Builderd are Start-only); "+
+			"use Start, or teach StartWithEnv to boot them", unsupported)
+	}
+	if which&Imaged != 0 {
+		startImaged(t, h, bin, dbURL, tmp, appsRoot, extraEnv)
 	}
 	if which&Meterd != 0 {
 		startMeterd(t, h, bin, dbURL, extraEnv)
@@ -991,9 +956,6 @@ func startGatewayd(t *testing.T, h *Harness, bin, dbURL string, extraEnv []strin
 	// immediately hand the same ephemeral port back to the next probe, which
 	// makes the public and control servers race to bind one address. Keep
 	// probing until the two configured listeners are distinct.
-	for controlAddr == addr {
-		controlAddr = freeTCPAddr(t)
-	}
 	if h.ScheddSock == "" {
 		h.ScheddSock = filepath.Join(h.SockDir, "schedd.sock")
 	}
@@ -1008,6 +970,10 @@ func startGatewayd(t *testing.T, h *Harness, bin, dbURL string, extraEnv []strin
 	), 0o600); err != nil {
 		t.Fatalf("e2etest: write gatewayd.toml: %v", err)
 	}
+	// Release the held ports only after the final config is written and just
+	// before exec. This closes the allocation gap that let another listener
+	// claim a reserved address while apid/schedd were booting.
+	h.releaseGatewayAddressReservations()
 	synthSock := filepath.Join(h.SockDir, "gatewayd-internal.sock")
 	env := append(testEnvCommon(dbURL),
 		"FAAS_GATEWAY_LISTEN="+addr,
@@ -1018,10 +984,66 @@ func startGatewayd(t *testing.T, h *Harness, bin, dbURL string, extraEnv []strin
 		"FAAS_APPS_DOMAIN="+testDomain,
 	)
 	env = append(env, extraEnv...)
+	// Multi-gateway tests need a named gateway without making the legacy
+	// single-box schedd claim the synthetic default-local node. Keep this
+	// test-only override scoped to gatewayd-internal.
+	for _, entry := range extraEnv {
+		if nodeName, ok := strings.CutPrefix(entry, "FAAS_E2E_GATEWAY_NODE_NAME="); ok {
+			env = append(env, "FAAS_NODE_NAME="+nodeName)
+		}
+	}
 	h.procs = append(h.procs, startProc(t, bin, "gatewayd-internal", env))
 	h.GatewayURL = "http://" + addr
 	h.GatewayControlURL = "http://" + controlAddr
-	waitTCP(t, controlAddr, 10*time.Second)
+	waitReadyz(t, controlAddr, 30*time.Second)
+}
+
+// StartAdditionalGateway runs a second named gatewayd-internal against this
+// harness's database and schedd. Its independent listener, cache, and PG
+// subscription let rollout tests exercise the real fleet ACK barrier rather
+// than manufacturing acknowledgements in a notifier fake. The process is
+// owned by Harness.Stop like the primary gateway.
+func (h *Harness) StartAdditionalGateway(nodeName string, extraEnv ...string) string {
+	if h == nil || h.T == nil {
+		panic("e2etest: nil harness")
+	}
+	t := h.T
+	t.Helper()
+	if h.GatewayURL == "" || h.ScheddSock == "" || nodeName == "" {
+		t.Fatal("e2etest: additional gateway requires a running gateway, schedd, and node name")
+	}
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		dbURL = "postgres:///faas?host=/run/postgresql&user=faas"
+	}
+	dbURL = daemonDSN(dbURL, h.Pool)
+	publicAddr := freeTCPAddr(t)
+	controlAddr := freeTCPAddr(t)
+	for controlAddr == publicAddr {
+		controlAddr = freeTCPAddr(t)
+	}
+	dir, err := os.MkdirTemp(h.SockDir, "gw-*")
+	if err != nil {
+		t.Fatalf("e2etest: create additional gateway socket dir: %v", err)
+	}
+	configPath := filepath.Join(dir, "gatewayd.toml")
+	config := fmt.Sprintf("public_addr=%q\ncontrol_addr=%q\napid_loopback=%q\n", publicAddr, controlAddr, h.APIDURL)
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		t.Fatalf("e2etest: write additional gateway config: %v", err)
+	}
+	env := append(testEnvCommon(dbURL),
+		"FAAS_GATEWAY_LISTEN="+publicAddr,
+		"FAAS_GATEWAYD_CONFIG="+configPath,
+		"FAAS_GATEWAY_CONTROL_LISTEN="+controlAddr,
+		"FAAS_GATEWAY_SYNTH_SOCKET="+filepath.Join(dir, "gatewayd-internal.sock"),
+		"FAAS_SCHEDD_SOCKET="+h.ScheddSock,
+		"FAAS_APPS_DOMAIN="+testDomain,
+		"FAAS_NODE_NAME="+nodeName,
+	)
+	env = append(env, extraEnv...)
+	h.procs = append(h.procs, startProc(t, h.BinDir, "gatewayd-internal", env))
+	waitReadyz(t, controlAddr, 30*time.Second)
+	return "http://" + publicAddr
 }
 
 // startGatewaydPublic boots the public edge next to gatewayd-internal. It is
@@ -1034,9 +1056,6 @@ func startGatewaydPublic(t *testing.T, h *Harness, bin, dbURL string, extraEnv [
 	}
 	publicAddr := freeTCPAddr(t)
 	controlAddr := freeTCPAddr(t)
-	for controlAddr == publicAddr {
-		controlAddr = freeTCPAddr(t)
-	}
 	internalSocket := filepath.Join(h.SockDir, "gatewayd-internal.sock")
 	env := append(testEnvCommon(dbURL),
 		"FAAS_PUBLIC_LISTEN_ADDR="+publicAddr,
@@ -1050,22 +1069,45 @@ func startGatewaydPublic(t *testing.T, h *Harness, bin, dbURL string, extraEnv [
 	h.procs = append(h.procs, startProc(t, bin, "gatewayd-public", env))
 	h.GatewayPublicURL = "http://" + publicAddr
 	h.GatewayPublicControlURL = "http://" + controlAddr
-	waitTCP(t, controlAddr, 15*time.Second)
+	waitReadyz(t, controlAddr, 30*time.Second)
 }
 
-// reserveGatewayAddresses chooses the public and control ports before
-// schedd's TOML is rendered. freeTCPAddr closes its probe listener, so the
-// later daemon bind still gets the usual race-resistant availability check;
-// reserving both addresses here only makes the configuration deterministic.
+// reserveGatewayAddresses chooses and holds the public and control ports
+// before schedd's TOML is rendered. The listeners stay open while apid and
+// schedd boot, then startGatewayd releases them immediately before exec so a
+// second local process cannot claim one of the configured ports in between.
 func reserveGatewayAddresses(t *testing.T, h *Harness) {
 	t.Helper()
-	addr := freeTCPAddr(t)
-	controlAddr := freeTCPAddr(t)
-	for controlAddr == addr {
-		controlAddr = freeTCPAddr(t)
+	public, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("e2etest: reserve gateway public address: %v", err)
 	}
-	h.gatewayPublicAddr = addr
-	h.gatewayControlAddr = controlAddr
+	control, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		_ = public.Close()
+		t.Fatalf("e2etest: reserve gateway control address: %v", err)
+	}
+	h.gatewayPublicReservation = public
+	h.gatewayControlReservation = control
+	h.gatewayPublicAddr = public.Addr().String()
+	h.gatewayControlAddr = control.Addr().String()
+}
+
+// releaseGatewayAddressReservations closes the held gateway listeners. It is
+// safe to call more than once: startup calls it immediately before launching
+// gatewayd and test cleanup calls it again for failed/partial boots.
+func (h *Harness) releaseGatewayAddressReservations() {
+	if h == nil {
+		return
+	}
+	if h.gatewayPublicReservation != nil {
+		_ = h.gatewayPublicReservation.Close()
+		h.gatewayPublicReservation = nil
+	}
+	if h.gatewayControlReservation != nil {
+		_ = h.gatewayControlReservation.Close()
+		h.gatewayControlReservation = nil
+	}
 }
 
 func startGatewaySynthStub(t *testing.T, h *Harness) {
@@ -1382,6 +1424,7 @@ func startMeterd(t *testing.T, h *Harness, bin, dbURL string, extraEnv ...[]stri
 // when startProc's bytes.Buffer is GC'd; surfacing it always is cheaper
 // than re-running with -v on a CI flake (issue #52 PR #59 follow-up).
 func (h *Harness) stop() {
+	h.releaseGatewayAddressReservations()
 	for _, p := range h.procs {
 		if p.Process == nil {
 			continue
@@ -1502,6 +1545,17 @@ func (h *Harness) RestartSchedd() error {
 	if err := h.KillSchedd(); err != nil {
 		return err
 	}
+	// KillSchedd has reaped the prior process. It is no longer owned by
+	// Stop and must not be treated as a failed daemon when checking the
+	// replacement's startup health.
+	procs := h.procs[:0]
+	for _, candidate := range h.procs {
+		if candidate != nil && filepath.Base(candidate.Path) == "schedd" && candidate.ProcessState != nil {
+			continue
+		}
+		procs = append(procs, candidate)
+	}
+	h.procs = procs
 	_ = os.Remove(h.ScheddSock)
 	proc := startProc(h.T, h.BinDir, "schedd", append([]string(nil), h.scheddEnv...))
 	h.procs = append(h.procs, proc)
@@ -1939,20 +1993,117 @@ func injectSearchPath(dsn, schema string) string {
 
 // Slight race between close and the daemon re-listening, but acceptable in
 // tests — the daemon retries on bind error.
+// allocatedPorts records every address freeTCPAddr has handed out in this
+// test binary. Entries are never released: a port reused by a later daemon
+// is exactly the bug this prevents, and one e2e binary needs only a few
+// hundred ports.
+var (
+	allocatedPortsMu sync.Mutex
+	allocatedPorts   = map[string]struct{}{}
+)
+
+// claimAddr records addr as handed out and reports whether THIS caller won
+// it. A second caller offered the same address gets false and must keep
+// probing.
+//
+// This is the whole collision guard, factored out because the end-to-end
+// behaviour cannot be tested through freeTCPAddr: the kernel cycles the
+// ephemeral range, so it will not hand the same port to two sequential draws
+// on demand. A test that merely drew N addresses and found them distinct
+// passed just as happily with this guard disabled — it proved nothing.
+// Testing the decision directly is the part that can actually fail.
+func claimAddr(addr string) bool {
+	allocatedPortsMu.Lock()
+	defer allocatedPortsMu.Unlock()
+	if _, taken := allocatedPorts[addr]; taken {
+		return false
+	}
+	allocatedPorts[addr] = struct{}{}
+	return true
+}
+
+// freeTCPAddr returns a loopback address no other daemon in this test binary
+// has been given.
+//
+// Binding :0 and closing the listener is inherently TOCTOU — the port is free
+// at that instant and nothing holds it until the daemon execs. Two calls can
+// therefore return the SAME port, and the loser dies on bind with "address
+// already in use". For gatewayd-internal that means run() returns, its
+// `defer pool.Close()` fires, and every later route lookup fails with
+// "closed pool" — surfacing as a 404 routing timeout in a test that looks
+// nothing like a port conflict. That is the TestE2E_NormalPath_* flake: a CI
+// failure showed apid's loopback target and the gateway's control listener
+// both on 127.0.0.1:32997.
+//
+// Callers used to de-duplicate PAIRWISE ("keep probing until the public and
+// control listeners differ"), which cannot see a collision with a port
+// already handed to a different daemon. This registry is global to the
+// process, so it covers every pair.
+//
+// Rejected probes are held OPEN until the end: closing one would let the
+// kernel hand the same port straight back on the next iteration.
 func freeTCPAddr(t *testing.T) string {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("e2etest: freeTCPAddr: %v", err)
+	var held []net.Listener
+	defer func() {
+		for _, l := range held {
+			_ = l.Close()
+		}
+	}()
+	for attempt := 0; attempt < 64; attempt++ {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("e2etest: freeTCPAddr: %v", err)
+		}
+		addr := l.Addr().String()
+		if claimAddr(addr) {
+			_ = l.Close()
+			return addr
+		}
+		held = append(held, l)
 	}
-	addr := l.Addr().String()
-	_ = l.Close()
-	return addr
+	t.Fatalf("e2etest: freeTCPAddr: no unallocated loopback port after 64 attempts")
+	return ""
 }
 
 // waitTCP dials addr every 50ms until it accepts or deadline. On timeout
 // it dumps the live daemon stdout/stderr so a CI flake has the daemon's
 // last words to bisect with (mirrors waitUnix's dumpProcs).
+// waitReadyz blocks until the daemon's control /readyz returns 200.
+//
+// waitTCP is not a sufficient gate for a routing daemon. It proves only that
+// the control port is bound, which for gatewayd-internal happens roughly
+// 300us before its Postgres pool is known to be usable and before its
+// pg_notify LISTEN for route invalidations exists. A harness that proceeds on
+// the bind alone can drive a whole test against a daemon that is already
+// dying, and the failure surfaces as an unrelated 404 routing timeout ten
+// seconds later.
+//
+// /readyz is the daemon's own answer to "may I receive traffic", so gating on
+// it means the harness asks the same question a load balancer does.
+func waitReadyz(t *testing.T, controlAddr string, d time.Duration) {
+	t.Helper()
+	waitTCP(t, controlAddr, d)
+	url := "http://" + controlAddr + "/readyz"
+	client := &http.Client{Timeout: time.Second}
+	deadline := time.Now().Add(d)
+	lastStatus := 0
+	for time.Now().Before(deadline) {
+		resp, err := client.Get(url)
+		if err == nil {
+			lastStatus = resp.StatusCode
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			if lastStatus == http.StatusOK {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	dumpProcs(t)
+	t.Fatalf("e2etest: %s/readyz did not return 200 within %s (last status=%d)", controlAddr, d, lastStatus)
+}
+
 func waitTCP(t *testing.T, addr string, d time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(d)
@@ -2330,7 +2481,7 @@ func imagedEnv(t *testing.T, dbURL, guestInit, appsRoot, tmp string) []string {
 // without touching this file.
 func boundingSetPrefix(t *testing.T, name string) []string {
 	t.Helper()
-	if name != "imaged" || runtime.GOOS != "linux" || os.Geteuid() != 0 {
+	if name != "imaged" || runtime.GOOS != "linux" {
 		return nil
 	}
 	unit, err := daemonunitspec.UnitByName("imaged")
@@ -2344,14 +2495,51 @@ func boundingSetPrefix(t *testing.T, name string) []string {
 	if err != nil {
 		// Failing here beats letting imaged exit with a capdecl error that
 		// reads like a product bug.
-		t.Fatalf("e2etest: setpriv is required to run imaged as root with a "+
+		t.Fatalf("e2etest: setpriv is required to run imaged with a "+
 			"restricted bounding set (capdecl refuses cap_sys_admin): %v", err)
 	}
 	set := "-all"
 	for _, c := range unit.CapabilityBoundingSet {
 		set += ",+" + strings.TrimPrefix(strings.ToLower(c), "cap_")
 	}
-	return []string{setpriv, "--bounding-set=" + set, "--"}
+	if os.Geteuid() == 0 {
+		return []string{setpriv, "--bounding-set=" + set, "--"}
+	}
+	// Unprivileged path — a GitHub-hosted runner.
+	//
+	// The runner user still carries cap_sys_admin in CapBnd, and imaged
+	// refuses to boot while it is reachable (ADR-075). Dropping a bounding-set
+	// capability needs CAP_SETPCAP in the EFFECTIVE set, which that user does
+	// not have, so this cannot be done from inside the test process.
+	//
+	// Escalate for exactly one execve and come straight back down: sudo to get
+	// CAP_SETPCAP, drop the bounding set, then --reuid/--regid to the original
+	// uid. imaged ends up unprivileged with production's capability boundary.
+	//
+	// Scoped to imaged's argv on purpose. Wrapping the whole test binary
+	// instead ALSO narrows vmmd's bounding set, and vmmd needs cap_sys_admin
+	// to do its job — that broke TestSec11_HostKey0400_Required, where vmmd
+	// then produced no output at all.
+	sudo, err := exec.LookPath("sudo")
+	if err != nil {
+		t.Skipf("e2etest: imaged needs a restricted bounding set and neither root nor sudo is available: %v", err)
+	}
+	// -E preserves the environment the harness built. Without it sudo resets
+	// it and imaged exits with "missing required environment variables:
+	// FAAS_DATABASE_URL, FAAS_FUNCTION_RUNNER_*" — its env contract doing its
+	// job against an env that sudo had already emptied.
+	//
+	// PATH is re-applied separately because sudoers' secure_path overrides it
+	// even under -E, and imaged resolves debugfs (and mkfs) from PATH.
+	return []string{
+		sudo, "-n", "-E", setpriv,
+		"--bounding-set=" + set,
+		"--reuid", strconv.Itoa(os.Getuid()),
+		"--regid", strconv.Itoa(os.Getgid()),
+		"--init-groups",
+		"--no-new-privs",
+		"--", "env", "PATH=" + os.Getenv("PATH"),
+	}
 }
 
 // spoolRootFor is the per-test source spool root.
@@ -2409,4 +2597,107 @@ func metricsAddrFor(t *testing.T, daemon string) string {
 	addr := "127.0.0.1:0"
 	t.Logf("e2etest: %s metrics on %s", daemon, addr)
 	return addr
+}
+
+// EdgeURL is the customer-facing entry point: gatewayd-public when the test
+// booted it, and gatewayd-internal directly otherwise.
+//
+// Production has no path that reaches gatewayd-internal from outside — every
+// customer request arrives at gatewayd-public and is handed over the unix
+// socket (ADR-070). A test that talks to gatewayd-internal directly therefore
+// cannot observe anything that happens in the handover, which is where the
+// two-hop bugs live: PR #1284's `kind=budget` rules were silently capped
+// because gatewayd-public stamped its own 3s parent budget first, and unit
+// tests on either side of that boundary passed.
+//
+// Selecting by what the harness booted keeps this opt-in. Adding
+// e2etest.GatewaydPublic to a Which mask is all it takes to move that family
+// onto the production-shaped path; every other family is untouched.
+func (h *Harness) EdgeURL() string {
+	if h.GatewayPublicURL != "" {
+		return h.GatewayPublicURL
+	}
+	return h.GatewayURL
+}
+
+// startImaged boots imaged and waits for it to SUBSCRIBE, not merely to be
+// running: it stages the builder base first and only then listens, so a test
+// that posts a deployment before that point lands in a LISTEN that does not
+// exist yet and its row sits in `pending` until the test gives up.
+//
+// Extracted so Start and StartWithEnv share one implementation. They did not,
+// and StartWithEnv simply ignored the Imaged bit — a test could ask for imaged,
+// get no imaged, no error, and a deployment that never moved.
+func startImaged(t *testing.T, h *Harness, bin, dbURL, tmp, appsRoot string, extraEnv []string) {
+	t.Helper()
+	// imaged signs every layer it publishes, and the signing key is minted by
+	// writeScheddSignPub — inside the SCHEDD block. A harness that starts
+	// imaged without schedd therefore left SignKeyPath empty, imaged fell back
+	// to the host's /etc/faas/secrets/sign.key, and on a machine without one
+	// every publish failed. imaged's need for a key does not depend on schedd
+	// being present, so mint one here when nothing else has.
+	if h.SignKeyPath == "" {
+		_ = writeScheddSignPub(t, h)
+	}
+	// guest/init lives at repo root in dev; tests don't run a real guest,
+	// but imaged still wants the path. Use a placeholder file so its
+	// existence check passes — the metal test will overwrite with the
+	// real binary if it needs to.
+	guestInit := os.Getenv("FAAS_GUEST_INIT")
+	if guestInit == "" {
+		guestInit = filepath.Join(tmp, "init")
+		if err := os.WriteFile(guestInit, []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatalf("e2etest: write placeholder guest init: %v", err)
+		}
+	}
+	env := imagedEnv(t, dbURL, guestInit, appsRoot, tmp)
+	// imaged must sign with the same keypair schedd verifies against
+	// (FAAS_SIGN_PUB). Without this it falls back to the host's
+	// /etc/faas/secrets/sign.key and every snapshot prime fails with
+	// sig_invalid.
+	if h.SignKeyPath != "" {
+		env = append(env, "FAAS_SIGN_KEY="+h.SignKeyPath)
+	}
+	// Optional builder-base override (Lima / CI without ghcr creds). When
+	// FAAS_TEST_BUILDER_BASE_REF is set, imaged pulls the base from there
+	// instead of the production ghcr.io/poyrazk/builder-base:latest
+	// (which 403s anonymously). FAAS_TEST_DEPLOY_BASE_REF, if set,
+	// overrides the per-runtime base ref used by aboveBaseLayers at
+	// deploy time so it also dials the stub registry. Default behavior
+	// is unchanged.
+	if ref := os.Getenv("FAAS_TEST_BUILDER_BASE_REF"); ref != "" {
+		env = append(env, "FAAS_BUILDER_BASE_REF="+ref)
+		if path := os.Getenv("FAAS_TEST_BUILDER_BASE_PATH"); path != "" {
+			env = append(env, "FAAS_BUILDER_BASE_PATH="+path)
+		}
+	}
+	if dbr := os.Getenv("FAAS_TEST_DEPLOY_BASE_REF"); dbr != "" {
+		env = append(env, "FAAS_TEST_DEPLOY_BASE_REF="+dbr)
+	}
+	if os.Getenv("FAAS_E2E_API_HOSTING_SMOKE") == "1" && h.GatewayURL != "" {
+		env = append(env, "FAAS_API_HOSTING_SMOKE_URL="+h.GatewayURL)
+		env = append(env, "FAAS_APPS_DOMAIN="+testDomain)
+	}
+	// extraEnv last so a caller can override a harness default — a test
+	// that needs FAAS_STORAGE_ROOT somewhere writable, for instance.
+	env = append(env, extraEnv...)
+	h.procs = append(h.procs, startProc(t, bin, "imaged", env))
+	// imaged is not ready when its process is up. It stages the builder
+	// base first — 70s on faas-acceptance-1 in smoke run 35157946150 —
+	// and only then subscribes to deployment_changed. Start used to return
+	// here immediately, the test POSTed a deployment into a LISTEN that
+	// did not exist yet, and imaged's catch-up sweep only looks at
+	// deployments older than two hours: the image deploy sat in `pending`
+	// until the test gave up, in every image-deploy test. Wait for the
+	// subscription itself, not the process.
+	imagedStart := time.Now()
+	if err := h.waitImagedListens(3 * time.Minute); err != nil {
+		// Say why: an imaged that exited (metrics port taken, base
+		// staging failed) is otherwise reported only as "never
+		// subscribed", with its last words lost — smoke run
+		// 35217250297.
+		dumpProcs(t)
+		t.Fatalf("e2etest: imaged did not subscribe to its notify channels: %v", err)
+	}
+	t.Logf("e2etest: imaged subscribed after %s", time.Since(imagedStart).Round(time.Millisecond))
 }

@@ -321,13 +321,9 @@ func (s *server) buildApp(acct state.Account, req api.CreateAppRequest, limits a
 	// CodePlanStreamingNotAllowed returns the same status on
 	// POST vs PATCH — telemetry collapsing on `code` is uniform.
 	//
-	// TODO(ADR-102-followup): add apps_streaming_enabled_plan_check
-	// Postgres CHECK constraint via NOT VALID + VALIDATE
-	// migrations once production telemetry confirms zero Free+
-	// streaming_enabled=true rows. Until then this runtime gate is
-	// the only enforcement; a direct-DB write or backup-restore
-	// can still violate the invariant. The follow-up ships a
-	// 1-cycle telemetry window after this PR lands.
+	// The apps_streaming_enabled_plan_check migration is the database
+	// backstop for direct writes and restores. Keep this runtime gate as
+	// the customer-facing 403 so API callers get the same stable error.
 	if req.StreamingEnabled != nil && *req.StreamingEnabled && !acct.Plan.StreamingResponseAllowed() {
 		return state.App{}, api.NewProblem(http.StatusForbidden,
 			api.CodePlanStreamingNotAllowed,
@@ -592,7 +588,7 @@ func (s *server) createDeployment(w http.ResponseWriter, r *http.Request, acct s
 		api.WriteProblem(w, p)
 		return
 	}
-	if p := validateAndPlanSidecars(&req, acct, limits); p != nil {
+	if p := s.validateAndPlanSidecars(&req, acct, limits); p != nil {
 		api.WriteProblem(w, p)
 		return
 	}
@@ -667,7 +663,7 @@ func (s *server) createDeployment(w http.ResponseWriter, r *http.Request, acct s
 		s.writeDeploymentCreateError(w, err)
 		return
 	}
-	notifyAndAuditDeployment(r.Context(), s, acct, app, d, prev, &req)
+	notifyAndAuditDeployment(r, s, acct, app, d, prev, &req)
 	writeJSON(w, http.StatusAccepted, s.deploymentResponse(d, app))
 }
 
@@ -795,7 +791,10 @@ func (s *server) appResponseWithContext(ctx context.Context, a state.App, plan a
 			HealthPathWakes:  a.Manifest.HealthPathWakes,
 			SessionAffinity:  a.Manifest.SessionAffinity,
 		},
-		EgressAllowlist: ea,
+		ServiceBindings:           append([]api.AppServiceBinding(nil), a.Manifest.ServiceBindings...),
+		ServiceBindingPolicy:      a.Manifest.EffectiveServiceBindingPolicy(),
+		PreviewServiceCallsPolicy: a.Manifest.EffectivePreviewServiceCallsPolicy(),
+		EgressAllowlist:           ea,
 		// Issue #169 / #172: per-app reactive scale-up trigger
 		// targets. 0 = "disabled" (no autoscale rule). Reactive
 		// scale-up runs in pkg/sched/scaleup; the trigger reads
@@ -948,6 +947,15 @@ func appEffectiveLimits(a state.App, plan api.Plan) api.AppEffectiveLimits {
 	if !ok {
 		return api.AppEffectiveLimits{MemoryLimitMB: a.RAMMB, CPULimitMillicores: effectiveAppCPUMillicores(a, plan), MaxInstances: a.MaxConcurrency, RequestBodyMaxBytes: plan.MaxRequestBodyBytes()}
 	}
+	queueDepth, queueWait, _ := api.ConcurrencyQueueDefaultsForPlan(plan)
+	if a.ScalingPolicy != nil {
+		if a.ScalingPolicy.MaxQueueDepth > 0 {
+			queueDepth = a.ScalingPolicy.MaxQueueDepth
+		}
+		if a.ScalingPolicy.MaxQueueWaitMS > 0 {
+			queueWait = time.Duration(a.ScalingPolicy.MaxQueueWaitMS) * time.Millisecond
+		}
+	}
 	maxInstances := a.MaxConcurrency
 	if a.ScalingPolicy != nil && a.ScalingPolicy.MaxInstances > 0 {
 		maxInstances = a.ScalingPolicy.MaxInstances
@@ -959,6 +967,7 @@ func appEffectiveLimits(a state.App, plan api.Plan) api.AppEffectiveLimits {
 		EphemeralDiskMaxMB: limits.EphemeralDiskMaxMB(),
 		GuestVCPUs:         limits.VCPU, CPULimitMillicores: cpuMillicores, PlanCPUMaxMillicores: planCPUMaxMillicores, CPUWeight: limits.CPUWeight,
 		MaxInstances: maxInstances, ConcurrencyPerInstance: limits.ConcurrencyPerVMBound,
+		ConcurrencyQueueDepth: queueDepth, ConcurrencyQueueWaitMS: queueWait.Milliseconds(),
 		AppRequestRateRPS: limits.RateLimitRPS, AppRequestBurst: limits.RateLimitBurst,
 		AccountRequestRateRPM: limits.RateLimitPerAccountRPM,
 		RequestBudgetMS:       limits.RequestBudgetForType(string(a.Type)).Milliseconds(),
@@ -1034,6 +1043,7 @@ func statePolicyToDTO(p *state.ScalingPolicy) *api.ScalingPolicy {
 		ScaleInCooldownS:        p.ScaleInCooldownS,
 		ConcurrencyOverflow:     p.ConcurrencyOverflow,
 		MaxQueueWaitMS:          p.MaxQueueWaitMS,
+		MaxQueueDepth:           p.MaxQueueDepth,
 		WakeMaxQueueDepth:       p.WakeMaxQueueDepth,
 		WakeMaxQueueWaitSeconds: p.WakeMaxQueueWaitSeconds,
 	}
@@ -1041,7 +1051,22 @@ func statePolicyToDTO(p *state.ScalingPolicy) *api.ScalingPolicy {
 		out.Target = &api.ScalingTarget{
 			Metric: p.Target.Metric,
 			Value:  p.Target.Value,
+			Name:   p.Target.Name,
 		}
+	}
+	// ADR-194 targets, ADR-195 schedules — the read half of the same gap
+	// policyPtrFromReq had. A customer could not see what they had
+	// configured even once the write path carried it.
+	for _, t := range p.Targets {
+		out.Targets = append(out.Targets, api.ScalingTarget{
+			Metric: t.Metric, Value: t.Value, Name: t.Name,
+		})
+	}
+	out.Timezone = p.Timezone
+	for _, sched := range p.Schedules {
+		out.Schedules = append(out.Schedules, api.ScalingSchedule{
+			Cron: sched.Cron, DurationS: sched.DurationS, MinInstances: sched.MinInstances,
+		})
 	}
 	return out
 }

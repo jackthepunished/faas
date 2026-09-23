@@ -181,6 +181,7 @@ func TestDo_MutatingCallsCarryIdempotencyKey(t *testing.T) {
 		{"Park", func(c *Client) error { return c.Park(context.Background(), "x") }},
 		{"Wake", func(c *Client) error { _, err := c.Wake(context.Background(), "x"); return err }},
 		{"RestartApp", func(c *Client) error { _, err := c.RestartApp(context.Background(), "x"); return err }},
+		{"RestartAppFresh", func(c *Client) error { _, err := c.RestartAppFresh(context.Background(), "x"); return err }},
 		{"RestoreAccount", func(c *Client) error { _, err := c.RestoreAccount(context.Background()); return err }},
 		{"ChangePlan", func(c *Client) error { _, err := c.ChangePlan(context.Background(), "hobby"); return err }},
 		{"RaiseOverageCap", func(c *Client) error {
@@ -653,6 +654,27 @@ func TestListOrgInvitations_EncodesCursor(t *testing.T) {
 	want := "before=" + url.QueryEscape(cursor) + "&limit=50"
 	if gotQuery != want {
 		t.Errorf("RawQuery = %q, want %q", gotQuery, want)
+	}
+}
+
+func TestListOrgActivity_EncodesFilters(t *testing.T) {
+	var gotRequestURI string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotRequestURI = r.URL.RequestURI()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"items":[]}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "fp_test")
+	_, err := c.ListOrgActivity(context.Background(), "acme", "cursor+/=", "deploy.", "github",
+		"11111111-1111-4111-8111-111111111111", 25)
+	if err != nil {
+		t.Fatalf("ListOrgActivity: %v", err)
+	}
+	want := "/v1/orgs/acme/activity?actor_type=github&app_id=11111111-1111-4111-8111-111111111111&before=cursor%2B%2F%3D&kind_prefix=deploy.&limit=25"
+	if gotRequestURI != want {
+		t.Errorf("RequestURI = %q, want %q", gotRequestURI, want)
 	}
 }
 

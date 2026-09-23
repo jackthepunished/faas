@@ -263,22 +263,28 @@ func (g *gatewaydEdgeRules) loadHostUncached(ctx context.Context, host string) (
 	budget, budgetErrs := compileBudgetRules(storeRules)
 	cache, cacheErrs := compileCacheRules(storeRules)
 	respond, respondErrs := compileRespondRules(storeRules)
+	asyncRules, asyncErrs := compileAsyncRules(storeRules)
+	retry, retryErrs := compileRetryRules(storeRules)
+	circuitBreaker, circuitBreakerErrs := compileCircuitBreakerRules(storeRules)
 	entry := &gateway.HostEntry{
-		Route:       route,
-		Rewrite:     rewrite,
-		Redirect:    redirect,
-		Headers:     headers,
-		CORS:        cors,
-		JWT:         jwt,
-		IP:          ip,
-		Validate:    validate,
-		Limit:       limit,
-		Maintenance: maintenance,
-		Geo:         geo,
-		Throttle:    throttle,
-		Budget:      budget,
-		Cache:       cache,
-		Respond:     respond,
+		Route:          route,
+		Rewrite:        rewrite,
+		Redirect:       redirect,
+		Headers:        headers,
+		CORS:           cors,
+		JWT:            jwt,
+		IP:             ip,
+		Validate:       validate,
+		Limit:          limit,
+		Maintenance:    maintenance,
+		Geo:            geo,
+		Throttle:       throttle,
+		Budget:         budget,
+		Cache:          cache,
+		Respond:        respond,
+		Async:          asyncRules,
+		Retry:          retry,
+		CircuitBreaker: circuitBreaker,
 	}
 	parseErrs := append(routeErrs, rewriteErrs...)
 	parseErrs = append(parseErrs, redirectErrs...)
@@ -293,7 +299,10 @@ func (g *gatewaydEdgeRules) loadHostUncached(ctx context.Context, host string) (
 	parseErrs = append(parseErrs, throttleErrs...)
 	parseErrs = append(parseErrs, budgetErrs...)
 	parseErrs = append(parseErrs, cacheErrs...)
+	parseErrs = append(parseErrs, retryErrs...)
+	parseErrs = append(parseErrs, circuitBreakerErrs...)
 	parseErrs = append(parseErrs, respondErrs...)
+	parseErrs = append(parseErrs, asyncErrs...)
 	if len(parseErrs) > 0 {
 		entry.PathGlobErrs = parseErrs
 	}
@@ -346,6 +355,9 @@ func (g *gatewaydEdgeRules) loadHostUncached(ctx context.Context, host string) (
 		}
 		for range respondErrs {
 			g.metrics.ObserveEdgeRuleCompileError("respond")
+		}
+		for range asyncErrs {
+			g.metrics.ObserveEdgeRuleCompileError("async")
 		}
 	}
 	g.cache.PutIfGeneration(host, entry, generation)
@@ -738,6 +750,28 @@ func (g *gatewaydEdgeRules) MatchRespond(ctx context.Context, host, requestPath,
 		rules = entry.Respond
 	}
 	return gateway.PickFirstRespondMatch(rules, requestPath, method)
+}
+
+// MatchAsync returns the highest-priority durable async-route rule matching
+// the public request. It shares the per-host cache and single database load
+// with every other edge-rule kind.
+func (g *gatewaydEdgeRules) MatchAsync(ctx context.Context, host, requestPath, method string) *gateway.EdgeRuleAsyncResolved {
+	if g == nil || g.cache == nil {
+		return nil
+	}
+	rules, hit := g.cache.GetAsync(host)
+	if !hit {
+		entry, err := g.loadHost(ctx, host)
+		if err != nil {
+			if g.log != nil {
+				g.log.Warn("edge rule loader failed; treating async rule as miss", "host", host, "err", err)
+			}
+			return nil
+		}
+		g.warnPathGlobErrs(host, entry.PathGlobErrs)
+		rules = entry.Async
+	}
+	return gateway.PickFirstAsyncMatch(rules, requestPath, method)
 }
 
 // Reset drops every cached entry. Called by the pg_notify loop in
@@ -1481,6 +1515,34 @@ func compileRespondRules(storeRules []state.EdgeRule) ([]gateway.EdgeRuleRespond
 	return out, parseErrs
 }
 
+// compileAsyncRules compiles kind=async rows into the same priority/path/
+// method matcher shape as respond and cache. A missing action drops a direct-
+// database row rather than accidentally making a route asynchronous.
+func compileAsyncRules(storeRules []state.EdgeRule) ([]gateway.EdgeRuleAsyncResolved, []gateway.PathGlobError) {
+	if len(storeRules) == 0 {
+		return nil, nil
+	}
+	out := make([]gateway.EdgeRuleAsyncResolved, 0, len(storeRules))
+	var parseErrs []gateway.PathGlobError
+	for i := range storeRules {
+		rule := &storeRules[i]
+		if !rule.Enabled || rule.Kind != state.EdgeRuleKindAsync || rule.Action.Async == nil {
+			continue
+		}
+		if errs := validatePathGlob(rule.ID, rule.MatchPath); errs != nil {
+			parseErrs = append(parseErrs, errs...)
+			continue
+		}
+		out = append(out, gateway.EdgeRuleAsyncResolved{
+			ID: rule.ID, AccountID: rule.AccountID, AppID: rule.AppID,
+			Priority: rule.Priority, PathGlob: rule.MatchPath,
+			Methods: buildMethodsMap(rule.MatchMethods),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Priority < out[j].Priority })
+	return out, parseErrs
+}
+
 // compileThrottleRules mirrors compileMaintenanceRules for
 // kind=throttle (ADR-091 D20.5 amendment, issue #881). The
 // compiled slice carries the per-rule RequestsPerSecond + Burst
@@ -1584,11 +1646,17 @@ func compileThrottleRules(storeRules []state.EdgeRule) ([]gateway.EdgeRuleThrott
 			// KeyBy + empty JWTClaimName + clamped MaxKeys
 			// preserve PR #887 behaviour bit-for-bit (the
 			// per-consumer branch in applyEdgeRuleThrottle
-			// only fires when KeyBy ∈
-			// {api_key, consumer_id, jwt_subject, jwt_claim}).
+			// only fires when KeyBy ∈ {api_key, consumer_id,
+			// jwt_subject, jwt_claim, country}).
 			KeyBy:          r.Action.Throttle.KeyBy,
 			JWTClaimName:   r.Action.Throttle.JWTClaimName,
 			MaxKeysPerRule: maxKeys,
+			MissingKeyPolicy: func() string {
+				if r.Action.Throttle.MissingKeyPolicy == api.ThrottleMissingKeyReject {
+					return api.ThrottleMissingKeyReject
+				}
+				return api.ThrottleMissingKeyShared
+			}(),
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Priority < out[j].Priority })
@@ -1711,16 +1779,24 @@ func compileCacheRules(storeRules []state.EdgeRule) ([]gateway.EdgeRuleCacheReso
 		if stale > api.ResponseCacheStaleIfErrorMaxSeconds {
 			stale = api.ResponseCacheStaleIfErrorMaxSeconds
 		}
+		staleWhileRevalidate := r.Action.Cache.StaleWhileRevalidateSeconds
+		if staleWhileRevalidate < 0 {
+			staleWhileRevalidate = 0
+		}
+		if staleWhileRevalidate > api.ResponseCacheStaleWhileRevalidateMaxSeconds {
+			staleWhileRevalidate = api.ResponseCacheStaleWhileRevalidateMaxSeconds
+		}
 		out = append(out, gateway.EdgeRuleCacheResolved{
-			ID:                  r.ID,
-			AccountID:           r.AccountID,
-			AppID:               r.AppID,
-			Priority:            r.Priority,
-			PathGlob:            r.MatchPath,
-			Methods:             buildMethodsMap(r.MatchMethods),
-			MaxAgeSeconds:       maxAge,
-			StaleIfErrorSeconds: stale,
-			VaryOn:              r.Action.Cache.VaryOn,
+			ID:                          r.ID,
+			AccountID:                   r.AccountID,
+			AppID:                       r.AppID,
+			Priority:                    r.Priority,
+			PathGlob:                    r.MatchPath,
+			Methods:                     buildMethodsMap(r.MatchMethods),
+			MaxAgeSeconds:               maxAge,
+			StaleWhileRevalidateSeconds: staleWhileRevalidate,
+			StaleIfErrorSeconds:         stale,
+			VaryOn:                      r.Action.Cache.VaryOn,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Priority < out[j].Priority })

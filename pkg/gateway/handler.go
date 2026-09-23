@@ -23,18 +23,20 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
+	"golang.org/x/sync/singleflight"
+
 	"github.com/onebox-faas/faas/pkg/api"
 	authmw "github.com/onebox-faas/faas/pkg/auth/middleware"
 	"github.com/onebox-faas/faas/pkg/gateway/drain"
 	"github.com/onebox-faas/faas/pkg/gateway/egresssink"
-	"github.com/onebox-faas/faas/pkg/geoip"
 	"github.com/onebox-faas/faas/pkg/realtime"
 	"github.com/onebox-faas/faas/pkg/reqbudget"
+	"github.com/onebox-faas/faas/pkg/safetext"
 	"github.com/onebox-faas/faas/pkg/sched"
 	pkgtrace "github.com/onebox-faas/faas/pkg/trace"
 	"github.com/onebox-faas/faas/pkg/wire"
-	"go.opentelemetry.io/otel/attribute"
-	"golang.org/x/sync/singleflight"
 )
 
 // ResolveSlugFn (ADR-093) is the (slug → appID) resolver the
@@ -100,6 +102,9 @@ type App struct {
 	// Function/default budget posture by limits.RequestBudgetForType.
 	Type AppType
 	Plan api.Plan
+	// RequestInvocationsEnabled is true for request-serving apps/functions and
+	// false for worker/job workloads, which have no HTTP invocation listener.
+	RequestInvocationsEnabled bool
 	// OnlyAllowDeclaredRoutes enables the pre-wake route contract. When set,
 	// the gateway asks DeclaredRouteMatcher before authentication, rate
 	// limiting, or capacity admission. Undeclared paths are answered directly
@@ -116,6 +121,9 @@ type App struct {
 	ConcurrencyOverflow string
 	// MaxQueueWaitMS overrides the plan-derived wait budget for admission.
 	MaxQueueWaitMS int
+	// MaxQueueDepth overrides the plan-derived warm saturation waiter cap.
+	// Zero uses the plan default.
+	MaxQueueDepth int
 	// WakeMaxQueueDepth overrides the per-app cold-wake waiter cap. Zero uses
 	// the plan default.
 	WakeMaxQueueDepth int
@@ -222,6 +230,11 @@ type App struct {
 	// the App struct keeps the hot path allocation-free
 	// after first sight.
 	Sidecars []AppSidecar
+	// PrimaryIngressPort, when non-zero, sends the application's ordinary
+	// hostname (including custom domains) to a long-running companion instead
+	// of the main workload port. Hydration only sets it when all traffic-bearing
+	// live deployments agree, preventing proxy bypass during mixed rollouts.
+	PrimaryIngressPort int
 	// Ports is the app-owned listener roster. The public edge only selects
 	// TCP entries through the reserved `--port-<name>` hostname form;
 	// UDP entries remain guest-only.
@@ -274,6 +287,14 @@ type App struct {
 	// existing route cache (apps_update / domain_changed wipes
 	// the route cache, and the next Lookup re-derives).
 	Scope string
+	// PinnedDeploymentID is set only for a deployment-preview hostname. It
+	// makes the public request path select the immutable deployment addressed
+	// by deploy-{revision}-{slug}, independent of customer traffic weights.
+	// PinnedDeploymentScope is the deployment's environment scope and must be
+	// forwarded on a cold admission so the exact artifact receives the same
+	// scoped configuration it was built to serve.
+	PinnedDeploymentID    string
+	PinnedDeploymentScope string
 	// CORS improvements D1: per-app default CORS
 	// opt-in. Plumbed from apps.cors_default_enabled
 	// through pgRouter.toApp so applyEdgeRuleCORS
@@ -328,6 +349,7 @@ type App struct {
 type concurrencyAdmissionConfig struct {
 	overflow             string
 	maxQueueWaitMS       int
+	maxQueueDepth        int
 	wakeMaxQueueDepth    int
 	wakeMaxQueueWaitSecs int
 }
@@ -336,6 +358,7 @@ func concurrencyConfigForApp(app App) concurrencyAdmissionConfig {
 	return concurrencyAdmissionConfig{
 		overflow:             app.ConcurrencyOverflow,
 		maxQueueWaitMS:       app.MaxQueueWaitMS,
+		maxQueueDepth:        app.MaxQueueDepth,
 		wakeMaxQueueDepth:    app.WakeMaxQueueDepth,
 		wakeMaxQueueWaitSecs: app.WakeMaxQueueWaitSeconds,
 	}
@@ -440,6 +463,12 @@ const (
 	rateLimitScopeRule    = "rule"
 	rateLimitScopeRoute   = "route"
 )
+
+// centralRateLimitDegradedCooldown bounds outage logging and audit writes to
+// one event per scope per minute. The Prometheus counter still records every
+// fallback; the cooldown only prevents a failed central store from amplifying
+// itself through one log and one best-effort audit insert per request.
+const centralRateLimitDegradedCooldown = time.Minute
 
 // AppSidecar (issue #463 / ADR-069 / ADR-071 / PR-C §5) is
 // the narrow subset of pkg/api.SidecarSpec the public
@@ -813,9 +842,10 @@ type Handler struct {
 	// metrics, which arrive too late to protect a cold burst.
 	burstPressure *burstPressure
 	// vmConcurrency enforces the plan's concurrency_per_vm bound after the
-	// picker selects a concrete instance. It is intentionally gateway-local:
-	// the guest listener remains runtime-agnostic while the edge can account
-	// for the complete bridge lifetime, including streams and upgrades.
+	// picker selects a concrete instance. Instance slots and FIFO ordering are
+	// gateway-local; production installs a shared admission backend so the
+	// queue-depth budget remains fleet-wide. The guest listener stays runtime-
+	// agnostic while the edge accounts for streams and upgrades.
 	vmConcurrency *vmConcurrencyManager
 	// vmConcurrencyAudit emits vm.inflight_threshold_reached when a request
 	// observes a full instance slot set. It shares the gateway audit sink so
@@ -823,6 +853,11 @@ type Handler struct {
 	vmConcurrencyAudit RequireAuthnAuditor
 	// metrics may be nil; nil-guarded everywhere it is read.
 	metrics *Metrics
+	// centralRateLimitDegradedLast rate-limits the warning/audit side of a
+	// central-counter failure. The per-request metric is deliberately outside
+	// this gate. Key space is the closed {app,account,rule,other} scope set.
+	centralRateLimitDegradedMu   sync.Mutex
+	centralRateLimitDegradedLast map[string]time.Time
 	// headHeaders retains a bounded, safe subset of the last successful
 	// origin response headers for parked-app HEAD / answers. It is process
 	// local; after restart the edge returns 204 until a live response lands.
@@ -841,6 +876,10 @@ type Handler struct {
 	// a nil field is safe; tests inject a stub via
 	// WithMirrorRoundTripper.
 	mirrorRoundTripper MirrorRoundTripper
+	// mirrorResultStore is the durable comparison ledger. It is optional so
+	// gateway unit tests and development backends can omit Postgres; production
+	// wires the shared PgStore.
+	mirrorResultStore mirrorResultStore
 	// mirrorSlots (issue #72 / ADR-133 / ADR-125 PR-A3
 	// code-review fix #3) is the per-rule concurrent mirror-VM
 	// cost circuit. Keyed on the mirror-rule UUID (NOT the
@@ -955,6 +994,23 @@ type Handler struct {
 	// cmd/gatewayd-internal/main.go so production defaults to off and operators
 	// opt in per-cluster after PR-B ships.
 	streamingEnabled bool
+	// retryEnabled is the FAAS_GATEWAY_RETRY operator gate (ADR-201 §1).
+	// Off by default; with it off, proxyAttempt calls the forwarder directly
+	// and the tree is byte-identical to the pre-ADR-201 path.
+	retryEnabled bool
+	// retryDefault is the policy applied when the gate is on and no
+	// kind=retry rule matched. Zero MaxAttempts means no replay, so an
+	// operator can enable the gate and roll the behaviour out per-app via
+	// edge rules rather than fleet-wide in one step.
+	retryDefault RetryPolicy
+	// retryMatch resolves the matched kind=retry rule for a request. Nil
+	// falls back to retryDefault.
+	retryMatch func(app App, r *http.Request) (RetryPolicy, bool)
+	// retryObs counts attempts and exhaustions. Nil disables the metric.
+	retryObs retryObserver
+	// retryBudget caps aggregate replay amplification per app. It is shared
+	// with internal service forwarding in production.
+	retryBudget *RetryBudget
 	// streamingWarned is the once-per-process log dedup for the
 	// buffered-fallback deprecation. Keyed on (appID, content-type) so
 	// the first instance of an SSE-emitting app under the flag-off
@@ -1073,12 +1129,15 @@ type Handler struct {
 	// proxy all see the *target* app's context, not the
 	// inbound host's (auth remains per-app).
 	edgeRules EdgeRuleMatcher
-	// geoReader is the pkg/geoip.Reader used by applyEdgeRuleGeo
-	// (ADR-091 D21). A nil reader means the gate is disabled —
-	// applyEdgeRuleGeo short-circuits to fall-through so the
-	// daemon boots cleanly without a DB-IP file (§11 fail-open
-	// spirit). Set via WithGeoReader.
-	geoReader *geoip.Reader
+	// asyncRoutes persists requests matched by kind=async. Nil is a fail-closed
+	// runtime wiring error only when such a rule actually matches.
+	asyncRoutes AsyncRouteEnqueuer
+	// geoReader is the country lookup used by applyEdgeRuleGeo and
+	// country-keyed throttles (ADR-091 D21). A nil reader is allowed
+	// at boot, but a matched policy that needs geography fails closed.
+	// A matched policy fails closed when the reader is unavailable;
+	// the daemon itself can still boot without a DB-IP file.
+	geoReader CountryReader
 	// resolveTargetApp is the closure the matcher uses to
 	// swap the gateway.App when a `kind=route` rule fires.
 	// It returns (App{}, false) when the slug is not found
@@ -1224,6 +1283,7 @@ func NewHandlerWith(backend Backend, m *Metrics, log *slog.Logger) *Handler {
 			},
 		),
 		burstPressure:      &burstPressure{},
+		retryBudget:        NewRetryBudget(0, nil),
 		metrics:            m,
 		headHeaders:        newEdgeHeadHeaderCache(),
 		log:                log,
@@ -1251,6 +1311,11 @@ func NewHandlerWith(backend Backend, m *Metrics, log *slog.Logger) *Handler {
 	h.vmConcurrency = newVMConcurrencyManager(func(plan string, delta int64) {
 		if m != nil {
 			m.ObserveVMInflightDelta(plan, delta)
+		}
+	})
+	h.vmConcurrency.setQueueDepthSink(func(appID, plan string, depth int) {
+		if m != nil {
+			m.SetConcurrencyQueueDepth(appID, plan, depth)
 		}
 	})
 	// piApps is a value-typed sync.Map wrapper; its zero value is valid
@@ -1309,19 +1374,62 @@ func (h *Handler) WithCentralBackend(central CentralBackend) *Handler {
 	if central == nil {
 		return h
 	}
-	if h.limiter != nil {
-		h.limiter.central = central
-	}
-	if h.accountLimiter != nil {
-		h.accountLimiter.central = central
-	}
-	if h.routeLimiter != nil {
-		h.routeLimiter.central = central
-	}
-	if h.routeConsumerLimiter != nil {
-		h.routeConsumerLimiter.central = central
+	for _, limiter := range h.limiters() {
+		limiter.central = central
+		limiter.centralErrorObserver = h.observeCentralRateLimitDegraded
 	}
 	return h
+}
+
+// observeCentralRateLimitDegraded makes the limiter's local-fallback posture
+// explicit. Metrics count every fallback. Logs and audit rows are rate-limited
+// per closed scope so a Postgres outage does not create an additional write
+// storm. The audit attempt gets its own short context because the failed
+// central consume may have exhausted or cancelled the request's child context.
+func (h *Handler) observeCentralRateLimitDegraded(ctx context.Context, scope string, err error) {
+	if h == nil || err == nil {
+		return
+	}
+	switch scope {
+	case rateLimitScopeApp, rateLimitScopeAccount, rateLimitScopeRule:
+	default:
+		scope = "other"
+	}
+	if h.metrics != nil {
+		h.metrics.ObserveRateLimitDegraded(scope)
+	}
+
+	now := time.Now()
+	h.centralRateLimitDegradedMu.Lock()
+	if h.centralRateLimitDegradedLast == nil {
+		h.centralRateLimitDegradedLast = make(map[string]time.Time, 4)
+	}
+	last := h.centralRateLimitDegradedLast[scope]
+	if !last.IsZero() && now.Sub(last) < centralRateLimitDegradedCooldown {
+		h.centralRateLimitDegradedMu.Unlock()
+		return
+	}
+	h.centralRateLimitDegradedLast[scope] = now
+	h.centralRateLimitDegradedMu.Unlock()
+
+	if h.log != nil {
+		h.log.Warn("gateway rate limiter fell back to process-local counters",
+			"scope", scope, "error", err)
+	}
+	var audit RequireAuthnAuditor
+	if h.requireAuthnAudit != nil {
+		audit = h.requireAuthnAudit
+	} else if h.edgeRuleAudit != nil {
+		audit = h.edgeRuleAudit
+	}
+	if audit != nil {
+		auditCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 100*time.Millisecond)
+		defer cancel()
+		audit.Emit(auditCtx, "ratelimit_degraded", nil, map[string]any{
+			"scope": scope,
+			"error": err.Error(),
+		})
+	}
 }
 
 // InvalidateRateLimit drops the in-process fallback/header mirror for
@@ -1465,6 +1573,16 @@ func (h *Handler) WithVMConcurrencyAudit(audit RequireAuthnAuditor) *Handler {
 	return h
 }
 
+// WithConcurrencyQueueAdmission installs the shared permit backend that makes
+// max_queue_depth a fleet-wide per-app cap across gateway replicas. A nil
+// backend retains process-local admission for tests and single-process embeds.
+func (h *Handler) WithConcurrencyQueueAdmission(admission ConcurrencyQueueAdmission) *Handler {
+	if h != nil && h.vmConcurrency != nil {
+		h.vmConcurrency.setQueueAdmission(admission)
+	}
+	return h
+}
+
 // WithForwarding installs the per-node HTTP→gRPC forwarder built by
 // pkg/gateway/forwardproxy.go (issue #98 / ADR-028). When set, every
 // request dispatches through fn(nodeID) where nodeID is the value
@@ -1578,6 +1696,12 @@ func (h *Handler) WithEdgeRules(matcher EdgeRuleMatcher, resolve ResolveTargetAp
 	return h
 }
 
+// WithAsyncRouteEnqueuer arms durable enqueue for kind=async rules.
+func (h *Handler) WithAsyncRouteEnqueuer(enqueuer AsyncRouteEnqueuer) *Handler {
+	h.asyncRoutes = enqueuer
+	return h
+}
+
 // WithDeclaredRouteMatcher arms the opt-in pre-wake route contract. The
 // matcher is deliberately a narrow seam so the gateway package does not need
 // to import state or OpenAPI parsing code. A nil matcher is treated as a
@@ -1621,14 +1745,17 @@ func (h *Handler) enforceDeclaredRoute(w http.ResponseWriter, r *http.Request, a
 	return true
 }
 
-// WithGeoReader (ADR-091 D21 / §4.1.2.8b) arms the per-rule
-// geographic lookup consulted by applyEdgeRuleGeo. r may be nil
-// (geo kind disabled; pre-PR-7 + file-missing posture). The
-// nil-receiver-safe pattern in pkg/geoip.Reader.Lookup means a
-// nil reader keeps the gate fail-open — the matcher can still
-// surface a geo rule, but the lookup returns ("", false, nil)
-// and the rule does not fire.
-func (h *Handler) WithGeoReader(r *geoip.Reader) *Handler {
+// CountryReader is the narrow GeoIP seam used by geo access rules and
+// country-keyed throttles. *geoip.Reader is the production implementation;
+// the interface keeps request-policy tests independent from a binary MMDB.
+type CountryReader interface {
+	Lookup(net.IP) (country string, ok bool, err error)
+}
+
+// WithGeoReader (ADR-091 D21 / §4.1.2.8b) arms the geographic lookup
+// consulted by geo access rules and country-keyed throttles. A nil reader is
+// allowed at boot, but any matched policy that needs it fails closed with 503.
+func (h *Handler) WithGeoReader(r CountryReader) *Handler {
 	h.geoReader = r
 	return h
 }
@@ -1690,6 +1817,14 @@ func (h *Handler) WithResponseCache(cache *ResponseCache) *Handler {
 // real upstream. Fluent setter, mirrors WithResponseCache.
 func (h *Handler) WithMirrorRoundTripper(rt MirrorRoundTripper) *Handler {
 	h.mirrorRoundTripper = rt
+	return h
+}
+
+// WithMirrorResultStore wires the durable per-invocation comparison ledger.
+// Writes are best-effort and happen only from detached mirror goroutines, so a
+// slow or unavailable store never delays the customer response.
+func (h *Handler) WithMirrorResultStore(store mirrorResultStore) *Handler {
+	h.mirrorResultStore = store
 	return h
 }
 
@@ -2503,7 +2638,18 @@ func (h *Handler) applyEdgeRuleJWT(w http.ResponseWriter, r *http.Request, app A
 		h.jwtEmit(r.Context(), "jwt", "missing", rule.ID, r.Host, nil, nil)
 		return true
 	}
-	claims, err := h.verifyJWTWithDeadline(r.Context(), raw, rule)
+	// A matching jwt_claim throttle chooses a verified custom claim even when
+	// the JWT access rule does not require that claim's value. Copy the cached
+	// JWT rule before adding the extraction hint; matcher-owned values are
+	// immutable and shared across requests.
+	verifyRule := rule
+	if throttle := h.edgeRules.MatchThrottle(r.Context(), hostname(r.Host), r.URL.Path, r.Method); throttle != nil &&
+		throttle.AccountID == app.AccountID && throttle.KeyBy == api.ThrottleKeyByJWTClaim && throttle.JWTClaimName != "" {
+		cloned := *rule
+		cloned.ExtractClaims = []string{throttle.JWTClaimName}
+		verifyRule = &cloned
+	}
+	claims, err := h.verifyJWTWithDeadline(r.Context(), raw, verifyRule)
 	if err != nil {
 		w.Header().Set("WWW-Authenticate", `Bearer realm="apps"`)
 		api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized,
@@ -3980,12 +4126,13 @@ func (h *Handler) applyEdgeRuleGeo(w http.ResponseWriter, r *http.Request, app A
 // same-account governance doesn't get to gate traffic.
 //
 // Phase 3 (ADR-104, issue #881 Phase 3): when the matched rule
-// opts into a per-consumer KeyBy value (`api_key`, `consumer_id`, `jwt_subject`,
-// `jwt_claim`), this applier reads the Authenticated struct from
-// the request context (populated by enforceRequireAuthn and
-// applyEdgeRuleJWT) and routes the bucket lookup through the
-// routeConsumerLimiter (separate scope so per-rule and
-// per-consumer buckets don't share slots). The __other__ collapse
+// opts into a dimensional KeyBy value (`api_key`, `consumer_id`,
+// `jwt_subject`, `jwt_claim`, or `country`), this applier resolves the
+// trusted request concept and routes the bucket lookup through the
+// routeConsumerLimiter. A dimensional rule does not also spend from a shared
+// parent route bucket: doing so would let one identity drain that bucket and
+// starve every other identity, defeating the isolation promised by key_by.
+// The __other__ collapse
 // bucket — see ratelimit.go::AllowWithConsumerKey — is pinned
 // non-evictable so an attacker cannot weaponise key-space growth
 // to bypass the throttle. Empty KeyBy (and the "none" sentinel)
@@ -4023,83 +4170,108 @@ func (h *Handler) applyEdgeRuleThrottle(w http.ResponseWriter, r *http.Request, 
 		}
 		return false
 	}
+	// Resolve the optional request dimension before consuming its authoritative
+	// bucket. A strict missing-key policy and an unavailable GeoIP dependency
+	// must not charge a request that never reaches the application.
+	var consumerID string
+	dimensional := api.ThrottleKeyByIsPerConsumer(rule.KeyBy)
+	if dimensional {
+		if h.routeConsumerLimiter == nil {
+			h.rejectUnavailableEdgeRule(w, r, "throttle", rule.ID, "dimension_limiter_not_configured")
+			return true
+		}
+		var ok bool
+		var unavailableReason string
+		consumerID, ok, unavailableReason = h.resolveThrottleDimension(r, rule)
+		if unavailableReason != "" {
+			if unavailableReason == "caller_ip_untrusted" {
+				api.WriteProblem(w, api.NewProblem(http.StatusForbidden, api.CodeForbidden,
+					"Caller IP not in trusted set", "X-Forwarded-For did not contain exactly one trusted address; refusing to evaluate a country-keyed throttle"))
+				if h.edgeRuleAudit != nil {
+					h.edgeRuleAudit.Emit(r.Context(), "edge_rule.caller_ip_forged", nil, map[string]any{
+						"rule_id": rule.ID, "from_host": r.Host,
+						"xff_count": len(r.Header.Values("X-Forwarded-For")),
+						"policy":    "throttle_country",
+					})
+				}
+				if h.metrics != nil {
+					h.metrics.ObserveEdgeRuleMatch("throttle", "blocked")
+					h.metrics.ObserveEdgeRuleApply("throttle", "error")
+				}
+				return true
+			}
+			h.rejectUnavailableEdgeRule(w, r, "throttle", rule.ID, unavailableReason)
+			return true
+		}
+		if !ok {
+			if h.metrics != nil {
+				h.metrics.ObserveRouteConsumerThrottleDecision(rule.KeyBy, "anonymous")
+			}
+			if rule.MissingKeyPolicy == api.ThrottleMissingKeyReject {
+				api.WriteProblem(w, api.NewProblem(http.StatusUnauthorized, api.CodeUnauthorized,
+					"Throttle identity required", "the request did not provide the authenticated identity or claim required by this throttle rule"))
+				if h.edgeRuleAudit != nil {
+					h.edgeRuleAudit.Emit(r.Context(), "edge_rule.throttle_identity_missing", nil, map[string]any{
+						"rule_id": rule.ID,
+						"app_id":  app.ID,
+						"key_by":  rule.KeyBy,
+					})
+				}
+				if h.metrics != nil {
+					h.metrics.ObserveEdgeRuleMatch("throttle", "blocked")
+					h.metrics.ObserveEdgeRuleApply("throttle", "success")
+				}
+				return true
+			}
+			consumerID = "__anonymous__"
+		}
+	}
+
 	// Bucket key is `appID + "\x00" + ruleID` for PR #887 rules
-	// (KeyBy == "" or "none"). Per-consumer keying (Phase 3)
-	// constructs a longer key by appending the resolved consumer
-	// identity — see resolveConsumerKey below. The routeConsumerLimiter
-	// owns the consumer-keyed buckets and applies the __other__
-	// collapse; routeLimiter owns the rule-only buckets and is
-	// untouched. Phase 1+2 rules never enter the per-consumer branch.
+	// (KeyBy == "" or "none"). Dimensional rules append the resolved
+	// identity inside routeConsumerLimiter, which also applies the bounded
+	// __other__ collapse. The two modes are alternatives: consuming both a
+	// parent route bucket and a dimensional child bucket would reintroduce a
+	// shared bottleneck and allow one identity to starve all others.
 	bucketKey := app.ID + "\x00" + rule.ID
-	// Per-rule throttle consult (ADR-104 amendment 5, issue #881
-	// Phase 4 C3). When the daemon is running under
+	// Central throttle consult (ADR-104 amendment 5, issue #881 Phase 4 C3).
+	// When the daemon is running under
 	// [ratelimit] mode = "central" (the cross-replica drift fix
 	// documented in amendment 5), every request atomically consumes from
-	// pg_ratelimit_counters — wired via
-	// AllowWithCentralParams + the centralKey "rule:<ruleID>:<plan>"
-	// triple. Empty centralKey (mode = "local", the default) reproduces
-	// today's AllowWithParams byte-for-byte. The fix to the Phase 4
-	// C3 wiring gap: the per-rule call site MUST use the central-aware
-	// sibling even though the central consume is bypassed
-	// under mode=local — otherwise enabling central mode in TOML
-	// would not affect per-rule buckets and the multi-replica drift
-	// documented in the 00126 schema would remain.
+	// pg_ratelimit_counters. Non-dimensional rules use the rule UUID itself;
+	// dimensional rules derive a deterministic bounded shard from the rule,
+	// dimension kind, and value inside AllowWithCentralConsumerKey.
 	centralKey := "rule:" + rule.ID + ":" + string(app.Plan)
-	allowed := h.routeLimiter.AllowWithCentralParams(r.Context(), bucketKey, rule.RequestsPerSecond, float64(rule.Burst), centralKey)
-	// consumerID is hoisted out of the per-consumer branch so the
-	// 429 path (below) can read it for the X-RouteRateLimit-Policy
-	// collapse detection (ADR-104 amendment 5, issue #881 Phase 4
-	// H1). Empty string means "anonymous / not resolved" — the
-	// policy-header computation treats that as "route" (no
-	// collapse to advertise).
-	var consumerID string
-	if allowed && api.ThrottleKeyByIsPerConsumer(rule.KeyBy) {
-		authed := authenticatedFrom(r.Context())
-		var ok bool
-		consumerID, ok = resolveConsumerKey(rule.KeyBy, rule.JWTClaimName, authed)
-		if ok {
-			// The consumer bucket key is the same
-			// `appID+"\x00"+ruleID` prefix used by the per-rule
-			// bucket, plus a "\x00"+consumerID suffix. The per-rule
-			// AllowWithParams call above already admitted the
-			// request into the rule scope (token decrement on the
-			// rule bucket — the parent bucket the per-consumer
-			// sub-buckets ride on); the per-consumer AllowWithConsumerKey
-			// call throttles within that scope.
-			//
-			// When MaxKeysPerRule == 0 (resolver-default; cmd-side
-			// compileThrottleRules substitutes the plan default) we
-			// surface a sensible ceiling here. cmd-side is the source
-			// of truth — but defence-in-depth against a direct-DB
-			// write that bypassed compileThrottleRules.
-			cap := rule.MaxKeysPerRule
-			if cap <= 0 {
-				cap = api.ThrottleMaxKeysPerRuleDefault
-			}
-			if !h.routeConsumerLimiter.AllowWithConsumerKey(bucketKey, consumerID, rule.RequestsPerSecond, float64(rule.Burst), cap) {
-				allowed = false
-				h.metrics.ObserveRouteConsumerThrottleDecision(rule.KeyBy, "throttle")
-			} else {
-				h.metrics.ObserveRouteConsumerThrottleDecision(rule.KeyBy, "admit")
-			}
-		} else {
-			// Anonymous on a per-consumer rule — emit the
-			// `anonymous` outcome so the dashboard can flag
-			// authn-gated apps that are seeing unauthenticated
-			// traffic on a per-consumer rule (a misconfiguration
-			// signal).
-			h.metrics.ObserveRouteConsumerThrottleDecision(rule.KeyBy, "anonymous")
+	allowed := false
+	deniedLimiter := h.routeLimiter
+	deniedBucketKey := bucketKey
+	policy := rateLimitScopeRoute
+	if dimensional {
+		// When MaxKeysPerRule == 0 (resolver-default; cmd-side
+		// compileThrottleRules substitutes the plan default) use the
+		// platform default as defence-in-depth against a direct-DB write.
+		cap := rule.MaxKeysPerRule
+		if cap <= 0 {
+			cap = api.ThrottleMaxKeysPerRuleDefault
 		}
-		// resolveConsumerKey returning ok=false means anonymous
-		// traffic on a per-consumer rule (e.g. an unauthenticated
-		// request hitting a rule with key_by=api_key). The PR #887
-		// rule-only bucket has already been consumed; we treat
-		// anonymous on a per-consumer rule as a free pass through
-		// the per-consumer layer — anonymous collapses into the
-		// rule scope via the AllowWithParams token. A future
-		// hardening may explicitly 401 here, but for Phase 3 the
-		// documented behaviour matches today (per-rule bucket
-		// already throttled).
+		allowed = h.routeConsumerLimiter.AllowWithCentralConsumerKey(
+			r.Context(), bucketKey, rule.KeyBy, consumerID,
+			rule.RequestsPerSecond, float64(rule.Burst), cap, centralKey,
+		)
+		deniedLimiter = h.routeConsumerLimiter
+		deniedBucketKey = h.routeConsumerLimiter.consumerBucketKey(bucketKey, consumerID)
+		policy = "per-consumer"
+		if h.metrics != nil {
+			outcome := "throttle"
+			if allowed {
+				outcome = "admit"
+			}
+			h.metrics.ObserveRouteConsumerThrottleDecision(rule.KeyBy, outcome)
+		}
+	} else {
+		allowed = h.routeLimiter.AllowWithCentralParams(
+			r.Context(), bucketKey, rule.RequestsPerSecond, float64(rule.Burst), centralKey,
+		)
 	}
 	if !allowed {
 		w.Header().Set("Retry-After", "1")
@@ -4107,34 +4279,11 @@ func (h *Handler) applyEdgeRuleThrottle(w http.ResponseWriter, r *http.Request, 
 		// (established by per-account / per-app 429 paths
 		// respectively) — see writeRouteRateLimitHeaders comment.
 		w.Header().Set("x-faas-rate-limit-scope", "route")
-		// ADR-104 amendment 5 (issue #881 Phase 4 H1): emit
-		// X-RouteRateLimit-Policy so operators can read the
-		// per-consumer collapse state without parsing the
-		// X-RouteRateLimit-* numerics. `route` is the
-		// back-compat default (Phase 1+2 rules); `per-consumer`
-		// fires when the request hit a Phase 3 per-consumer rule
-		// AND the consumer collapsed into the __other__ bucket
-		// (the collapse-bucket invariant from
-		// pkg/gateway/ratelimit.go:119-124).
-		policy := rateLimitScopeRoute
-		// Per-consumer collapse detection (ADR-104 amendment 5,
-		// issue #881 Phase 4 H1): the 429 path's bucketKey is the
-		// RULE-level key (app.ID+"\x00"+rule.ID); the per-consumer
-		// bucket is a sub-bucket on routeConsumerLimiter that the
-		// applier already consulted above. We can't read the
-		// sub-bucket key from the wire here, so we ask the limiter
-		// directly: ConsumerIsTracked returns false iff the
-		// consumer has collapsed to the __other__ bucket (which is
-		// exactly the "per-consumer" policy-header value). Rules
-		// with KeyBy ∈ {"", "none"} never enter this branch
-		// (ThrottleKeyByIsPerConsumer is false) so the
-		// back-compat "route" default is preserved.
-		if api.ThrottleKeyByIsPerConsumer(rule.KeyBy) {
-			if !h.routeConsumerLimiter.ConsumerIsTracked(bucketKey, consumerID) {
-				policy = "per-consumer"
-			}
-		}
-		h.writeRouteRateLimitHeaders(w, bucketKey, rule.RequestsPerSecond, rule.Burst, policy)
+		// The policy names the authoritative bucket family: `route` for a
+		// shared rule bucket and `per-consumer` for every dimensional rule,
+		// whether the identity owns a dedicated bucket or shares __other__.
+		h.writeRouteRateLimitHeadersFromLimiter(w, deniedLimiter, deniedBucketKey,
+			rule.RequestsPerSecond, rule.Burst, policy)
 		api.WriteProblem(w, api.NewProblem(http.StatusTooManyRequests, "rate_limited",
 			"Rate limit exceeded", "slow down and retry"))
 		if h.edgeRuleAudit != nil {
@@ -4170,6 +4319,33 @@ func (h *Handler) applyEdgeRuleThrottle(w http.ResponseWriter, r *http.Request, 
 		h.metrics.ObserveEdgeRuleApply("throttle", "success")
 	}
 	return false
+}
+
+// resolveThrottleDimension resolves only trusted, platform-established
+// request concepts. Authentication dimensions come from the verified request
+// context; country comes from the single sanitized X-Forwarded-For hop and the
+// configured GeoIP database. A missing database, forged XFF, lookup error, or
+// uncovered address is unavailable and fails closed.
+func (h *Handler) resolveThrottleDimension(r *http.Request, rule *EdgeRuleThrottleResolved) (string, bool, string) {
+	if rule.KeyBy != api.ThrottleKeyByCountry {
+		value, ok := resolveConsumerKey(rule.KeyBy, rule.JWTClaimName, authenticatedFrom(r.Context()))
+		return value, ok, ""
+	}
+	if h.geoReader == nil {
+		return "", false, "geo_reader_not_configured"
+	}
+	clientIP, ok := clientIPFromTrustedXFF(r)
+	if !ok {
+		return "", false, "caller_ip_untrusted"
+	}
+	country, found, err := h.geoReader.Lookup(clientIP)
+	if err != nil {
+		return "", false, "geo_lookup_error"
+	}
+	if !found || country == "" {
+		return "", false, "geo_country_not_found"
+	}
+	return strings.ToUpper(country), true, ""
 }
 
 // geoFailReason returns a short audit-friendly string explaining
@@ -5229,7 +5405,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// otelhttp span, but gatewayd-internal also serves the handler directly in
 	// split-node and test paths. This child gives the routing, wake, and
 	// forwarding work one stable span regardless of how the request arrived.
-	requestCtx, requestSpan := pkgtrace.StartSpan(r.Context(), "gateway.request",
+	// gatewayd-internal uses a plain/private HTTP listener rather than an
+	// otelhttp server wrapper. Extract the edge's W3C context at this boundary
+	// so request telemetry, the guest hop, and service-proxy dependencies share
+	// the public trace ID.
+	parentCtx := propagation.TraceContext{}.Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+	requestCtx, requestSpan := pkgtrace.StartSpan(parentCtx, "gateway.request",
 		attribute.String("http.method", r.Method))
 	r = r.WithContext(requestCtx)
 	defer func() {
@@ -5669,7 +5850,11 @@ haveApp:
 		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
 		return
 	}
-	if served, rule := h.applyEdgeRuleCache(w, r, app, rec); served {
+	var asyncRule *EdgeRuleAsyncResolved
+	if !deploymentSmoke {
+		asyncRule = h.matchAsyncRoute(r, sidecarName)
+	}
+	if served, rule := h.applyEdgeRuleCacheUnlessAsync(w, r, app, rec, asyncRule); served {
 		return
 	} else if isNonUserTriggerClass(triggerClass) && normalizeCrawlerPolicy(app.CrawlerPolicy) == "cached" {
 		// A fresh kind=cache hit returned above. A miss (including a stale
@@ -5776,6 +5961,8 @@ haveApp:
 		// request context via a sentinel added below.
 		_ = port
 		r = withSidecarPort(r, port)
+	} else if app.PrimaryIngressPort != 0 {
+		r = withSidecarPort(r, app.PrimaryIngressPort)
 	}
 
 	// Issue #273 / ADR-042 — pre-instantiate the closed (class) set
@@ -5862,6 +6049,10 @@ haveApp:
 		admittedBody := r.Body
 		defer func() { _ = admittedBody.Close() }()
 	}
+	if h.applyEdgeRuleAsync(w, r, app, asyncRule) {
+		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
+		return
+	}
 
 	burstDone := h.burstPressure.begin(app.ID)
 	defer burstDone()
@@ -5886,25 +6077,38 @@ haveApp:
 	if app.SessionAffinity {
 		preferredInstanceID = h.affinityTargetFromRequest(r, app.ID)
 	}
+	exactDeploymentID := smokeDeploymentID
+	exactDeploymentScope := app.Scope
+	exactDeploymentTrigger := sched.TriggerDeploymentSmoke
+	exactUnavailableTitle := "Deployment verification unavailable"
+	exactUnavailableDetail := "the candidate deployment has no routable target"
+	if !deploymentSmoke && app.PinnedDeploymentID != "" {
+		exactDeploymentID = app.PinnedDeploymentID
+		exactDeploymentScope = app.PinnedDeploymentScope
+		exactDeploymentTrigger = sched.TriggerGateway
+		exactUnavailableTitle = "Deployment preview unavailable"
+		exactUnavailableDetail = "the requested deployment is not ready to serve preview traffic"
+	}
+	exactDeployment := exactDeploymentID != ""
 	var pick PickResult
-	if deploymentSmoke {
+	if exactDeployment {
 		picker, ok := h.backend.(deploymentTargetPicker)
 		if !ok {
 			api.WriteProblem(w, api.NewProblem(http.StatusServiceUnavailable, api.CodeCapacity,
-				"Deployment verification unavailable", "the gateway cannot select a candidate deployment directly"))
+				exactUnavailableTitle, "the gateway cannot select a deployment directly"))
 			h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
 			return
 		}
-		pick = picker.PickForDeployment(app.ID, smokeDeploymentID)
+		pick = picker.PickForDeployment(app.ID, exactDeploymentID)
 		if !pick.OK {
-			// A snapshot candidate is parked before this public verification
-			// runs. Admit one deployment-scoped verification instance outside
-			// the customer's serving-concurrency count; node RAM/vCPU limits
-			// remain authoritative in schedd.
+			// A snapshot candidate or zero-percent live deployment can be cold
+			// before its exact URL is visited. Admit one deployment-scoped
+			// instance; schedd remains authoritative for the bounded rollout
+			// overlap and node RAM/vCPU limits.
 			maxInstances := effectiveAppConcurrencyLimit(app, limits.MaxConcurrency)
 			admittedWakeID, method, atCapacity, admitErr := h.backend.Admit(
-				r.Context(), app.ID, smokeDeploymentID, app.Scope,
-				sched.TriggerDeploymentSmoke, maxInstances+1,
+				r.Context(), app.ID, exactDeploymentID, exactDeploymentScope,
+				exactDeploymentTrigger, maxInstances+api.RolloutConcurrencyGrant,
 			)
 			if admitErr != nil || atCapacity {
 				if admitErr == nil {
@@ -5915,10 +6119,10 @@ haveApp:
 				return
 			}
 			cold, wakeID, wakeMethod = true, admittedWakeID, method
-			pick = picker.PickForDeployment(app.ID, smokeDeploymentID)
+			pick = picker.PickForDeployment(app.ID, exactDeploymentID)
 			if !pick.OK {
 				api.WriteProblem(w, api.NewProblem(http.StatusServiceUnavailable, api.CodeCapacity,
-					"Deployment verification unavailable", "the candidate became unavailable after admission"))
+					exactUnavailableTitle, "the requested deployment became unavailable after admission"))
 				h.observe(r, rec.status, app.ID, string(app.Plan), cold, Target{})
 				return
 			}
@@ -5939,9 +6143,9 @@ haveApp:
 			}
 		}
 	}
-	if deploymentSmoke && !pick.OK {
+	if exactDeployment && !pick.OK {
 		api.WriteProblem(w, api.NewProblem(http.StatusServiceUnavailable, api.CodeCapacity,
-			"Deployment verification unavailable", "the candidate deployment has no routable target"))
+			exactUnavailableTitle, exactUnavailableDetail))
 		h.observe(r, rec.status, app.ID, string(app.Plan), cold, Target{})
 		return
 	}
@@ -5977,7 +6181,7 @@ haveApp:
 			attribute.Int("desired_instances", maxInstances),
 		)
 		//nolint:contextcheck // request ctx at handler boundary.
-		cold, wakeID, wakeMethod, err = h.ensureCapacity(wakeCtx, app.ID, app.AccountID, app.Scope, maxInstances, app.Plan, app.AutoscaleTargetRPS, concurrencyConfigForApp(app))
+		cold, wakeID, wakeMethod, err = h.ensureCapacity(wakeCtx, app.ID, app.AccountID, app.Scope, maxInstances, app.Plan, app.AutoscaleTargetRPS, sched.TriggerGateway, concurrencyConfigForApp(app))
 		wakeSpan.SetAttributes(
 			attribute.Bool("cold", cold),
 			attribute.String("wake_id", wakeID),
@@ -6037,30 +6241,35 @@ haveApp:
 			return
 		}
 	}
-	// The first request above guarantees one routable target. Reconcile the
-	// request pressure accumulated by the whole burst. Additional capacity is
-	// admitted in the background once a healthy target exists; the forwarding
-	// concurrency gate bounds work on that target while siblings become ready.
-	//nolint:contextcheck // request ctx at handler boundary.
+	// The first ordinary request above guarantees one routable target.
+	// Reconcile pressure accumulated by that app-level burst. Exact-deployment
+	// URLs deliberately skip this step: burst admission uses the weighted app
+	// picker and could wake or select a sibling deployment instead of the
+	// immutable revision named by the hostname.
 	perVMConcurrency := effectiveVMConcurrencyLimit(app, limits.ConcurrencyPerVMBound)
-	burstWaitCtx, cancelBurstWait := context.WithTimeout(r.Context(), WakeAdmissionPolicyForApp(app.Plan, app.ConcurrencyOverflow, app.MaxQueueWaitMS).MaxWait)
-	defer cancelBurstWait()
-	waitedForBurst, burstErr := h.maybeBurstCapacity(burstWaitCtx, app, limits.MaxConcurrency, perVMConcurrency)
-	if burstErr != nil {
-		// A burst that cannot become routable within its admission policy is
-		// a controlled timeout, not an upstream 502. Client disconnects
-		// remain silent; genuine admission failures use the normal
-		// capacity problem response.
-		writeBurstCapacityError(w, r, burstErr)
-		h.observe(r, rec.status, app.ID, string(app.Plan), cold, Target{})
-		return
+	waitedForBurst := false
+	if !exactDeployment {
+		//nolint:contextcheck // request ctx at handler boundary.
+		burstWaitCtx, cancelBurstWait := context.WithTimeout(r.Context(), ConcurrencyAdmissionPolicyForApp(app.Plan, app.ConcurrencyOverflow, app.MaxQueueWaitMS, app.MaxQueueDepth).MaxWait)
+		defer cancelBurstWait()
+		var burstErr error
+		waitedForBurst, burstErr = h.maybeBurstCapacity(burstWaitCtx, app, limits.MaxConcurrency, perVMConcurrency)
+		if burstErr != nil {
+			// A burst that cannot become routable within its admission policy is
+			// a controlled timeout, not an upstream 502. Client disconnects
+			// remain silent; genuine admission failures use the normal
+			// capacity problem response.
+			writeBurstCapacityError(w, r, burstErr)
+			h.observe(r, rec.status, app.ID, string(app.Plan), cold, Target{})
+			return
+		}
 	}
 
 	// Choose from the capacity that is now ready. A pre-wake selection
 	// would send every queued request to the first guest even after waiting
 	// for siblings. Keep the single PickWarm call on ordinary warm traffic
 	// so round-robin cursors advance only once per request.
-	if !deploymentSmoke && (!pick.OK || waitedForBurst) {
+	if !exactDeployment && (!pick.OK || waitedForBurst) {
 		pick = h.pickAfterCapacity(app, preferredInstanceID)
 	}
 
@@ -6121,14 +6330,16 @@ haveApp:
 	// the request waits under the plan's bounded capacity-admission allowance.
 	var vmRelease func()
 	var vmWaited bool
-	capacityWaitCtx, cancelCapacityWait := context.WithTimeout(r.Context(), WakeAdmissionPolicyForApp(app.Plan, app.ConcurrencyOverflow, app.MaxQueueWaitMS).MaxWait)
+	queuePolicy := ConcurrencyAdmissionPolicyForApp(app.Plan, app.ConcurrencyOverflow, app.MaxQueueWaitMS, app.MaxQueueDepth)
+	capacityWaitCtx, cancelCapacityWait := context.WithTimeout(r.Context(), queuePolicy.MaxWait)
 	defer cancelCapacityWait()
+	capacityWaitStarted := time.Now()
 	capacityCtx, capacitySpan := pkgtrace.StartSpan(capacityWaitCtx, "gateway.capacity_wait",
 		attribute.String("app_id", app.ID),
 		attribute.String("instance_id", pick.Target.InstanceID),
 		attribute.Int("concurrency_per_vm", perVMConcurrency),
 	)
-	pick, vmRelease, vmWaited, err = h.acquireVMTarget(capacityCtx, app, pick, perVMConcurrency, smokeDeploymentID)
+	pick, vmRelease, vmWaited, err = h.acquireVMTarget(capacityCtx, app, pick, perVMConcurrency, exactDeploymentID)
 	capacitySpan.SetAttributes(
 		attribute.Bool("waited", vmWaited),
 		attribute.String("selected_instance_id", pick.Target.InstanceID),
@@ -6139,10 +6350,34 @@ haveApp:
 	capacitySpan.End()
 	if vmWaited {
 		h.emitVMConcurrencyThreshold(r.Context(), app, pick.Target, perVMConcurrency)
+		waitedFor := time.Since(capacityWaitStarted)
+		outcome := "admitted"
+		switch {
+		case errors.Is(err, ErrConcurrencyQueueFull):
+			outcome = "full"
+		case errors.Is(err, ErrConcurrencyQueueWaitTimeout), errors.Is(err, context.DeadlineExceeded):
+			outcome = "timeout"
+		case errors.Is(err, context.Canceled):
+			outcome = "canceled"
+		case err != nil:
+			outcome = "error"
+		}
+		if h.metrics != nil {
+			h.metrics.ObserveConcurrencyQueueWait(app.ID, string(app.Plan), outcome, waitedFor)
+		}
+		if err == nil {
+			waitedMS := waitedFor.Milliseconds()
+			w.Header().Set(api.QueueWaitHeader, strconv.FormatInt(waitedMS, 10))
+			w.Header().Add("Server-Timing", fmt.Sprintf("gregale_queue;dur=%d", waitedMS))
+		}
 	}
 	if err != nil {
-		if h.metrics != nil && isWakeConcurrencyDrop(err) {
-			h.metrics.ObserveConcurrencyThrottled(app.ID, api.ConcurrencyOverflowDrop)
+		if h.metrics != nil {
+			if isWakeConcurrencyDrop(err) {
+				h.metrics.ObserveConcurrencyThrottled(app.ID, api.ConcurrencyOverflowDrop)
+			} else if errors.Is(err, ErrConcurrencyQueueFull) || errors.Is(err, ErrConcurrencyQueueWaitTimeout) {
+				h.metrics.ObserveConcurrencyThrottled(app.ID, api.ConcurrencyOverflowQueue)
+			}
 		}
 		writeBurstCapacityError(w, r, err)
 		h.observe(r, rec.status, app.ID, string(app.Plan), cold, pick.Target)
@@ -6190,37 +6425,22 @@ haveApp:
 		identity.AppID = app.ID
 	}
 	identity.ApplyGuestHeaders(r.Header)
+	// Keep the same scheduler-authored identity on the request context so
+	// request-scoped logs and any subsequent schedd/vmmd metadata hop cannot
+	// drift from the headers sent to the guest.
+	r = r.WithContext(wire.WithPlatformIdentity(r.Context(), identity))
+	requestSpan.SetAttributes(pkgtrace.PlatformIdentityAttributes(identity)...)
 
 	// Semantic bridge span. The request context is passed through the existing
 	// otelgrpc client instrumentation, so vmmd's forwarding server span and
 	// the guest-side bridge remain children of this span. Stable identifiers
 	// are used here; request paths and headers are intentionally excluded.
-	forwardCtx, forwardSpan := pkgtrace.StartSpan(r.Context(), "gateway.forward",
-		attribute.String("app_id", app.ID),
-		attribute.String("instance_id", target.InstanceID),
-		attribute.String("deployment_id", target.DeploymentID),
-		attribute.String("node_id", target.NodeID),
+	forwardAttrs := pkgtrace.PlatformIdentityAttributes(identity)
+	forwardAttrs = append(forwardAttrs,
 		attribute.String("protocol", decideProtocol(app)),
 		attribute.Bool("cold", cold),
 	)
-	if identity.TenantID != "" {
-		forwardSpan.SetAttributes(attribute.String("tenant_id", identity.TenantID))
-	}
-	if identity.Region != "" {
-		forwardSpan.SetAttributes(attribute.String("region", identity.Region))
-	}
-	if identity.CommitSHA != "" {
-		forwardSpan.SetAttributes(attribute.String("commit_sha", identity.CommitSHA))
-	}
-	if identity.DeploymentTag != "" {
-		forwardSpan.SetAttributes(attribute.String("deployment_tag", identity.DeploymentTag))
-	}
-	if identity.DeploymentCreatedAt != "" {
-		forwardSpan.SetAttributes(attribute.String("deployment_created_at", identity.DeploymentCreatedAt))
-	}
-	if identity.ImageDigest != "" {
-		forwardSpan.SetAttributes(attribute.String("image_digest", identity.ImageDigest))
-	}
+	forwardCtx, forwardSpan := pkgtrace.StartSpan(r.Context(), "gateway.forward", forwardAttrs...)
 	r = r.WithContext(forwardCtx)
 	defer func() {
 		forwardSpan.SetAttributes(attribute.Int("http.status_code", rec.status))
@@ -6240,12 +6460,11 @@ haveApp:
 	// asynchronously. The lookup itself does NOT block on the
 	// store read.
 	//
-	// Source snapshot (code-review PR-A3 #1, #2): the dispatch
-	// goroutine needs the source status + body to drive
-	// ClassifyResult AND to replay the body against the mirror.
-	// The proxy consumes r.Body downstream and the status is only
-	// known after the proxy commits a response header, so the
-	// handler captures both BEFORE fanout:
+	// The dispatch needs two distinct bounded snapshots: the source request
+	// body to forward to v2, and the source response body to compare with v2.
+	// The request body is captured before fanout and immediately restored. The
+	// response is captured by statusRecorder as v1 writes it and handed to the
+	// detached goroutines through mirrorSourceCapture.
 	//
 	//   - sourceBody: io.ReadAll(r.Body) capped at MirrorBodySnapshotCap
 	//     bytes (default 64 KiB — more than enough for status_diff
@@ -6253,34 +6472,23 @@ haveApp:
 	//     unbuffered).
 	//   - r.Body is restored to a fresh bytes.Reader so the proxy
 	//     downstream sees the full body unchanged.
-	//   - sourceStatus: read from `rec` after the proxy commits
-	//     WriteHeader. The fanout schedules BEFORE the proxy runs,
-	//     so the goroutine reads rec.status via the shared
-	//     statusRecorder pointer. nil body when the capture
-	//     failed (oversized body); statusDiff defaults to true so
-	//     the metric surfaces "we don't know what the source
-	//     did" rather than a silent no-diff.
 	if rules, ok := h.backend.LookupMirrorRules(r.Context(), app.ID); ok { //nolint:contextcheck // request ctx at handler boundary.
-		sourceBody, restoreBody := snapshotSourceBody(r)
+		requestBody, restoreBody := snapshotSourceBody(r)
 		// snapshotSourceBody consumes the captured prefix from r.Body. Restore
 		// it before the source proxy runs; deferring this until ServeHTTP exits
 		// leaves Content-Length non-zero with an empty body and turns mirrored
 		// POST requests into upstream cancellations/502s.
 		restoreBody()
-		// Install the cross-goroutine status sink BEFORE the proxy
-		// commits its WriteHeader, so the dispatchMirror goroutine
-		// reads the committed status via rec.captureStatusForMirror()
-		// once its round-trip completes (proxy is local + fast,
-		// round-trip is to a cold-boot VM, so the goroutine's read
-		// lands after the proxy's store in practice — the atomic
-		// makes the handoff explicit anyway).
-		rec.mirrorStatusSink = &atomic.Int32{}
+		sourceCapture := newMirrorSourceCapture()
+		rec.mirrorSourceCapture = sourceCapture
+		defer sourceCapture.complete()
+		requestID := requestIDFrom(r)
 		for _, rule := range rules {
 			rule := rule
 			if !shouldMirrorRequest(rule.Percent, pick.Picked) {
 				continue
 			}
-			go h.dispatchMirror(r.Context(), target.InstanceID, &target, rule, snapshotRequestForMirror(r), sourceBody, rec)
+			go h.dispatchMirror(r.Context(), target.InstanceID, &target, rule, snapshotRequestForMirror(r), requestBody, requestID, sourceCapture)
 		}
 	}
 
@@ -6310,24 +6518,30 @@ haveApp:
 	// bridge on transport/liveness failures; ordinary guest 502/503 responses
 	// are therefore left untouched.
 	staleContext := r.Context()
+	// retireStaleTarget is shared by the plain path's signal below and by the
+	// ADR-201 §1 retry loop, which reports each attempt's own failed target.
+	// Extracted so both report identically — a retry that evicted differently
+	// from a non-retry failure would make the two paths diverge in exactly the
+	// situation an operator is trying to read.
+	retireStaleTarget := func(failed Target) {
+		// Evict synchronously with the transport failure so a
+		// concurrent request cannot pick this known-dead target.
+		// RecoverStaleTarget detaches and bounds lifecycle work in
+		// the production backend; it does not inherit the client
+		// cancellation even though the request context is passed in.
+		if evictor, ok := h.backend.(interface {
+			EvictInstance(appID, instanceID string)
+		}); ok {
+			evictor.EvictInstance(app.ID, failed.InstanceID)
+			h.log.Warn("gateway: evicted stale target", "app_id", app.ID,
+				"instance_id", failed.InstanceID, "node_id", failed.NodeID)
+		}
+		if recovery, ok := h.backend.(staleTargetRecovery); ok {
+			recovery.RecoverStaleTarget(staleContext, app.ID, app.Scope, limits.MaxConcurrency)
+		}
+	}
 	staleSignal := &staleTargetSignal{
-		onStale: func() {
-			// Evict synchronously with the transport failure so a
-			// concurrent request cannot pick this known-dead target.
-			// RecoverStaleTarget detaches and bounds lifecycle work in
-			// the production backend; it does not inherit the client
-			// cancellation even though the request context is passed in.
-			if evictor, ok := h.backend.(interface {
-				EvictInstance(appID, instanceID string)
-			}); ok {
-				evictor.EvictInstance(app.ID, target.InstanceID)
-				h.log.Warn("gateway: evicted stale target", "app_id", app.ID,
-					"instance_id", target.InstanceID, "node_id", target.NodeID)
-			}
-			if recovery, ok := h.backend.(staleTargetRecovery); ok {
-				recovery.RecoverStaleTarget(staleContext, app.ID, app.Scope, limits.MaxConcurrency)
-			}
-		},
+		onStale: func() { retireStaleTarget(target) },
 	}
 	//nolint:contextcheck // withStaleTargetSignal intentionally inherits r.Context.
 	r = r.WithContext(withStaleTargetSignal(r.Context(), staleSignal))
@@ -6562,7 +6776,15 @@ haveApp:
 		// re-frames to H1+chunked on the guest side per
 		// PR #750).
 		r.Header.Set("x-faas-protocol", decideProtocol(app))
-		h.proxyByNode(target).ServeHTTP(capped, r)
+		// ADR-201 §1. Retry only wraps the BUFFERED path: a streaming
+		// response commits on its first flush, so a replay is impossible by
+		// construction, and wrapping it would put a buffering writer in front
+		// of the very path whose point is not to buffer. Upgrade requests
+		// returned above and never reach here.
+		h.proxyAttempt(capped, r, target, isStreaming, retireStaleTarget,
+			func(w http.ResponseWriter, req *http.Request, tgt Target) {
+				h.proxyByNode(tgt).ServeHTTP(w, req)
+			}, app)
 	} else {
 		platformWakeTrace.markProxyStarted(time.Now())
 		// Legacy addr-based path. Target.NodeID is treated as a
@@ -6574,7 +6796,10 @@ haveApp:
 		// branch above for the onCap-vs-connection-reset contract.
 		planCap := app.Plan.MaxResponseBodyBytes()
 		capped := h.setupBufferedCapWriter(w, app, planCap)
-		h.proxyFor(target.NodeID, planCap).ServeHTTP(capped, r)
+		h.proxyAttempt(capped, r, target, isStreaming, retireStaleTarget,
+			func(w http.ResponseWriter, req *http.Request, tgt Target) {
+				h.proxyFor(tgt.NodeID, planCap).ServeHTTP(w, req)
+			}, app)
 	}
 	// Issue #471 / ADR-047 PR-A buffered-fallback AC. The
 	// per-app streaming_enabled flag (ap.StreamingEnabled,
@@ -6769,7 +6994,17 @@ func (h *Handler) observe(r *http.Request, status int, appID, plan string, cold 
 	// time so the slog latency_ms field is no longer effectively ~0. Doing
 	// the time.Since(startTime(r)) call here would yield the same result
 	// but recomputes; `elapsed` was already measured above.
-	(&requestLogger{log: h.log}).Log(appID, code, elapsed, cold, requestID)
+	requestLog := h.log
+	if fields, ok := wire.FromContext(r.Context()); ok {
+		requestLog = wire.WithCorrelationFields(requestLog, fields)
+	} else if target.InstanceID != "" || target.DeploymentID != "" {
+		identity := target.PlatformIdentity("", requestID)
+		if identity.AppID == "" {
+			identity.AppID = appID
+		}
+		requestLog = wire.WithPlatformIdentityLogger(requestLog, identity)
+	}
+	(&requestLogger{log: requestLog}).Log(appID, code, elapsed, cold, requestID)
 
 	// Idle reaper hook (spec §4.1): 2xx → the instance is alive. 4xx/5xx are
 	// not evidence of activity (a misconfigured client can hammer a dead
@@ -6823,26 +7058,32 @@ func (h *Handler) observe(r *http.Request, status int, appID, plan string, cold 
 				requestTraceID = telemetryTraceID(requestID)
 			}
 			h.requestTelemetry.RecordFromObserve(RequestTelemetryRow{
-				AccountID:       acctUUID,
-				AppID:           appUUID,
-				DeploymentID:    deploymentUUID,
-				Route:           telemetryRoute,
-				Method:          r.Method,
-				Status:          status,
-				LatencyMS:       int(elapsed / time.Millisecond),
-				ColdBoot:        cold,
-				TraceID:         requestTraceID,
-				ReceivedAt:      time.Now(),
-				WakeID:          target.WakeID,
-				InstanceID:      target.InstanceID,
-				UAFamily:        uaFamily,
-				ReferrerHost:    referrerHost,
-				Country:         country,
-				GuestDurationMS: guestEvidence.DurationMS,
-				GuestRuntime:    guestEvidence.Runtime,
-				GuestOutcome:    guestEvidence.Outcome,
-				GuestErrorClass: guestEvidence.ErrorClass,
-				ConsumerID:      consumerID,
+				AccountID:           acctUUID,
+				AppID:               appUUID,
+				DeploymentID:        deploymentUUID,
+				Route:               telemetryRoute,
+				Method:              r.Method,
+				Status:              status,
+				LatencyMS:           int(elapsed / time.Millisecond),
+				ColdBoot:            cold,
+				TraceID:             requestTraceID,
+				ReceivedAt:          time.Now(),
+				WakeID:              target.WakeID,
+				InstanceID:          target.InstanceID,
+				UAFamily:            uaFamily,
+				ReferrerHost:        referrerHost,
+				Country:             country,
+				GuestDurationMS:     guestEvidence.DurationMS,
+				GuestRuntime:        guestEvidence.Runtime,
+				GuestOutcome:        guestEvidence.Outcome,
+				GuestErrorClass:     guestEvidence.ErrorClass,
+				ConsumerID:          consumerID,
+				NodeID:              target.NodeID,
+				Region:              target.Region,
+				CommitSHA:           target.CommitSHA,
+				DeploymentTag:       target.DeploymentTag,
+				DeploymentCreatedAt: target.DeploymentCreatedAt,
+				ImageDigest:         target.ImageDigest,
 			})
 		}
 	}
@@ -7067,11 +7308,9 @@ func (h *Handler) writeAccountRateLimitHeaders(w http.ResponseWriter, accountID 
 // trio for the per-rule bucket (ADR-091 D20.5 amendment,
 // issue #881). Distinct header family from X-RateLimit-* and
 // X-AccountRateLimit-* so generic X-RateLimit-* consumers (e.g.
-// browser DevTools) don't conflate the three scopes. Set on both
-// the per-rule 429 path (so a customer debugging a 429 storm can
-// see which throttle tripped) and the 2xx success path (so a
-// customer's standard X-RateLimit-*-style dashboard surfaces the
-// per-rule values without bespoke parsing).
+// browser DevTools) don't conflate the three scopes. Set on the
+// per-rule 429 path so a customer debugging a 429 storm can see
+// which throttle tripped.
 //
 // rps is the rule's requests_per_second (post-clamp at apid +
 // post-clamp at compile); burst is the rule's burst ceiling
@@ -7083,17 +7322,23 @@ func (h *Handler) writeAccountRateLimitHeaders(w http.ResponseWriter, accountID 
 // policy is the X-RouteRateLimit-Policy value (ADR-104 amendment
 // 5, issue #881 Phase 4 H1): "route" for rules where KeyBy ∈
 // {"", "none"} (back-compat default — the value pre-Phase 4
-// callers expect to read), or "per-consumer" when the consumer
-// collapsed into the __other__ bucket on a per-consumer rule.
+// callers expect to read), or "per-consumer" for a dimensional rule.
 // The header is emitted on EVERY call site (never silently
 // omitted) so dashboards that key off its presence don't break;
 // pre-Phase 4 callers observed only the trio and the new header
 // is additive.
 func (h *Handler) writeRouteRateLimitHeaders(w http.ResponseWriter, bucketKey string, rps float64, burst int, policy string) {
-	if h == nil || h.routeLimiter == nil || bucketKey == "" {
+	if h == nil {
 		return
 	}
-	limit, remaining, reset, ok := h.routeLimiter.PeekWithParams(bucketKey, rps, float64(burst))
+	h.writeRouteRateLimitHeadersFromLimiter(w, h.routeLimiter, bucketKey, rps, burst, policy)
+}
+
+func (h *Handler) writeRouteRateLimitHeadersFromLimiter(w http.ResponseWriter, limiter *Limiter, bucketKey string, rps float64, burst int, policy string) {
+	if limiter == nil || bucketKey == "" {
+		return
+	}
+	limit, remaining, reset, ok := limiter.PeekWithParams(bucketKey, rps, float64(burst))
 	if !ok {
 		return
 	}
@@ -7103,7 +7348,7 @@ func (h *Handler) writeRouteRateLimitHeaders(w http.ResponseWriter, bucketKey st
 	// ADR-104 amendment 5 (issue #881 Phase 4 H1): the policy
 	// hint is emitted unconditionally so dashboards that key off
 	// its presence don't break; the value distinguishes the
-	// route vs per-consumer collapse scope without polluting
+	// route vs per-consumer bucket family without polluting
 	// the existing x-faas-rate-limit-scope enum.
 	if policy == "" {
 		policy = rateLimitScopeRoute
@@ -7328,27 +7573,10 @@ type statusRecorder struct {
 	// everything on the streaming path).
 	streaming bool
 
-	// mirrorStatusSink (issue #72 / ADR-133 / ADR-125 PR-A3
-	// code-review fix) is the cross-goroutine channel the
-	// dispatchMirror goroutine reads to learn the source
-	// response's HTTP status. nil = "no mirror on this request"
-	// (the dispatcher never scheduled a mirror, so the field
-	// stays unset — ClassifyResult falls back to status=0 which
-	// surfaces statusDiff=true rather than a silent no-diff).
-	//
-	// Handle installs the *atomic.Int32 pointer on a mirror
-	// fanout path; the proxy's WriteHeader Stores the committed
-	// status code; the dispatch goroutine Loads it after its
-	// round-trip completes (by which time the proxy has
-	// committed the response header — the proxy is local, the
-	// round-trip is to a cold-boot VM, so the gateway's local
-	// WriteHeader fires microseconds before the goroutine reads).
-	//
-	// atomic.Int32 (not int) because the writer (proxy /
-	// WriteHeader) runs in a different goroutine than the
-	// reader (dispatchMirror) — the Go memory model would flag a
-	// plain int read/write as a race.
-	mirrorStatusSink *atomic.Int32
+	// mirrorSourceCapture records the actual v1 response status and bounded
+	// body. It is concurrency-safe because detached v2 goroutines consume it
+	// after (or while) the source response is being written.
+	mirrorSourceCapture *mirrorSourceCapture
 }
 
 // Unwrap lets http.ResponseController reach the underlying server writer for
@@ -7363,22 +7591,6 @@ func (s *statusRecorder) ProblemHTMLRequest() *http.Request {
 		return nil
 	}
 	return s.request
-}
-
-// captureStatusForMirror (issue #72 / ADR-133 / ADR-125 PR-A3)
-// returns the source response's HTTP status as committed by the
-// proxy's WriteHeader. Returns 0 if no mirror was scheduled for
-// this request (mirrorStatusSink is nil), which the dispatch
-// goroutine treats as "unknown source status" — ClassifyResult
-// emits statusDiff=true to surface the "we don't know what the
-// source did" shape rather than a silent no-diff.
-//
-// Safe to call from any goroutine. nil-receiver safe.
-func (s *statusRecorder) captureStatusForMirror() int {
-	if s == nil || s.mirrorStatusSink == nil {
-		return 0
-	}
-	return int(s.mirrorStatusSink.Load())
 }
 
 // installFlushHook arms the recorder for streaming. After install,
@@ -7403,15 +7615,7 @@ func (s *statusRecorder) WriteHeader(code int) {
 	if !s.wroteHeader {
 		s.status = code
 		s.wroteHeader = true
-		// Issue #72 / ADR-133 / ADR-125 PR-A3: if Handle armed a
-		// mirrorStatusSink for this request, store the committed
-		// status so the async dispatchMirror goroutine can read
-		// it (via captureStatusForMirror) and drive
-		// ClassifyResult's statusDiff branch correctly. nil
-		// sink = no mirror on this request, no-op.
-		if s.mirrorStatusSink != nil {
-			s.mirrorStatusSink.Store(int32(code))
-		}
+		s.mirrorSourceCapture.writeHeader(code)
 		// Issue #471: capture the upstream Content-Type at header
 		// commit time so the post-proxy site can detect a buffered
 		// SSE response for the deprecation log. Header() returns the
@@ -7454,6 +7658,7 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 		// First Write with no explicit WriteHeader → 200.
 		s.status = http.StatusOK
 		s.wroteHeader = true
+		s.mirrorSourceCapture.writeHeader(http.StatusOK)
 	}
 
 	// lgtm[go/reflected-xss] false-positive: statusRecorder is a pass-through; every caller writes application/json, application/problem+json (api.WriteProblem at :326/:335/:366/:384/:906/:911/:914) or proxies to a Firecracker guest rendered via html/template. See statusRecorder doc-comment.
@@ -7467,6 +7672,7 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 	// cheap insurance for the future.
 	if n > 0 {
 		s.Bytes += int64(n)
+		s.mirrorSourceCapture.write(b[:n])
 	}
 	if s.flusher != nil {
 		s.maybeFlush()
@@ -7621,7 +7827,13 @@ func (s *statusRecorder) finalFlush() {
 // prod app's. Empty = prod (legacy). When the cold-start path calls
 // coldStart and coldStart in turn calls Admit, scope is plumbed
 // through both paths.
-func (h *Handler) ensureCapacity(ctx context.Context, appID, accountID, scope string, maxConcurrency int, plan api.Plan, autoscaleTargetRPS int, configs ...concurrencyAdmissionConfig) (cold bool, wakeID string, method WakeMethod, err error) {
+//
+// trigger (ADR-123 vocabulary, ADR-196) is the wake-boot trigger stamped on
+// the emitted wake.boot_started / wake.boot_completed rows. Request paths
+// driven by an Internet client pass sched.TriggerGateway; the node-local
+// service proxy passes sched.TriggerServiceMesh so internal fan-out is
+// distinguishable from customer traffic in the wake timeline.
+func (h *Handler) ensureCapacity(ctx context.Context, appID, accountID, scope string, maxConcurrency int, plan api.Plan, autoscaleTargetRPS int, trigger string, configs ...concurrencyAdmissionConfig) (cold bool, wakeID string, method WakeMethod, err error) {
 	// HealthyCount is intentionally process-local for the hot path, but an
 	// empty process-local cache is not authoritative in a multi-node fleet.
 	// The empty-cache reconciliation now runs inside coldStart's WakeGate
@@ -7635,11 +7847,39 @@ func (h *Handler) ensureCapacity(ctx context.Context, appID, accountID, scope st
 	if len(configs) > 0 {
 		config = configs[0]
 	}
-	cold, wakeID, method, err = h.coldStart(ctx, appID, accountID, scope, maxConcurrency, plan, autoscaleTargetRPS, config)
+	cold, wakeID, method, err = h.coldStart(ctx, appID, accountID, scope, maxConcurrency, plan, autoscaleTargetRPS, trigger, config)
 	if err != nil {
 		return false, "", WakeMethodUnspecified, err
 	}
 	return cold, wakeID, method, nil
+}
+
+// EnsureServiceCapacity is the node-local service proxy's entry into the same
+// wake machinery the public edge uses (ADR-196). A call to
+// <slug>.svc.gregale for a parked app must hold and wake exactly like a
+// public request does, otherwise an internal service can never scale to zero:
+// its callers would see 503 on every cold call and customers would be forced
+// to pin min_instances on every internal dependency.
+//
+// Reusing Handler.ensureCapacity — rather than giving the proxy its own
+// admission path — is deliberate. The WakeGate is keyed on appID alone, so a
+// public request and an internal service call that arrive for the same parked
+// app coalesce into ONE restore instead of racing to create two instances.
+// That coalescing is also what keeps invariant §6.2-1 (≤ max_concurrency
+// instances in {WAKING, COLD_BOOTING, RUNNING}) intact across both entry
+// points.
+//
+// The returned error is the admission error only. An at-capacity outcome is
+// not an error: the caller re-reads the endpoint registry and surfaces
+// "no healthy replicas" if the wake genuinely produced nothing.
+func (h *Handler) EnsureServiceCapacity(ctx context.Context, app App) error {
+	limits, ok := api.LimitsFor(app.Plan)
+	if !ok {
+		limits = api.Limits{}
+	}
+	maxInstances := effectiveAppConcurrencyLimit(app, limits.MaxConcurrency)
+	_, _, _, err := h.ensureCapacity(ctx, app.ID, app.AccountID, app.Scope, maxInstances, app.Plan, app.AutoscaleTargetRPS, sched.TriggerServiceMesh, concurrencyConfigForApp(app))
+	return err
 }
 
 func (h *Handler) warmTargetNeedsValidation(app App, target Target, now time.Time) bool {
@@ -7665,7 +7905,10 @@ func (h *Handler) warmTargetNeedsValidation(app App, target Target, now time.Tim
 // through the WakeGate's single-flight coalescing. shouldWake is held
 // under the gate lock and re-runs HealthyCount; if a peer's admit has
 // just landed, we skip the redundant cold boot.
-func (h *Handler) coldStart(ctx context.Context, appID, accountID, scope string, maxConcurrency int, plan api.Plan, autoscaleTargetRPS int, configs ...concurrencyAdmissionConfig) (bool, string, WakeMethod, error) {
+func (h *Handler) coldStart(ctx context.Context, appID, accountID, scope string, maxConcurrency int, plan api.Plan, autoscaleTargetRPS int, trigger string, configs ...concurrencyAdmissionConfig) (bool, string, WakeMethod, error) {
+	if trigger == "" {
+		trigger = sched.TriggerGateway
+	}
 	var (
 		admittedWakeID string
 		cold           bool
@@ -7717,7 +7960,7 @@ func (h *Handler) coldStart(ctx context.Context, appID, accountID, scope string,
 			}
 			admit := func(admitCtx context.Context) error {
 				if ensurer, ok := h.backend.(capacityWarmEnsurer); ok && scope == "" {
-					id, m, atCapacity, e := h.ensureInitialWarm(admitCtx, ensurer, appID, scope, sched.TriggerGateway, h.initialWakeDemand(appID, maxConcurrency, plan, autoscaleTargetRPS))
+					id, m, atCapacity, e := h.ensureInitialWarm(admitCtx, ensurer, appID, scope, trigger, h.initialWakeDemand(appID, maxConcurrency, plan, autoscaleTargetRPS))
 					if e != nil {
 						return e
 					}
@@ -7735,7 +7978,7 @@ func (h *Handler) coldStart(ctx context.Context, appID, accountID, scope string,
 					return nil
 				}
 				if ensurer, ok := h.backend.(warmEnsurer); ok && scope == "" {
-					id, m, atCapacity, e := ensurer.EnsureWarm(admitCtx, appID, scope, sched.TriggerGateway)
+					id, m, atCapacity, e := ensurer.EnsureWarm(admitCtx, appID, scope, trigger)
 					if e != nil {
 						return e
 					}
@@ -7749,7 +7992,7 @@ func (h *Handler) coldStart(ctx context.Context, appID, accountID, scope string,
 					h.finishWakePageCycle(admitCtx, appID, id)
 					return nil
 				}
-				id, m, atCapacity, e := h.backend.Admit(admitCtx, appID, "", scope, sched.TriggerGateway, maxConcurrency)
+				id, m, atCapacity, e := h.backend.Admit(admitCtx, appID, "", scope, trigger, maxConcurrency)
 				if e != nil {
 					return e
 				}
@@ -7827,6 +8070,28 @@ func writeWakeError(w http.ResponseWriter, err error) {
 		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 		api.WriteProblem(w, api.NewProblem(http.StatusTooManyRequests, api.CodeConcurrencyThrottled,
 			"Concurrency limit reached", "the app is configured to drop requests when its concurrency limit is saturated"))
+	case errors.Is(err, ErrConcurrencyQueueFull):
+		retryAfter := wakeRetryAfterSeconds(err, 1)
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+		w.Header().Set(api.ErrorCodeHeader, api.CodeConcurrencyQueueFull)
+		problem := api.NewProblem(http.StatusTooManyRequests, api.CodeConcurrencyQueueFull,
+			"Concurrency queue full", "the app's bounded warm-capacity queue is full; retry after capacity is released")
+		var full *ConcurrencyQueueFullError
+		if errors.As(err, &full) {
+			problem = problem.WithLimit(int64(full.Limit), int64(full.Depth))
+		}
+		api.WriteProblem(w, problem)
+	case errors.Is(err, ErrConcurrencyQueueWaitTimeout):
+		retryAfter := wakeRetryAfterSeconds(err, 1)
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+		w.Header().Set(api.ErrorCodeHeader, api.CodeConcurrencyQueueTimeout)
+		api.WriteProblem(w, api.NewProblem(http.StatusServiceUnavailable, api.CodeConcurrencyQueueTimeout,
+			"Concurrency queue wait expired", "no warm instance slot became available within the configured wait budget"))
+	case errors.Is(err, ErrConcurrencyQueueAdmissionUnavailable):
+		retryAfter := wakeRetryAfterSeconds(err, 1)
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+		api.WriteProblem(w, api.NewProblem(http.StatusServiceUnavailable, api.CodeCapacity,
+			"Concurrency queue temporarily unavailable", "the fleet-wide queue admission budget could not be checked; retry shortly"))
 	case errors.Is(err, ErrWakeQueueWaitTimeout):
 		retryAfter := wakeRetryAfterSeconds(err, 5)
 		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
@@ -7877,7 +8142,17 @@ func writeWakeInProgress(w http.ResponseWriter, requestID string) {
 		w.Header().Set(api.RequestIDHeader, requestID)
 	}
 	w.WriteHeader(http.StatusAccepted)
-	_, _ = fmt.Fprintf(w, `{"status":202,"code":%q,"title":"App is waking","detail":"retry the request after the Retry-After interval"}`+"\n", api.CodeWakeInProgress)
+	_, _ = w.Write(append(safetext.JSONObject(struct {
+		Status int    `json:"status"`
+		Code   string `json:"code"`
+		Title  string `json:"title"`
+		Detail string `json:"detail"`
+	}{
+		Status: http.StatusAccepted,
+		Code:   api.CodeWakeInProgress,
+		Title:  "App is waking",
+		Detail: "retry the request after the Retry-After interval",
+	}), '\n'))
 }
 
 func wakeRetryAfterSeconds(err error, fallback int) int {
@@ -7888,11 +8163,20 @@ func wakeRetryAfterSeconds(err error, fallback int) int {
 	var perAppFull *WakeQueueFullError
 	var perAppTimeout *WakeQueueWaitTimeoutError
 	var concurrencyDrop *WakeConcurrencyDropError
+	var concurrencyFull *ConcurrencyQueueFullError
+	var concurrencyTimeout *ConcurrencyQueueWaitTimeoutError
+	var concurrencyAdmission *ConcurrencyQueueAdmissionError
 	var globalFull *WakeAdmissionQueueFullError
 	var globalTimeout *WakeAdmissionQueueWaitTimeoutError
 	switch {
 	case errors.As(err, &concurrencyDrop):
 		retryAfter = concurrencyDrop.RetryAfter
+	case errors.As(err, &concurrencyFull):
+		retryAfter = concurrencyFull.RetryAfter
+	case errors.As(err, &concurrencyTimeout):
+		retryAfter = concurrencyTimeout.RetryAfter
+	case errors.As(err, &concurrencyAdmission):
+		retryAfter = concurrencyAdmission.RetryAfter
 	case errors.As(err, &perAppFull):
 		retryAfter = perAppFull.RetryAfter
 	case errors.As(err, &perAppTimeout):

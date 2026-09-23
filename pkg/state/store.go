@@ -151,6 +151,21 @@ var ErrInvalidTrafficPercent = errors.New("state: invalid traffic_percent")
 // repair a superseded, failed, or pending target.
 var ErrDeploymentNotLive = errors.New("state: deployment is not live")
 
+// ErrTrafficServingChanged means a conditional traffic update observed a
+// different sole 100% serving deployment while holding the live-row locks.
+var ErrTrafficServingChanged = errors.New("state: serving deployment changed")
+
+// sameDeploymentID accepts both API-supported UUID spellings. PgStore reads
+// dashed IDs from PostgreSQL; MemStore's historical IDs are 32-hex.
+func sameDeploymentID(a, b string) bool {
+	if a == b {
+		return true
+	}
+	parsedA, errA := uuid.Parse(a)
+	parsedB, errB := uuid.Parse(b)
+	return errA == nil && errB == nil && parsedA == parsedB
+}
+
 // ErrCanaryStepConflict is returned by AdvanceCanary when the deployment's
 // current step differs from the caller's expected step. The compare-and-swap
 // is checked while the deployment row is locked, so this is the safe race
@@ -448,7 +463,7 @@ var (
 type ConsumeAccountCreditParams struct {
 	AccountID         string
 	TargetCents       int64  // >= 0; 0 is a no-op
-	Provider          string // "stripe" | "paddle" (denormalised for audit context)
+	Provider          string // required: "stripe" | "paddle" | "polar"; part of the replay key
 	ProviderInvoiceID string // dedupe key; required for the partial unique index to apply
 	InvoiceID         string // for the audit row + ledger reason text
 	Reason            string
@@ -643,29 +658,43 @@ type PaddleOverageDedupeSchemaResult struct {
 // so handlers don't have to thread pgtype values through the
 // wire layer. PgStore converts at the boundary.
 type AppErrorGroup struct {
-	ID            uuid.UUID
-	Fingerprint   string
-	ErrorClass    string
-	Route         string
-	HTTPStatus    int32
-	Count         int64
-	RequestCount  int64
-	FirstSeenAt   time.Time
-	LastSeenAt    time.Time
-	SampleMessage string
+	ID                      uuid.UUID
+	Fingerprint             string
+	ErrorClass              string
+	Route                   string
+	HTTPStatus              int32
+	Count                   int64
+	RequestCount            int64
+	FirstSeenAt             time.Time
+	LastSeenAt              time.Time
+	SampleMessage           string
+	LastInstanceID          string
+	LastNodeID              string
+	LastRegion              string
+	LastCommitSHA           string
+	LastDeploymentTag       string
+	LastDeploymentCreatedAt string
+	LastImageDigest         string
 }
 
 // AppErrorRequestRow is the typed drill-down row for
 // /v1/apps/{slug}/errors/{fingerprint}.
 type AppErrorRequestRow struct {
-	ID            uuid.UUID
-	RequestID     uuid.UUID
-	ReceivedAt    time.Time
-	Route         string
-	HTTPStatus    int32
-	ErrorClass    string
-	SampleMessage string
-	DeploymentID  *uuid.UUID
+	ID                  uuid.UUID
+	RequestID           uuid.UUID
+	ReceivedAt          time.Time
+	Route               string
+	HTTPStatus          int32
+	ErrorClass          string
+	SampleMessage       string
+	DeploymentID        *uuid.UUID
+	InstanceID          string
+	NodeID              string
+	Region              string
+	CommitSHA           string
+	DeploymentTag       string
+	DeploymentCreatedAt string
+	ImageDigest         string
 }
 
 // AppErrorSampleRow is the typed single-sample row for
@@ -1681,6 +1710,12 @@ type Store interface {
 	// Soft-deleted rows are filtered out — the teardown janitor's
 	// tombstone-aware sweep uses ListPreviewsForTeardown instead.
 	PreviewAppsByParent(ctx context.Context, accountID, parentSlug string) ([]App, error)
+	// PreviewAppByProjectWorkload resolves one workload inside a pull-request
+	// preview environment. The complete tenant/project/PR tuple is required so
+	// a service lookup can never drift into a sibling PR or another account.
+	// Developer sessions (preview_pr_number=0), production rows, and deleted
+	// previews are intentionally excluded.
+	PreviewAppByProjectWorkload(ctx context.Context, accountID, projectID string, previewPRNumber int, workloadName string) (App, error)
 	// ListPreviewsForAccount (Mega-C PR-1 / issue #961 leaf 3) lists
 	// every non-deleted preview row for the account, across all
 	// parents. Backs the new /dashboard/previews page (a global
@@ -1811,7 +1846,7 @@ type Store interface {
 	ListDeploymentsByNodeID(ctx context.Context, nodeID string) ([]Deployment, error)
 	// ConcurrencyForDeployment returns the live-instance count for a
 	// (app, deployment) pair — the sum of state IN ('waking',
-	// 'cold_booting', 'running'). Backed by the partial index added
+	// 'cold_booting', 'running', 'draining'). Backed by the partial index added
 	// in migration 00132.
 	ConcurrencyForDeployment(ctx context.Context, appID, deploymentID string) (int, error)
 	// UpdateDeploymentMinInstances stamps the per-deployment cold-wake
@@ -2167,8 +2202,8 @@ type Store interface {
 	// ListProjectsForAccount returns every project under the account
 	// (sorted by created_at desc) for the dashboard list view.
 	//
-	// AppsForProject returns the project's member apps in
-	// slug-ascending order, filtered to status <> 'deleted'. Cross-
+	// AppsForProject returns the project's production workload apps in
+	// workload-name order, excluding deleted apps and preview rows. Cross-
 	// account reads return ErrNotFound, mirroring the AppsByAccount
 	// precedent so handlers can 404 cleanly without checking which
 	// store is in use.
@@ -2207,6 +2242,13 @@ type Store interface {
 	ProjectEnvironmentBySlug(ctx context.Context, accountID, projectID, slug string) (ProjectEnvironment, error)
 	CreateProjectEnvironment(ctx context.Context, env ProjectEnvironment) (ProjectEnvironment, error)
 	UpdateProjectEnvironmentProtection(ctx context.Context, accountID, projectID, slug string, protected bool) (ProjectEnvironment, error)
+	// DeleteProjectEnvironment removes an unprotected, non-production
+	// environment when it has no live releases. Scoped app variables and
+	// ordinary secrets plus related configuration/approval rows are removed;
+	// managed credential rows remain for the API layer to revoke safely.
+	// ErrConflict protects production, the reserved default app scope, protected
+	// environments, and environments still serving a live release.
+	DeleteProjectEnvironment(ctx context.Context, accountID, projectID, slug string) error
 	CreateProjectEnvironmentApproval(ctx context.Context, approval ProjectEnvironmentApproval) (ProjectEnvironmentApproval, error)
 	ProjectEnvironmentApprovalByID(ctx context.Context, accountID, projectSlug, environmentSlug, id string) (ProjectEnvironmentApproval, error)
 	ProjectEnvironmentApprovalByToken(ctx context.Context, accountID, projectSlug, environmentSlug, planTokenHash, approvalTokenHash string) (ProjectEnvironmentApproval, error)
@@ -2390,7 +2432,21 @@ type Store interface {
 	// Returns ErrNotFound when no row exists for deploymentID
 	// (handled by the apid handler with the standard 404 +
 	// IDOR posture).
+	//
+	// ADR-198: this now reads the stored deployments.revision column
+	// rather than recomputing row_number() on every call. The
+	// migration backfilled that column with the identical window, so
+	// the stability contract above is unchanged — and strengthened,
+	// because a stored value cannot shift when an earlier row is
+	// removed.
 	DeploymentOrdinal(ctx context.Context, appID, deploymentID string) (int, error)
+	// DeploymentByRevision resolves an app's deployment by its per-app
+	// revision (ADR-198) — the customer-facing `v42` handle accepted
+	// anywhere a deployment id is taken (`gregale rollback --to v42`,
+	// `gregale traffic set --deployment v42`). Returns ErrNotFound for
+	// an unknown or non-positive revision, preserving the 404 + IDOR
+	// posture of DeploymentByID.
+	DeploymentByRevision(ctx context.Context, appID string, revision int) (Deployment, error)
 	// LiveDeployment returns the app's current live deployment (status='live').
 	// schedd's wake path boots from this; ErrNotFound if the app has never had a
 	// successful deploy (an app always has a live snapshot OR a cold-bootable
@@ -2413,6 +2469,12 @@ type Store interface {
 	// canaries are in flight — both consumers treat (nil, nil) as a
 	// no-op.
 	ListCanaryInFlight(ctx context.Context) ([]Deployment, error)
+	// ListServiceRolloutsInFlight returns readiness-gated zero-step service
+	// rollouts that still need scheduler reconciliation. Unlike the canary
+	// orchestrator's walk set, this deliberately includes rows left at the
+	// routing handoff after a schedd restart. A non-empty ownerNodeID scopes the
+	// recovery walk to apps owned by that schedd; empty preserves single-box.
+	ListServiceRolloutsInFlight(ctx context.Context, ownerNodeID string) ([]Deployment, error)
 	// SafedeployListPendingRollouts (issue #976 / ADR-122 /
 	// SAFE-RELEASES-F) returns the orchestrator's walk set: rows
 	// whose rollout_state is 'pending' or 'rolling_out' AND
@@ -2448,6 +2510,18 @@ type Store interface {
 	// the same app/scope. The target must be a live zero-step row marked
 	// rollout_state='rolling_out'.
 	FinalizeServiceRollout(ctx context.Context, id string) (Deployment, error)
+	// BeginServiceRolloutCutover publishes the candidate as the sole
+	// positive-weight live generation without superseding its predecessor. The
+	// predecessor remains available until every serving gateway acknowledges
+	// the routing generation and its in-flight requests drain.
+	BeginServiceRolloutCutover(ctx context.Context, id string) (Deployment, error)
+	// BeginServiceRolloutAbort restores the predecessor's traffic weight while
+	// retaining both generations as live. The scheduler must wait for gateway
+	// acknowledgement and candidate request drain before finalising the abort.
+	BeginServiceRolloutAbort(ctx context.Context, id string) (Deployment, error)
+	// UpdateServiceRolloutHandoff persists scheduler progress between the
+	// routing and drain barriers so another schedd can resume safely.
+	UpdateServiceRolloutHandoff(ctx context.Context, id string, handoff ServiceRolloutHandoff) (Deployment, error)
 	// AbortServiceRollout atomically removes a failed service rollout and
 	// restores the newest older live deployment in the same app/scope to 100%
 	// traffic. The target must be a live zero-step row marked
@@ -2465,7 +2539,7 @@ type Store interface {
 	// the env overlay only contains that scope's rows.
 	LiveDeploymentForScope(ctx context.Context, appID, scope string) (Deployment, error)
 	// CountLiveInstancesByDeployment returns the number of instances
-	// currently in {WAKING, COLD_BOOTING, RUNNING} for the given
+	// currently in {WAKING, COLD_BOOTING, RUNNING, DRAINING} for the given
 	// deployment_id (issue #555 PR-6). The DeploymentCounterWatcher
 	// (pkg/sched/deployment_counter_watcher.go) consults this query
 	// to detect the "last live instance parked" transition that
@@ -2512,8 +2586,9 @@ type Store interface {
 	// unknown. The handler is responsible for the plan-gate (Pro+
 	// only, ErrPlanTrafficSplitNotAllowed) and the request-time
 	// range-check — this method holds the FOR UPDATE lock that
-	// makes the rebalance race-free against CreateDeployment.
-	UpdateDeploymentTraffic(ctx context.Context, id string, newPercent int) (Deployment, error)
+	// makes the rebalance race-free against CreateDeployment. An optional
+	// expectedServingID is checked while those locks are held, before writes.
+	UpdateDeploymentTraffic(ctx context.Context, id string, newPercent int, expectedServingID ...string) (Deployment, error)
 
 	// RecoverRollout (issue #976 / ADR-122 / SAFE-RELEASES-R) is
 	// the operator manual-recovery escape hatch — the back-end
@@ -2675,6 +2750,7 @@ type Store interface {
 	// cheap).
 	AppendDeploymentLog(ctx context.Context, deploymentID, stream, line string) (seq int64, err error)
 	ListDeploymentLogs(ctx context.Context, deploymentID string, beforeSeq int64, limit int) (rows []LogEntry, hasMore bool, err error)
+	LogEventStore
 	UpdateDeploymentStatus(ctx context.Context, id string, status DeploymentStatus, errMsg string) error
 	MarkDeploymentSuperseded(ctx context.Context, id string) error
 	MarkDeploymentLive(ctx context.Context, id string) error
@@ -3842,6 +3918,10 @@ type Store interface {
 	ReplayDeadLetterEvents(ctx context.Context, accountID, appID string, limit int) (int, error)
 	DeleteDeadLetterEvent(ctx context.Context, accountID, appID, eventID string) error
 	DeleteDeadLetterEvents(ctx context.Context, accountID, appID string, limit int) (int, error)
+	// PurgeExpiredDeadLetterEvents deletes old unified DLQ projection rows
+	// without touching their authoritative source rows or audit events. The
+	// cutoff is exclusive and the store should delete at most limit rows.
+	PurgeExpiredDeadLetterEvents(ctx context.Context, before time.Time, limit int) (int, error)
 	// Account-scoped unified dead-letter projection. These methods include
 	// app-owned events plus account-owned job runs, whose app_id is NULL.
 	ListDeadLetterEventsForAccount(ctx context.Context, accountID string, limit int, before string) ([]DeadLetterEvent, error)
@@ -3906,10 +3986,15 @@ type Store interface {
 	// Move 2 cursor change: was time.Time (drifted across equal-second
 	// rows); id is stable across ties.
 	ListInvocationsForAccount(ctx context.Context, accountID string, limit int, before string) ([]Invocation, error)
+	// ListDelayedTasksForApp is the customer-facing delayed-task collection.
+	// It is app- and source-scoped and uses the same stable invocation-id cursor
+	// ordering as ListInvocationsForAccount.
+	ListDelayedTasksForApp(ctx context.Context, appID string, limit int, before string) ([]Invocation, error)
 	// ListInvocationsByTraceID returns bounded, metadata-only invocation rows
-	// linked to a platform trace. The account predicate is mandatory; the
-	// implementation reads only the canonical platform trace header and never
-	// returns payloads through the account trace API.
+	// linked to a platform trace across all durable invocation sources. The
+	// account predicate is mandatory; the implementation reads only the
+	// canonical platform trace header and never returns payloads through the
+	// account trace API.
 	ListInvocationsByTraceID(ctx context.Context, accountID, traceID string, limit int) ([]Invocation, error)
 	// ListInvocationsForApp is the per-app filtered variant used by
 	// deleteApp's GC sweep (cancel every pending/dispatching row before
@@ -3948,6 +4033,26 @@ type Store interface {
 	// Used by the queueStats handler. OldestPendingAt is the zero-time
 	// when the app has no pending rows; callers translate to nil.
 	QueueState(ctx context.Context, appID string) (QueueStats, error)
+
+	// --- ADR-202 custom application metrics -------------------------
+	//
+	// PutCustomMetric upserts one customer-pushed gauge. Keyed
+	// (app_id, name), so a push to an existing name replaces the value
+	// and the timestamp rather than adding a row — that upsert is what
+	// bounds the table. distinctLimit caps how many DISTINCT names an
+	// app may hold; the store enforces it in the same transaction as the
+	// insert, because a check-then-insert would let concurrent pushes of
+	// two new names both pass a limit of one.
+	PutCustomMetric(ctx context.Context, appID, name string, value float64, observedAt time.Time, distinctLimit int) error
+	// ListCustomMetrics returns every stored gauge for an app. The
+	// scaling trigger calls this per owned app per tick, which is why
+	// MaxCustomMetricsPerApp is a latency bound and not only a storage
+	// one. Freshness is NOT applied here: the caller owns the clock, so
+	// a replayed or back-dated evaluation sees what actually applied.
+	ListCustomMetrics(ctx context.Context, appID string) ([]CustomMetric, error)
+	// DeleteCustomMetric removes one gauge by name so a customer can
+	// retire a metric without waiting for the app to be deleted.
+	DeleteCustomMetric(ctx context.Context, appID, name string) error
 	// QueueStateForQueue returns the same live counters scoped to one named
 	// queue binding. Queue names are exact matches; the empty queue name is
 	// reserved for the legacy app-wide queue returned by QueueState.
@@ -4346,6 +4451,14 @@ type Store interface {
 	// LatestSnapshot (which now ranks warm above init on ties).
 	LatestSnapshotForTier(ctx context.Context, deploymentID, tier string) (Snapshot, error)
 	MarkSnapshotStale(ctx context.Context, snapshotID string) error
+	// MarkAppRuntimeConfigChanged (issue #3360) records now() as the last
+	// time the app's secrets or environment changed. InvalidateAppSnapshots
+	// calls it, so every runtime-config mutation stamps it.
+	MarkAppRuntimeConfigChanged(ctx context.Context, appID string) error
+	// AppRuntimeConfigChangedAt returns that stamp; ok is false when the
+	// app's runtime config has not changed since the stamp was introduced.
+	// schedd refuses to snapshot an instance that started before it.
+	AppRuntimeConfigChangedAt(ctx context.Context, appID string) (changedAt time.Time, ok bool, err error)
 
 	// Snapshot GC (imaged nightly + on FC upgrade, spec §4.6 + §4.4).
 	//
@@ -4425,7 +4538,7 @@ type Store interface {
 	// ComputeNodeUsedMB returns the Σ(ram_mb + PerVMOverheadMB) for
 	// live instances on the given node. Single SQL aggregate, no
 	// client loop. Live = state IN ('waking','cold_booting',
-	// 'running') per spec §6.2-2 re-stated per-node. Atomic with
+	// 'running','draining') per spec §6.2-2 re-stated per-node. Atomic with
 	// the ledger; the ledger is the cache, this is the source of
 	// truth after a schedd restart. PerVMOverheadMB is the 8 MB
 	// fixed cost (spec §4.7 / billing model) added per live instance.
@@ -4741,7 +4854,8 @@ type Store interface {
 	// sidecar-aware read-side query for the customer-facing
 	// timeline endpoint. Filters on the jsonb expression
 	// data->>'sidecar_name' = $1 and the closed wake.kind IN
-	// ('wake.sidecar_init_exit', 'wake.sidecar_restart') so a
+	// ('wake.sidecar_init_exit', 'wake.sidecar_restart',
+	// 'wake.sidecar_health') so a
 	// query never returns non-sidecar rows even if a future
 	// event reuses the field name. Orders by at ASC and respects
 	// the same since / limit contract as ListEventsByWakeID so
@@ -5105,8 +5219,8 @@ type Store interface {
 	// list method alone cannot fetch an unknown invoice without
 	// knowing its account_id up-front.
 	GetInvoiceByID(ctx context.Context, id string) (Invoice, error)
-	// GetInvoiceByProviderID resolves the natural webhook key without an
-	// account-wide list scan.
+	// GetInvoiceByProviderID resolves an invoice ID or charge ID within an
+	// account/provider. Ambiguous cross-namespace matches return ErrConflict.
 	GetInvoiceByProviderID(ctx context.Context, accountID, provider, providerInvoiceID string) (Invoice, error)
 	// UpsertInvoice persists one provider invoice projection. The natural key
 	// (account_id, provider, provider_invoice_id) makes webhook redelivery and
@@ -5167,10 +5281,11 @@ type Store interface {
 	ListActiveCreditsForConsumption(ctx context.Context, accountID string) ([]AccountCredit, error)
 	// ConsumeAccountCredit performs an atomic FIFO decrement across the
 	// account's active credits, capped at TargetCents. The unique
-	// (provider_invoice_id, credit_id) partial index on credit_ledger
-	// (migration 00058) makes the call idempotent: re-running with
-	// the same ProviderInvoiceID and credit set is a no-op and
+	// (provider, provider_invoice_id, credit_id) partial index on credit_ledger
+	// makes the call idempotent: re-running with the same account,
+	// Provider and ProviderInvoiceID is a no-op and
 	// returns AlreadyConsumedForInvoice=true.
+	// Unqualified legacy invoice rows return ErrConflict until audited.
 	//
 	// "Atomic" here means: for each credit, the conditional UPDATE
 	// (WHERE cents_remaining >= $amt) cannot return a row that would
@@ -5439,6 +5554,10 @@ type Store interface {
 	// CountAppSecrets is the quota check helper. apid calls it before
 	// UpsertAppSecret to enforce Limits.SecretCountMax.
 	CountAppSecrets(ctx context.Context, accountID, appID string) (int, error)
+	// RecordAppSecretDelivery conditionally records one runtime-start result
+	// for the exact secret versions schedd staged. A concurrent rotation wins:
+	// candidates whose version no longer matches remain pending.
+	RecordAppSecretDelivery(ctx context.Context, result AppSecretDeliveryResult) (int, error)
 
 	// Per-app private-registry Basic Auth (issue #461 / ADR-062). apid
 	// is the only writer; imaged is the only reader. PasswordEncrypted
@@ -5971,9 +6090,11 @@ type Store interface {
 	// request; no ON CONFLICT — every request gets its own row.
 	// The recorder's in-process LRU dedupe at minute granularity
 	// is the upstream tripwire; the unique-index absence here is
-	// intentional (request_id is the natural dedupe, but the
-	// recorder doesn't carry it).
+	// intentional for direct callers. The receiver uses
+	// RequestTelemetryLogStore below, which gates retries on the stable
+	// publisher event ID before calling this query in a transaction.
 	InsertRequestTelemetry(ctx context.Context, arg sqlc.InsertRequestTelemetryParams) error
+	RequestTelemetryLogStore
 
 	// UpdateSpansSummary is the per-trace UPDATE called by the
 	// apid gRPC WriteSpansSummary handler (ADR-127 PR-D). It
@@ -6159,6 +6280,22 @@ type Store interface {
 	// the window.
 	ListDataUpstreamProbesByHostRegion(ctx context.Context, arg sqlc.ListDataUpstreamProbesByHostRegionParams) ([]DataUpstreamProbe, error)
 
+	// ListEgressCircuitCandidates (ADR-201 §3) backs schedd's egress
+	// circuit-breaker loop. Returns every opted-in upstream joined to its
+	// newest probe verdict no older than `since`; an opted-in upstream with
+	// no probe in the window comes back with a zero Sampled rather than
+	// being dropped, because "never measured" and "row gone" must stay
+	// distinguishable to the loop. Postgres-only — MemStore returns the
+	// ADR-098 sentinel.
+	ListEgressCircuitCandidates(ctx context.Context, since time.Time) ([]EgressCircuitCandidate, error)
+
+	// UpdateDataUpstreamCircuitBreaker (ADR-201 §3) applies a partial
+	// per-upstream egress-breaker policy update. Scoped by (id, app_id) so
+	// a forged ID from a sibling app cannot enable a breaker on an upstream
+	// the caller cannot see — this rule can cut an app off from its own
+	// database. Postgres-only; MemStore returns the ADR-098 sentinel.
+	UpdateDataUpstreamCircuitBreaker(ctx context.Context, in UpdateDataUpstreamCircuitBreakerParams) error
+
 	// ListDataUpstreamProbeHistory backs
 	// GET /v1/apps/{slug}/upstreams/history. It aggregates the raw probe
 	// rows into server-side time buckets so the API never serializes the
@@ -6335,6 +6472,15 @@ type Store interface {
 // older operator implementations.
 type DefaultCustomDomainStore interface {
 	DefaultCustomDomain(context.Context, string) (string, error)
+}
+
+// OrgActivityStore is the optional durable projection behind the global
+// organization activity timeline. It remains a narrow capability instead of
+// widening Store so small test doubles and alternate stores do not need to
+// implement a customer-facing read model they never use.
+type OrgActivityStore interface {
+	AppendOrgActivity(context.Context, OrgActivity) (OrgActivity, error)
+	ListOrgActivity(context.Context, OrgActivityFilter) ([]OrgActivity, error)
 }
 
 // CustomerEventFilter is the tenant-safe query contract for the customer audit

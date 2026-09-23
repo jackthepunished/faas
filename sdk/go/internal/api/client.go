@@ -165,6 +165,10 @@ func (c *Client) addAuthHeader(req *http.Request) {
 // when body != nil, decodes non-2xx as Problem, and unmarshals a
 // successful response into out when out != nil.
 func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
+	return c.doWithIdempotencyKey(ctx, method, path, body, out, "")
+}
+
+func (c *Client) doWithIdempotencyKey(ctx context.Context, method, path string, body, out any, idempotencyKey string) error {
 	var r io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -183,7 +187,10 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 	// or double-creates. We never override an explicit key the caller
 	// already set.
 	if method != http.MethodGet && method != http.MethodHead && req.Header.Get("Idempotency-Key") == "" {
-		req.Header.Set("Idempotency-Key", newUUIDv4())
+		if idempotencyKey == "" {
+			idempotencyKey = newUUIDv4()
+		}
+		req.Header.Set("Idempotency-Key", idempotencyKey)
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -831,6 +838,11 @@ func (c *Client) QueueSend(ctx context.Context, slug string, req QueueSendReques
 	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/queues/send", req, &out)
 }
 
+func (c *Client) SendAppMessage(ctx context.Context, targetApp string, req SendAppMessageRequest) (SendAppMessageResponse, error) {
+	var out SendAppMessageResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+targetApp+"/inbox", req, &out)
+}
+
 // QueueReceive long-polls for the next dispatched row on the queue.
 // 30s server-side cap; on timeout returns (zero, ErrLongPollTimeout)
 // — caller is expected to retry. Stays open across the app's
@@ -851,6 +863,27 @@ func (c *Client) AckQueueRow(ctx context.Context, slug, id string) error {
 func (c *Client) CreateDelayedTask(ctx context.Context, slug string, req DelayedTaskRequest) (DelayedTaskResponse, error) {
 	var out DelayedTaskResponse
 	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/delayed-tasks", req, &out)
+}
+
+func (c *Client) CreateDelayedTaskWithIdempotencyKey(ctx context.Context, slug string, req DelayedTaskRequest, idempotencyKey string) (DelayedTaskResponse, error) {
+	var out DelayedTaskResponse
+	return out, c.doWithIdempotencyKey(ctx, "POST", "/v1/apps/"+slug+"/delayed-tasks", req, &out, idempotencyKey)
+}
+
+func (c *Client) ListDelayedTasks(ctx context.Context, slug, before string, limit int) (ListDelayedTasksResponse, error) {
+	var out ListDelayedTasksResponse
+	q := url.Values{}
+	if before != "" {
+		q.Set("before", before)
+	}
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	path := "/v1/apps/" + slug + "/delayed-tasks"
+	if len(q) > 0 {
+		path += "?" + q.Encode()
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
 }
 
 // GetDelayedTask returns a single delayed-task by id. Account-scoped
@@ -1408,6 +1441,34 @@ func (c *Client) GetOrg(ctx context.Context, slug string) (OrgResponse, error) {
 	return out, c.do(ctx, "GET", "/v1/orgs/"+slug, nil, &out)
 }
 
+// ListOrgActivity returns one newest-first page of the organization's global
+// infrastructure history. before is the opaque NextBefore value from the
+// prior page; empty-string filters are omitted.
+func (c *Client) ListOrgActivity(ctx context.Context, slug, before, kindPrefix, actorType, appID string, limit int) (ListOrgActivityResponse, error) {
+	var out ListOrgActivityResponse
+	q := url.Values{}
+	if before != "" {
+		q.Set("before", before)
+	}
+	if kindPrefix != "" {
+		q.Set("kind_prefix", kindPrefix)
+	}
+	if actorType != "" {
+		q.Set("actor_type", actorType)
+	}
+	if appID != "" {
+		q.Set("app_id", appID)
+	}
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	path := "/v1/orgs/" + slug + "/activity"
+	if encoded := q.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
 // PatchOrg applies a partial update to the org (name and/or plan).
 // Authz routing:
 //   - Name → org.manage_billing (owner + billing)
@@ -1530,6 +1591,11 @@ func (c *Client) ListAppWebhooks(ctx context.Context, slug string) ([]AppWebhook
 func (c *Client) CreateAppWebhook(ctx context.Context, slug string, req CreateAppWebhookRequest) (AppWebhookResponse, error) {
 	var out AppWebhookResponse
 	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/webhooks", req, &out)
+}
+
+func (c *Client) DeliverAppEvent(ctx context.Context, sourceApp string, req DeliverAppEventRequest) (DeliverAppEventResponse, error) {
+	var out DeliverAppEventResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+sourceApp+"/outbox", req, &out)
 }
 
 // GetAppWebhook returns a single subscription by id.

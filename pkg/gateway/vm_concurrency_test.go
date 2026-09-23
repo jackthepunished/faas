@@ -5,10 +5,13 @@ package gateway
 import (
 	"context"
 	"errors"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/onebox-faas/faas/pkg/api"
 )
 
 func TestVMConcurrencyManagerEnforcesPerInstanceLimit(t *testing.T) {
@@ -166,6 +169,136 @@ func TestVMConcurrencyManagerWakesWaiterOnRelease(t *testing.T) {
 	}
 	if len(m.gates) != 0 {
 		t.Fatalf("gate remained after all requests drained, gates=%d", len(m.gates))
+	}
+}
+
+func TestVMConcurrencyWarmQueueIsBoundedFIFO(t *testing.T) {
+	m := newVMConcurrencyManager(nil)
+	first, depth, ok, err := m.enterQueue(context.Background(), "app", "pro", 2, time.Second)
+	if err != nil || !ok || depth != 1 {
+		t.Fatalf("first queue entry = depth %d ok %v err %v", depth, ok, err)
+	}
+	second, depth, ok, err := m.enterQueue(context.Background(), "app", "pro", 2, time.Second)
+	if err != nil || !ok || depth != 2 {
+		t.Fatalf("second queue entry = depth %d ok %v err %v", depth, ok, err)
+	}
+	if _, depth, ok, err := m.enterQueue(context.Background(), "app", "pro", 2, time.Second); err != nil || ok || depth != 2 {
+		t.Fatalf("overflow queue entry = depth %d ok %v err %v, want full at 2", depth, ok, err)
+	}
+
+	select {
+	case <-first.ready:
+	default:
+		t.Fatal("queue head was not made runnable")
+	}
+	select {
+	case <-second.ready:
+		t.Fatal("second waiter bypassed the queue head")
+	default:
+	}
+	if err := first.leave(context.Background()); err != nil {
+		t.Fatalf("leave first: %v", err)
+	}
+	select {
+	case <-second.ready:
+	case <-time.After(time.Second):
+		t.Fatal("leaving queue head did not release the next waiter")
+	}
+	if err := second.leave(context.Background()); err != nil {
+		t.Fatalf("leave second: %v", err)
+	}
+	if got := m.queueDepth("app"); got != 0 {
+		t.Fatalf("queue depth after drain = %d, want 0", got)
+	}
+}
+
+type fakeFleetQueueAdmission struct {
+	mu     sync.Mutex
+	next   int
+	leases map[string]map[string]struct{}
+}
+
+func (f *fakeFleetQueueAdmission) TryAcquireConcurrencyQueueLease(_ context.Context, appID string, limit int, _ time.Duration) (string, int, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.leases == nil {
+		f.leases = make(map[string]map[string]struct{})
+	}
+	appLeases := f.leases[appID]
+	if appLeases == nil {
+		appLeases = make(map[string]struct{})
+		f.leases[appID] = appLeases
+	}
+	if len(appLeases) >= limit {
+		return "", len(appLeases), false, nil
+	}
+	f.next++
+	leaseID := strconv.Itoa(f.next)
+	appLeases[leaseID] = struct{}{}
+	return leaseID, len(appLeases), true, nil
+}
+
+func (f *fakeFleetQueueAdmission) ReleaseConcurrencyQueueLease(_ context.Context, appID, leaseID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.leases[appID], leaseID)
+	return nil
+}
+
+func TestVMConcurrencyWarmQueueCapIsSharedAcrossGatewayManagers(t *testing.T) {
+	admission := &fakeFleetQueueAdmission{}
+	firstGateway := newVMConcurrencyManager(nil)
+	secondGateway := newVMConcurrencyManager(nil)
+	firstGateway.setQueueAdmission(admission)
+	secondGateway.setQueueAdmission(admission)
+
+	first, depth, ok, err := firstGateway.enterQueue(context.Background(), "app", "pro", 2, time.Second)
+	if err != nil || !ok || depth != 1 {
+		t.Fatalf("first gateway admission = depth %d ok %v err %v", depth, ok, err)
+	}
+	second, depth, ok, err := secondGateway.enterQueue(context.Background(), "app", "pro", 2, time.Second)
+	if err != nil || !ok || depth != 2 {
+		t.Fatalf("second gateway admission = depth %d ok %v err %v", depth, ok, err)
+	}
+	if _, depth, ok, err := firstGateway.enterQueue(context.Background(), "app", "pro", 2, time.Second); err != nil || ok || depth != 2 {
+		t.Fatalf("fleet overflow = depth %d ok %v err %v, want full at 2", depth, ok, err)
+	}
+
+	if err := first.leave(context.Background()); err != nil {
+		t.Fatalf("release first fleet permit: %v", err)
+	}
+	replacement, depth, ok, err := firstGateway.enterQueue(context.Background(), "app", "pro", 2, time.Second)
+	if err != nil || !ok || depth != 2 {
+		t.Fatalf("replacement admission = depth %d ok %v err %v", depth, ok, err)
+	}
+	if err := replacement.leave(context.Background()); err != nil {
+		t.Fatalf("release replacement fleet permit: %v", err)
+	}
+	if err := second.leave(context.Background()); err != nil {
+		t.Fatalf("release second fleet permit: %v", err)
+	}
+}
+
+func TestAcquireVMTargetReturnsTypedWarmQueueTimeout(t *testing.T) {
+	b := &fakeBackend{app: App{ID: "app", Type: AppTypeFunction, Plan: api.PlanFree, MaxQueueDepth: 1}, targets: []Target{{NodeID: "node", InstanceID: "first"}}}
+	h := NewHandlerWith(b, NewMetrics(), nil)
+	held, ok := h.vmConcurrency.tryAcquire("first", "free", 1)
+	if !ok {
+		t.Fatal("failed to occupy first target")
+	}
+	defer held()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	_, release, waited, err := h.acquireVMTarget(ctx, b.app, PickResult{Target: b.targets[0], OK: true}, 1, "")
+	if release != nil {
+		release()
+	}
+	if !waited || !errors.Is(err, ErrConcurrencyQueueWaitTimeout) {
+		t.Fatalf("waited=%v err=%v, want typed warm queue timeout", waited, err)
+	}
+	if got := h.vmConcurrency.queueDepth("app"); got != 0 {
+		t.Fatalf("queue depth after timeout = %d, want 0", got)
 	}
 }
 

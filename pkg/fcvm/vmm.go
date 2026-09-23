@@ -27,6 +27,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/extension"
 	"github.com/onebox-faas/faas/pkg/fcvm/logbuf"
+	"github.com/onebox-faas/faas/pkg/jailsetup"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/storage"
 	pkgtrace "github.com/onebox-faas/faas/pkg/trace"
@@ -128,6 +129,9 @@ type JailerVMM struct {
 	// bindSourceModes reference-counts temporary source permission widening
 	// when multiple VMs bind the same shared base image concurrently.
 	bindSourceModes map[string]bindSourceMode
+	// wakePhaseMetrics is the vmmd wake registry (ADR-098 C11), shared with
+	// the Manager. Optional; every observation site is nil-safe.
+	wakePhaseMetrics *WakePhaseMetrics
 	// events is the wake-timeline fan-out (issue #517 / PR-C /
 	// ADR-064). vmmd is the source for the corroborating wake.boot_observed
 	// event and the canonical emit site for
@@ -152,27 +156,57 @@ type bindSourceMode struct {
 // only when the wake-timeline event is emitted; keeping the struct in
 // durations avoids making the restore path depend on the event wire shape.
 type restoreTimingBreakdown struct {
+	// Prepare carries the Manager.Wake phases that ran BEFORE this
+	// JailerVMM.Restore window (ADR-192). They are outside TotalMs; the
+	// timeline previously had no way to attribute that gap.
+	Prepare              WakePrepareTimings
 	RestoreGateWaitMs    int64
 	ChrootMs             int64
 	MaterializeMemMs     int64
 	MaterializeVMStateMs int64
 	ResolveImagesMs      int64
 	StageDrivesMs        int64
-	StageSnapshotMs      int64
-	HelperMs             int64
-	StartJailerMs        int64
-	BindTunMs            int64
-	LoadSnapshotMs       int64
-	ResumeHookMs         int64
-	WaitReadyMs          int64
-	TotalMs              int64
-	ResolveArtifacts     []restoreArtifactTiming
+	// TunWaitMntnsMs .. CgroupFenceMs split the bind_tun window so an
+	// optimisation targets the right thing; see bindTunTimings. Operator-
+	// facing only: they ride the Debug record and are deliberately NOT on
+	// the wake.restore_breakdown event, which is a customer contract.
+	TunWaitMntnsMs  int64
+	TunWaitChrootMs int64
+	TunSetupJailMs  int64
+	// TunSetupJailWorkUs is the helper's own in-namespace duration, self
+	// reported on stdout. TunSetupJailMs minus this is process-spawn cost.
+	TunSetupJailWorkUs int64
+	CgroupFenceMs      int64
+	// StagePreBootFilesMs is the single loop-mount session that writes
+	// secrets.env / env.json / resolver / workload files onto drive1
+	// (ADR-192). It was folded into StageSnapshotMs before, which made the
+	// two-syscall mem/vmstate bind look expensive.
+	StagePreBootFilesMs int64
+	StageSnapshotMs     int64
+	HelperMs            int64
+	StartJailerMs       int64
+	BindTunMs           int64
+	LoadSnapshotMs      int64
+	ResumeHookMs        int64
+	WaitReadyMs         int64
+	TotalMs             int64
+	ResolveArtifacts    []restoreArtifactTiming
 }
 
+// restoreArtifactTiming attributes one restore input to where its bytes came
+// from. Source is the discriminator that matters for placement: a local hit
+// is a stat plus a bind, while "materialized" is a full streamed copy of the
+// object out of the configured backend.
+//
+// Bytes mirrors coldBootArtifactTiming.Bytes. Without it a remote fetch and a
+// local hit are only distinguishable by duration, which conflates "the object
+// is large" with "the network was slow" — the two questions cross-node
+// placement actually has to separate.
 type restoreArtifactTiming struct {
 	Artifact   string `json:"artifact"`
 	Source     string `json:"source"`
 	DurationMs int64  `json:"duration_ms"`
+	Bytes      int64  `json:"bytes"`
 }
 
 type restoreArtifactSpec struct {
@@ -274,8 +308,27 @@ func (w *customerConsoleWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// stripFirecrackerTimestamp drops the wall-clock token Firecracker's logger
+// prints before its "[instance:origin]" header, for example
+// "2026-09-22T18:27:44.308421861 [id:main] Running Firecracker v1.7.0".
+// Without this every production control line bypassed the filter, which only
+// recognised lines that start with "[" (issue #3362). A leading token that
+// is not timestamp-shaped is left alone.
+func stripFirecrackerTimestamp(line string) string {
+	token, rest, ok := strings.Cut(line, " ")
+	if !ok || len(token) < len("2006-01-02T15:04:05") || !strings.HasPrefix(strings.TrimSpace(rest), "[") {
+		return line
+	}
+	for _, r := range token {
+		if (r < '0' || r > '9') && r != '-' && r != ':' && r != '.' && r != 'T' && r != 'Z' && r != '+' {
+			return line
+		}
+	}
+	return strings.TrimSpace(rest)
+}
+
 func firecrackerControlLine(line []byte) bool {
-	trimmed := strings.TrimSpace(string(line))
+	trimmed := stripFirecrackerTimestamp(strings.TrimSpace(string(line)))
 	if !strings.HasPrefix(trimmed, "[") {
 		return false
 	}
@@ -303,9 +356,17 @@ func firecrackerControlLine(line []byte) bool {
 	}
 	for _, marker := range []string{
 		"running firecracker",
+		"firecracker exiting",
 		"host cpu vendor",
 		"snapshot cpu vendor",
 		"device kick",
+		"kick devices",
+		"kick net ",
+		"kick entropy ",
+		"kick block ",
+		"kick vsock",
+		"development preview",
+		"vmm action took",
 		"api server",
 		"request was executed successfully",
 		"api request took",
@@ -512,6 +573,34 @@ func (v *JailerVMM) acquireRestoreSlot(ctx context.Context) (func(), error) {
 func (v *JailerVMM) WithEvents(p *events.Platform) VMM {
 	v.events = p
 	return v
+}
+
+// WithWakePhaseMetrics stamps the vmmd wake registry on the VMM so restore
+// can report per-artifact materialization alongside the per-wake event.
+//
+// The same *WakePhaseMetrics the Manager holds: restore input resolution
+// happens down here in the VMM while the Manager owns the wake-phase
+// histogram, and the two belong on one registry so an operator reads the
+// whole wake from a single scrape. Sibling of WithEvents — nil opts out, and
+// every observation site is nil-safe, so fixtures that skip this keep
+// working.
+func (v *JailerVMM) WithWakePhaseMetrics(m *WakePhaseMetrics) *JailerVMM {
+	v.wakePhaseMetrics = m
+	return v
+}
+
+// observeRestoreArtifacts mirrors the restore breakdown's artifact list into
+// the wake registry. The event carries the per-wake detail for forensics; the
+// histogram is what a dashboard or an alert can actually read, which is the
+// difference between being able to reconstruct one slow wake and being able
+// to see cross-node fetch cost as a trend.
+func (v *JailerVMM) observeRestoreArtifacts(timings []restoreArtifactTiming) {
+	if v == nil || v.wakePhaseMetrics == nil {
+		return
+	}
+	for _, t := range timings {
+		v.wakePhaseMetrics.ObserveMaterialize(t.Artifact, t.Source, t.DurationMs, t.Bytes)
+	}
 }
 
 // resolveFCChrootName returns the directory name jailer will use for the chroot:
@@ -774,7 +863,7 @@ func (v *JailerVMM) boot(ctx context.Context, l Lease, cfg VMConfig, skipReady b
 	}
 	startedJailerAt := time.Now()
 	if len(cfg.NetworkInterfaces) > 0 {
-		if err = v.bindTunDeviceInJailer(root, l.Instance, l.UID, l.GID); err != nil {
+		if _, err = v.bindTunDeviceInJailer(root, l.Instance, l.UID, l.GID); err != nil {
 			return err
 		}
 	}
@@ -881,21 +970,70 @@ func (v *JailerVMM) preparesWakeStateBeforeBoot() bool { return true }
 // The main drive is available after provision; the Firecracker process has not
 // received its config yet, so this is the last safe point for secrets, API env,
 // per-sidecar env overrides, and the sidecar roster.
+// stagePreBootFiles writes every per-instance file the guest expects on
+// drive1 in ONE loop-mount session (ADR-192). Before this, secrets.env,
+// env.json, the service resolver, each sidecar env override, the main
+// manifest and the roster mounted and unmounted the layer on their own, so
+// an app with secrets plus API env paid two to three ext4 mount +
+// journal-flush cycles on every restore — the dominant cost inside the
+// restore breakdown's stage window on the production SSD nodes. The
+// per-file writers are shared with the public Stage* methods, which keep
+// their single-file mount for the legacy Manager path and for tests.
 func (v *JailerVMM) stagePreBootFiles(instance string, workloads []WorkloadSpec, secretsEnvJSON, apiEnvJSON []byte, serviceDiscoveryIP string) error {
-	if len(secretsEnvJSON) > 0 {
-		if err := v.StageSecretsEnv(instance, secretsEnvJSON); err != nil {
-			return fmt.Errorf("stage secrets.env: %w", err)
+	writers, err := preBootFileWriters(workloads, secretsEnvJSON, apiEnvJSON, serviceDiscoveryIP)
+	if err != nil {
+		return err
+	}
+	if len(writers) == 0 {
+		return nil
+	}
+	drive1, err := v.resolveDriveImage(instance)
+	if err != nil {
+		return err
+	}
+	return loopMountSession(drive1, "faas-vmm-preboot-", func(mountRoot string) error {
+		for _, w := range writers {
+			if err := w.write(mountRoot); err != nil {
+				return fmt.Errorf("%s: %w", w.what, err)
+			}
 		}
+		return nil
+	})
+}
+
+// preBootFileWriter is one deferred write against a mounted drive1. what is
+// the operation label the caller wraps errors with, matching the messages
+// the previous one-mount-per-file implementation produced.
+type preBootFileWriter struct {
+	what  string
+	write func(mountRoot string) error
+}
+
+// preBootFileWriters validates inputs and projects byte caps BEFORE any
+// mount, so a rejected payload never costs a loop mount — the same posture
+// the individual Stage* methods always had. Order is preserved from the
+// previous implementation: secrets, API env, resolver, sidecar env
+// overrides, main manifest, roster.
+func preBootFileWriters(workloads []WorkloadSpec, secretsEnvJSON, apiEnvJSON []byte, serviceDiscoveryIP string) ([]preBootFileWriter, error) {
+	var writers []preBootFileWriter
+	if len(secretsEnvJSON) > 0 {
+		writers = append(writers, preBootFileWriter{what: "stage secrets.env", write: func(mp string) error {
+			return writeSecretsEnv(mp, secretsEnvJSON)
+		}})
 	}
 	if len(apiEnvJSON) > 0 {
-		if err := v.StageAPIEnv(instance, apiEnvJSON); err != nil {
-			return fmt.Errorf("stage env.json: %w", err)
-		}
+		writers = append(writers, preBootFileWriter{what: "stage env.json", write: func(mp string) error {
+			return writeAPIEnv(mp, apiEnvJSON)
+		}})
 	}
 	if strings.TrimSpace(serviceDiscoveryIP) != "" {
-		if err := v.stageServiceDiscoveryResolver(instance, serviceDiscoveryIP); err != nil {
-			return fmt.Errorf("stage service resolver: %w", err)
+		ip, err := parseServiceDiscoveryIP(serviceDiscoveryIP)
+		if err != nil {
+			return nil, fmt.Errorf("stage service resolver: %w", err)
 		}
+		writers = append(writers, preBootFileWriter{what: "stage service resolver", write: func(mp string) error {
+			return writeServiceDiscoveryResolver(mp, ip)
+		}})
 	}
 	if len(workloads) > 1 {
 		// Sidecar drives are deliberately read-only. Image defaults and the
@@ -906,41 +1044,102 @@ func (v *JailerVMM) stagePreBootFiles(instance string, workloads []WorkloadSpec,
 			if len(workload.preparedEnvJSON) == 0 {
 				continue
 			}
-			if err := v.StageWorkloadEnv(instance, workload.Name, workload.preparedEnvJSON); err != nil {
-				return fmt.Errorf("stage workload %s env: %w", workload.Name, err)
+			if !validWorkloadName(workload.Name) {
+				return nil, fmt.Errorf("stage workload %s env: invalid workload name %q", workload.Name, workload.Name)
 			}
+			name, blob := workload.Name, workload.preparedEnvJSON
+			writers = append(writers, preBootFileWriter{what: "stage workload " + name + " env", write: func(mp string) error {
+				return writeWorkloadEnv(mp, name, blob)
+			}})
 		}
-		if err := v.StageWorkloadManifest(instance, -1, workloads[0]); err != nil {
-			return fmt.Errorf("stage main workload manifest: %w", err)
+		manifest, err := marshalWorkloadManifest(workloads[0])
+		if err != nil {
+			return nil, fmt.Errorf("stage main workload manifest: %w", err)
 		}
-		if err := v.StageWorkloadRoster(instance, workloads[0], workloads[1:]); err != nil {
-			return fmt.Errorf("stage workload roster: %w", err)
+		writers = append(writers, preBootFileWriter{what: "stage main workload manifest", write: func(mp string) error {
+			return writeDriveFile(mp, workloadManifestPath, manifest, 0o400, "workload.json")
+		}})
+		roster, err := marshalWorkloadRoster(workloads[0], workloads[1:])
+		if err != nil {
+			return nil, fmt.Errorf("stage workload roster: %w", err)
 		}
+		writers = append(writers, preBootFileWriter{what: "stage workload roster", write: func(mp string) error {
+			return writeDriveFile(mp, workloadRosterPath, roster, 0o400, "workloads.json")
+		}})
+	}
+	return writers, nil
+}
+
+// loopMountSession loop-mounts an ext4 drive image read-write, runs fn
+// against the mountpoint, then unmounts and removes the mountpoint. vmmd is
+// the only root component, so the loopback mount is permitted by the §11
+// threat model. It is a package variable so the pure-Go test tier — which
+// has neither root nor a loop device — can substitute a plain directory
+// and count sessions.
+var loopMountSession = func(drive, prefix string, fn func(mountRoot string) error) error {
+	mp, err := os.MkdirTemp("", prefix)
+	if err != nil {
+		return fmt.Errorf("mkdir mountpoint: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(mp) }()
+	if out, err := exec.Command("mount", "-o", "loop,rw", drive, mp).CombinedOutput(); err != nil {
+		return fmt.Errorf("mount loop: %w (%s)", err, bytes.TrimSpace(out))
+	}
+	defer func() { _ = exec.Command("umount", mp).Run() }()
+	return fn(mp)
+}
+
+// writeDriveFile writes one file beneath a mounted drive, resolving the
+// full-rootfs marker the same way every Stage* method always has.
+func writeDriveFile(mountRoot, optimizedPath string, blob []byte, mode os.FileMode, label string) error {
+	target, err := stagedDrivePath(mountRoot, optimizedPath)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", strings.TrimPrefix(filepath.Dir(optimizedPath), "upper/"), err)
+	}
+	if err := os.WriteFile(target, blob, mode); err != nil {
+		return fmt.Errorf("write %s: %w", label, err)
+	}
+	return nil
+}
+
+func writeSecretsEnv(mountRoot string, blob []byte) error {
+	return writeDriveFile(mountRoot, secretsEnvPath, blob, 0o400, "secrets.env")
+}
+
+func writeAPIEnv(mountRoot string, blob []byte) error {
+	return writeDriveFile(mountRoot, apiEnvPath, blob, 0o400, "env.json")
+}
+
+func writeWorkloadEnv(mountRoot, workloadName string, blob []byte) error {
+	base, err := stagedDrivePath(mountRoot, workloadEnvPath)
+	if err != nil {
+		return err
+	}
+	target := filepath.Join(base, workloadName, "env.json")
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return fmt.Errorf("mkdir workload env: %w", err)
+	}
+	if err := os.WriteFile(target, blob, 0o400); err != nil {
+		return fmt.Errorf("write workload env: %w", err)
 	}
 	return nil
 }
 
 const serviceDiscoveryResolverPath = "upper/etc/resolv.conf"
 
-func (v *JailerVMM) stageServiceDiscoveryResolver(instance, bridgeIP string) error {
+func parseServiceDiscoveryIP(bridgeIP string) (netip.Addr, error) {
 	ip, err := netip.ParseAddr(strings.TrimSpace(bridgeIP))
 	if err != nil || !ip.Is4() || !ip.IsPrivate() || ip.IsLoopback() || ip.IsUnspecified() {
-		return fmt.Errorf("invalid private bridge address %q", bridgeIP)
+		return netip.Addr{}, fmt.Errorf("invalid private bridge address %q", bridgeIP)
 	}
-	drive1, err := v.resolveDriveImage(instance)
-	if err != nil {
-		return err
-	}
-	mp, err := os.MkdirTemp("", "faas-vmm-resolver-")
-	if err != nil {
-		return fmt.Errorf("mkdir mountpoint: %w", err)
-	}
-	defer func() { _ = os.RemoveAll(mp) }()
-	if out, mountErr := exec.Command("mount", "-o", "loop,rw", drive1, mp).CombinedOutput(); mountErr != nil {
-		return fmt.Errorf("mount loop: %w (%s)", mountErr, bytes.TrimSpace(out))
-	}
-	defer func() { _ = exec.Command("umount", mp).Run() }()
-	target, err := stagedDrivePath(mp, serviceDiscoveryResolverPath)
+	return ip, nil
+}
+
+func writeServiceDiscoveryResolver(mountRoot string, ip netip.Addr) error {
+	target, err := stagedDrivePath(mountRoot, serviceDiscoveryResolverPath)
 	if err != nil {
 		return err
 	}
@@ -1038,13 +1237,14 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 	// /srv/fc/snap and the resolution is essentially a stat; the OCI
 	// driver streams the bytes over HTTP. Tmp cleanup happens via the
 	// deferred Kill (chroot lives on tmpfs and disappears with it).
-	memSrc, err := v.restoreMemSource(ctx, l.Instance, spec)
+	memSrc, memTiming, err := v.resolveRestoreBlob(ctx, l.Instance, "mem", spec.StorageKey, spec.VMStatePath)
 	if err != nil {
 		return err
 	}
 	if memSrc == "" {
 		return fmt.Errorf("vmm: restore spec missing mem source (storage_key=%q)", spec.StorageKey)
 	}
+	blobTimings := []restoreArtifactTiming{memTiming}
 	memReady := time.Now()
 
 	// #121 / ADR-025 axis 2 slice 4 — materialise the vmstate blob
@@ -1060,22 +1260,17 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 	// When the key is empty we fall back to spec.VMStatePath byte-for-bit
 	// (the existing single-box behaviour).
 	vmstateStart := time.Now()
-	stateSrc := spec.VMStatePath
-	if spec.VMStateStorageKey != "" && v.storage != nil {
-		stateTmp, gerr := v.restoreSourceFromStorage(ctx, l.Instance, spec.VMStateStorageKey)
-		if gerr != nil {
-			return gerr
-		}
-		if stateTmp != "" {
-			stateSrc = stateTmp
-		}
-		// Defensive: a nil-error, empty-result from materializeFromStorage
-		// means the backend didn't surface a file for this key (e.g. the
-		// materialise helper's "no entry" return code). Falling through to
-		// spec.VMStatePath below keeps Restore advancing when a legacy
-		// host-path file is still around; the next branch's empty-stateSrc
-		// check is the hard error when neither locator has bytes.
+	// resolveRestoreBlob preserves the branch above byte-for-bit: an empty
+	// key or nil storage returns spec.VMStatePath unchanged, and a
+	// nil-error/empty-result materialization falls back to it too (the
+	// backend surfaced no file for this key). It adds only the source and
+	// byte attribution that mem and vmstate previously lacked.
+	stateSrc, stateTiming, gerr := v.resolveRestoreBlob(
+		ctx, l.Instance, "vmstate", spec.VMStateStorageKey, spec.VMStatePath)
+	if gerr != nil {
+		return gerr
 	}
+	blobTimings = append(blobTimings, stateTiming)
 	if stateSrc == "" {
 		return fmt.Errorf("vmm: restore spec missing vmstate source (vmstate_storage_key=%q vmstate_path=%q)",
 			spec.VMStateStorageKey, spec.VMStatePath)
@@ -1184,6 +1379,7 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 	if err := v.stagePreBootFiles(l.Instance, spec.Workloads, spec.SecretsEnvJSON, spec.APIEnvJSON, spec.ServiceDiscoveryIP); err != nil {
 		return fmt.Errorf("vmm: stage pre-boot workload state: %w", err)
 	}
+	tPreBootFiles := time.Now()
 
 	// Snapshot files are read-only inputs shared across the N instances a single
 	// snapshot may restore (invariant §6.2-5): hardlink them in and widen for read
@@ -1226,11 +1422,13 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 		return err
 	}
 	tStartJailer := time.Now()
+	var tunTimings bindTunTimings
 	if !spec.Networkless {
-		if err = v.bindTunDeviceInJailer(root, l.Instance, l.UID, l.GID); err != nil {
+		if tunTimings, err = v.bindTunDeviceInJailer(root, l.Instance, l.UID, l.GID); err != nil {
 			return err
 		}
 	}
+	tTunReady := time.Now()
 	var restoreCPU startupCPUProfile
 	trackRestoreCPU := !l.IsBuilder && l.Plan.Valid()
 	if l.IsBuilder || l.Plan.Valid() {
@@ -1288,13 +1486,20 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 	}
 	tDone := time.Now()
 	breakdown := restoreTimingBreakdown{
+		Prepare:              spec.Prepare,
 		RestoreGateWaitMs:    restoreAdmitted.Sub(t0).Milliseconds(),
 		ChrootMs:             chrootReady.Sub(restoreAdmitted).Milliseconds(),
 		MaterializeMemMs:     memReady.Sub(chrootReady).Milliseconds(),
 		MaterializeVMStateMs: vmstateReady.Sub(vmstateStart).Milliseconds(),
 		ResolveImagesMs:      tResolve.Sub(vmstateReady).Milliseconds(),
 		StageDrivesMs:        tStageDrives.Sub(tResolve).Milliseconds(),
-		StageSnapshotMs:      tMemState.Sub(tStageDrives).Milliseconds(),
+		TunWaitMntnsMs:       tunTimings.WaitMntnsMs,
+		TunWaitChrootMs:      tunTimings.WaitChrootMs,
+		TunSetupJailMs:       tunTimings.SetupJailMs,
+		TunSetupJailWorkUs:   tunTimings.SetupJailWorkUs,
+		CgroupFenceMs:        tBindTun.Sub(tTunReady).Milliseconds(),
+		StagePreBootFilesMs:  tPreBootFiles.Sub(tStageDrives).Milliseconds(),
+		StageSnapshotMs:      tMemState.Sub(tPreBootFiles).Milliseconds(),
 		HelperMs:             tHelper.Sub(tMemState).Milliseconds(),
 		StartJailerMs:        tStartJailer.Sub(tHelper).Milliseconds(),
 		BindTunMs:            tBindTun.Sub(tStartJailer).Milliseconds(),
@@ -1302,8 +1507,13 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 		ResumeHookMs:         tResume.Sub(tLoad).Milliseconds(),
 		WaitReadyMs:          tReady.Sub(tResume).Milliseconds(),
 		TotalMs:              tDone.Sub(t0).Milliseconds(),
-		ResolveArtifacts:     restoreArtifactTimings(resolvedArtifacts),
+		// Blob timings first: mem and vmstate are the largest inputs and the
+		// ones whose source decides whether a cross-node wake can hold the
+		// budget, so an operator reading the timeline sees them before the
+		// kernel/base/layer drives.
+		ResolveArtifacts: append(blobTimings, restoreArtifactTimings(resolvedArtifacts)...),
 	}
+	v.observeRestoreArtifacts(breakdown.ResolveArtifacts)
 	v.emitRestoreBreakdown(ctx, l, tDone, breakdown)
 	// The durable wake event above is the operator-facing record. Keep the
 	// duplicate structured log at Debug so a slow journald sink cannot delay
@@ -1320,36 +1530,22 @@ func (v *JailerVMM) Restore(ctx context.Context, l Lease, spec RestoreSpec) (err
 		"mem_state_resolve_ms", tMemStateResolve.Sub(tMemStateResolveStart).Milliseconds(),
 		"stage_drives_ms", breakdown.StageDrivesMs,
 		"stage_writable_ms", tStageWritable.Sub(tStageWritableStart).Milliseconds(),
+		"stage_pre_boot_files_ms", breakdown.StagePreBootFilesMs,
 		"stage_snapshot_ms", breakdown.StageSnapshotMs,
 		"helper_ms", breakdown.HelperMs,
 		"start_jailer_ms", breakdown.StartJailerMs,
 		"bind_tun_ms", breakdown.BindTunMs,
+		"tun_wait_mntns_ms", breakdown.TunWaitMntnsMs,
+		"tun_wait_chroot_ms", breakdown.TunWaitChrootMs,
+		"tun_setup_jail_ms", breakdown.TunSetupJailMs,
+		"tun_setup_jail_work_us", breakdown.TunSetupJailWorkUs,
+		"cgroup_fence_ms", breakdown.CgroupFenceMs,
 		"load_snapshot_ms", breakdown.LoadSnapshotMs,
 		"resume_hook_ms", breakdown.ResumeHookMs,
 		"wait_ready_ms", breakdown.WaitReadyMs,
 		"total_ms", breakdown.TotalMs,
 	)
 	return nil
-}
-
-// restoreMemSource resolves the memory blob from the canonical storage key
-// whenever one is present. The legacy VMStatePath is only a fallback for
-// callers that predate StorageKey. This must not branch on
-// FAAS_STORAGE_BACKEND: OCI mode still needs the memory blob materialized
-// from StorageBackend before Firecracker can load the snapshot.
-func (v *JailerVMM) restoreMemSource(ctx context.Context, instanceID string, spec RestoreSpec) (string, error) {
-	memSrc := spec.VMStatePath
-	if spec.StorageKey == "" || v.storage == nil {
-		return memSrc, nil
-	}
-	memTmp, err := v.restoreSourceFromStorage(ctx, instanceID, spec.StorageKey)
-	if err != nil {
-		return "", err
-	}
-	if memTmp != "" {
-		memSrc = memTmp
-	}
-	return memSrc, nil
 }
 
 // vsockUDSSock is the host-side path the TriggerResumeHook dialer reaches.
@@ -3227,30 +3423,9 @@ func (v *JailerVMM) StageSecretsEnv(instance string, jsonBlob []byte) error {
 	if err != nil {
 		return err
 	}
-	mp, err := os.MkdirTemp("", "faas-vmm-secrets-")
-	if err != nil {
-		return fmt.Errorf("mkdir mountpoint: %w", err)
-	}
-	defer func() { _ = os.RemoveAll(mp) }()
-
-	// rw,noexec,nosuid — drive1 is a vfat-less ext4; noexec would still
-	// work but we don't need it and rw alone is the minimum.
-	if out, err := exec.Command("mount", "-o", "loop,rw", drive1, mp).CombinedOutput(); err != nil {
-		return fmt.Errorf("mount loop: %w (%s)", err, bytes.TrimSpace(out))
-	}
-	defer func() { _ = exec.Command("umount", mp).Run() }()
-
-	target, err := stagedDrivePath(mp, secretsEnvPath)
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-		return fmt.Errorf("mkdir etc/faas: %w", err)
-	}
-	if err := os.WriteFile(target, jsonBlob, 0o400); err != nil {
-		return fmt.Errorf("write secrets.env: %w", err)
-	}
-	return nil
+	return loopMountSession(drive1, "faas-vmm-secrets-", func(mp string) error {
+		return writeSecretsEnv(mp, jsonBlob)
+	})
 }
 
 // StageAPIEnv is the plaintext sibling of StageSecretsEnv (issue #395 /
@@ -3273,28 +3448,9 @@ func (v *JailerVMM) StageAPIEnv(instance string, jsonBlob []byte) error {
 	if err != nil {
 		return err
 	}
-	mp, err := os.MkdirTemp("", "faas-vmm-apienv-")
-	if err != nil {
-		return fmt.Errorf("mkdir mountpoint: %w", err)
-	}
-	defer func() { _ = os.RemoveAll(mp) }()
-
-	if out, err := exec.Command("mount", "-o", "loop,rw", drive1, mp).CombinedOutput(); err != nil {
-		return fmt.Errorf("mount loop: %w (%s)", err, bytes.TrimSpace(out))
-	}
-	defer func() { _ = exec.Command("umount", mp).Run() }()
-
-	target, err := stagedDrivePath(mp, apiEnvPath)
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-		return fmt.Errorf("mkdir etc/faas: %w", err)
-	}
-	if err := os.WriteFile(target, jsonBlob, 0o400); err != nil {
-		return fmt.Errorf("write env.json: %w", err)
-	}
-	return nil
+	return loopMountSession(drive1, "faas-vmm-apienv-", func(mp string) error {
+		return writeAPIEnv(mp, jsonBlob)
+	})
 }
 
 // workloadEnvPath is the per-sidecar override file written to the main
@@ -3317,28 +3473,9 @@ func (v *JailerVMM) StageWorkloadEnv(instance, workloadName string, jsonBlob []b
 	if err != nil {
 		return err
 	}
-	mp, err := os.MkdirTemp("", "faas-vmm-workload-env-")
-	if err != nil {
-		return fmt.Errorf("mkdir mountpoint: %w", err)
-	}
-	defer func() { _ = os.RemoveAll(mp) }()
-	if out, err := exec.Command("mount", "-o", "loop,rw", drive1, mp).CombinedOutput(); err != nil {
-		return fmt.Errorf("mount loop: %w (%s)", err, bytes.TrimSpace(out))
-	}
-	defer func() { _ = exec.Command("umount", mp).Run() }()
-
-	base, err := stagedDrivePath(mp, workloadEnvPath)
-	if err != nil {
-		return err
-	}
-	target := filepath.Join(base, workloadName, "env.json")
-	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-		return fmt.Errorf("mkdir workload env: %w", err)
-	}
-	if err := os.WriteFile(target, jsonBlob, 0o400); err != nil {
-		return fmt.Errorf("write workload env: %w", err)
-	}
-	return nil
+	return loopMountSession(drive1, "faas-vmm-workload-env-", func(mp string) error {
+		return writeWorkloadEnv(mp, workloadName, jsonBlob)
+	})
 }
 
 func validWorkloadName(name string) bool {
@@ -3399,15 +3536,19 @@ func (v *JailerVMM) writeWorkloadManifest(drive string, w WorkloadSpec) error {
 	if _, err := os.Stat(drive); err != nil {
 		return fmt.Errorf("stat workload drive: %w", err)
 	}
-	mp, err := os.MkdirTemp("", "faas-vmm-workload-")
+	blob, err := marshalWorkloadManifest(w)
 	if err != nil {
-		return fmt.Errorf("mkdir mountpoint: %w", err)
+		return err
 	}
-	defer func() { _ = os.RemoveAll(mp) }()
-	if out, err := exec.Command("mount", "-o", "loop,rw", drive, mp).CombinedOutput(); err != nil {
-		return fmt.Errorf("mount loop: %w (%s)", err, bytes.TrimSpace(out))
-	}
-	defer func() { _ = exec.Command("umount", mp).Run() }()
+	return loopMountSession(drive, "faas-vmm-workload-", func(mp string) error {
+		return writeDriveFile(mp, workloadManifestPath, blob, 0o400, "workload.json")
+	})
+}
+
+// marshalWorkloadManifest projects the byte cap and marshals the
+// compatibility manifest. It runs BEFORE any mount so an oversized payload
+// never costs a loop device.
+func marshalWorkloadManifest(w WorkloadSpec) ([]byte, error) {
 	// Pre-marshal byte cap projection (PR-B review finding #7).
 	// Marshalling an unbounded Name field before checking size
 	// would let a malicious or buggy wire payload allocate
@@ -3416,7 +3557,7 @@ func (v *JailerVMM) writeWorkloadManifest(drive string, w WorkloadSpec) error {
 	// The projection is conservative — the workloadManifest
 	// struct shape is fixed, and only Name can vary.
 	if projected := projectedWorkloadManifestBytes(w); projected > api.MaxExportedLayerBytes {
-		return fmt.Errorf("workload manifest projected %d bytes exceeds cap %d (name=%q)", projected, api.MaxExportedLayerBytes, w.Name)
+		return nil, fmt.Errorf("workload manifest projected %d bytes exceeds cap %d (name=%q)", projected, api.MaxExportedLayerBytes, w.Name)
 	}
 	// Marshal the manifest. encoding/json sorts map keys
 	// alphabetically so re-reads produce the same bytes; we don't
@@ -3431,6 +3572,8 @@ func (v *JailerVMM) writeWorkloadManifest(drive string, w WorkloadSpec) error {
 		DiskIOProfile: w.DiskIOProfile,
 		Port:          w.Port,
 		Essential:     w.Essential,
+		LivenessProbe: w.LivenessProbe,
+		StartupProbe:  w.StartupProbe,
 		Cmd:           w.Cmd,
 		Entrypoint:    w.Entrypoint,
 		DependsOn:     w.DependsOn,
@@ -3441,19 +3584,9 @@ func (v *JailerVMM) writeWorkloadManifest(drive string, w WorkloadSpec) error {
 	}
 	blob, err := json.Marshal(manifest)
 	if err != nil {
-		return fmt.Errorf("marshal workload manifest: %w", err)
+		return nil, fmt.Errorf("marshal workload manifest: %w", err)
 	}
-	target, err := stagedDrivePath(mp, workloadManifestPath)
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-		return fmt.Errorf("mkdir etc/faas: %w", err)
-	}
-	if err := os.WriteFile(target, blob, 0o400); err != nil {
-		return fmt.Errorf("write workload.json: %w", err)
-	}
-	return nil
+	return blob, nil
 }
 
 // projectedWorkloadManifestBytes (issue #463 / ADR-069 / PR-B
@@ -3502,6 +3635,7 @@ func projectedWorkloadManifestBytes(w WorkloadSpec) int64 {
 	for _, dep := range w.DependsOn {
 		dependencyBytes += int64(len(dep.Name)+len(dep.Condition)) * 2
 	}
+	probeBytes := projectedSidecarProbeBytes(w.StartupProbe) + projectedSidecarProbeBytes(w.LivenessProbe)
 	// Three int fields (port, ram_mb, cpu_millicores) and a bool + 2 array
 	// fields. 11 bytes per int is the worst case for a 32-bit
 	// value; 5 bytes for "false". The 5 quoted keys + 2 numeric
@@ -3509,7 +3643,26 @@ func projectedWorkloadManifestBytes(w WorkloadSpec) int64 {
 	// overhead; we over-estimate at 128 to absorb the new
 	// cmd/entrypoint keys.
 	const fixedOverhead = 128
-	return nameBytes + cmdBytes + entrypointBytes + dependencyBytes + fixedOverhead
+	return nameBytes + cmdBytes + entrypointBytes + dependencyBytes + probeBytes + fixedOverhead
+}
+
+func projectedSidecarProbeBytes(probe *api.SidecarProbe) int64 {
+	if probe == nil {
+		return 0
+	}
+	bytes := int64(128)
+	for _, value := range probe.Test {
+		bytes += int64(len(value)) * 2
+	}
+	if probe.Exec != nil {
+		for _, value := range probe.Exec.Command {
+			bytes += int64(len(value))*2 + 4
+		}
+	}
+	if probe.HTTPGet != nil {
+		bytes += int64(len(probe.HTTPGet.Path)) * 2
+	}
+	return bytes
 }
 
 // projectedWorkloadRosterBytes (issue #463 / ADR-069 / PR-B
@@ -3571,10 +3724,12 @@ type workloadManifest struct {
 	DependsOn     []api.WorkloadDependency `json:"depends_on,omitempty"`
 	Entrypoint    []string                 `json:"entrypoint,omitempty"`
 	Essential     bool                     `json:"essential"`
+	LivenessProbe *api.SidecarProbe        `json:"liveness_probe,omitempty"`
 	Name          string                   `json:"name"`
 	Port          int                      `json:"port"`
 	RamMB         int                      `json:"ram_mb"`
 	ScratchMB     int                      `json:"scratch_mb,omitempty"`
+	StartupProbe  *api.SidecarProbe        `json:"startup_probe,omitempty"`
 	Type          string                   `json:"type"`
 }
 
@@ -3619,23 +3774,25 @@ func (v *JailerVMM) StageWorkloadRoster(instance string, main WorkloadSpec, side
 	if err != nil {
 		return err
 	}
-	mp, err := os.MkdirTemp("", "faas-vmm-roster-")
+	blob, err := marshalWorkloadRoster(main, sidecars)
 	if err != nil {
-		return fmt.Errorf("mkdir mountpoint: %w", err)
+		return err
 	}
-	defer func() { _ = os.RemoveAll(mp) }()
-	if out, err := exec.Command("mount", "-o", "loop,rw", drive1, mp).CombinedOutput(); err != nil {
-		return fmt.Errorf("mount loop: %w (%s)", err, bytes.TrimSpace(out))
-	}
-	defer func() { _ = exec.Command("umount", mp).Run() }()
+	return loopMountSession(drive1, "faas-vmm-roster-", func(mp string) error {
+		return writeDriveFile(mp, workloadRosterPath, blob, 0o400, "workloads.json")
+	})
+}
 
+// marshalWorkloadRoster projects the byte cap and marshals the deployment
+// roster before any mount is taken.
+func marshalWorkloadRoster(main WorkloadSpec, sidecars []WorkloadSpec) ([]byte, error) {
 	// Pre-marshal byte cap projection (PR-B review finding #7).
 	// Cap runs BEFORE json.Marshal — matches the posture
 	// writeWorkloadManifest adopts. The roster is at most 1
 	// main + SidecarCapMax (2) sidecars, so the projection
 	// multiplies per-workload projections by len(sidecars)+1.
 	if projected := projectedWorkloadRosterBytes(main, sidecars); projected > api.MaxExportedLayerBytes {
-		return fmt.Errorf("workload roster projected %d bytes exceeds cap %d (sidecars=%d)", projected, api.MaxExportedLayerBytes, len(sidecars))
+		return nil, fmt.Errorf("workload roster projected %d bytes exceeds cap %d (sidecars=%d)", projected, api.MaxExportedLayerBytes, len(sidecars))
 	}
 
 	roster := workloadRoster{
@@ -3648,6 +3805,8 @@ func (v *JailerVMM) StageWorkloadRoster(instance string, main WorkloadSpec, side
 			DiskIOProfile: main.DiskIOProfile,
 			Port:          main.Port,
 			Essential:     main.Essential,
+			LivenessProbe: main.LivenessProbe,
+			StartupProbe:  main.StartupProbe,
 			DependsOn:     main.DependsOn,
 		},
 	}
@@ -3661,6 +3820,8 @@ func (v *JailerVMM) StageWorkloadRoster(instance string, main WorkloadSpec, side
 			DiskIOProfile: sc.DiskIOProfile,
 			Port:          sc.Port,
 			Essential:     sc.Essential,
+			LivenessProbe: sc.LivenessProbe,
+			StartupProbe:  sc.StartupProbe,
 			Cmd:           sc.Cmd,
 			Entrypoint:    sc.Entrypoint,
 			DependsOn:     sc.DependsOn,
@@ -3668,19 +3829,9 @@ func (v *JailerVMM) StageWorkloadRoster(instance string, main WorkloadSpec, side
 	}
 	blob, err := json.Marshal(roster)
 	if err != nil {
-		return fmt.Errorf("marshal workload roster: %w", err)
+		return nil, fmt.Errorf("marshal workload roster: %w", err)
 	}
-	target, err := stagedDrivePath(mp, workloadRosterPath)
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-		return fmt.Errorf("mkdir etc/faas: %w", err)
-	}
-	if err := os.WriteFile(target, blob, 0o400); err != nil {
-		return fmt.Errorf("write workloads.json: %w", err)
-	}
-	return nil
+	return blob, nil
 }
 
 // exportMax resolves the per-export byte cap. Zero means "unset" — fall back
@@ -4239,31 +4390,70 @@ func writeConfigFIFOWithFallback(ctx context.Context, path string, body []byte, 
 // open(2). A private device-capable tmpfs fixes KVM; the real host TUN remains
 // a bind mount because this kernel rejects a synthetic TUN node. The config
 // FIFO keeps Firecracker paused until both repairs are complete.
-func (v *JailerVMM) bindTunDeviceInJailer(root, instance string, uid, gid int) error {
+// bindTunTimings attributes the jail device-setup window. bind_tun measured
+// 32 ms mean on an idle SSD acceptance node — a third of a 96 ms restore, and
+// unlike the page-fault phases it does not shrink relative to a larger guest.
+// The window is four different things with four different fixes (waiting on
+// the jailer twice, one nsenter process spawn, then the cgroup fence), so it
+// is split before anything is optimised.
+type bindTunTimings struct {
+	// WaitMntnsMs waits for jailer to unshare its mount namespace.
+	WaitMntnsMs int64
+	// WaitChrootMs waits for the jailed helper and /dev to appear, which
+	// proves /proc/<pid>/root has switched to this instance.
+	WaitChrootMs int64
+	// SetupJailMs is the nsenter invocation that prepares /dev, binds the
+	// TUN device and mknods KVM. It is two process spawns (nsenter, then
+	// the helper it execs) plus a few mount/mknod syscalls.
+	SetupJailMs int64
+	// SetupJailWorkUs is what the helper reports for its own work inside
+	// the namespace, so SetupJailMs minus it isolates spawn overhead.
+	SetupJailWorkUs int64
+}
+
+// parseSetupJailWorkUs reads the helper's self-reported duration. A helper
+// that predates the marker simply yields 0, which reads as "unknown" rather
+// than "instant" — the caller only ever reports it alongside the total.
+func parseSetupJailWorkUs(out []byte) int64 {
+	for _, line := range strings.Split(string(out), "\n") {
+		rest, ok := strings.CutPrefix(strings.TrimSpace(line), jailsetup.SetupJailTimingPrefix)
+		if !ok {
+			continue
+		}
+		if us, err := strconv.ParseInt(strings.TrimSpace(rest), 10, 64); err == nil {
+			return us
+		}
+	}
+	return 0
+}
+
+func (v *JailerVMM) bindTunDeviceInJailer(root, instance string, uid, gid int) (bindTunTimings, error) {
+	var timings bindTunTimings
 	if instance == "" {
-		return fmt.Errorf("vmm: bind TUN device: empty instance")
+		return timings, fmt.Errorf("vmm: bind TUN device: empty instance")
 	}
 	const source = "/dev/net/tun"
 	fi, err := os.Stat(source)
 	if err != nil {
-		return fmt.Errorf("vmm: stat TUN device: %w", err)
+		return timings, fmt.Errorf("vmm: stat TUN device: %w", err)
 	}
 	if fi.Mode()&os.ModeCharDevice == 0 {
-		return fmt.Errorf("vmm: TUN path %s is not a character device", source)
+		return timings, fmt.Errorf("vmm: TUN path %s is not a character device", source)
 	}
 	if fi.Mode().Perm()&0o006 != 0o006 {
-		return fmt.Errorf("vmm: TUN device %s must be accessible to jailer users (mode %04o)", source, fi.Mode().Perm())
+		return timings, fmt.Errorf("vmm: TUN device %s must be accessible to jailer users (mode %04o)", source, fi.Mode().Perm())
 	}
 	pid, ok := v.InstancePID(instance)
 	if !ok {
-		return fmt.Errorf("vmm: bind TUN device: jailer process is not alive")
+		return timings, fmt.Errorf("vmm: bind TUN device: jailer process is not alive")
 	}
 	selfNS, err := os.Readlink("/proc/self/ns/mnt")
 	if err != nil {
-		return fmt.Errorf("vmm: read vmmd mount namespace: %w", err)
+		return timings, fmt.Errorf("vmm: read vmmd mount namespace: %w", err)
 	}
 	deadline := time.NewTimer(5 * time.Second)
 	defer deadline.Stop()
+	tWaitMntnsStart := time.Now()
 	for {
 		childNS, readErr := os.Readlink(fmt.Sprintf("/proc/%d/ns/mnt", pid))
 		if readErr == nil && childNS != selfNS {
@@ -4271,10 +4461,12 @@ func (v *JailerVMM) bindTunDeviceInJailer(root, instance string, uid, gid int) e
 		}
 		select {
 		case <-deadline.C:
-			return fmt.Errorf("vmm: jailer did not create a private mount namespace")
+			return timings, fmt.Errorf("vmm: jailer did not create a private mount namespace")
 		case <-time.After(1 * time.Millisecond):
 		}
 	}
+	timings.WaitMntnsMs = time.Since(tWaitMntnsStart).Milliseconds()
+	tWaitChrootStart := time.Now()
 	// The jailer unshares its mount namespace before it finishes constructing
 	// the chroot. Under a concurrent boot burst that small gap is observable:
 	// nsenter succeeds, but /dev does not exist yet and the tmpfs mount fails
@@ -4290,28 +4482,33 @@ func (v *JailerVMM) bindTunDeviceInJailer(root, instance string, uid, gid int) e
 		}
 		select {
 		case <-deadline.C:
-			return fmt.Errorf("vmm: jailer chroot device tree did not become ready")
+			return timings, fmt.Errorf("vmm: jailer chroot device tree did not become ready")
 		case <-time.After(1 * time.Millisecond):
 		}
 	}
+	timings.WaitChrootMs = time.Since(tWaitChrootStart).Milliseconds()
+	tSetupJailStart := time.Now()
 	// Single-pass setup: prepare /dev tmpfs, bind TUN, and mknod KVM in one nsenter invocation.
-	if _, err := exec.Command("nsenter", "-t", strconv.Itoa(pid), "-m", "-r", "--", "/faas-mount-helper", "--setup-jail", "/dev", "/faas-host-tun", "/dev/net/tun", "/dev/kvm", strconv.Itoa(uid), strconv.Itoa(gid)).CombinedOutput(); err != nil {
+	if setupOut, err := exec.Command("nsenter", "-t", strconv.Itoa(pid), "-m", "-r", "--", "/faas-mount-helper", "--setup-jail", "/dev", "/faas-host-tun", "/dev/net/tun", "/dev/kvm", strconv.Itoa(uid), strconv.Itoa(gid)).CombinedOutput(); err != nil {
 		// Fallback to legacy 3-step sequence if the mounted helper doesn't support --setup-jail yet
 		if outDev, errDev := exec.Command("nsenter", "-t", strconv.Itoa(pid), "-m", "-r", "--", "/faas-mount-helper", "--mount-dev", "/dev").CombinedOutput(); errDev != nil {
-			return fmt.Errorf("vmm: prepare jail device tree: %w (%s)", errDev, strings.TrimSpace(string(outDev)))
+			return timings, fmt.Errorf("vmm: prepare jail device tree: %w (%s)", errDev, strings.TrimSpace(string(outDev)))
 		}
 		if outTun, errTun := exec.Command("nsenter", "-t", strconv.Itoa(pid), "-m", "-r", "--", "/faas-mount-helper", "--mount-bind", "/faas-host-tun", source).CombinedOutput(); errTun != nil {
-			return fmt.Errorf("vmm: bind TUN device: %w (%s)", errTun, strings.TrimSpace(string(outTun)))
+			return timings, fmt.Errorf("vmm: bind TUN device: %w (%s)", errTun, strings.TrimSpace(string(outTun)))
 		}
 		if outKvm, errKvm := exec.Command("nsenter", "-t", strconv.Itoa(pid), "-m", "-r", "--", "/faas-mount-helper", "--mknod-kvm", "/dev/kvm", strconv.Itoa(uid), strconv.Itoa(gid)).CombinedOutput(); errKvm != nil {
-			return fmt.Errorf("vmm: provision KVM device: %w (%s)", errKvm, strings.TrimSpace(string(outKvm)))
+			return timings, fmt.Errorf("vmm: provision KVM device: %w (%s)", errKvm, strings.TrimSpace(string(outKvm)))
 		}
+	} else {
+		timings.SetupJailWorkUs = parseSetupJailWorkUs(setupOut)
 	}
+	timings.SetupJailMs = time.Since(tSetupJailStart).Milliseconds()
 	_ = os.Remove(filepath.Join(root, "faas-mount-helper"))
 	v.mu.Lock()
 	v.bindMounts[instance] = append(v.bindMounts[instance], ephemeralBind{source: source, mountpoint: filepath.Join(root, "dev", "net", "tun")})
 	v.mu.Unlock()
-	return nil
+	return timings, nil
 }
 
 // unmountBindMounts releases image bind mounts before the jail chroot is
@@ -4714,12 +4911,17 @@ func (v *JailerVMM) emitRestoreBreakdown(ctx context.Context, l Lease, at time.T
 		WakeID:               fields.WakeID,
 		AppID:                fields.AppID,
 		InstanceID:           l.Instance,
+		LeaseAcquireMs:       b.Prepare.LeaseAcquireMs,
+		EnvPrepareMs:         b.Prepare.EnvPrepareMs,
+		PreNetworkMs:         b.Prepare.PreNetworkMs,
+		SetupNetworkMs:       b.Prepare.SetupNetworkMs,
 		RestoreGateWaitMs:    b.RestoreGateWaitMs,
 		ChrootMs:             b.ChrootMs,
 		MaterializeMemMs:     b.MaterializeMemMs,
 		MaterializeVMStateMs: b.MaterializeVMStateMs,
 		ResolveImagesMs:      b.ResolveImagesMs,
 		StageDrivesMs:        b.StageDrivesMs,
+		StagePreBootFilesMs:  b.StagePreBootFilesMs,
 		StageSnapshotMs:      b.StageSnapshotMs,
 		HelperMs:             b.HelperMs,
 		StartJailerMs:        b.StartJailerMs,
@@ -4822,6 +5024,7 @@ func eventRestoreArtifactTimings(timings []restoreArtifactTiming) []events.Resto
 			Artifact:   timings[i].Artifact,
 			Source:     timings[i].Source,
 			DurationMs: timings[i].DurationMs,
+			Bytes:      timings[i].Bytes,
 		}
 	}
 	return resolved
@@ -5618,6 +5821,9 @@ func (v *JailerVMM) resolveRestoreArtifacts(ctx context.Context, instanceID stri
 				},
 				path: path,
 			}
+			if hit {
+				results[i].Bytes = artifactBytes(path)
+			}
 			local[i] = hit
 			errs[i] = err
 		}(i)
@@ -5639,6 +5845,7 @@ func (v *JailerVMM) resolveRestoreArtifacts(ctx context.Context, instanceID stri
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", specs[i].errorContext, err)
 		}
+		results[i].Bytes = artifactBytes(path)
 	}
 	return results, nil
 }
@@ -5649,6 +5856,73 @@ func restoreArtifactTimings(resolutions []restoreArtifactResolution) []restoreAr
 		timings[i] = resolutions[i].restoreArtifactTiming
 	}
 	return timings
+}
+
+// artifactBytes stats a resolved artifact path. A failed stat leaves Bytes at
+// zero rather than failing the restore: this value is attribution, and the
+// staging operation that follows retains authority over whether the file is
+// usable. Mirrors resolveColdBootArtifact's handling.
+func artifactBytes(path string) int64 {
+	if path == "" {
+		return 0
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return fi.Size()
+}
+
+// resolveRestoreBlob resolves the mem or vmstate snapshot blob and reports
+// where its bytes came from.
+//
+// These two are the largest inputs a restore touches — the fleet target is
+// 130 MB of mem per snapshot and production parks write up to 1 GiB — and
+// until now they were the only restore inputs with no source attribution.
+// materialize_mem_ms timed a local bind and a full remote copy identically,
+// so a wake placed on a node without a local replica was indistinguishable in
+// the timeline from one placed on a warm node. That is precisely the term
+// that decides whether cross-node placement can stay inside the wake budget.
+//
+// fallback is the legacy host-path locator (spec.VMStatePath); it is used
+// unchanged when no storage key is set, which is the single-box path.
+func (v *JailerVMM) resolveRestoreBlob(
+	ctx context.Context,
+	instanceID, artifact, key, fallback string,
+) (string, restoreArtifactTiming, error) {
+	timing := restoreArtifactTiming{Artifact: artifact, Source: "host_path"}
+	if key == "" || v.storage == nil {
+		timing.Bytes = artifactBytes(fallback)
+		return fallback, timing, nil
+	}
+
+	started := time.Now()
+	path, source, local, err := v.probeRestoreLocalPath(key)
+	if err != nil {
+		return "", timing, err
+	}
+	if local {
+		timing.Source = source
+		timing.DurationMs = time.Since(started).Milliseconds()
+		timing.Bytes = artifactBytes(path)
+		return path, timing, nil
+	}
+
+	path, err = v.materializeFromStorage(ctx, instanceID, key)
+	timing.Source = "materialized"
+	timing.DurationMs = time.Since(started).Milliseconds()
+	if err != nil {
+		return "", timing, err
+	}
+	timing.Bytes = artifactBytes(path)
+	if path == "" {
+		// The backend surfaced no file for this key. Keep the legacy
+		// fallback behaviour and report what actually carried the bytes.
+		timing.Source = "host_path"
+		timing.Bytes = artifactBytes(fallback)
+		return fallback, timing, nil
+	}
+	return path, timing, nil
 }
 
 // trackMaterialised records tmpPath against instanceID so Kill /

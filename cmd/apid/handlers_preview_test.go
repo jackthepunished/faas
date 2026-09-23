@@ -48,6 +48,13 @@ func TestCreatePreview_ProvisionsStablePRAppAndReusesIt(t *testing.T) {
 		AccountID: e.acct.ID, Slug: "acme", Type: "stateless", Runtime: "node22",
 		RAMMB: 512, CPUMillicores: 500, MaxConcurrency: 8, IdleTimeoutS: 45,
 		Status: state.AppActive, WorkloadClass: state.WorkloadClassHTTP,
+		Manifest: state.AppManifest{
+			ServiceBindingPolicy: api.ServiceBindingPolicyDeclared,
+			ServiceBindings: []api.AppServiceBinding{{
+				Binding: "GREGALE_SERVICE_BILLING_URL",
+				Service: "billing",
+			}},
+		},
 	}, api.MustLimitsFor(api.PlanPro))
 	if err != nil {
 		t.Fatalf("create parent: %v", err)
@@ -67,12 +74,18 @@ func TestCreatePreview_ProvisionsStablePRAppAndReusesIt(t *testing.T) {
 	if got.Status != api.AppStatusUndeployed {
 		t.Fatalf("preview status = %q, want %q", got.Status, api.AppStatusUndeployed)
 	}
+	if got.ServiceBindingPolicy != api.ServiceBindingPolicyDeclared || len(got.ServiceBindings) != 1 {
+		t.Fatalf("preview service binding policy = %q, bindings = %#v; want inherited strict policy", got.ServiceBindingPolicy, got.ServiceBindings)
+	}
 	created, err := e.store.AppBySlug(context.Background(), "pr-42-acme")
 	if err != nil {
 		t.Fatalf("lookup preview: %v", err)
 	}
 	if created.RAMMB != parent.RAMMB || created.CPUMillicores != parent.CPUMillicores || created.MaxConcurrency != parent.MaxConcurrency {
 		t.Fatalf("preview config = %+v, parent = %+v", created, parent)
+	}
+	if created.Manifest.EffectiveServiceBindingPolicy() != api.ServiceBindingPolicyDeclared || len(created.Manifest.ServiceBindings) != 1 {
+		t.Fatalf("persisted preview manifest did not inherit service binding policy: %#v", created.Manifest)
 	}
 
 	repeat := e.do(t, "POST", "/v1/apps/acme/previews", api.CreatePreviewRequest{PRNumber: 42, TTLHours: 24}, nil)
@@ -103,6 +116,53 @@ func TestCreatePreview_RejectsInvalidTTLAndPreviewParent(t *testing.T) {
 
 	nested := e.do(t, "POST", "/v1/apps/"+preview.Slug+"/previews", api.CreatePreviewRequest{PRNumber: 43}, nil)
 	assertProblem(t, nested, http.StatusBadRequest, api.CodeValidation)
+}
+
+func TestGetPreviewStatusReturnsFirstClassResource(t *testing.T) {
+	e := setup(t, api.PlanPro)
+	parent, err := e.store.CreateAppIfUnderQuota(context.Background(), state.App{
+		AccountID: e.acct.ID, Slug: "acme", Type: state.AppTypeApp, Runtime: "node22",
+		RAMMB: 512, CPUMillicores: 500, MaxConcurrency: 8, Status: state.AppActive,
+		WorkloadClass: state.WorkloadClassHTTP,
+	}, api.MustLimitsFor(api.PlanPro))
+	if err != nil {
+		t.Fatal(err)
+	}
+	preview := seedPreviewAppForTest(t, e, "pr-42-acme", parent.Slug, 42)
+	productionDeployment, err := e.store.CreateDeployment(context.Background(), state.Deployment{
+		AppID: parent.ID, Kind: state.DeploymentKindImage, ImageDigest: "sha256:production",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	previewDeployment, err := e.store.CreateDeployment(context.Background(), state.Deployment{
+		AppID: preview.ID, Kind: state.DeploymentKindImage, ImageDigest: "sha256:preview",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := e.do(t, http.MethodGet, "/v1/preview/pr-42-acme", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var response api.PreviewResourceResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.App.ID != preview.ID || response.Parent == nil || response.Parent.ID != parent.ID {
+		t.Fatalf("preview resource=%+v", response)
+	}
+	if response.LatestDeployment == nil || response.LatestDeployment.ID != previewDeployment.ID ||
+		response.ProductionDeployment == nil || response.ProductionDeployment.ID != productionDeployment.ID {
+		t.Fatalf("deployments preview=%+v production=%+v", response.LatestDeployment, response.ProductionDeployment)
+	}
+	if !response.Changes.ArtifactChanged || !strings.Contains(strings.Join(response.Changes.ConfigurationChangedGroups, ","), "resources") {
+		t.Fatalf("changes=%+v", response.Changes)
+	}
+	if response.Links.URL == "" || response.Links.Logs != "/v1/apps/pr-42-acme/logs" || response.Links.Metrics != "/v1/apps/pr-42-acme/metrics" {
+		t.Fatalf("links=%+v", response.Links)
+	}
 }
 
 // TestDestroyPreview_HappyPath confirms the destroy endpoint

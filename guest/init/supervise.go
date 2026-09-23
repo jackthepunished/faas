@@ -29,11 +29,21 @@ type Supervisor struct {
 	Policy  string                       // restart policy; empty preserves on-failure
 	Start   func() error                 // runs the app to completion; nil = clean exit
 	OnCrash func(attempt int, err error) // optional hook for logging/backoff
+	// stopSignal and stopGrace are the per-workload graceful shutdown
+	// contract. The main workload derives these from its AppManifest;
+	// sidecars use the OCI/PID-1 defaults until their image manifest is
+	// projected into the workload roster.
+	stopSignal syscall.Signal
+	stopGrace  time.Duration
 	// onStart and onHealthy are lifecycle hooks used by the workload roster
 	// scheduler. They are fired once per supervisor lifetime, after the child
 	// has started and after its startup gate respectively.
 	onStart   func() //nolint:unused // invoked by Linux workload supervision.
 	onHealthy func() //nolint:unused // invoked by Linux workload supervision.
+	// onHealth reports sidecar lifecycle transitions to the host event proxy.
+	// It is intentionally best-effort and is only wired for long-running
+	// sidecars by the Linux workload roster.
+	onHealth func(status, reason string) //nolint:unused
 
 	// LastCmd tracks the *exec.Cmd the supervisor most-recently forked,
 	// swapped atomically on every restart. nil until the first fork.
@@ -109,6 +119,12 @@ func (s *Supervisor) markHealthy() { //nolint:unused // called by Linux workload
 				s.onHealthy()
 			}
 		})
+	}
+}
+
+func (s *Supervisor) reportHealth(status, reason string) { //nolint:unused // called by Linux workload supervision.
+	if s != nil && s.onHealth != nil {
+		s.onHealth(status, reason)
 	}
 }
 

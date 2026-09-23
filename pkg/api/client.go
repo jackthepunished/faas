@@ -1596,6 +1596,21 @@ func (c *Client) GetProjectEnvironmentReleases(ctx context.Context, projectSlug,
 	return out, c.do(ctx, http.MethodGet, path, nil, &out)
 }
 
+// GetProjectEnvironmentState returns the effective configuration, release,
+// variable, safe secret metadata, and managed bindings for one environment.
+func (c *Client) GetProjectEnvironmentState(ctx context.Context, projectSlug, environmentSlug string) (ProjectEnvironmentStateResponse, error) {
+	var out ProjectEnvironmentStateResponse
+	path := "/v1/projects/" + url.PathEscape(projectSlug) + "/environments/" + url.PathEscape(environmentSlug) + "/state"
+	return out, c.do(ctx, http.MethodGet, path, nil, &out)
+}
+
+// GetProjectEnvironmentDiff returns a unified effective-state comparison.
+func (c *Client) GetProjectEnvironmentDiff(ctx context.Context, projectSlug, targetEnvironment, sourceEnvironment string) (ProjectEnvironmentDiffResponse, error) {
+	var out ProjectEnvironmentDiffResponse
+	path := "/v1/projects/" + url.PathEscape(projectSlug) + "/environments/" + url.PathEscape(targetEnvironment) + "/diff?from=" + url.QueryEscape(sourceEnvironment)
+	return out, c.do(ctx, http.MethodGet, path, nil, &out)
+}
+
 // CreateProjectEnvironment adds a named environment to a project.
 func (c *Client) CreateProjectEnvironment(ctx context.Context, projectSlug string, req CreateProjectEnvironmentRequest) (ProjectEnvironmentResponse, error) {
 	var out ProjectEnvironmentResponse
@@ -1610,6 +1625,19 @@ func (c *Client) UpdateProjectEnvironment(ctx context.Context, projectSlug, envi
 	var out ProjectEnvironmentResponse
 	path := "/v1/projects/" + url.PathEscape(projectSlug) + "/environments/" + url.PathEscape(environmentSlug)
 	return out, c.do(ctx, http.MethodPatch, path, req, &out)
+}
+
+// DeleteProjectEnvironment removes an unused project environment. Gregale
+// rejects production, protected, and environments with live releases.
+func (c *Client) DeleteProjectEnvironment(ctx context.Context, projectSlug, environmentSlug string) error {
+	path := "/v1/projects/" + url.PathEscape(projectSlug) + "/environments/" + url.PathEscape(environmentSlug)
+	return c.do(ctx, http.MethodDelete, path, nil, nil)
+}
+
+// DeleteProjectsSlugEnvironmentsEnvironment is the route-shaped alias used by
+// the SDK coverage contract. Prefer DeleteProjectEnvironment for new callers.
+func (c *Client) DeleteProjectsSlugEnvironmentsEnvironment(ctx context.Context, projectSlug, environmentSlug string) error {
+	return c.DeleteProjectEnvironment(ctx, projectSlug, environmentSlug)
 }
 
 // GetProjectEnvironmentConfig returns the latest non-secret configuration
@@ -2018,6 +2046,14 @@ func (c *Client) PatchDeploymentsIdTraffic(ctx context.Context, id string, perce
 		UpdateDeploymentTrafficRequest{TrafficPercent: percent}, &out)
 }
 
+// PatchDeploymentTrafficIfServing updates traffic only if the named live
+// sibling still owns all production traffic at the transaction boundary.
+func (c *Client) PatchDeploymentTrafficIfServing(ctx context.Context, id string, percent int, servingID string) (DeploymentResponse, error) {
+	var out DeploymentResponse
+	return out, c.do(ctx, "PATCH", "/v1/deployments/"+id+"/traffic",
+		UpdateDeploymentTrafficRequest{TrafficPercent: percent, ExpectedServingDeploymentID: &servingID}, &out)
+}
+
 // AdvanceCanary advances exactly one persisted canary step. APID resolves
 // the next percentage from the deployment's stored preset and performs the
 // expected-step compare-and-swap together with traffic, rollout state, and
@@ -2069,6 +2105,14 @@ func (c *Client) Wake(ctx context.Context, slug string) (AppWakeResponse, error)
 func (c *Client) RestartApp(ctx context.Context, slug string) (AppRestartResponse, error) {
 	var out AppRestartResponse
 	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/restart", nil, &out)
+}
+
+// RestartAppFresh destroys live instances without snapshotting their process
+// memory, invalidates cached snapshots, and cold-wakes with current runtime
+// configuration. Use this after environment or secret mutations.
+func (c *Client) RestartAppFresh(ctx context.Context, slug string) (AppRestartResponse, error) {
+	var out AppRestartResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/restart?fresh=true", nil, &out)
 }
 
 // PurgeAppCache asks the gateways to evict cached responses for an app. An
@@ -2933,6 +2977,14 @@ func (c *Client) QueueSend(ctx context.Context, slug string, req QueueSendReques
 	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/queues/send", req, &out)
 }
 
+// SendAppMessage reliably enqueues a CloudEvents-wrapped message for another
+// Gregale application. The returned invocation id is visible through the
+// ordinary invocation and DLQ APIs.
+func (c *Client) SendAppMessage(ctx context.Context, targetApp string, req SendAppMessageRequest) (SendAppMessageResponse, error) {
+	var out SendAppMessageResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+targetApp+"/inbox", req, &out)
+}
+
 // QueueReceive long-polls for the next dispatched row on the queue.
 // 30s server-side cap; on timeout returns (zero, ErrLongPollTimeout)
 // — caller is expected to retry. Stays open across the app's
@@ -3181,6 +3233,30 @@ func (c *Client) CreateDelayedTask(ctx context.Context, slug string, req Delayed
 	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/delayed-tasks", req, &out)
 }
 
+// CreateDelayedTaskWithIdempotencyKey lets producers reuse the same key when
+// retrying an uncertain create response, preventing duplicate scheduled work.
+func (c *Client) CreateDelayedTaskWithIdempotencyKey(ctx context.Context, slug string, req DelayedTaskRequest, idempotencyKey string) (DelayedTaskResponse, error) {
+	var out DelayedTaskResponse
+	return out, c.doWithIdempotencyKey(ctx, "POST", "/v1/apps/"+slug+"/delayed-tasks", req, &out, idempotencyKey)
+}
+
+// ListDelayedTasks returns one newest-first page for an app.
+func (c *Client) ListDelayedTasks(ctx context.Context, slug, before string, limit int) (ListDelayedTasksResponse, error) {
+	var out ListDelayedTasksResponse
+	q := url.Values{}
+	if before != "" {
+		q.Set("before", before)
+	}
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	path := "/v1/apps/" + slug + "/delayed-tasks"
+	if len(q) > 0 {
+		path += "?" + q.Encode()
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
 // GetDelayedTask returns a single delayed-task by id. Account-scoped
 // — cross-account reads surface 404, not 200 with a foreign row.
 func (c *Client) GetDelayedTask(ctx context.Context, id string) (DelayedTaskResponse, error) {
@@ -3411,6 +3487,29 @@ func (c *Client) ListWakeTimeline(ctx context.Context, slug, wakeID, since strin
 		q.Set("limit", strconv.Itoa(limit))
 	}
 	path := "/v1/apps/" + slug + "/wakes/" + wakeID + "/timeline"
+	if encoded := q.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
+// ListSidecarTimeline returns the init, restart, and health-transition frames
+// for one sidecar (issue #463 / ADR-069). Events are oldest-first and Latest
+// contains the most recent health status when a health frame exists.
+//
+// since is an RFC 3339 timestamp and limit is bounded server-side at 1000.
+// Cross-account visibility is enforced server-side by the slug ownership and
+// per-row data.app_id forge-proof checks.
+func (c *Client) ListSidecarTimeline(ctx context.Context, slug, sidecarName, since string, limit int) (SidecarTimelineResponse, error) {
+	var out SidecarTimelineResponse
+	q := url.Values{}
+	if since != "" {
+		q.Set("since", since)
+	}
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	path := "/v1/apps/" + slug + "/sidecars/" + sidecarName + "/timeline"
 	if encoded := q.Encode(); encoded != "" {
 		path += "?" + encoded
 	}
@@ -4131,23 +4230,39 @@ func (c *Client) GetAppRoutes(ctx context.Context, slug string) (AppRoutesRespon
 	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/routes", nil, &out)
 }
 
-// GetAppStreamingStatus returns the per-request streaming
-// classification for the named app (ADR-102 D6). The endpoint is
-// the SDK-side mirror of pkg/gateway.(*Handler).decideStreaming —
-// a customer hitting this endpoint sees exactly what the gateway's
-// gate machine would resolve for the next inbound request, with the
-// same status enum (api.StreamingStatus*) and the same effective
-// cap (plan cap by default; endpoint-rule MaxBodyBytesStreaming if
-// a kind=limit edge rule matched).
-//
-// Use case: a customer evaluating "will my next request stream?"
-// fires this endpoint pre-flight instead of probing with a real
-// request and reading the Streaming-Status response header. The
-// probe does NOT mutate state and does NOT warm a wake — it's a
-// pure read against the per-app cache.
+// StreamingCapRequest identifies the request shape used to resolve a
+// per-edge-rule streaming response cap. A zero value preserves the
+// plan-level probe and avoids the gatewayd control-listener hop.
+type StreamingCapRequest struct {
+	Host   string
+	Path   string
+	Method string
+}
+
+// GetAppStreamingStatus returns the per-request streaming classification for
+// the named app (ADR-102 D6). With no request shape it reports the plan cap;
+// use GetAppStreamingStatusForRequest to resolve a matching kind=limit
+// endpoint override using gatewayd's compiled rule cache.
 func (c *Client) GetAppStreamingStatus(ctx context.Context, slug string) (AppStreamingStatus, error) {
+	return c.GetAppStreamingStatusForRequest(ctx, slug, StreamingCapRequest{})
+}
+
+// GetAppStreamingStatusForRequest is the route-aware streaming probe. Host,
+// Path, and Method must be supplied together; when present the server asks
+// gatewayd to apply the same host/path/method matcher used by live requests.
+// A gatewayd miss or unavailable control listener falls back to the plan cap
+// and still returns a successful probe response.
+func (c *Client) GetAppStreamingStatusForRequest(ctx context.Context, slug string, shape StreamingCapRequest) (AppStreamingStatus, error) {
 	var out AppStreamingStatus
-	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/streaming-cap", nil, &out)
+	path := "/v1/apps/" + slug + "/streaming-cap"
+	if shape.Host != "" || shape.Path != "" || shape.Method != "" {
+		q := url.Values{}
+		q.Set("host", shape.Host)
+		q.Set("path", shape.Path)
+		q.Set("method", shape.Method)
+		path += "?" + q.Encode()
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
 }
 
 // GetAppsMetrics returns the account-wide per-app metrics rollup
@@ -4662,6 +4777,15 @@ func (c *Client) GetAppSecurity(ctx context.Context, slug string) (AppSecurityPo
 	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/security", nil, &out)
 }
 
+// RecoverAppSecurityQuarantine restores a quarantined app only after the
+// selected newer live deployment and every live canary have fresh,
+// digest-matched clean scan evidence. The server performs the atomic
+// lifecycle transition and emits the corresponding audit/notification event.
+func (c *Client) RecoverAppSecurityQuarantine(ctx context.Context, slug string, req SecurityQuarantineRecoveryRequest) (SecurityQuarantineRecoveryResponse, error) {
+	var out SecurityQuarantineRecoveryResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/security/recover", req, &out)
+}
+
 // GetAppStaticEgressIP reads the per-app static egress IP pin
 // (ADR-119). Plan-agnostic — returns the current pin status even
 // when the plan doesn't allow static egress IPs (plan_allowed=false,
@@ -4758,7 +4882,7 @@ func (c *Client) SetGithubWebhookSecret(ctx context.Context, req AdminSetGithubW
 	return out, c.do(ctx, "POST", "/v1/admin/github-webhook-secrets", req, &out)
 }
 
-// Org surface (issue #190 / IAM-6 / ADR-061, PR 5). The 11 methods
+// Org surface (issue #190 / IAM-6 / ADR-061, PR 5). The methods
 // below mirror the spec routes documented under api/openapi.yaml
 // paths /v1/orgs*, /v1/invitations/{token}. Each maps 1:1 to a
 // spec route so the sdk-coverage gate (cmd/sdk-coverage) doesn't
@@ -4789,6 +4913,34 @@ func (c *Client) CreateOrg(ctx context.Context, req CreateOrgRequest) (OrgRespon
 func (c *Client) GetOrg(ctx context.Context, slug string) (OrgResponse, error) {
 	var out OrgResponse
 	return out, c.do(ctx, "GET", "/v1/orgs/"+slug, nil, &out)
+}
+
+// ListOrgActivity returns one newest-first page of the organization's global
+// infrastructure history. before is the opaque NextBefore value from the
+// prior page; empty-string filters are omitted.
+func (c *Client) ListOrgActivity(ctx context.Context, slug, before, kindPrefix, actorType, appID string, limit int) (ListOrgActivityResponse, error) {
+	var out ListOrgActivityResponse
+	q := url.Values{}
+	if before != "" {
+		q.Set("before", before)
+	}
+	if kindPrefix != "" {
+		q.Set("kind_prefix", kindPrefix)
+	}
+	if actorType != "" {
+		q.Set("actor_type", actorType)
+	}
+	if appID != "" {
+		q.Set("app_id", appID)
+	}
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	path := "/v1/orgs/" + slug + "/activity"
+	if encoded := q.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
 }
 
 // PatchOrg applies a partial update to the org (name and/or plan).
@@ -4960,6 +5112,14 @@ func (c *Client) CreateAppWebhook(ctx context.Context, slug string, req CreateAp
 	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/webhooks", req, &out)
 }
 
+// DeliverAppEvent queues an arbitrary event for a registered webhook
+// destination. The webhook subscription supplies signing, retries, timeout,
+// delivery format, and dead-letter behavior.
+func (c *Client) DeliverAppEvent(ctx context.Context, sourceApp string, req DeliverAppEventRequest) (DeliverAppEventResponse, error) {
+	var out DeliverAppEventResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+sourceApp+"/outbox", req, &out)
+}
+
 // GetAppWebhook returns a single subscription by id.
 func (c *Client) GetAppWebhook(ctx context.Context, slug, id string) (AppWebhookResponse, error) {
 	var out AppWebhookResponse
@@ -5016,6 +5176,32 @@ func (c *Client) ListAppWebhookDeliveries(ctx context.Context, slug, id string, 
 func (c *Client) RetryAppWebhookDelivery(ctx context.Context, slug, id, deliveryID string) (AppWebhookRetryDeliveryResponse, error) {
 	var out AppWebhookRetryDeliveryResponse
 	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/webhooks/"+id+"/deliveries/"+deliveryID+"/retry", nil, &out)
+}
+
+// --- Durable inbound webhooks (ADR-212) ----------------------------------
+
+func (c *Client) ListInboundWebhookEndpoints(ctx context.Context, slug string) ([]InboundWebhookEndpointResponse, error) {
+	var out []InboundWebhookEndpointResponse
+	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/inbound-webhooks", nil, &out)
+}
+
+func (c *Client) CreateInboundWebhookEndpoint(ctx context.Context, slug string, req CreateInboundWebhookEndpointRequest) (InboundWebhookEndpointResponse, error) {
+	var out InboundWebhookEndpointResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/inbound-webhooks", req, &out)
+}
+
+func (c *Client) GetInboundWebhookEndpoint(ctx context.Context, slug, id string) (InboundWebhookEndpointResponse, error) {
+	var out InboundWebhookEndpointResponse
+	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/inbound-webhooks/"+id, nil, &out)
+}
+
+func (c *Client) UpdateInboundWebhookEndpoint(ctx context.Context, slug, id string, req UpdateInboundWebhookEndpointRequest) (InboundWebhookEndpointResponse, error) {
+	var out InboundWebhookEndpointResponse
+	return out, c.do(ctx, "PATCH", "/v1/apps/"+slug+"/inbound-webhooks/"+id, req, &out)
+}
+
+func (c *Client) DeleteInboundWebhookEndpoint(ctx context.Context, slug, id string) error {
+	return c.do(ctx, "DELETE", "/v1/apps/"+slug+"/inbound-webhooks/"+id, nil, nil)
 }
 
 // --- Managed realtime endpoints (ADR-156) -------------------------------
@@ -5379,6 +5565,18 @@ func (c *Client) GetAppDataUpstreamHistory(ctx context.Context, slug, from, to, 
 func (c *Client) GetAppDataUpstream(ctx context.Context, slug, id string) (DataUpstreamResponse, error) {
 	var out DataUpstreamResponse
 	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/upstreams/"+id, nil, &out)
+}
+
+// UpdateAppDataUpstreamCircuitBreaker opts one upstream into (or out of)
+// egress circuit breaking and optionally tunes its thresholds (ADR-201 §3).
+//
+// Enabling this grants the platform permission to reject the app's
+// connections to that upstream while its circuit is open — which is the
+// point, but also why it is an explicit per-upstream call rather than
+// anything inferred.
+func (c *Client) UpdateAppDataUpstreamCircuitBreaker(ctx context.Context, slug, id string, req UpdateUpstreamCircuitBreakerRequest) (DataUpstreamResponse, error) {
+	var out DataUpstreamResponse
+	return out, c.do(ctx, "PATCH", "/v1/apps/"+slug+"/upstreams/"+id+"/circuit-breaker", req, &out)
 }
 func (c *Client) CreateAppDataUpstream(ctx context.Context, slug string, req PutDataUpstreamRequest) (DataUpstreamResponse, error) {
 	var out DataUpstreamResponse
@@ -5924,6 +6122,13 @@ func (c *Client) GetAppsSlugMirrorsIdSummary(ctx context.Context, slug, id, wind
 	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/mirrors/"+id+"/summary?window="+windowStr, nil, &out)
 }
 
+// PostAppsSlugMirrorsIdReplay queues an explicitly sanitized historical
+// request corpus against one mirror rule.
+func (c *Client) PostAppsSlugMirrorsIdReplay(ctx context.Context, slug, id string, req MirrorReplayBatchRequest) (MirrorReplayBatchResponse, error) {
+	var out MirrorReplayBatchResponse
+	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/mirrors/"+id+"/replay", req, &out)
+}
+
 // --- CORS presets (issue #975 item #4 / ADR-129) -------------------------
 //
 // Customer-owned, named, reusable CORS configurations. The data
@@ -6053,9 +6258,86 @@ func (c *Client) PublishEvent(ctx context.Context, req PublishEventRequest) (Pub
 	return resp, err
 }
 
+// ListEventSubscriptions returns the manifest declarations currently
+// reconciled for one app, in stable creation order.
+func (c *Client) ListEventSubscriptions(ctx context.Context, slug string) (EventSubscriptionListResponse, error) {
+	var out EventSubscriptionListResponse
+	return out, c.do(ctx, "GET", "/v1/apps/"+url.PathEscape(slug)+"/event-subscriptions", nil, &out)
+}
+
+// ListAppsSlugEventSubscriptions is the route-shaped alias used by generated
+// SDK coverage and callers that prefer method names matching the REST path.
+func (c *Client) ListAppsSlugEventSubscriptions(ctx context.Context, slug string) (EventSubscriptionListResponse, error) {
+	return c.ListEventSubscriptions(ctx, slug)
+}
+
+// ListEventDeliveries returns the app's event-triggered invocation lifecycle,
+// newest first. Optional filters are exact event-id/state matches.
+func (c *Client) ListEventDeliveries(ctx context.Context, slug, eventID, deliveryState, before string, limit int) (EventDeliveryListResponse, error) {
+	var out EventDeliveryListResponse
+	q := url.Values{}
+	if eventID != "" {
+		q.Set("event_id", eventID)
+	}
+	if deliveryState != "" {
+		q.Set("state", deliveryState)
+	}
+	if before != "" {
+		q.Set("before", before)
+	}
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	path := "/v1/apps/" + url.PathEscape(slug) + "/event-deliveries"
+	if len(q) > 0 {
+		path += "?" + q.Encode()
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
+// ListAppsSlugEventDeliveries is the route-shaped alias used by generated
+// SDK coverage and callers that prefer method names matching the REST path.
+func (c *Client) ListAppsSlugEventDeliveries(ctx context.Context, slug, eventID, deliveryState, before string, limit int) (EventDeliveryListResponse, error) {
+	return c.ListEventDeliveries(ctx, slug, eventID, deliveryState, before, limit)
+}
+
 // CancelWorkflowRun (ADR-081) cancels an in-flight workflow run.
 func (c *Client) CancelWorkflowRun(ctx context.Context, runID string) (WorkflowRunResponse, error) {
 	var resp WorkflowRunResponse
 	err := c.do(ctx, "POST", "/v1/workflows/runs/"+runID+"/cancel", nil, &resp)
 	return resp, err
+}
+
+// --- ADR-202 custom application metrics ---------------------------------
+//
+// Method names come from cmd/sdk-coverage's explicit alias map rather than
+// its auto-derivation: the `custom-metrics` path segment contains a hyphen,
+// which is not a Go identifier. Same treatment as GetAppEnvDiff.
+
+// GetAppCustomMetrics lists the app's pushed metrics, including rows whose
+// last push has gone stale. Stale rows carry Stale=true rather than being
+// hidden — an operator debugging "why isn't my custom target scaling" needs
+// to see that the value is old, because a hidden expired row is
+// indistinguishable from one that was never pushed.
+func (c *Client) GetAppCustomMetrics(ctx context.Context, slug string) (CustomMetricListResponse, error) {
+	var out CustomMetricListResponse
+	return out, c.do(ctx, "GET", "/v1/apps/"+slug+"/custom-metrics", nil, &out)
+}
+
+// PutAppCustomMetric pushes one gauge. The value is FLEET-TOTAL: a
+// `metric: custom` scaling target divides it by the per-instance target.
+//
+// Safe to call from anywhere with a metrics:write token — the app itself, a
+// cron, or a database trigger. That is the point of the push: a parked app
+// has no process, so a signal only a running instance could produce could
+// never scale the app up from zero.
+func (c *Client) PutAppCustomMetric(ctx context.Context, slug, name string, value float64) error {
+	return c.do(ctx, "PUT", "/v1/apps/"+slug+"/custom-metrics/"+name,
+		CustomMetricRequest{Value: value}, nil)
+}
+
+// DeleteAppCustomMetric removes one gauge, freeing a slot against the
+// per-app name cap. Deleting a name that does not exist succeeds.
+func (c *Client) DeleteAppCustomMetric(ctx context.Context, slug, name string) error {
+	return c.do(ctx, "DELETE", "/v1/apps/"+slug+"/custom-metrics/"+name, nil, nil)
 }

@@ -33,12 +33,16 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/db"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -148,6 +152,162 @@ func (s *server) getAppSecurity(w http.ResponseWriter, r *http.Request, acct sta
 	writeJSON(w, http.StatusOK, posture)
 }
 
+// recoverAppSecurityQuarantine restores an app only after the caller has
+// supplied a newer live deployment whose scan is complete, digest-matched,
+// and free of HIGH, CRITICAL, and UNKNOWN findings. Every other live canary
+// row must satisfy the same evidence gate so recovery cannot expose an unsafe
+// sibling through weighted traffic.
+func (s *server) recoverAppSecurityQuarantine(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	app, ok := s.loadApp(w, r, acct, r.PathValue("slug"))
+	if !ok {
+		return
+	}
+	var req api.SecurityQuarantineRecoveryRequest
+	if err := decodeJSON(r, &req); err != nil || strings.TrimSpace(req.DeploymentID) == "" {
+		api.WriteProblem(w, api.ErrValidation("deployment_id is required"))
+		return
+	}
+	target, err := s.store.DeploymentByID(r.Context(), req.DeploymentID)
+	if err != nil || target.AppID != app.ID {
+		s.notFound(w, "no such deployment")
+		return
+	}
+	parked, err := s.store.LatestParkedDeploymentForApp(r.Context(), app.ID)
+	if err != nil {
+		if errors.Is(err, state.ErrNotFound) {
+			api.WriteProblem(w, api.ErrSecurityQuarantineRecoveryBlocked("the app has no recorded security quarantine; deploy a clean image before retrying"))
+			return
+		}
+		api.WriteProblem(w, api.ErrCapacity("could not load security quarantine"))
+		return
+	}
+	if parked.ParkedReason != string(state.ParkReasonSecurityScanRegressed) {
+		api.WriteProblem(w, api.ErrSecurityQuarantineRecoveryBlocked("the latest parked deployment was not quarantined for a security scan regression"))
+		return
+	}
+	if app.Status != state.AppEvictedCold && app.Status != state.AppActive {
+		api.WriteProblem(w, api.ErrSecurityQuarantineRecoveryBlocked("the app is not in a recoverable security-quarantine state"))
+		return
+	}
+	if target.Status != state.DeployLive {
+		api.WriteProblem(w, api.ErrSecurityQuarantineRecoveryBlocked("recovery requires a live replacement deployment"))
+		return
+	}
+	if parked.ImageDigest == "" || target.ImageDigest == "" || target.ImageDigest == parked.ImageDigest {
+		api.WriteProblem(w, api.ErrSecurityQuarantineRecoveryBlocked("the replacement deployment must use a different image digest from the quarantined deployment"))
+		return
+	}
+	if parked.ParkedAt == nil || target.CreatedAt.IsZero() || !target.CreatedAt.After(*parked.ParkedAt) {
+		api.WriteProblem(w, api.ErrSecurityQuarantineRecoveryBlocked("the replacement deployment must have been created after the quarantine"))
+		return
+	}
+	live, err := s.store.LiveDeployments(r.Context(), app.ID)
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("could not load live security deployments"))
+		return
+	}
+	if len(live) == 0 {
+		api.WriteProblem(w, api.ErrSecurityQuarantineRecoveryBlocked("recovery requires at least one live replacement deployment"))
+		return
+	}
+	for _, dep := range live {
+		if !s.securityScanEvidenceClean(dep) {
+			api.WriteProblem(w, api.ErrSecurityQuarantineRecoveryBlocked(fmt.Sprintf("deployment %s does not have complete, digest-matched clean scan evidence", dep.ID)))
+			return
+		}
+	}
+	if app.Status != state.AppActive {
+		claimed, casErr := transitionSecurityRecovery(r.Context(), s.store, app.ID, app.Status)
+		if casErr != nil {
+			api.WriteProblem(w, api.ErrCapacity("could not restore quarantined app"))
+			return
+		}
+		if !claimed {
+			current, readErr := s.store.AppByID(r.Context(), app.ID)
+			if readErr != nil || current.Status != state.AppActive {
+				api.WriteProblem(w, api.ErrSecurityQuarantineRecoveryBlocked("the app lifecycle changed while recovery was being validated; retry"))
+				return
+			}
+		}
+		if claimed && s.audit != nil {
+			s.audit.Emit(r.Context(), "app.security_quarantine_recovered", &acct.ID, map[string]any{
+				"app_id": app.ID, "slug": app.Slug,
+				"quarantined_deployment_id": parked.ID,
+				"quarantined_image_digest":  parked.ImageDigest,
+				"deployment_id":             target.ID,
+				"image_digest":              target.ImageDigest,
+			})
+		}
+	}
+	payload, err := json.Marshal(map[string]any{
+		"kind": "security_recovered", "app_id": app.ID, "slug": app.Slug,
+		"status": string(state.AppActive), "deployment_id": target.ID,
+		"lifecycle_changed": true,
+	})
+	if err != nil {
+		api.WriteProblem(w, api.ErrCapacity("could not encode security recovery notification"))
+		return
+	}
+	if err := s.notif.Notify(r.Context(), db.NotifyAppChanged, string(payload)); err != nil {
+		s.log.Warn("apid: notify security recovery", "app", app.ID, "err", err)
+		api.WriteProblem(w, api.ErrCapacity("could not publish security recovery"))
+		return
+	}
+	recoveredAt := time.Now().UTC()
+	writeJSON(w, http.StatusOK, api.SecurityQuarantineRecoveryResponse{
+		AppID: app.ID, Slug: app.Slug, DeploymentID: target.ID,
+		ImageDigest: target.ImageDigest, RecoveredAt: recoveredAt,
+		Status: string(state.AppActive),
+	})
+}
+
+func (s *server) securityScanEvidenceClean(dep state.Deployment) bool {
+	if dep.ScanStatus != "complete" || dep.ScannedAt.IsZero() || dep.ImageDigest == "" {
+		return false
+	}
+	if len(dep.ScanResult) == 0 {
+		return false
+	}
+	var raw api.ScanResult
+	// Scan status is persisted in its own deployment column; the imaged
+	// payload contains scanner evidence only and does not repeat that status.
+	if err := json.Unmarshal(dep.ScanResult, &raw); err != nil || dep.ScanStatus != "complete" ||
+		strings.TrimSpace(raw.ImageDigest) != strings.TrimSpace(dep.ImageDigest) ||
+		raw.ArtifactDigest == "" || raw.ScannerVersion == "" || raw.ScannerDBVersion == "" ||
+		raw.ScannerDBBuiltAt == "" || !strings.EqualFold(raw.ScannerDBStatus, "valid") ||
+		raw.Vulnerabilities == nil || raw.Error != "" {
+		return false
+	}
+	now := time.Now().UTC()
+	scannedAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(raw.ScannedAt))
+	if err != nil || scannedAt.After(now) || now.Sub(scannedAt) > 5*time.Minute {
+		return false
+	}
+	dbBuiltAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(raw.ScannerDBBuiltAt))
+	if err != nil || dbBuiltAt.After(now) || now.Sub(dbBuiltAt) > 30*24*time.Hour {
+		return false
+	}
+	scan := s.scanResponse(dep)
+	if scan == nil || scan.Status != "complete" || scan.ImageDigest != dep.ImageDigest || scan.Error != "" {
+		return false
+	}
+	counts := scan.SeverityCounts
+	return counts.Critical == 0 && counts.High == 0 && counts.Unknown == 0
+}
+
+type securityRecoveryStatusStore interface {
+	CompareAndSetAppStatus(context.Context, string, state.AppStatus, state.AppStatus) (bool, error)
+}
+
+func transitionSecurityRecovery(ctx context.Context, store state.Store, appID string, current state.AppStatus) (bool, error) {
+	if cas, ok := store.(securityRecoveryStatusStore); ok {
+		return cas.CompareAndSetAppStatus(ctx, appID, current, state.AppActive)
+	}
+	active := state.AppActive
+	_, err := store.UpdateApp(ctx, appID, state.UpdateAppParams{Status: &active})
+	return err == nil, err
+}
+
 func normalizedAppSecurityPolicy(policy api.AppSecurityPolicy) api.AppSecurityPolicy {
 	if !policy.Valid() {
 		return api.AppSecurityPolicyOff
@@ -168,7 +328,7 @@ func (s *server) appSecurityPosture(ctx context.Context, app state.App) (api.App
 		profile = "authenticated"
 	}
 
-	findings := make([]api.AppSecurityFinding, 0, 5)
+	findings := make([]api.AppSecurityFinding, 0, 9)
 	if profile == "public" {
 		findings = append(findings, api.AppSecurityFinding{
 			Code: "anonymous_access", Severity: postureSeverityHigh,
@@ -225,7 +385,7 @@ func (s *server) appSecurityPosture(ctx context.Context, app state.App) (api.App
 			Remediation: "Replace * with the smallest set of trusted origins.",
 		})
 	}
-	if !app.RequireSigned {
+	if !app.RequireSigned && !normalizedAppSecurityPolicy(app.SecurityPolicy).RequiresSignedImage() {
 		findings = append(findings, api.AppSecurityFinding{
 			Code: "unsigned_deploys", Severity: postureSeverityLow,
 			Title:       "Image signature enforcement is disabled",
@@ -241,6 +401,12 @@ func (s *server) appSecurityPosture(ctx context.Context, app state.App) (api.App
 			Remediation: "Enable only_allow_declared_routes after importing or declaring the API routes.",
 		})
 	}
+
+	scanFindings, err := s.liveImageScanFindings(ctx, app)
+	if err != nil {
+		return api.AppSecurityPostureResponse{}, err
+	}
+	findings = append(findings, scanFindings...)
 
 	// Keep the report stable if checks are added or reordered in the future.
 	sort.SliceStable(findings, func(i, j int) bool {
@@ -263,9 +429,128 @@ func (s *server) appSecurityPosture(ctx context.Context, app state.App) (api.App
 	if score < 0 {
 		score = 0
 	}
+	quarantine, err := s.securityQuarantineForApp(ctx, app)
+	if err != nil {
+		return api.AppSecurityPostureResponse{}, err
+	}
 	return api.AppSecurityPostureResponse{
 		AppID: app.ID, Slug: app.Slug, Profile: profile, Score: score,
 		SecurityPolicy: normalizedAppSecurityPolicy(app.SecurityPolicy), Findings: findings,
+		Quarantine: quarantine,
+	}, nil
+}
+
+const (
+	postureScanStaleAfter  = 7 * time.Hour
+	postureScannerDBMaxAge = 30 * 24 * time.Hour
+	postureScanMissing     = "image_scan_missing"
+	postureScanIncomplete  = "image_scan_incomplete"
+	postureScanStale       = "image_scan_stale"
+	postureScanBlocking    = "image_scan_blocking"
+)
+
+// liveImageScanFindings makes the posture report answer the operational
+// question that deploy admission alone cannot: does every currently serving
+// deployment have usable, recent evidence? Enforce mode treats any gap as a
+// high finding; warn mode keeps the same signal visible without making it a
+// deploy blocker. Off mode deliberately preserves the advisory posture.
+func (s *server) liveImageScanFindings(ctx context.Context, app state.App) ([]api.AppSecurityFinding, error) {
+	policy := normalizedAppSecurityPolicy(app.SecurityPolicy)
+	if policy == api.AppSecurityPolicyOff {
+		return nil, nil
+	}
+	live, err := s.store.LiveDeployments(ctx, app.ID)
+	if err != nil {
+		return nil, err
+	}
+	if len(live) == 0 {
+		return nil, nil
+	}
+
+	severity := postureSeverityMedium
+	if policy == api.AppSecurityPolicyEnforce {
+		severity = postureSeverityHigh
+	}
+	now := time.Now().UTC()
+	counts := map[string]int{}
+	for _, dep := range live {
+		// Source and Dockerfile builds do not use the imported-image scan
+		// admission path and must not be reported as missing OCI evidence.
+		if dep.Kind != state.DeploymentKindImage {
+			continue
+		}
+		if reason := classifyLiveImageScan(dep, now); reason != "" {
+			counts[reason]++
+		}
+	}
+	findings := make([]api.AppSecurityFinding, 0, len(counts))
+	appendFinding := func(reason, title, detail, remediation string) {
+		if count := counts[reason]; count > 0 {
+			findings = append(findings, api.AppSecurityFinding{
+				Code: reason, Severity: severity, Title: title,
+				Detail:      fmt.Sprintf("%s (%d live deployment%s).", detail, count, pluralSuffix(count)),
+				Remediation: remediation,
+			})
+		}
+	}
+	appendFinding(postureScanMissing, "Live images lack scan evidence", "A live image deployment has no recorded security scan", "Deploy a replacement image after a complete verified scan succeeds.")
+	appendFinding(postureScanIncomplete, "Live image scan is incomplete", "A live image deployment has failed, mismatched, or incomplete scan metadata", "Retry the deployment scan and replace the live image only after verified evidence is recorded.")
+	appendFinding(postureScanStale, "Live image scan evidence is stale", "A live image deployment is relying on evidence older than the allowed freshness window", "Run a fresh scan or deploy a newly scanned image before continuing to serve traffic.")
+	appendFinding(postureScanBlocking, "Live images contain blocking vulnerabilities", "A live image deployment has high, critical, or unknown-severity findings", "Deploy an image with zero high, critical, and unknown findings.")
+	return findings, nil
+}
+
+func pluralSuffix(count int) string {
+	if count == 1 {
+		return ""
+	}
+	return "s"
+}
+
+func classifyLiveImageScan(dep state.Deployment, now time.Time) string {
+	if strings.TrimSpace(dep.ImageDigest) == "" || dep.ScanStatus == "" || len(dep.ScanResult) == 0 {
+		return postureScanMissing
+	}
+	var result api.ScanResult
+	// The deployment column is authoritative for status; imaged stores the
+	// scanner payload separately and does not embed the status in scan_result.
+	if err := json.Unmarshal(dep.ScanResult, &result); err != nil || dep.ScanStatus != "complete" ||
+		strings.TrimSpace(result.ImageDigest) != strings.TrimSpace(dep.ImageDigest) ||
+		result.ArtifactDigest == "" || result.ScannerVersion == "" || result.ScannerDBVersion == "" ||
+		!strings.EqualFold(result.ScannerDBStatus, "valid") || result.Vulnerabilities == nil || result.Error != "" {
+		return postureScanIncomplete
+	}
+	if result.SeverityCounts.Critical > 0 || result.SeverityCounts.High > 0 || result.SeverityCounts.Unknown > 0 {
+		return postureScanBlocking
+	}
+	scannedAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(result.ScannedAt))
+	if err != nil || scannedAt.After(now) || now.Sub(scannedAt) > postureScanStaleAfter {
+		return postureScanStale
+	}
+	dbBuiltAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(result.ScannerDBBuiltAt))
+	if err != nil || dbBuiltAt.After(now) || now.Sub(dbBuiltAt) > postureScannerDBMaxAge {
+		return postureScanStale
+	}
+	return ""
+}
+
+func (s *server) securityQuarantineForApp(ctx context.Context, app state.App) (*api.AppSecurityQuarantine, error) {
+	if app.Status != state.AppEvictedCold {
+		return nil, nil
+	}
+	dep, err := s.store.LatestParkedDeploymentForApp(ctx, app.ID)
+	if errors.Is(err, state.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if dep.ParkedReason != string(state.ParkReasonSecurityScanRegressed) {
+		return nil, nil
+	}
+	return &api.AppSecurityQuarantine{
+		DeploymentID: dep.ID, ImageDigest: dep.ImageDigest,
+		Reason: dep.ParkedReason, ParkedAt: dep.ParkedAt,
 	}, nil
 }
 
@@ -282,6 +567,12 @@ func (s *server) enforceSecurityPostureGate(ctx context.Context, app state.App) 
 	}
 	codes := make([]string, 0, len(posture.Findings))
 	for _, finding := range posture.Findings {
+		// Live-image evidence is intentionally advisory to replacement deploys.
+		// Blocking here would deadlock recovery: a clean replacement could not
+		// be admitted while the currently serving image remained unsafe.
+		if strings.HasPrefix(finding.Code, "image_scan_") {
+			continue
+		}
 		if finding.Severity == postureSeverityHigh || finding.Severity == postureSeverityCritical {
 			codes = append(codes, finding.Code)
 		}

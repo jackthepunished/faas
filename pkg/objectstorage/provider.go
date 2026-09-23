@@ -44,6 +44,24 @@ type Provider interface {
 	AbortMultipartUpload(context.Context, string, MultipartAbortRequest) error
 }
 
+// ObjectReadPresigner is the optional provider capability used by Gregale's
+// proxying data planes. Unlike customer-facing download URLs, these reads must
+// preserve the object's stored response metadata (not force an attachment or
+// application/octet-stream response).
+type ObjectReadPresigner interface {
+	PresignObjectRead(context.Context, string, string, string, int64) (SignedRequest, error)
+}
+
+// PresignObjectRead keeps existing third-party providers source-compatible
+// while allowing built-in providers to distinguish transparent proxy reads
+// from customer-facing forced-download URLs.
+func PresignObjectRead(ctx context.Context, provider Provider, bucket, method, key string, expiresIn int64) (SignedRequest, error) {
+	if signer, ok := provider.(ObjectReadPresigner); ok {
+		return signer.PresignObjectRead(ctx, bucket, method, key, expiresIn)
+	}
+	return provider.Presign(ctx, bucket, SignRequest{Method: method, Key: key, ExpiresIn: expiresIn})
+}
+
 // ObjectReader is an optional provider capability used by operator-owned
 // access-log collectors. It is deliberately separate from Provider so a
 // storage driver does not have to expose raw object bodies to customer API
@@ -117,6 +135,13 @@ type ObjectCopier interface {
 	CopyObject(context.Context, string, CopyObjectRequest) (CopyObjectResult, error)
 }
 
+// CrossBucketObjectCopier is the optional provider capability used when an
+// environment clone needs an isolated bucket. Providers must copy server-side
+// and preserve the same metadata and tag directives as CopyObject.
+type CrossBucketObjectCopier interface {
+	CopyObjectBetweenBuckets(context.Context, string, string, CopyObjectRequest) (CopyObjectResult, error)
+}
+
 // ObjectSizer lets the gateway reserve the source object's bytes before a
 // server-side copy. Drivers that cannot cheaply inspect an object may omit it;
 // usage reconciliation remains authoritative in that case.
@@ -171,10 +196,10 @@ type SignedRequest = api.ObjectSignedRequest
 // persisted as object metadata so a completion response lost between the
 // provider and Gregale can be verified without exposing its upload ID.
 type MultipartCreateRequest struct {
-	SessionID   string
-	Key         string
-	SizeBytes   int64
-	ContentType string
+	SessionID string
+	Key       string
+	SizeBytes int64
+	Metadata  ObjectMetadata
 }
 
 type MultipartPartRequest struct {
@@ -249,6 +274,9 @@ const (
 	// object-tagging API (currently the GCS adapter). It never crosses the
 	// branded S3 response boundary as ordinary user metadata.
 	ReservedObjectTagsMetadataKey = "gregale-s3-tags"
+	// ReservedMultipartSessionMetadataKey fences the provider-private recovery
+	// marker written when Gregale initiates a multipart upload.
+	ReservedMultipartSessionMetadataKey = "gregale-upload-id"
 )
 
 // ValidateObjectMetadata applies the portable S3 metadata/tag limits before
@@ -264,7 +292,7 @@ func ValidateObjectMetadata(metadata ObjectMetadata) error {
 		return ErrInvalid
 	}
 	for key, value := range metadata.Metadata {
-		if key == "" || len(key) > maxObjectMetadataKey || len(value) > maxObjectMetadataValue || !utf8.ValidString(key) || !utf8.ValidString(value) || strings.ContainsAny(key, "\r\n") || strings.ContainsAny(value, "\r\n") || strings.EqualFold(key, ReservedObjectTagsMetadataKey) {
+		if key == "" || len(key) > maxObjectMetadataKey || len(value) > maxObjectMetadataValue || !utf8.ValidString(key) || !utf8.ValidString(value) || strings.ContainsAny(key, "\r\n") || strings.ContainsAny(value, "\r\n") || strings.EqualFold(key, ReservedObjectTagsMetadataKey) || strings.EqualFold(key, ReservedMultipartSessionMetadataKey) {
 			return ErrInvalid
 		}
 	}

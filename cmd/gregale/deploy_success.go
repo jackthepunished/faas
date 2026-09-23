@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/simpleapp"
 )
 
 // deploymentReceiptFetchTimeout keeps a successful deploy from hanging on a
@@ -63,22 +64,115 @@ func deploymentWithReleaseSummary(ctx context.Context, c *Client, appSlug, deplo
 // output. The lookup is deliberately best-effort so a metadata read cannot
 // turn an already successful deployment into a failed command.
 func deploymentAppURL(ctx context.Context, c *Client, appSlug string) string {
-	if c != nil && appSlug != "" {
-		readCtx, cancel := context.WithTimeout(ctx, deploymentReceiptFetchTimeout)
-		defer cancel()
-		if app, err := c.GetApp(readCtx, appSlug); err == nil {
-			return canonicalAppURL(app)
-		}
+	if app, ok := deploymentApp(ctx, c, appSlug); ok {
+		return canonicalAppURL(app)
 	}
 	return deployedAppURL(appSlug)
+}
+
+// deploymentApp is the best-effort app read behind the success output.
+func deploymentApp(ctx context.Context, c *Client, appSlug string) (api.AppResponse, bool) {
+	if c == nil || appSlug == "" {
+		return api.AppResponse{}, false
+	}
+	readCtx, cancel := context.WithTimeout(ctx, deploymentReceiptFetchTimeout)
+	defer cancel()
+	app, err := c.GetApp(readCtx, appSlug)
+	return app, err == nil
+}
+
+// renderDeploymentAccess says when the new URL rejects anonymous requests.
+// Hobby and above default to require_authn (ADR-080), and the post-deploy
+// verifier authenticates, so "verified, 200" followed by a 401 from curl
+// looked like a broken deploy (issue #3362).
+func renderDeploymentAccess(w io.Writer, app api.AppResponse, appSlug string) {
+	if !app.RequireAuthn {
+		return
+	}
+	if app.PublicAuth.Mode == api.AppPublicAuthModeBasic {
+		PrintProgress(w, "Access: requests need HTTP Basic credentials (%s).", formatAppAuth(app))
+	} else {
+		PrintProgress(w, "Access: requests need Authorization: Bearer <api-key> (%s).", formatAppAuth(app))
+	}
+	PrintProgress(w, "  make the URL public: gregale app %s --no-require-authn", appSlug)
+}
+
+// deploymentPreviewURL resolves the immutable per-deployment URL after a
+// dark deployment is live. This is receipt enrichment, not a deployment
+// prerequisite: platforms without the preview zone still get a useful
+// promotion command and can inspect the revision later.
+func deploymentPreviewURL(ctx context.Context, c *Client, deploymentID string) string {
+	if c == nil || deploymentID == "" {
+		return ""
+	}
+	readCtx, cancel := context.WithTimeout(ctx, deploymentReceiptFetchTimeout)
+	defer cancel()
+	preview, err := c.GetDeploymentURL(readCtx, deploymentID)
+	if err != nil || !preview.Alive {
+		return ""
+	}
+	return preview.URL
+}
+
+func deploymentCommandRef(dep api.DeploymentResponse) string {
+	if label := renderRevision(dep.Revision); label != "" {
+		return label
+	}
+	return dep.ID
+}
+
+// deploymentPromotionCommand includes a production-revision precondition when
+// a single live sibling owns 100% of traffic. A split or failed read cannot
+// safely provide a copy-paste promotion command.
+func deploymentPromotionCommand(ctx context.Context, c *Client, appSlug string, dep api.DeploymentResponse) (command, servingRef string) {
+	if c == nil || appSlug == "" {
+		return "", ""
+	}
+	readCtx, cancel := context.WithTimeout(ctx, deploymentReceiptFetchTimeout)
+	defer cancel()
+	deployments, err := c.ListAppDeploymentsAll(readCtx, appSlug)
+	if err != nil {
+		return "", ""
+	}
+	command = fmt.Sprintf("gregale traffic promote --app %s --deployment %s", appSlug, deploymentCommandRef(dep))
+	for _, sibling := range deployments {
+		if sibling.ID == dep.ID || sibling.Status != statusLive || sibling.TrafficPercent == 0 {
+			continue
+		}
+		if sibling.TrafficPercent != 100 || servingRef != "" {
+			return "", ""
+		}
+		servingRef = deploymentCommandRef(sibling)
+	}
+	if servingRef != "" {
+		command += " --if-serving " + servingRef
+	}
+	return command, servingRef
+}
+
+func renderQueuedDeployment(dep api.DeploymentResponse, appURL string, darkDeploy bool) {
+	if !darkDeploy {
+		PrintOK(osStdout, "Deployment %s queued. %s", dep.ID, appURL)
+		return
+	}
+	PrintOK(osStdout, "Deployment %s queued with 0%% production traffic.", dep.ID)
+	PrintProgress(osStdout, "Production traffic remains unchanged. %s", appURL)
 }
 
 // renderSuccessfulDeployment prints the existing success/cold-wake copy and
 // appends the verified zero-config profile and smoke evidence when the API has
 // persisted a hosting receipt.
 func renderSuccessfulDeployment(ctx context.Context, c *Client, dep api.DeploymentResponse, appSlug string) int {
+	return renderSuccessfulDeploymentWithOptions(ctx, c, dep, appSlug, false)
+}
+
+func renderSuccessfulDeploymentWithOptions(ctx context.Context, c *Client, dep api.DeploymentResponse, appSlug string, darkDeploy bool) int {
 	final := deploymentWithReceipt(ctx, c, dep)
-	appURL := deploymentAppURL(ctx, c, appSlug)
+	app, appOK := deploymentApp(ctx, c, appSlug)
+	appURL := deployedAppURL(appSlug)
+	if appOK {
+		appURL = canonicalAppURL(app)
+	}
 	if final.CanaryTotalSteps > 0 && final.RolloutState == rolloutStateAborted {
 		reason := final.RolloutAbortedReason
 		if reason == "" {
@@ -93,19 +187,58 @@ func renderSuccessfulDeployment(ctx context.Context, c *Client, dep api.Deployme
 		if step > final.CanaryTotalSteps {
 			step = final.CanaryTotalSteps
 		}
-		PrintOK(osStdout, "Candidate live. %s", appURL)
+		// ADR-198: name the revision that just went live. During a canary the
+		// customer is watching two revisions at once, so "candidate" without
+		// saying WHICH one is the least useful moment to omit it.
+		if label := renderRevision(final.Revision); label != "" {
+			PrintOK(osStdout, "Candidate %s live. %s", label, appURL)
+		} else {
+			PrintOK(osStdout, "Candidate live. %s", appURL)
+		}
 		PrintProgress(osStdout, "Rollout: %d%% traffic · step %d/%d · in progress", final.TrafficPercent, step, final.CanaryTotalSteps)
 		PrintProgress(osStdout, "follow: gregale deployment wait %s --rollout", final.ID)
+	} else if darkDeploy {
+		if final.TrafficPercent != 0 {
+			PrintFail(osStderr, "Deployment %s became live with %d%% production traffic; expected 0%%. Inspect with: gregale traffic status %s", final.ID, final.TrafficPercent, appSlug)
+			return 1
+		}
+		ref := deploymentCommandRef(final)
+		PrintOK(osStdout, "Staged %s with 0%% production traffic.", ref)
+		if previewURL := deploymentPreviewURL(ctx, c, final.ID); previewURL != "" {
+			PrintProgress(osStdout, "Preview: %s", previewURL)
+		} else {
+			PrintProgress(osStdout, "Preview: gregale deploys show %s --app %s --url", ref, appSlug)
+		}
+		promotionCommand, servingRef := deploymentPromotionCommand(ctx, c, appSlug, final)
+		if servingRef != "" {
+			PrintProgress(osStdout, "Production remains on %s. %s", servingRef, appURL)
+		} else {
+			PrintProgress(osStdout, "Production traffic remains unchanged. %s", appURL)
+		}
+		if promotionCommand != "" {
+			PrintProgress(osStdout, "Promote: %s", promotionCommand)
+		} else {
+			PrintProgress(osStdout, "Promotion: inspect current traffic with gregale traffic status %s", appSlug)
+		}
+	} else if label := renderRevision(final.Revision); label != "" {
+		PrintOK(osStdout, "Deployed %s. %s", label, appURL)
 	} else {
 		PrintOK(osStdout, "Deployed. %s", appURL)
 	}
-	printDeployColdWakeSentence()
-	if cache := formatBuildCacheSummary(final.BuildCacheStatus, final.CacheKeySHA256); cache != "" {
-		PrintProgress(osStdout, "Build cache: %s", cache)
+	if !darkDeploy {
+		printDeployColdWakeSentence()
+	}
+	if appOK {
+		renderDeploymentAccess(osStdout, app, appSlug)
+	}
+	if cache := formatArtifactCacheSummary(final.BuildCacheStatus, final.CacheKeySHA256); cache != "" {
+		PrintProgress(osStdout, "Artifact cache: %s", cache)
 	}
 	renderDeploymentHostingReceipt(osStdout, final.APIHostingReceipt)
-	if summary, ok := deploymentWithReleaseSummary(ctx, c, appSlug, final.ID); ok {
-		renderDeploymentReleaseSummary(osStdout, summary, appSlug)
+	if !darkDeploy {
+		if summary, ok := deploymentWithReleaseSummary(ctx, c, appSlug, final.ID); ok {
+			renderDeploymentReleaseSummary(osStdout, summary, appSlug)
+		}
 	}
 	return 0
 }
@@ -168,9 +301,9 @@ func renderDeploymentReleaseSummary(w io.Writer, summary api.DeploymentSummaryRe
 	case summary.Previous == nil:
 		_, _ = fmt.Fprintln(w, "  Changes: initial release")
 	case len(summary.Changes) == 0:
-		_, _ = fmt.Fprintf(w, "  Changes since %s: none\n", summary.Previous.ID)
+		_, _ = fmt.Fprintf(w, "  Changes since %s: none\n", deploymentLabel(*summary.Previous))
 	default:
-		_, _ = fmt.Fprintf(w, "  Changes since %s:\n", summary.Previous.ID)
+		_, _ = fmt.Fprintf(w, "  Changes since %s:\n", deploymentLabel(*summary.Previous))
 		for _, change := range summary.Changes {
 			_, _ = fmt.Fprintf(w, "    %-18s %s -> %s\n", change.Field,
 				formatSummaryValue(change.Before), formatSummaryValue(change.After))
@@ -180,7 +313,15 @@ func renderDeploymentReleaseSummary(w io.Writer, summary api.DeploymentSummaryRe
 		_, _ = fmt.Fprintln(w, "  Rollback: unavailable (no previous release)")
 		return
 	}
-	_, _ = fmt.Fprintf(w, "  Rollback: gregale rollback %s --to %s\n", appSlug, summary.RollbackTargetID)
+	// ADR-198: print the revision handle when the target has one. This line is
+	// meant to be copy-pasted, and a uuid is the one thing in this output a
+	// human cannot retype or recognise later. Rows predating the revision
+	// column still fall back to the id so the command always works.
+	target := summary.RollbackTargetID
+	if label := renderRevision(summary.RollbackTargetRevision); label != "" {
+		target = label
+	}
+	_, _ = fmt.Fprintf(w, "  Rollback: gregale rollback %s --to %s\n", appSlug, target)
 }
 
 // waitForDeploymentReceiptUntil is the timeout-aware implementation used by
@@ -237,10 +378,10 @@ func warnDeploymentTimeoutForMode(appSlug, deploymentID string, deadline time.Du
 // object using the caller's wait deadline. A timeout still returns the
 // accepted deployment id so automation can resume with `deployment wait`.
 func writeWaitedDeploymentReceiptUntil(ctx context.Context, c *Client, dep api.DeploymentResponse, prov *zeroConfigProvenance, appURL, sourceSHA256, appSlug string, deadline time.Duration) int {
-	return writeWaitedDeploymentReceiptUntilWithOptions(ctx, c, dep, prov, appURL, sourceSHA256, appSlug, deadline, false)
+	return writeWaitedDeploymentReceiptUntilWithOptions(ctx, c, dep, prov, appURL, sourceSHA256, appSlug, deadline, false, false)
 }
 
-func writeWaitedDeploymentReceiptUntilWithOptions(ctx context.Context, c *Client, dep api.DeploymentResponse, prov *zeroConfigProvenance, appURL, sourceSHA256, appSlug string, deadline time.Duration, waitForRollout bool) int {
+func writeWaitedDeploymentReceiptUntilWithOptions(ctx context.Context, c *Client, dep api.DeploymentResponse, prov *zeroConfigProvenance, appURL, sourceSHA256, appSlug string, deadline time.Duration, waitForRollout, darkDeploy bool, simplePlans ...*simpleapp.Plan) int {
 	if deadline <= 0 {
 		deadline = defaultDeployWaitTimeout
 	}
@@ -261,7 +402,7 @@ func writeWaitedDeploymentReceiptUntilWithOptions(ctx context.Context, c *Client
 		if final.ID != "" {
 			receiptDep = final
 		}
-		receipt := newDeployReceipt(receiptDep, prov, appURL, sourceSHA256)
+		receipt := newDeployReceipt(receiptDep, prov, appURL, sourceSHA256, simplePlans...)
 		receipt.TimedOut = true
 		receipt.ResumeCommand = resumeCommand
 		if code := jsonOut(writeJSON(receipt)); code != 0 {
@@ -269,8 +410,12 @@ func writeWaitedDeploymentReceiptUntilWithOptions(ctx context.Context, c *Client
 		}
 		return 3
 	}
-	receipt := newDeployReceipt(final, prov, appURL, sourceSHA256)
-	if final.Status == statusLive {
+	receipt := newDeployReceipt(final, prov, appURL, sourceSHA256, simplePlans...)
+	if final.Status == statusLive && darkDeploy && final.TrafficPercent == 0 {
+		receipt.PreviewURL = deploymentPreviewURL(ctx, c, final.ID)
+		receipt.PromotionCommand, _ = deploymentPromotionCommand(ctx, c, appSlug, final)
+	}
+	if final.Status == statusLive && !darkDeploy {
 		if summary, summaryOK := deploymentWithReleaseSummary(ctx, c, appSlug, final.ID); summaryOK {
 			receipt.ReleaseSummary = newDeployReleaseSummary(summary, appSlug)
 		}
@@ -282,6 +427,10 @@ func writeWaitedDeploymentReceiptUntilWithOptions(ctx context.Context, c *Client
 		return 1
 	}
 	if final.Status != statusLive {
+		return 1
+	}
+	if darkDeploy && final.TrafficPercent != 0 {
+		PrintFail(osStderr, "Deployment %s became live with %d%% production traffic; expected 0%%", final.ID, final.TrafficPercent)
 		return 1
 	}
 	return 0

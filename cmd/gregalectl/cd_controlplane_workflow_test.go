@@ -79,6 +79,57 @@ func TestCDControlPlaneObservesCustomerPathDuringActivation(t *testing.T) {
 	}
 }
 
+func TestCDControlPlanePlannedMaintenanceKeepsDeploymentFailureGate(t *testing.T) {
+	platformBody, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "cd-platform.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	platform := string(platformBody)
+	for _, required := range []string{
+		"maintenance_mode:",
+		"maintenance_mode: ${{ inputs.maintenance_mode }}",
+	} {
+		if !strings.Contains(platform, required) {
+			t.Errorf("platform workflow is missing maintenance input wiring %q", required)
+		}
+	}
+
+	controlBody, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "cd-controlplane.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	control := string(controlBody)
+	if got := strings.Count(control, "      maintenance_mode:"); got != 2 {
+		t.Errorf("control-plane workflow has %d maintenance inputs, want workflow_call and workflow_dispatch", got)
+	}
+	for _, required := range []string{
+		"MAINTENANCE_MODE: ${{ inputs.maintenance_mode }}",
+		`if [[ "$MAINTENANCE_MODE" == "true" ]]; then`,
+		"baseline_samples=0",
+		"ROLLOUT_BASELINE_SAMPLE_COUNT=\"$baseline_samples\"",
+		`ROLLOUT_PROBE_PROXY="$probe_proxy" scripts/ci/observe_rollout_availability.sh`,
+		"control-plane rollout probe proxy did not become ready",
+	} {
+		if !strings.Contains(control, required) {
+			t.Errorf("control-plane workflow is missing maintenance behavior %q", required)
+		}
+	}
+	observerBody, err := os.ReadFile(filepath.Join("..", "..", "scripts", "ci", "observe_rollout_availability.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	observer := string(observerBody)
+	for _, required := range []string{
+		"if (( command_status != 0 )); then",
+		"exit \"$command_status\"",
+		"baseline_total > 0 && baseline_success == baseline_total && rollout_failed > 0",
+	} {
+		if !strings.Contains(observer, required) {
+			t.Errorf("maintenance observer must preserve wrapped-command failure: missing %q", required)
+		}
+	}
+}
+
 func TestCDControlPlaneVerifiesSBOMBeforeActivationAndAcceptsAfterHealth(t *testing.T) {
 	body, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "cd-controlplane.yml"))
 	if err != nil {
@@ -234,6 +285,33 @@ func TestCDControlPlaneBundlesEveryCanonicalControlPlaneDaemon(t *testing.T) {
 	}
 }
 
+func TestCDControlPlanePreservesAndRecoversConfiguredOptionalS3Gateway(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "cd-controlplane.yml"))
+	if err != nil {
+		t.Fatalf("read cd-controlplane workflow: %v", err)
+	}
+	workflow := string(body)
+
+	bundle := strings.Index(workflow, `"${BUNDLE_ROOT}/optional-systemd/faas-s3-gatewayd.service"`)
+	seal := strings.Index(workflow, `bundle-create "${BUNDLE_ROOT}"`)
+	deploy := strings.Index(workflow, `deployctl deploy ${RELEASE_ID}`)
+	recover := strings.Index(workflow, "Restart configured optional S3 gateway")
+	marker := strings.Index(workflow, "apid_dropin=/etc/systemd/system/faas-apid.service.d/99-faas-object-storage.conf")
+	masked := strings.Index(workflow, `[[ "$(readlink "$installed_unit")" == /dev/null ]]`)
+	install := strings.Index(workflow, `mv -Tf "$staged_unit" "$installed_unit"`)
+	enable := strings.Index(workflow, "systemctl enable faas-s3-gatewayd.service")
+	ready := strings.Index(workflow, "http://127.0.0.1:9096/readyz")
+	if bundle < 0 || seal < 0 || deploy < 0 || recover < 0 || marker < 0 || masked < 0 || install < 0 || enable < 0 || ready < 0 {
+		t.Fatalf("optional S3 rollout contract is incomplete: bundle=%d seal=%d deploy=%d recover=%d marker=%d masked=%d install=%d enable=%d ready=%d", bundle, seal, deploy, recover, marker, masked, install, enable, ready)
+	}
+	if !(bundle < seal && seal < deploy && deploy < recover && recover < marker && marker < masked && masked < install && install < enable && enable < ready) {
+		t.Fatalf("optional S3 rollout contract is out of order: bundle=%d seal=%d deploy=%d recover=%d marker=%d masked=%d install=%d enable=%d ready=%d", bundle, seal, deploy, recover, marker, masked, install, enable, ready)
+	}
+	if strings.Contains(workflow, "if ! systemctl is-enabled --quiet faas-s3-gatewayd.service") {
+		t.Fatal("optional S3 recovery still treats the deployctl-created mask as an opt-out")
+	}
+}
+
 func TestCDControlPlaneConvergesOutbounddAndPublicBetaBilling(t *testing.T) {
 	body, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "cd-controlplane.yml"))
 	if err != nil {
@@ -356,5 +434,47 @@ func TestCDControlPlanePromotesDPAArtifactWithRelease(t *testing.T) {
 	}
 	if !(bundle < deploy && deploy < install) {
 		t.Fatalf("DPA must be bundled before activation and installed after it: bundle=%d deploy=%d install=%d", bundle, deploy, install)
+	}
+}
+
+// TestCDControlPlaneActivationToleratesKGVSidecarOnRetry pins the retry
+// contract for an already-installed release directory.
+//
+// KGV rotation writes the operator-owned sbom-baseline.json sidecar beside
+// the immutable bundle *after* a successful activation. The sidecar is
+// deliberately absent from the signed manifest, so the strict
+// `deployctl bundle-check` rejects it as an unexpected file. That made the
+// first rollout of a release pass and every retry of the same release fail.
+// Activation must therefore use the installed-release policy, exactly as the
+// earlier reuse probe already does.
+//
+// adr: 005
+// spec: §14
+func TestCDControlPlaneActivationToleratesKGVSidecarOnRetry(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "cd-controlplane.yml"))
+	if err != nil {
+		t.Fatalf("read cd-controlplane workflow: %v", err)
+	}
+	workflow := string(body)
+
+	activationCheck := strings.Index(workflow, "${release_dir}/bin/deployctl bundle-check-installed ${release_dir} &&")
+	rotate := strings.Index(workflow, "gregalectl release kgv rotate --git-sha")
+	activate := strings.Index(workflow, "${release_dir}/bin/deployctl deploy ${RELEASE_ID}")
+	if activationCheck < 0 || rotate < 0 || activate < 0 {
+		t.Fatalf("activation must verify the installed bundle before KGV rotation and deploy: check=%d rotate=%d activate=%d", activationCheck, rotate, activate)
+	}
+	if !(activationCheck < rotate && rotate < activate) {
+		t.Fatalf("activation order is wrong: check=%d rotate=%d activate=%d", activationCheck, rotate, activate)
+	}
+
+	// The strict variant must never run against a release directory that a
+	// prior activation may already have written the KGV sidecar into.
+	for _, banned := range []string{
+		"deployctl bundle-check ${release_dir}",
+		"deployctl' bundle-check '${release_dir}'",
+	} {
+		if strings.Contains(workflow, banned) {
+			t.Errorf("control-plane workflow runs the strict bundle check against an installed release: %q", banned)
+		}
 	}
 }

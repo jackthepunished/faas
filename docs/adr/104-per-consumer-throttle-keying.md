@@ -2,13 +2,13 @@
 
 - **Status:** accepted
 - **Date:** 2026-08-14
-- **Decision:** Per-rule `kind=throttle` buckets key by an optional consumer
-  dimension (`key_by ∈ {"none", "api_key", "consumer_id", "jwt_subject", "jwt_claim"}`) chosen
+- **Decision:** Per-rule `kind=throttle` buckets key by an optional request
+  dimension (`key_by ∈ {"none", "api_key", "consumer_id", "jwt_subject", "jwt_claim", "country"}`) chosen
   at rule-create time. The cardinality is bounded per-rule by
   `max_keys_per_rule` (Free 100 / Hobby 1000 / Pro 5000 / Scale 10000).
   When the per-rule consumer set exceeds the cap, all over-cap callers
   collapse into a single non-evicting `__other__` bucket that still
-  consumes the parent rule's tokens.
+  consumes tokens at the rule's configured rate.
 - **Why:** PR #887 (ADR-091 D20.5 amendment) shipped `kind=throttle` keyed
   only by `appID + "\x00" + ruleID`. Customers asked for two follow-ups
   that the v1 bucket shape cannot express:
@@ -36,11 +36,12 @@
   The `__other__` bucket is created exactly once per rule (lazy-init
   on first overflow) and is **pinned non-evictable** — it always
   consumes tokens regardless of how full it is, so an attacker who
-  pushed past the cap still pays the parent rule's rps cost.
+  pushed past the cap still pays the rule's configured rps cost.
 - **Consequences:**
   - New `EdgeRuleThrottleAction.KeyBy` (closed vocab, default `none`),
     `JWTClaimName` (regex `^[a-zA-Z_][a-zA-Z0-9_]{0,63}$`), and
-    `MaxKeysPerRule` (Free 100 / Hobby 1000 / Pro 5000 / Scale 10000).
+    `MaxKeysPerRule` (Free 100 / Hobby 1000 / Pro 5000 / Scale 10000),
+    plus amendment-6 `MissingKeyPolicy` (`shared` or `reject`).
   - Wire-shape additive: existing rules keep `KeyBy=""` and behave
     exactly as PR #887 (today's behaviour preserved bit-for-bit).
   - New `Authenticated` struct on the request context, populated by
@@ -54,7 +55,8 @@
     configurable) to keep the per-consumer bucket map bounded
     independent of the per-rule bucket map.
   - New CLI flags `--throttle-key-by`, `--throttle-jwt-claim`,
-    `--throttle-max-keys-per-rule` on `cmd/gregale` create + update.
+    `--throttle-max-keys-per-rule`, and
+    `--throttle-missing-key-policy` on `cmd/gregale` create + update.
   - `make sdk-check` requires `KeyBy`/`JWTClaimName`/`MaxKeysPerRule`
     on every SDK (`sdk/go`, `sdk/node`, `sdk/python`).
   - PR-cluster outlined in
@@ -111,12 +113,15 @@
     verification, sourced from `pkg/edgejwks/verifier.go:46-52`.
 - LRU interaction:
   - `routeLimiter` (today, `NewLimiterWithLRU(EdgeRuleCacheCap=10_000)`)
-    continues to hold the per-rule bucket. Phase 3 keeps the
-    `appID + "\x00" + ruleID` shape here unchanged.
+    holds the per-rule bucket only for `key_by ∈ {"", "none"}`. Phase 3
+    keeps the `appID + "\x00" + ruleID` shape for that mode unchanged.
   - `routeConsumerLimiter` (NEW, `NewLimiterWithLRU(EdgeRuleConsumerCacheCap=100_000)`)
     holds the per-rule per-consumer buckets plus the `__other__` overflow.
     `__other__` is marked non-evictable in `Limiter` bookkeeping
     (mirrors the full-bucket-only invariant at `pkg/gateway/ratelimit.go:234-267`).
+  - These modes are alternatives. A dimensional request does not also
+    consume a shared parent route bucket: that bucket would let one noisy
+    identity exhaust the shared burst and starve every other identity.
 - Property tests (the load-bearing ones):
   - `TestRouteConsumerThrottle_OtherBucketPinnedEvenWhenFull` —
     the `__other__` bucket must NOT be evictable even at full.
@@ -142,13 +147,15 @@
 
 ## Out of scope (deferred to Phase 4 or new ADR)
 
-- `jwt_claim: <name>` for non-string claims (numbers, arrays, objects)
+- `jwt_claim: <name>` for arrays and objects. Top-level string, number,
+  and boolean values are supported and normalized to strings.
 - Per-consumer rate-limit *quotas* (max number of per-consumer rules an
   account can configure) — uses existing `Limits.EdgeRulesThrottlePerApp`
   for now.
 - Server-side allowlist of consumer IDs.
 - Per-IP variant (explicit ADR-091 D20.5 deferral preserved).
-- Per-country / per-user-ID limits.
+- Per-user-ID aliases beyond `jwt_subject`, `consumer_id`, or a named
+  `jwt_claim`.
 - Auto-applying recommendations.
 
 ## Amendment 5 (issue #881 Phase 4, 2026-08-18)
@@ -200,15 +207,11 @@ Prometheus counter + audit row documents the degraded window.
 New sibling header of `X-RouteRateLimit-{Limit,Remaining,Reset}`,
 emitted on the per-rule 429 path. Values: literal `route` (default
 — preserved back-compat for rules with `KeyBy ∈ {"", "none"}`) or
-`per-consumer` (when `api.ThrottleKeyByIsPerConsumer(rule.KeyBy)`
-AND the consumer collapses to the `__other__` bucket). The
+`per-consumer` (when `api.ThrottleKeyByIsPerConsumer(rule.KeyBy)`). The
 existing `x-faas-rate-limit-scope` enum is untouched.
 
-The applier consults `Limiter.ConsumerIsTracked(ruleKey,
-consumerID)` after the per-consumer bucket consume (a new
-accessor at `pkg/gateway/ratelimit.go::ConsumerIsTracked`). When
-the consumer has collapsed to `__other__`, the accessor returns
-false and the policy header is set to `per-consumer`.
+The numeric headers are read from the concrete dimensional bucket selected
+for the request, including the pinned `__other__` bucket after overflow.
 
 ### C. Dry-run preview on throttle-suggestions
 
@@ -228,11 +231,64 @@ does not carry per-consumer labels today. The preview can only
 answer "would ANY consumer on the rule's `__other__` collapse
 bucket have been rejected?" — surfaced on the wire (the static
 `per_consumer_limit_note` literal), in the CLI human output, and
-in this amendment. Phase 4 per-consumer central mode (the
-eventual fix) widens the PK + carries consumer_id on the series.
+in this amendment. Amendment 6 coordinates bounded dimensional
+counters across replicas, but it still does not add raw consumer
+labels to the metric series; per-identity preview remains unavailable.
 
 CLI twin: `gregale throttle-suggestions <slug> [--range 5m]
 [--dry-run --candidate-rps N --candidate-burst N]`.
+
+## Amendment 6 (request dimensions, 2026-09-22)
+
+`kind=throttle` is generalized from authenticated-consumer keying to
+bounded request dimensions:
+
+- `key_by="country"` resolves the existing trusted single-hop
+  `X-Forwarded-For` value through the configured GeoIP reader and keys by
+  uppercase ISO 3166-1 alpha-2 code. A missing/corrupt database or forged
+  forwarding chain, lookup error, or address missing from the database fails
+  closed; it never falls back to an attacker-provided address or an unknown
+  geography bucket.
+- `key_by="jwt_claim"` now receives verified top-level scalar custom claims
+  even when the JWT access rule did not list the claim in `required_claims`.
+  Strings, JSON numbers, and booleans are normalized to strings. Registered
+  JWT claims, arrays, objects, empty strings, values over 256 bytes, unsafe
+  claim names, and claims beyond the 64-entry extraction set are omitted. The
+  matched throttle's configured claim is extracted first, so unrelated token
+  claims cannot crowd it out of the bounded request context.
+- `missing_key_policy="shared"` (the default) places requests missing an
+  authentication-backed dimension into one `__anonymous__` child bucket.
+  `"reject"` returns 401 before any tokens are consumed,
+  preventing credential omission from bypassing a user or tenant limit.
+- The apid DTO→state conversion now carries all throttle fields. Before this
+  amendment it dropped `key_by`, `jwt_claim_name`, and `max_keys_per_rule`, so
+  API-created dimensional rules silently compiled as shared route rules.
+- Central mode coordinates dimensional buckets across replicas. The gateway
+  hashes `(rule ID, dimension kind, dimension value)` into one of
+  `max_keys_per_rule` deterministic shards, then derives a version-8 UUID for
+  the existing `pg_ratelimit_counters.subject_id`. This requires no schema
+  migration, bounds database cardinality, does not persist raw claims, and is
+  conservative on collision: colliding concepts share allowance rather than
+  receiving extra allowance. Local/degraded mode retains the original
+  tracked-consumer plus pinned-`__other__` behavior.
+
+The route matcher remains the endpoint dimension: host, path glob, and method
+select the rule before the request dimension selects its child bucket.
+
+## Amendment 7 (isolation and degraded-mode observability, 2026-09-22)
+
+Dimensional and route-wide buckets are mutually exclusive enforcement modes.
+The initial Phase-3 applier consumed the shared route bucket before the
+dimensional bucket. That accidentally allowed one identity to exhaust the
+shared burst and starve unrelated identities, contradicting the purpose of
+`key_by`. Dimensional requests now consume only their bounded dimensional
+bucket; non-dimensional rules retain the original route bucket unchanged.
+
+Central-store failures now increment
+`gateway_ratelimit_degraded_total{scope="app|account|rule|other"}` on every
+local fallback. A warning and `ratelimit_degraded` audit event are emitted at
+most once per scope per minute so a database outage cannot amplify itself
+through logging or audit writes.
 
 ## References
 

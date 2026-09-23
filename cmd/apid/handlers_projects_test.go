@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -143,6 +144,23 @@ func TestProjectEnvironmentRegistryLifecycleAndOwnership(t *testing.T) {
 		t.Fatalf("listed environments=%+v err=%v", listed, err)
 	}
 
+	req, rec = projectRequest(http.MethodDelete, "/v1/projects/shop/environments/staging", "shop", nil)
+	req.SetPathValue("environment", "staging")
+	srv.deleteProjectEnvironment(rec, req, acct)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("delete status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if _, err := store.ProjectEnvironmentBySlug(ctx, acct.ID, project.ID, "staging"); !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("deleted staging lookup err=%v, want ErrNotFound", err)
+	}
+
+	req, rec = projectRequest(http.MethodDelete, "/v1/projects/shop/environments/production", "shop", nil)
+	req.SetPathValue("environment", "production")
+	srv.deleteProjectEnvironment(rec, req, acct)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("production delete status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
 	other, err := store.CreateAccount(ctx, "other-environment-owner@example.com", api.PlanPro)
 	if err != nil {
 		t.Fatal(err)
@@ -151,6 +169,67 @@ func TestProjectEnvironmentRegistryLifecycleAndOwnership(t *testing.T) {
 	srv.listProjectEnvironments(rec, req, other)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("cross-account list status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestProjectEnvironmentCloneCopiesScopedStateAtomically(t *testing.T) {
+	srv, store, acct, project, app := newProjectLifecycleFixture(t)
+	ctx := context.Background()
+	createProjectEnvironmentConfigFixture(t, store, acct.ID, project.ID, "production", `{"region":"us"}`)
+	if err := store.UpsertAppEnvInScope(ctx, acct.ID, app.ID, "production", "MODE", "production"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertAppSecretWithKidAndValueHashInScope(ctx, acct.ID, app.ID, "production", "STRIPE_KEY", "age1-source", "1111111111111111", []byte("sealed-source")); err != nil {
+		t.Fatal(err)
+	}
+
+	req, rec := projectRequest(http.MethodPost, "/v1/projects/shop/environments", "shop", []byte(`{"slug":"staging","from_environment":"production"}`))
+	srv.createProjectEnvironment(rec, req, acct)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("clone status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var response api.ProjectEnvironmentResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.ClonedFrom != "production" || response.Clone == nil || !response.Clone.ConfigurationCopied || response.Clone.VariablesCopied != 1 || response.Clone.SecretsCopied != 1 {
+		t.Fatalf("clone response=%+v", response)
+	}
+	if strings.Contains(rec.Body.String(), "sealed-source") || strings.Contains(rec.Body.String(), "age1-source") {
+		t.Fatalf("clone response leaked secret material: %s", rec.Body.String())
+	}
+	config, err := store.ProjectEnvironmentConfigLatest(ctx, acct.ID, project.ID, "staging")
+	if err != nil || config.Version != 1 || string(config.Values) != `{"region":"us"}` {
+		t.Fatalf("cloned config=%+v err=%v", config, err)
+	}
+	envs, err := store.ListAppEnvInScope(ctx, acct.ID, app.ID, "staging")
+	if err != nil || len(envs) != 1 || envs[0].Value != "production" {
+		t.Fatalf("cloned env=%+v err=%v", envs, err)
+	}
+	secrets, err := store.ListAppSecretsInScope(ctx, acct.ID, app.ID, "staging")
+	if err != nil || len(secrets) != 1 || string(secrets[0].Ciphertext) != "sealed-source" || secrets[0].ValueHash != "1111111111111111" {
+		t.Fatalf("cloned secrets=%+v err=%v", secrets, err)
+	}
+}
+
+// adr: 211
+func TestProjectEnvironmentCloneFailsClosedWhenManagedResourceIsolationUnavailable(t *testing.T) {
+	srv, store, acct, project, app := newProjectLifecycleFixture(t)
+	ctx := context.Background()
+	if err := store.PutManagedPostgresSecret(ctx, state.AppSecret{
+		AccountID: acct.ID, AppID: app.ID, Scope: "production", Key: "DATABASE_URL",
+		Ciphertext: []byte("managed-sealed"), ManagedPostgresBindingID: "binding-production",
+		ManagedCredentialRef: "credential-production", ManagedCredentialGeneration: 3,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	req, rec := projectRequest(http.MethodPost, "/v1/projects/shop/environments", "shop", []byte(`{"slug":"staging","from_environment":"production"}`))
+	srv.createProjectEnvironment(rec, req, acct)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("clone status=%d body=%s, want managed-resource isolation unavailable", rec.Code, rec.Body.String())
+	}
+	if _, err := store.ProjectEnvironmentBySlug(ctx, acct.ID, project.ID, "staging"); !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("blocked clone created target: %v", err)
 	}
 }
 

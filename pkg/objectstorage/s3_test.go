@@ -134,6 +134,14 @@ func TestS3Presign(t *testing.T) {
 	if u.Query().Get("response-content-disposition") != "attachment" || u.Query().Get("X-Amz-Expires") != "60" {
 		t.Fatal("unsafe download")
 	}
+	proxied, err := p.(ObjectReadPresigner).PresignObjectRead(context.Background(), "gregale-test", http.MethodGet, "index.html", 60)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxiedURL, _ := url.Parse(proxied.URL)
+	if proxiedURL.Query().Has("response-content-disposition") || proxiedURL.Query().Has("response-content-type") {
+		t.Fatalf("proxied read overrides stored metadata: %s", proxied.URL)
+	}
 	head, err := p.Presign(context.Background(), "gregale-test", SignRequest{Method: http.MethodHead, Key: "index.html", ExpiresIn: 60})
 	if err != nil {
 		t.Fatal(err)
@@ -211,8 +219,8 @@ func TestS3MultipartProtocolAndCompletionRecovery(t *testing.T) {
 		case r.Method == http.MethodGet && r.URL.Query().Has("uploads"):
 			_, _ = io.WriteString(w, `<ListMultipartUploadsResult><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>`)
 		case r.Method == http.MethodPost && r.URL.Query().Has("uploads"):
-			if r.Header.Get("X-Amz-Meta-Gregale-Upload-Id") != "session-1" {
-				t.Errorf("missing recovery metadata: %q", r.Header.Get("X-Amz-Meta-Gregale-Upload-Id"))
+			if r.Header.Get("X-Amz-Meta-Gregale-Upload-Id") != "session-1" || r.Header.Get("X-Amz-Meta-Owner") != "platform" || r.Header.Get("Cache-Control") != "public, max-age=60" || r.Header.Get("Content-Disposition") != `attachment; filename="large.bin"` || r.Header.Get("Content-Encoding") != "gzip" || r.Header.Get("Content-Language") != "en" || r.Header.Get("X-Amz-Tagging") != "env=prod&team=core" {
+				t.Errorf("missing multipart metadata: %#v", r.Header)
 			}
 			_, _ = io.WriteString(w, `<InitiateMultipartUploadResult><Bucket>gregale-test</Bucket><Key>large.bin</Key><UploadId>provider-id</UploadId></InitiateMultipartUploadResult>`)
 		case r.Method == http.MethodPost && r.URL.Query().Get("uploadId") == "provider-id":
@@ -242,7 +250,10 @@ func TestS3MultipartProtocolAndCompletionRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	providerID, err := provider.EnsureMultipartUpload(context.Background(), "gregale-test", MultipartCreateRequest{SessionID: "session-1", Key: "large.bin", SizeBytes: 10})
+	providerID, err := provider.EnsureMultipartUpload(context.Background(), "gregale-test", MultipartCreateRequest{
+		SessionID: "session-1", Key: "large.bin", SizeBytes: 10,
+		Metadata: ObjectMetadata{ContentType: "application/octet-stream", CacheControl: "public, max-age=60", ContentDisposition: `attachment; filename="large.bin"`, ContentEncoding: "gzip", ContentLanguage: "en", Metadata: map[string]string{"owner": "platform"}, Tags: map[string]string{"env": "prod", "team": "core"}},
+	})
 	if err != nil || providerID != "provider-id" {
 		t.Fatal(providerID, err)
 	}
@@ -347,6 +358,7 @@ func TestS3ProtocolAndErrors(t *testing.T) {
 
 func TestS3CopyObjectAndDelimitedListing(t *testing.T) {
 	var copyHeader string
+	var copyDestination string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/xml")
 		switch {
@@ -357,6 +369,7 @@ func TestS3CopyObjectAndDelimitedListing(t *testing.T) {
 			_, _ = io.WriteString(w, `<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>root.txt</Key><Size>4</Size><LastModified>2026-09-05T00:00:00Z</LastModified></Contents><CommonPrefixes><Prefix>photos/</Prefix></CommonPrefixes></ListBucketResult>`)
 		case r.Method == http.MethodPut && r.Header.Get("X-Amz-Copy-Source") != "":
 			copyHeader = r.Header.Get("X-Amz-Copy-Source")
+			copyDestination = r.URL.Path
 			_, _ = io.WriteString(w, `<CopyObjectResult><LastModified>2026-09-07T00:00:00Z</LastModified><ETag>&quot;copy-etag&quot;</ETag></CopyObjectResult>`)
 		case r.Method == http.MethodHead:
 			w.Header().Set("Content-Length", "12")
@@ -387,6 +400,15 @@ func TestS3CopyObjectAndDelimitedListing(t *testing.T) {
 	result, err := copier.CopyObject(context.Background(), "gregale-test", CopyObjectRequest{SourceKey: "source.txt", DestinationKey: "copy.txt", MetadataDirective: "REPLACE", Metadata: ObjectMetadata{ContentType: "text/plain", Metadata: map[string]string{"owner": "platform"}}})
 	if err != nil || result.ETag != `"copy-etag"` || !strings.Contains(copyHeader, "gregale-test") || !strings.Contains(copyHeader, "source.txt") {
 		t.Fatalf("copy result = %+v err=%v header=%q", result, err, copyHeader)
+	}
+	between, ok := p.(CrossBucketObjectCopier)
+	if !ok {
+		t.Fatal("S3 provider does not expose cross-bucket CopyObject")
+	}
+	copyHeader = ""
+	result, err = between.CopyObjectBetweenBuckets(context.Background(), "source-bucket", "destination-bucket", CopyObjectRequest{SourceKey: "source.txt", DestinationKey: "copy.txt"})
+	if err != nil || result.ETag != `"copy-etag"` || !strings.Contains(copyHeader, "source-bucket") || !strings.Contains(copyHeader, "source.txt") || !strings.Contains(copyDestination, "destination-bucket") {
+		t.Fatalf("cross-bucket copy result = %+v err=%v source=%q destination=%q", result, err, copyHeader, copyDestination)
 	}
 	sizer, ok := p.(ObjectSizer)
 	if !ok {

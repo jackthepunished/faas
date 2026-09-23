@@ -35,6 +35,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/mail"
 	"github.com/onebox-faas/faas/pkg/meter"
 	"github.com/onebox-faas/faas/pkg/openapidiff"
+	"github.com/onebox-faas/faas/pkg/safetext"
 	"github.com/onebox-faas/faas/pkg/secretbox"
 	"github.com/onebox-faas/faas/pkg/state"
 	artifactstorage "github.com/onebox-faas/faas/pkg/storage"
@@ -42,6 +43,11 @@ import (
 	"github.com/onebox-faas/faas/pkg/webhookdedupe"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
+
+// dialFailureDetailMaxBytes bounds the error text folded into a dial-failure
+// reason. The value can originate from a hostile DNS server, so it is both
+// capped and normalized before it reaches a stored reason string.
+const dialFailureDetailMaxBytes = 96
 
 // --- apps CRUD --------------------------------------------------------------
 
@@ -678,6 +684,12 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 				"Invalid scaling policy",
 				fmt.Sprintf("max_queue_wait_ms must be between 0 and %d", api.MaxConcurrencyQueueWaitMS))
 		}
+		if sp.MaxQueueDepth < 0 || (sp.MaxQueueDepth > 0 && sp.MaxQueueDepth > api.ConcurrencyQueueMaxDepthForPlan(acct.Plan)) {
+			return api.NewProblem(http.StatusUnprocessableEntity,
+				api.CodeValidation,
+				"Invalid scaling policy",
+				fmt.Sprintf("max_queue_depth must be between 0 and %d for the %s plan", api.ConcurrencyQueueMaxDepthForPlan(acct.Plan), acct.Plan))
+		}
 		if sp.WakeMaxQueueDepth < 0 || (sp.WakeMaxQueueDepth > 0 && sp.WakeMaxQueueDepth > api.WakeQueueMaxDepthForPlan(acct.Plan)) {
 			return api.NewProblem(http.StatusUnprocessableEntity, api.CodeValidation,
 				"Invalid scaling policy",
@@ -702,16 +714,31 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 				if app.WorkloadClass == state.WorkloadClassWorker {
 					return api.ErrScalingTargetIncompatibleWithWorkloadClass("concurrent_requests")
 				}
-			case "queue_depth":
+			case "queue_depth", "queue_lag":
 				if app.WorkloadClass != state.WorkloadClassWorker &&
-					app.WorkloadClass != state.WorkloadClassJob {
-					return api.ErrScalingTargetIncompatibleWithWorkloadClass("queue_depth")
+					app.WorkloadClass != state.WorkloadClassJob &&
+					app.Manifest.ExecutionMode != api.ExecutionModeWorker &&
+					app.Manifest.ExecutionMode != api.ExecutionModeJob {
+					return api.ErrScalingTargetIncompatibleWithWorkloadClass(sp.Target.Metric)
 				}
 			}
 		}
+		// ADR-198: schedules are validated BEFORE the plan gates so an
+		// unparseable cron is a 422 about the cron rather than a 403
+		// about a floor the customer cannot reach anyway.
+		if problem := api.ValidateScalingSchedules("schedules", sp.Timezone, sp.Schedules); problem != nil {
+			return problem
+		}
+		// ADR-198: every min_instances gate below reads the MAXIMUM
+		// REACHABLE floor, not the static field. A schedule buys the
+		// same warm capacity min_instances does, so gating only the
+		// static value would let `min_instances: 0` plus a schedule of
+		// `min_instances: 3` walk through the Free rejection and the
+		// per-plan cap alike.
+		reachableMin := sp.MaxReachableMinInstances()
 		// Plan gates first (403 supersedes 422): a Free customer
 		// patching a valid policy still sees the plan error.
-		if sp.MinInstances > 0 && !acct.Plan.MinInstancesAllowed() {
+		if reachableMin > 0 && !acct.Plan.MinInstancesAllowed() {
 			return api.ErrPlanMinInstancesNotAllowed(acct.Plan)
 		}
 		if sp.MaxInstances > 0 && !acct.Plan.MaxInstancesAllowed() {
@@ -721,15 +748,15 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 		// 0 is the explicit "scale to zero" form below the engine
 		// floor (1) — the engine applies the floor at wake time, so
 		// the apid gate only rejects the negative / over-cap cases.
-		if sp.MinInstances < 0 || sp.MinInstances > limits.MaxConcurrency {
-			return api.ErrInvalidMinInstances(sp.MinInstances, limits.MaxConcurrency)
+		if sp.MinInstances < 0 || reachableMin > limits.MaxConcurrency {
+			return api.ErrInvalidMinInstances(reachableMin, limits.MaxConcurrency)
 		}
 		// ADR-071 §Decision 5: per-plan MaxMinInstances cap
 		// (Hobby 1, Pro 3, Scale 10). Tighter than MaxConcurrency
 		// to protect the §6.2-2 RAM ceiling from a single API
 		// call pinning a large fraction of the box.
-		if sp.MinInstances > acct.Plan.MaxMinInstances() {
-			return api.ErrMaxMinInstancesExceeded(sp.MinInstances, acct.Plan.MaxMinInstances())
+		if reachableMin > acct.Plan.MaxMinInstances() {
+			return api.ErrMaxMinInstancesExceeded(reachableMin, acct.Plan.MaxMinInstances())
 		}
 		// Bounds on max_instances: must be in [MinInstances, plan.MaxConcurrency].
 		// 0 means "use plan max_concurrency"; the engine reads the
@@ -743,8 +770,11 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 		if sp.MaxInstances > 0 && sp.MaxInstances > limits.MaxConcurrency {
 			return api.ErrInvalidMaxInstances(sp.MaxInstances, sp.MinInstances, limits.MaxConcurrency)
 		}
-		if sp.MaxInstances > 0 && sp.MaxInstances < sp.MinInstances {
-			return api.ErrInvalidMaxInstances(sp.MaxInstances, sp.MinInstances, limits.MaxConcurrency)
+		// max_instances must sit above every floor the app can reach,
+		// including a scheduled one — a window that demands 5 under a
+		// max of 2 is a policy that contradicts itself at 08:00.
+		if sp.MaxInstances > 0 && sp.MaxInstances < reachableMin {
+			return api.ErrInvalidMaxInstances(sp.MaxInstances, reachableMin, limits.MaxConcurrency)
 		}
 		// Cooldown floors + ceilings. The plan allows a customer
 		// to opt for a tighter cooldown (e.g. 5 s on Hobby) than
@@ -765,29 +795,20 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 		// compat). The metric surface is the only field that
 		// triggers the workload-class gate, but the actual reject
 		// runs in updateApp after loadApp — the validator here
-		// only checks the value shape.
-		if sp.Target != nil {
-			switch sp.Target.Metric {
-			case "", "rps", "concurrent_requests", "queue_depth", "p99_latency_ms":
-				// ok
-			default:
-				return api.NewProblem(http.StatusUnprocessableEntity,
-					api.CodeValidation,
-					"Invalid scaling policy",
-					fmt.Sprintf("target.metric=%q is not in the closed set (rps, concurrent_requests, queue_depth, p99_latency_ms).", sp.Target.Metric))
-			}
-			if sp.Target.Value < 0 {
-				return api.NewProblem(http.StatusUnprocessableEntity,
-					api.CodeValidation,
-					"Invalid scaling policy",
-					fmt.Sprintf("target.value must be >= 0; got %v.", sp.Target.Value))
-			}
-			if sp.Target.Metric == "queue_depth" && sp.Target.Value <= 0 {
-				return api.NewProblem(http.StatusUnprocessableEntity,
-					api.CodeValidation,
-					"Invalid scaling policy",
-					fmt.Sprintf("target.value must be > 0 for queue_depth; got %v.", sp.Target.Value))
-			}
+		//
+		// ADR-194: the closed set and the per-metric value rules live in
+		// pkg/api so this handler, the manifest loader and the deploy-diff
+		// quota gate cannot drift apart again — they held three copies of
+		// the set, and all three agreed on metrics the scheduler did not
+		// implement.
+		if sp.Target != nil && len(sp.Targets) > 0 {
+			return api.ErrScalingTargetConflict()
+		}
+		if err := api.ValidateLegacyScalingTarget(sp.Target); err != nil {
+			return err
+		}
+		if err := api.ValidateScalingTargets("targets", sp.Targets); err != nil {
+			return err
 		}
 	}
 	// Issue #472 / ADR-054: per-app cosign signature-enforcement flag
@@ -976,7 +997,9 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 		if cap > 0 {
 			n, err := s.store.CountAppsWithEvictionPriority(r.Context(), acct.ID, string(api.EvictionPriorityReserved))
 			if err != nil {
-				api.WriteProblem(w, api.ErrInternal(fmt.Sprintf("count reserved apps: %v", err)))
+				writeCustomerInternalProblem(w, r, s.log, "count reserved applications",
+					"Gregale could not check this account's reserved application limit.",
+					"Retry the request in a moment; if it continues, contact support.", err)
 				return
 			}
 			// n excludes the current app already (CountAppsWithEvictionPriority
@@ -1002,7 +1025,9 @@ func (s *server) updateApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	if req.PublicAuth != nil && req.PublicAuth.Mode == api.AppPublicAuthModeBasic {
 		recipient := setSecretRecipient()
 		if recipient == nil {
-			api.WriteProblem(w, api.ErrCapacity("host age recipient not loaded — refusing to seal public_auth credentials"))
+			api.WriteProblem(w, customerCapacityProblem(s.log, "update app public authentication", "App settings temporarily unavailable",
+				"Gregale could not securely update these app settings.",
+				"Retry in a few seconds; if it still fails, contact support.", nil))
 			return
 		}
 		// Plaintext shape: "<basic_user>\n<basic_pass>" —
@@ -1768,7 +1793,9 @@ func (s *server) updateDeploymentMinInstances(w http.ResponseWriter, r *http.Req
 			s.notFound(w, "no such deployment")
 			return
 		}
-		api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, api.CodeInternal, "update failed", err.Error()))
+		writeCustomerInternalProblem(w, r, s.log, "update deployment minimum instances",
+			"Gregale could not update this deployment's minimum instance count.",
+			"Retry the request in a moment; if it continues, contact support.", err)
 		return
 	}
 	// Audit emit (issue #557 / ADR-072 §Decision 6). The kind
@@ -1855,6 +1882,19 @@ func (s *server) updateDeploymentTraffic(w http.ResponseWriter, r *http.Request,
 		api.WriteProblem(w, api.ErrInvalidTrafficPercent(req.TrafficPercent))
 		return
 	}
+	if req.ExpectedServingDeploymentID != nil {
+		if !deploymentIDRefPattern.MatchString(*req.ExpectedServingDeploymentID) {
+			api.WriteProblem(w, api.ErrValidation("expected_serving_deployment_id must be a deployment id"))
+			return
+		}
+		parsed, parseErr := uuid.Parse(*req.ExpectedServingDeploymentID)
+		if parseErr != nil {
+			api.WriteProblem(w, api.ErrValidation("expected_serving_deployment_id must be a deployment id"))
+			return
+		}
+		canonical := parsed.String()
+		req.ExpectedServingDeploymentID = &canonical
+	}
 	// Plan tier gate (issue #556). Pro + Scale only. Hobby is
 	// locked: the canary-rollout audience is more expensive
 	// (RAM-billable per-running-second for two deployments) than
@@ -1864,7 +1904,12 @@ func (s *server) updateDeploymentTraffic(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	prev := d.TrafficPercent
-	updated, err := s.store.UpdateDeploymentTraffic(r.Context(), id, req.TrafficPercent)
+	var updated state.Deployment
+	if req.ExpectedServingDeploymentID != nil {
+		updated, err = s.store.UpdateDeploymentTraffic(r.Context(), id, req.TrafficPercent, *req.ExpectedServingDeploymentID)
+	} else {
+		updated, err = s.store.UpdateDeploymentTraffic(r.Context(), id, req.TrafficPercent)
+	}
 	if err != nil {
 		switch {
 		case errors.Is(err, state.ErrNotFound):
@@ -1887,8 +1932,12 @@ func (s *server) updateDeploymentTraffic(w http.ResponseWriter, r *http.Request,
 			// for target=0 on a sole live row (legitimate Σ=0 —
 			// pinned by TestPg_UpdateDeploymentTraffic_SoleLiveRow).
 			api.WriteProblem(w, api.ErrTrafficPercentSumInvalid(0))
+		case errors.Is(err, state.ErrTrafficServingChanged):
+			api.WriteProblem(w, api.ErrTrafficServingChanged())
 		default:
-			api.WriteProblem(w, api.NewProblem(http.StatusInternalServerError, api.CodeInternal, "update failed", err.Error()))
+			writeCustomerInternalProblem(w, r, s.log, "update deployment traffic split",
+				"Gregale could not update this deployment's traffic split.",
+				"Refresh the deployment status before retrying.", err)
 		}
 		return
 	}
@@ -1956,7 +2005,7 @@ func (s *server) rollbackApp(w http.ResponseWriter, r *http.Request, acct state.
 			return
 		}
 	}
-	target, problem := s.rollbackAppCore(r.Context(), acct, app, req)
+	target, problem := s.rollbackAppCore(r, acct, app, req)
 	if problem != nil {
 		api.WriteProblem(w, problem)
 		return
@@ -1968,7 +2017,8 @@ func (s *server) rollbackApp(w http.ResponseWriter, r *http.Request, acct state.
 // and dashboard surfaces. The caller owns authentication and app lookup;
 // this helper owns target selection, notifications, and audit records so the
 // two entry points cannot drift.
-func (s *server) rollbackAppCore(ctx context.Context, acct state.Account, app state.App, req api.RollbackRequest) (state.Deployment, *api.Problem) {
+func (s *server) rollbackAppCore(r *http.Request, acct state.Account, app state.App, req api.RollbackRequest) (state.Deployment, *api.Problem) {
+	ctx := r.Context()
 	alertRuleID := uuid.Nil
 	if req.AlertRuleID != nil && *req.AlertRuleID != "" {
 		if parsed, parseErr := uuid.Parse(*req.AlertRuleID); parseErr == nil {
@@ -1980,6 +2030,17 @@ func (s *server) rollbackAppCore(ctx context.Context, acct state.Account, app st
 	mode := "latest_superseded"
 	if req.TargetDeploymentID != nil && *req.TargetDeploymentID != "" {
 		mode = "explicit"
+		// ADR-198 — accept the customer-facing `v42` handle (or a bare
+		// `42`) in place of a uuid. Resolved here, inside the app scope,
+		// so a revision can only ever address a deployment of the app
+		// named in the request path; the IDOR posture is unchanged.
+		// Every downstream error message keeps echoing the original
+		// reference so the operator sees the string they typed.
+		resolved, problem := s.resolveDeploymentRef(ctx, app.ID, *req.TargetDeploymentID)
+		if problem != nil {
+			return state.Deployment{}, problem
+		}
+		req.TargetDeploymentID = &resolved
 		target, err = s.store.GetDeploymentByIDScopedToSuperseded(ctx, app.ID, *req.TargetDeploymentID)
 		if err != nil {
 			switch {
@@ -1988,14 +2049,18 @@ func (s *server) rollbackAppCore(ctx context.Context, acct state.Account, app st
 			case errors.Is(err, state.ErrRollbackTargetAlreadyLive):
 				candidate, readErr := s.store.DeploymentByID(ctx, *req.TargetDeploymentID)
 				if readErr != nil {
-					return state.Deployment{}, api.ErrCapacity(fmt.Sprintf("lookup rollback target state: %v", readErr))
+					return state.Deployment{}, customerCapacityProblem(s.log, "load rollback target state", "Deployment temporarily unavailable",
+						"Gregale could not load the rollback target right now.",
+						"Retry the request in a moment; if it continues, contact support.", readErr)
 				}
 				if candidate.Status == state.DeployLive {
 					return state.Deployment{}, api.ErrRollbackTargetAlreadyLive(fmt.Sprintf("deployment %q is already the current live deployment", *req.TargetDeploymentID))
 				}
 				return state.Deployment{}, api.ErrRollbackTargetIneligible(fmt.Sprintf("deployment %q has status %q; only a superseded deployment can be rolled back", *req.TargetDeploymentID, candidate.Status))
 			default:
-				return state.Deployment{}, api.ErrCapacity(fmt.Sprintf("lookup rollback target: %v", err))
+				return state.Deployment{}, customerCapacityProblem(s.log, "load rollback target", "Deployment temporarily unavailable",
+					"Gregale could not load the rollback target right now.",
+					"Retry the request in a moment; if it continues, contact support.", err)
 			}
 		}
 	} else {
@@ -2010,7 +2075,9 @@ func (s *server) rollbackAppCore(ctx context.Context, acct state.Account, app st
 	var current state.Deployment
 	current, err = s.store.LiveDeploymentForScope(ctx, app.ID, target.Scope)
 	if err != nil && !errors.Is(err, state.ErrNotFound) {
-		return state.Deployment{}, api.ErrCapacity(fmt.Sprintf("lookup current deployment: %v", err))
+		return state.Deployment{}, customerCapacityProblem(s.log, "load current deployment for rollback", "Deployment temporarily unavailable",
+			"Gregale could not load the current deployment right now.",
+			"Retry the request in a moment; if it continues, contact support.", err)
 	}
 	if api.ApiContractDiffEnabled() && strings.EqualFold(strings.TrimSpace(target.Scope), "prod") {
 		check, gateErr := openapidiff.CheckDeploymentPromotion(ctx, s.store, app.ID, target.ID, "prod")
@@ -2063,7 +2130,12 @@ func (s *server) rollbackAppCore(ctx context.Context, acct state.Account, app st
 	auditEntry := state.DeploymentAudit{
 		DeploymentID: depUUID, AccountID: acctUUID, Kind: state.DeployRolledBack,
 		Actor: "apid:rollback", At: time.Now().UTC(),
-		Data: json.RawMessage(fmt.Sprintf(`{"from":%q,"to":%q,"mode":%q,"phase":"readiness_requested"}`, current.ID, target.ID, mode)),
+		Data: json.RawMessage(safetext.JSONObject(struct {
+			From  string `json:"from"`
+			To    string `json:"to"`
+			Mode  string `json:"mode"`
+			Phase string `json:"phase"`
+		}{From: current.ID, To: target.ID, Mode: mode, Phase: "readiness_requested"})),
 	}
 	if alertRuleID != uuid.Nil {
 		auditEntry.AlertRuleID = &alertRuleID
@@ -2071,6 +2143,14 @@ func (s *server) rollbackAppCore(ctx context.Context, acct state.Account, app st
 	if _, err := s.store.AppendDeploymentAudit(ctx, auditEntry); err != nil {
 		s.log.Warn("rollback: append deployment_audit failed", "app", app.ID, "deployment", target.ID, "err", err.Error())
 	}
+	activity := state.OrgActivity{
+		Kind: "deploy.rolled_back", SourceType: "rollback", SourceID: activitySourceID(r, target.ID),
+		Data: activityData(map[string]any{"from": current.ID, "to": target.ID, "mode": mode, "phase": "readiness_requested"}),
+	}
+	if targetID, err := uuid.Parse(target.ID); err == nil {
+		activity.DeploymentID = &targetID
+	}
+	s.recordAppActivity(ctx, r, acct, app, activity)
 	return target, nil
 }
 
@@ -2079,9 +2159,11 @@ func (s *server) verifyRollbackTargetArtifact(ctx context.Context, target state.
 		return api.ErrRollbackTargetUnavailable(fmt.Sprintf("deployment %q has no immutable rootfs artifact key", target.ID))
 	}
 	if s.rollbackArtifactVerifier == nil {
-		return api.ErrCapacity("rollback artifact verification is not configured")
+		return customerCapacityProblem(s.log, "verify rollback target", "Deployment temporarily unavailable",
+			"Gregale could not verify this deployment right now.",
+			"Retry in a few seconds; if it still fails, contact support.", nil)
 	}
-	err := s.rollbackArtifactVerifier.Verify(ctx, target.RootfsKey, "sigs/"+target.RootfsKey+".sig")
+	err := s.rollbackArtifactVerifier.CheckPresent(ctx, target.RootfsKey, "sigs/"+target.RootfsKey+".sig")
 	if err == nil {
 		return nil
 	}
@@ -2212,11 +2294,21 @@ func (s *server) enqueueExplicitAppWake(ctx context.Context, acct state.Account,
 	return wakeID, nil
 }
 
-// restartApp queues a park followed by a fresh wake from the newly captured
-// snapshot. The request is asynchronous because snapshot/VM work belongs to
-// schedd; the returned wake_id is propagated through the notification so the
-// caller can correlate the replacement wake with its timeline and audit row.
+// restartApp queues either a normal snapshot restart or, with ?fresh=true, a
+// rolling runtime-configuration refresh that boots replacements before
+// withdrawing old VMs and never captures their old process environment. The
+// fresh variant uses a durable notification so an accepted secret rotation
+// cannot be lost across a LISTEN interruption.
 func (s *server) restartApp(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	fresh := false
+	if raw := r.URL.Query().Get("fresh"); raw != "" {
+		parsed, err := strconv.ParseBool(raw)
+		if err != nil {
+			api.WriteProblem(w, api.ErrValidation("fresh must be true or false"))
+			return
+		}
+		fresh = parsed
+	}
 	app, ok := s.loadApp(w, r, acct, r.PathValue("slug"))
 	if !ok {
 		return
@@ -2236,26 +2328,55 @@ func (s *server) restartApp(w http.ResponseWriter, r *http.Request, acct state.A
 			"Restart already in progress", "wait for the accepted restart to finish before retrying"))
 		return
 	}
+	if fresh {
+		// Stamp the operation boundary in the API request, once. The durable
+		// scheduler handoff may replay; restamping there would make each retry's
+		// already-booted replacement look stale again.
+		if _, err := state.InvalidateAppSnapshots(r.Context(), s.store, app.ID); err != nil {
+			if releaseErr := releaseAppRestartClaim(r.Context(), s.store, app.ID); releaseErr != nil {
+				s.log.Error("runtime config restart: release failed claim", "app", app.ID, "err", releaseErr)
+			}
+			api.WriteProblem(w, api.ErrCapacity("could not invalidate application snapshots"))
+			return
+		}
+	}
 	wakeUUID, err := uuid.NewV7()
 	if err != nil {
 		wakeUUID = uuid.New()
 		s.log.Warn("app restart: uuid.NewV7 failed, fell back to v4", "app", app.ID, "err", err)
 	}
 	wakeID := wakeUUID.String()
-	if err := s.notif.Notify(r.Context(), db.NotifyAppChanged,
-		fmt.Sprintf(`{"kind":"restart","slug":"%s","app_id":"%s","wake_id":"%s"}`,
-			app.Slug, app.ID, wakeID)); err != nil {
+	channel := db.NotifyAppChanged
+	payload := fmt.Sprintf(`{"kind":"restart","slug":"%s","app_id":"%s","wake_id":"%s"}`,
+		app.Slug, app.ID, wakeID)
+	if fresh {
+		channel = db.NotifyRuntimeConfigRestart
+		payload = fmt.Sprintf(`{"app_id":"%s","wake_id":"%s"}`, app.ID, wakeID)
+	}
+	if err := s.notif.Notify(r.Context(), channel, payload); err != nil {
+		if fresh {
+			if releaseErr := releaseAppRestartClaim(r.Context(), s.store, app.ID); releaseErr != nil {
+				s.log.Error("runtime config restart: release failed claim", "app", app.ID, "err", releaseErr)
+			}
+			api.WriteProblem(w, api.ErrCapacity("could not queue runtime configuration restart"))
+			return
+		}
 		// pg_notify is a hint like the existing park/wake endpoints. The
 		// app remains safely parked and the reaper reconciles that state;
 		// preserve the accepted response and log the transient failure.
 		s.log.Warn("app restart: notify schedd failed", "app", app.ID, "err", err)
 	}
-	s.audit.Emit(r.Context(), "app.restart_requested", &acct.ID, map[string]any{
+	auditKind := "app.restart_requested"
+	if fresh {
+		auditKind = "app.runtime_config_restart_requested"
+	}
+	s.audit.Emit(r.Context(), auditKind, &acct.ID, map[string]any{
 		"app_id":  app.ID,
 		"slug":    app.Slug,
 		"wake_id": wakeID,
+		"fresh":   fresh,
 	})
-	s.log.Info("app restart requested", "app", app.ID, "account", acct.ID, "wake_id", wakeID)
+	s.log.Info("app restart requested", "app", app.ID, "account", acct.ID, "wake_id", wakeID, "fresh", fresh)
 	writeJSON(w, http.StatusAccepted, api.AppRestartResponse{WakeID: wakeID})
 }
 
@@ -2274,6 +2395,16 @@ func claimAppRestart(ctx context.Context, store state.Store, appID string) (bool
 		return false, err
 	}
 	return true, nil
+}
+
+func releaseAppRestartClaim(ctx context.Context, store state.Store, appID string) error {
+	if atomicStore, ok := store.(appStatusCompareAndSetter); ok {
+		_, err := atomicStore.CompareAndSetAppStatus(ctx, appID, state.AppEvictedCold, state.AppActive)
+		return err
+	}
+	active := state.AppActive
+	_, err := store.UpdateApp(ctx, appID, state.UpdateAppParams{Status: &active})
+	return err
 }
 
 // renameApp swaps an app's slug atomically (issue #63). Body is
@@ -2340,7 +2471,12 @@ func (s *server) renameApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	// race-conditions with concurrent deploys that still reference the
 	// old slug in their deployment.app_id-to-slug lookup.
 	_ = s.notif.Notify(r.Context(), db.NotifyAppChanged,
-		fmt.Sprintf(`{"kind":"renamed","app_id":"%s","from":%q,"to":%q}`, app.ID, oldSlug, req.NewSlug))
+		string(safetext.JSONObject(struct {
+			Kind  string `json:"kind"`
+			AppID string `json:"app_id"`
+			From  string `json:"from"`
+			To    string `json:"to"`
+		}{Kind: "renamed", AppID: app.ID, From: oldSlug, To: req.NewSlug})))
 	// CodeQL go/log-injection (CWE-117): oldSlug came from the
 	// apps.slug column (regex-validated at create) and req.NewSlug
 	// passed the same validSlug check on this request's body. Wrap
@@ -2478,6 +2614,11 @@ func (s *server) createDomain(w http.ResponseWriter, r *http.Request, acct state
 	s.audit.Emit(r.Context(), "domain.added", &acct.ID, map[string]any{
 		"app_id": d.AppID,
 		"domain": d.Domain,
+	})
+	s.recordAppActivity(r.Context(), r, acct, app, state.OrgActivity{
+		Kind: "domain.added", ResourceType: "domain", ResourceID: d.Domain,
+		ResourceLabel: d.Domain, SourceType: "domain.added", SourceID: activitySourceID(r, d.Domain),
+		Data: activityData(map[string]any{"app_id": d.AppID}),
 	})
 	writeJSON(w, http.StatusAccepted, domainResponse(d))
 }
@@ -2788,10 +2929,7 @@ func classifyCertError(err error) string {
 		// net.OpError (DNS, connection refused) etc. Fall back to
 		// the wrapped error's message but cap the length so a
 		// hostile DNS server can't blow up the wire.
-		msg := err.Error()
-		if len(msg) > 96 {
-			msg = msg[:96] + "…"
-		}
+		msg := safetext.Ellipsis(err.Error(), dialFailureDetailMaxBytes)
 		return "dial_failed:" + msg
 	}
 }
@@ -2811,11 +2949,7 @@ func dialFailureReason(err error) string {
 	if err == nil || err.Error() == "" {
 		return "unknown"
 	}
-	msg := err.Error()
-	if len(msg) > 96 {
-		msg = msg[:96] + "…"
-	}
-	return msg
+	return safetext.Ellipsis(err.Error(), dialFailureDetailMaxBytes)
 }
 
 // --- domain doctor (ADR-120) --------------------------------------------
@@ -4798,6 +4932,7 @@ func (s *server) deploymentResponse(d state.Deployment, app state.App) api.Deplo
 		StageState:        append(json.RawMessage(nil), d.StageState...),
 		ID:                d.ID,
 		AppID:             d.AppID,
+		Revision:          d.Revision, // ADR-198 — the `v42` handle.
 		BuildID:           d.BuildID,
 		ImageDigest:       d.ImageDigest,
 		Kind:              string(d.Kind),
@@ -4863,6 +4998,25 @@ func (s *server) deploymentResponse(d state.Deployment, app state.App) api.Deplo
 		RolloutAbortedAt:     d.RolloutAbortedAt,
 		RolloutAbortedReason: d.RolloutAbortedReason,
 		APIHostingReceipt:    d.APIHostingReceipt,
+	}
+	if d.ServiceRolloutHandoff.Action != "" {
+		h := d.ServiceRolloutHandoff
+		resp.ServiceRolloutHandoff = &api.ServiceRolloutHandoffResponse{
+			Action:                  h.Action,
+			Phase:                   h.Phase,
+			PredecessorDeploymentID: h.PredecessorDeploymentID,
+			Generation:              h.Generation,
+			ExpectedGateways:        append([]string(nil), h.ExpectedGateways...),
+			AcknowledgedGateways:    append([]string(nil), h.AcknowledgedGateways...),
+			MissingGateways:         append([]string(nil), h.MissingGateways...),
+			RetryCount:              h.RetryCount,
+			LastError:               h.LastError,
+			Reason:                  h.Reason,
+			StartedAt:               h.StartedAt,
+			UpdatedAt:               h.UpdatedAt,
+			AcknowledgedAt:          h.AcknowledgedAt,
+			CompletedAt:             h.CompletedAt,
+		}
 	}
 	if len(d.OverrideEntrypoint) > 0 {
 		resp.OverrideEntrypoint = d.OverrideEntrypoint
@@ -6443,6 +6597,7 @@ func policyPtrFromReq(req *api.UpdateAppRequest) *state.ScalingPolicy {
 		ScaleInCooldownS:        sp.ScaleInCooldownS,
 		ConcurrencyOverflow:     sp.ConcurrencyOverflow,
 		MaxQueueWaitMS:          sp.MaxQueueWaitMS,
+		MaxQueueDepth:           sp.MaxQueueDepth,
 		WakeMaxQueueDepth:       sp.WakeMaxQueueDepth,
 		WakeMaxQueueWaitSeconds: sp.WakeMaxQueueWaitSeconds,
 	}
@@ -6450,7 +6605,28 @@ func policyPtrFromReq(req *api.UpdateAppRequest) *state.ScalingPolicy {
 		out.Target = &state.ScalingTarget{
 			Metric: sp.Target.Metric,
 			Value:  sp.Target.Value,
+			Name:   sp.Target.Name,
 		}
+	}
+	// ADR-194 targets, ADR-195 schedules. These were absent here for the
+	// life of both features: the handler accepted them, validated them,
+	// returned 200 — and dropped them on the floor, so a policy written
+	// through PATCH /v1/apps/{slug} reached the scheduler with no
+	// multi-signal targets and no schedules at all. Nothing caught it
+	// because every unit test builds the state policy directly and the
+	// store conformance case calls UpdateApp, both of which bypass this
+	// function. See TestPolicyRoundTrip_CarriesEveryField below, which
+	// fails if a field is added to either type without being copied here.
+	for _, t := range sp.Targets {
+		out.Targets = append(out.Targets, state.ScalingTarget{
+			Metric: t.Metric, Value: t.Value, Name: t.Name,
+		})
+	}
+	out.Timezone = sp.Timezone
+	for _, sched := range sp.Schedules {
+		out.Schedules = append(out.Schedules, state.ScalingSchedule{
+			Cron: sched.Cron, DurationS: sched.DurationS, MinInstances: sched.MinInstances,
+		})
 	}
 	return out
 }

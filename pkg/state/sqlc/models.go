@@ -273,6 +273,13 @@ type App struct {
 	PurgeClaimedAt            pgtype.Timestamptz
 }
 
+type AppCustomMetric struct {
+	AppID      pgtype.UUID
+	Name       string
+	Value      float64
+	ObservedAt pgtype.Timestamptz
+}
+
 type AppEnv struct {
 	AccountID pgtype.UUID
 	AppID     pgtype.UUID
@@ -285,36 +292,50 @@ type AppEnv struct {
 }
 
 type AppError struct {
-	ID            pgtype.UUID
-	AccountID     pgtype.UUID
-	AppID         pgtype.UUID
-	DeploymentID  pgtype.UUID
-	Fingerprint   string
-	Route         string
-	HttpStatus    int32
-	ErrorClass    string
-	SampleMessage string
-	Count         int64
-	RequestCount  int64
-	FirstSeenAt   pgtype.Timestamptz
-	LastSeenAt    pgtype.Timestamptz
-	CreatedAt     pgtype.Timestamptz
+	ID                      pgtype.UUID
+	AccountID               pgtype.UUID
+	AppID                   pgtype.UUID
+	DeploymentID            pgtype.UUID
+	Fingerprint             string
+	Route                   string
+	HttpStatus              int32
+	ErrorClass              string
+	SampleMessage           string
+	Count                   int64
+	RequestCount            int64
+	FirstSeenAt             pgtype.Timestamptz
+	LastSeenAt              pgtype.Timestamptz
+	CreatedAt               pgtype.Timestamptz
+	LastInstanceID          string
+	LastNodeID              string
+	LastRegion              string
+	LastCommitSha           string
+	LastDeploymentTag       string
+	LastDeploymentCreatedAt string
+	LastImageDigest         string
 }
 
 type AppErrorRequest struct {
-	ID            pgtype.UUID
-	AccountID     pgtype.UUID
-	AppID         pgtype.UUID
-	Fingerprint   string
-	RequestID     pgtype.UUID
-	ReceivedAt    pgtype.Timestamptz
-	Route         string
-	HttpStatus    int32
-	ErrorClass    string
-	SampleMessage string
-	DeploymentID  pgtype.UUID
-	HeadersSample []byte
-	Redactions    []string
+	ID                  pgtype.UUID
+	AccountID           pgtype.UUID
+	AppID               pgtype.UUID
+	Fingerprint         string
+	RequestID           pgtype.UUID
+	ReceivedAt          pgtype.Timestamptz
+	Route               string
+	HttpStatus          int32
+	ErrorClass          string
+	SampleMessage       string
+	DeploymentID        pgtype.UUID
+	HeadersSample       []byte
+	Redactions          []string
+	InstanceID          string
+	NodeID              string
+	Region              string
+	CommitSha           string
+	DeploymentTag       string
+	DeploymentCreatedAt string
+	ImageDigest         string
 }
 
 type AppLogDrain struct {
@@ -392,6 +413,11 @@ type AppRegistryCredential struct {
 	CreatedAt         pgtype.Timestamptz
 	UpdatedAt         pgtype.Timestamptz
 	LastUsedAt        pgtype.Timestamptz
+}
+
+type AppRuntimeConfigChange struct {
+	AppID     pgtype.UUID
+	ChangedAt pgtype.Timestamptz
 }
 
 type AppSecret struct {
@@ -674,6 +700,7 @@ type CreditLedger struct {
 	CreatedAt         pgtype.Timestamptz
 	ProviderInvoiceID pgtype.Text
 	RefundReversalID  pgtype.UUID
+	Provider          string
 }
 
 type Cron struct {
@@ -715,21 +742,25 @@ type CustomDomain struct {
 }
 
 type DataUpstream struct {
-	ID               pgtype.UUID
-	AccountID        pgtype.UUID
-	AppID            pgtype.UUID
-	Source           string
-	Scope            string
-	Kind             string
-	Host             string
-	Port             int32
-	HostRedactedHash string
-	DeclaredRegion   pgtype.Text
-	LastRttMs        pgtype.Int4
-	LastProbedAt     pgtype.Timestamptz
-	LastSeenAt       pgtype.Timestamptz
-	CreatedAt        pgtype.Timestamptz
-	DeploymentScope  string
+	ID                             pgtype.UUID
+	AccountID                      pgtype.UUID
+	AppID                          pgtype.UUID
+	Source                         string
+	Scope                          string
+	Kind                           string
+	Host                           string
+	Port                           int32
+	HostRedactedHash               string
+	DeclaredRegion                 pgtype.Text
+	LastRttMs                      pgtype.Int4
+	LastProbedAt                   pgtype.Timestamptz
+	LastSeenAt                     pgtype.Timestamptz
+	CreatedAt                      pgtype.Timestamptz
+	DeploymentScope                string
+	CircuitBreakerEnabled          bool
+	CircuitBreakerFailureThreshold pgtype.Float8
+	CircuitBreakerMinSamples       pgtype.Int4
+	CircuitBreakerOpenSeconds      pgtype.Int4
 }
 
 type DataUpstreamProbe struct {
@@ -854,6 +885,7 @@ type Deployment struct {
 	SnapshotMissBackoffUntil pgtype.Timestamptz
 	ApiHostingReceipt        []byte
 	InferredProfile          []byte
+	Revision                 int32
 }
 
 type DeploymentAudit struct {
@@ -1094,6 +1126,20 @@ type IdempotencyKey struct {
 	ResponseStatus int32
 	ResponseBody   []byte
 	CreatedAt      pgtype.Timestamptz
+}
+
+type InboundWebhookEndpoint struct {
+	ID                  pgtype.UUID
+	AppID               pgtype.UUID
+	AccountID           pgtype.UUID
+	Name                string
+	Provider            string
+	TokenHash           []byte
+	SigningSecretSealed []byte
+	DeliveryPath        string
+	Enabled             bool
+	CreatedAt           pgtype.Timestamptz
+	UpdatedAt           pgtype.Timestamptz
 }
 
 type Instance struct {
@@ -1339,6 +1385,7 @@ type MirrorInvocationResult struct {
 	Crashed            bool
 	RequestID          string
 	CompletedAt        pgtype.Timestamptz
+	RollupCounted      bool
 }
 
 type MirrorInvocationSummary struct {
@@ -1396,25 +1443,26 @@ type OauthLink struct {
 }
 
 type ObjectBucket struct {
-	ID                 pgtype.UUID
-	AccountID          pgtype.UUID
-	AppID              pgtype.UUID
-	Name               string
-	Scope              string
-	Region             string
-	BackendID          string
-	BackendFingerprint string
-	PhysicalName       string
-	State              string
-	LeaseToken         pgtype.Text
-	LeaseUntil         pgtype.Timestamptz
-	CreatedAt          pgtype.Timestamptz
-	UpdatedAt          pgtype.Timestamptz
-	AttemptCount       int32
-	RetryAt            pgtype.Timestamptz
-	LastErrorCode      string
-	PublicRead         bool
-	ServeAt            pgtype.Text
+	ID                             pgtype.UUID
+	AccountID                      pgtype.UUID
+	AppID                          pgtype.UUID
+	Name                           string
+	Scope                          string
+	Region                         string
+	BackendID                      string
+	BackendFingerprint             string
+	PhysicalName                   string
+	State                          string
+	LeaseToken                     pgtype.Text
+	LeaseUntil                     pgtype.Timestamptz
+	CreatedAt                      pgtype.Timestamptz
+	UpdatedAt                      pgtype.Timestamptz
+	AttemptCount                   int32
+	RetryAt                        pgtype.Timestamptz
+	LastErrorCode                  string
+	PublicRead                     bool
+	ServeAt                        pgtype.Text
+	EnvironmentCloneSourceBucketID pgtype.UUID
 }
 
 type ObjectStorageAccessGrant struct {
@@ -1500,6 +1548,7 @@ type ObjectStorageMultipartUpload struct {
 	PartSizeBytes    int64
 	PartCount        int32
 	ContentType      string
+	ObjectMetadata   []byte
 	ProviderUploadID string
 	CompletionParts  []byte
 	State            string
@@ -1615,6 +1664,44 @@ type Org struct {
 	UpdatedAt              pgtype.Timestamptz
 }
 
+// Curated organization activity timeline; safe display facts only, FK-free and append-only
+type OrgActivity struct {
+	ID             int64
+	OrgID          pgtype.UUID
+	OccurredAt     pgtype.Timestamptz
+	Kind           string
+	ActorType      string
+	ActorAccountID pgtype.UUID
+	ActorLabel     string
+	ResourceType   string
+	ResourceID     pgtype.Text
+	ResourceLabel  string
+	AppID          pgtype.UUID
+	ProjectID      pgtype.UUID
+	DeploymentID   pgtype.UUID
+	// Non-secret display metadata. Environment variable values and credentials are forbidden.
+	Data       []byte
+	SourceType string
+	SourceID   string
+}
+
+type OrgActivityOutbox struct {
+	ID          int64
+	OrgID       pgtype.UUID
+	SourceType  string
+	SourceID    string
+	Activity    []byte
+	State       string
+	Attempts    int32
+	AvailableAt pgtype.Timestamptz
+	ClaimedBy   pgtype.Text
+	ClaimedAt   pgtype.Timestamptz
+	LeaseUntil  pgtype.Timestamptz
+	DeliveredAt pgtype.Timestamptz
+	LastError   pgtype.Text
+	CreatedAt   pgtype.Timestamptz
+}
+
 type OrgInvitation struct {
 	ID                 pgtype.UUID
 	OrgID              pgtype.UUID
@@ -1671,6 +1758,19 @@ type Project struct {
 	OrgID            pgtype.UUID
 }
 
+type ProjectEnvironmentCleanupJob struct {
+	ID              pgtype.UUID
+	AccountID       pgtype.UUID
+	ProjectID       pgtype.UUID
+	EnvironmentSlug string
+	Resources       []byte
+	AttemptCount    int32
+	NextAttemptAt   pgtype.Timestamptz
+	LeaseToken      string
+	LeaseUntil      pgtype.Timestamptz
+	CreatedAt       pgtype.Timestamptz
+}
+
 type ProvisionedStaticEgressIp struct {
 	AccountID  pgtype.UUID
 	CustomerIp netip.Addr
@@ -1694,29 +1794,35 @@ type ReleaseBundle struct {
 }
 
 type RequestTelemetry struct {
-	ID              pgtype.UUID
-	AccountID       pgtype.UUID
-	AppID           pgtype.UUID
-	DeploymentID    pgtype.UUID
-	Route           string
-	Method          string
-	Status          int32
-	LatencyMs       int32
-	ColdBoot        bool
-	TraceID         pgtype.Text
-	SpansSummary    []byte
-	ReceivedAt      pgtype.Timestamptz
-	Count           int32
-	UaFamily        string
-	ReferrerHost    string
-	Country         string
-	WakeID          pgtype.Text
-	InstanceID      pgtype.Text
-	GuestDurationMs int32
-	GuestRuntime    string
-	GuestOutcome    string
-	GuestErrorClass string
-	ConsumerID      pgtype.UUID
+	ID                  pgtype.UUID
+	AccountID           pgtype.UUID
+	AppID               pgtype.UUID
+	DeploymentID        pgtype.UUID
+	Route               string
+	Method              string
+	Status              int32
+	LatencyMs           int32
+	ColdBoot            bool
+	TraceID             pgtype.Text
+	SpansSummary        []byte
+	ReceivedAt          pgtype.Timestamptz
+	Count               int32
+	UaFamily            string
+	ReferrerHost        string
+	Country             string
+	WakeID              pgtype.Text
+	InstanceID          pgtype.Text
+	GuestDurationMs     int32
+	GuestRuntime        string
+	GuestOutcome        string
+	GuestErrorClass     string
+	ConsumerID          pgtype.UUID
+	NodeID              string
+	Region              string
+	CommitSha           string
+	DeploymentTag       string
+	DeploymentCreatedAt string
+	ImageDigest         string
 }
 
 type RequestTelemetry202608 struct {

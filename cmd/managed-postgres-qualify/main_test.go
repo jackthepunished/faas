@@ -53,6 +53,7 @@ func TestQualificationSpecUsesConservativeCapabilities(t *testing.T) {
 			PostgresMajors:          []int{16, 17},
 			ServiceClasses:          []managedpostgres.ServiceClass{managedpostgres.ClassDevelopment},
 			Availability:            []managedpostgres.Availability{managedpostgres.AvailabilitySingleZone},
+			CredentialAccess:        []managedpostgres.CredentialAccess{managedpostgres.CredentialReadWrite},
 			ScaleToZero:             true,
 			PointInTimeRestore:      true,
 			MaxRestoreWindowSeconds: 3600,
@@ -76,6 +77,7 @@ func TestQualificationSpecRequiresScaleToZero(t *testing.T) {
 			PostgresMajors:     []int{16},
 			ServiceClasses:     []managedpostgres.ServiceClass{managedpostgres.ClassDevelopment},
 			Availability:       []managedpostgres.Availability{managedpostgres.AvailabilitySingleZone},
+			CredentialAccess:   []managedpostgres.CredentialAccess{managedpostgres.CredentialReadWrite},
 			PointInTimeRestore: false,
 			MaxStorageBytes:    2 << 30,
 			UsageMeters:        []managedpostgres.Meter{managedpostgres.MeterComputeUnitSeconds},
@@ -194,7 +196,7 @@ func TestConfigurationPreflightIsProviderFreeAndReportsWarnings(t *testing.T) {
 	if !result.Readiness.Ready || result.BackendID != "neon-eu" || result.Spec == nil {
 		t.Fatalf("preflight result = %+v", result)
 	}
-	if !containsString(result.Warnings, "usage_policy_disabled") || !containsString(result.Warnings, "restore_usage_not_isolated") {
+	if !containsString(result.Warnings, "usage_policy_disabled") || !containsString(result.Warnings, "restore_usage_not_isolated") || containsString(result.Warnings, "restore_usage_unaccounted") {
 		t.Fatalf("preflight warnings = %v", result.Warnings)
 	}
 }

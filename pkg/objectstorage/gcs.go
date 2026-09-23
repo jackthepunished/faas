@@ -79,7 +79,7 @@ type gcsStore interface {
 	DeleteObject(context.Context, string, string) error
 	ObjectState(context.Context, string, string) (gcsObjectState, error)
 	UpdateObjectMetadata(context.Context, string, string, map[string]string) (gcsObjectState, error)
-	CopyObject(context.Context, string, string, string, ObjectMetadata, string) (gcsObjectState, error)
+	CopyObject(context.Context, string, string, string, string, ObjectMetadata, string) (gcsObjectState, error)
 }
 
 type googleGCSStore struct {
@@ -263,8 +263,8 @@ func (s *googleGCSStore) UpdateObjectMetadata(ctx context.Context, bucket, key s
 	return gcsObjectState{Key: attrs.Name, ETag: attrs.Etag, Size: attrs.Size, LastModified: attrs.Updated, Metadata: attrs.Metadata}, nil
 }
 
-func (s *googleGCSStore) CopyObject(ctx context.Context, bucket, source, destination string, metadata ObjectMetadata, directive string) (gcsObjectState, error) {
-	copier := s.client.Bucket(bucket).Object(destination).CopierFrom(s.client.Bucket(bucket).Object(source))
+func (s *googleGCSStore) CopyObject(ctx context.Context, sourceBucket, destinationBucket, source, destination string, metadata ObjectMetadata, directive string) (gcsObjectState, error) {
+	copier := s.client.Bucket(destinationBucket).Object(destination).CopierFrom(s.client.Bucket(sourceBucket).Object(source))
 	if directive == "REPLACE" {
 		objectMetadata, err := gcsMetadataForObject(metadata)
 		if err != nil {
@@ -409,6 +409,13 @@ func (p *GCS) WriteObject(ctx context.Context, bucket, key string, body io.Reade
 }
 
 func (p *GCS) CopyObject(ctx context.Context, bucket string, r CopyObjectRequest) (CopyObjectResult, error) {
+	return p.CopyObjectBetweenBuckets(ctx, bucket, bucket, r)
+}
+
+func (p *GCS) CopyObjectBetweenBuckets(ctx context.Context, sourceBucket, destinationBucket string, r CopyObjectRequest) (CopyObjectResult, error) {
+	if sourceBucket == "" || destinationBucket == "" {
+		return CopyObjectResult{}, ErrInvalid
+	}
 	if !ValidKey(r.SourceKey) || !ValidKey(r.DestinationKey) {
 		return CopyObjectResult{}, ErrInvalid
 	}
@@ -443,7 +450,7 @@ func (p *GCS) CopyObject(ctx context.Context, bucket string, r CopyObjectRequest
 		return CopyObjectResult{}, err
 	}
 	if r.MetadataDirective == "REPLACE" && r.TaggingDirective == "COPY" {
-		source, sourceErr := p.store.ObjectState(ctx, bucket, r.SourceKey)
+		source, sourceErr := p.store.ObjectState(ctx, sourceBucket, r.SourceKey)
 		if sourceErr != nil {
 			return CopyObjectResult{}, normalizeGCS(sourceErr)
 		}
@@ -453,7 +460,7 @@ func (p *GCS) CopyObject(ctx context.Context, bucket string, r CopyObjectRequest
 		}
 		r.Metadata.Tags = tags
 	}
-	object, err := p.store.CopyObject(ctx, bucket, r.SourceKey, r.DestinationKey, r.Metadata, r.MetadataDirective)
+	object, err := p.store.CopyObject(ctx, sourceBucket, destinationBucket, r.SourceKey, r.DestinationKey, r.Metadata, r.MetadataDirective)
 	if err != nil {
 		return CopyObjectResult{}, normalizeGCS(err)
 	}
@@ -599,6 +606,27 @@ func (p *GCS) Presign(ctx context.Context, bucket string, r SignRequest) (Signed
 	return result, nil
 }
 
+func (p *GCS) PresignObjectRead(ctx context.Context, bucket, method, key string, expiresIn int64) (SignedRequest, error) {
+	r := SignRequest{Method: method, Key: key, ExpiresIn: expiresIn}
+	if err := r.Validate(api.MaxObjectSinglePutBytes); err != nil || method != http.MethodGet && method != http.MethodHead {
+		return SignedRequest{}, ErrInvalid
+	}
+	ttl := time.Duration(expiresIn) * time.Second
+	if ttl == 0 {
+		ttl = 5 * time.Minute
+	}
+	expiresAt := p.now().Add(ttl)
+	opts := storage.SignedURLOptions{
+		GoogleAccessID: p.serviceAccount, Method: method, Expires: expiresAt, Scheme: storage.SigningSchemeV4,
+		Style: storage.PathStyle(),
+	}
+	value, err := p.signedURL(ctx, bucket, key, opts)
+	if err != nil {
+		return SignedRequest{}, err
+	}
+	return SignedRequest{URL: value, Method: method, Headers: map[string]string{}, ExpiresAt: expiresAt}, nil
+}
+
 func gcsMetadataHeaders(metadata map[string]string) []string {
 	values := gcsMetadataHeaderValues(metadata)
 	keys := make([]string, 0, len(values))
@@ -617,10 +645,17 @@ func gcsMetadataHeaderValues(metadata map[string]string) map[string]string {
 }
 
 func gcsContentHeaderValues(r SignRequest) map[string]string {
+	return gcsObjectContentHeaderValues(ObjectMetadata{
+		CacheControl: r.CacheControl, ContentDisposition: r.ContentDisposition,
+		ContentEncoding: r.ContentEncoding, ContentLanguage: r.ContentLanguage,
+	})
+}
+
+func gcsObjectContentHeaderValues(metadata ObjectMetadata) map[string]string {
 	values := map[string]string{}
 	for name, value := range map[string]string{
-		"Cache-Control": r.CacheControl, "Content-Disposition": r.ContentDisposition,
-		"Content-Encoding": r.ContentEncoding, "Content-Language": r.ContentLanguage,
+		"Cache-Control": metadata.CacheControl, "Content-Disposition": metadata.ContentDisposition,
+		"Content-Encoding": metadata.ContentEncoding, "Content-Language": metadata.ContentLanguage,
 	} {
 		if value != "" {
 			values[name] = value
@@ -641,7 +676,7 @@ func (p *GCS) signedURL(ctx context.Context, bucket, key string, opts storage.Si
 }
 
 func (p *GCS) EnsureMultipartUpload(ctx context.Context, bucket string, r MultipartCreateRequest) (string, error) {
-	if r.SessionID == "" || len(r.SessionID) > 128 || !ValidKey(r.Key) || r.SizeBytes < 0 || r.SizeBytes > api.MaxObjectUploadBytes || ValidateContentType(r.ContentType) != nil {
+	if r.SessionID == "" || len(r.SessionID) > 128 || !ValidKey(r.Key) || r.SizeBytes < 0 || r.SizeBytes > api.MaxObjectUploadBytes || ValidateObjectMetadata(r.Metadata) != nil {
 		return "", ErrInvalid
 	}
 	var found, keyMarker, uploadMarker string
@@ -677,11 +712,24 @@ func (p *GCS) EnsureMultipartUpload(ctx context.Context, bucket string, r Multip
 	if found != "" {
 		return found, nil
 	}
-	contentType := r.ContentType
+	contentType := r.Metadata.ContentType
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
-	headers := http.Header{"Content-Type": {contentType}, "x-goog-meta-" + multipartSessionMetadata: {r.SessionID}}
+	headers := http.Header{"Content-Type": {contentType}, "x-goog-meta-" + ReservedMultipartSessionMetadataKey: {r.SessionID}}
+	for name, value := range gcsMetadataHeaderValues(r.Metadata.Metadata) {
+		headers.Set(name, value)
+	}
+	for name, value := range gcsObjectContentHeaderValues(r.Metadata) {
+		headers.Set(name, value)
+	}
+	tagging, err := EncodeObjectTags(r.Metadata.Tags)
+	if err != nil {
+		return "", err
+	}
+	if tagging != "" {
+		headers.Set("x-goog-meta-"+ReservedObjectTagsMetadataKey, tagging)
+	}
 	var initiated gcsInitiateMultipartUploadResult
 	if err := p.xmlRequest(ctx, http.MethodPost, bucket, r.Key, url.Values{"uploads": {""}}, headers, nil, &initiated); err != nil {
 		return "", normalizeGCS(err)
@@ -769,7 +817,7 @@ func (p *GCS) CompleteMultipartUpload(ctx context.Context, bucket string, r Mult
 	if attrErr != nil {
 		return normalizeGCS(attrErr)
 	}
-	if object.Size != r.SizeBytes || object.Metadata[multipartSessionMetadata] != r.SessionID {
+	if object.Size != r.SizeBytes || object.Metadata[ReservedMultipartSessionMetadataKey] != r.SessionID {
 		return ErrConflict
 	}
 	return nil

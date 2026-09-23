@@ -31,6 +31,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/apihostingreceipt"
 	"github.com/onebox-faas/faas/pkg/appmetrics"
+	"github.com/onebox-faas/faas/pkg/cursor"
 	"github.com/onebox-faas/faas/pkg/dashboard"
 	"github.com/onebox-faas/faas/pkg/dashboard/stages"
 	"github.com/onebox-faas/faas/pkg/dashboard/views"
@@ -1851,12 +1852,18 @@ func (s *server) renderAccount(w http.ResponseWriter, r *http.Request, log *slog
 	}
 }
 
-// renderProblem turns a dashboard-render error into a 500 RFC 7807.
+// renderProblem preserves an existing customer-safe Problem and otherwise
+// turns a dashboard render failure into the canonical internal-error shape.
+// Raw template/store errors stay in logs and never reach the browser.
 func renderProblem(w http.ResponseWriter, log *slog.Logger, err error) {
 	log.Error("dashboard render", "err", err)
-	w.Header().Set("Content-Type", "application/problem+json")
-	w.WriteHeader(http.StatusInternalServerError)
-	_, _ = w.Write([]byte(`{"type":"about:blank","title":"render","status":500,"detail":"dashboard render failed"}`))
+	if problem := api.AsProblem(err); problem != nil {
+		api.WriteProblem(w, problem)
+		return
+	}
+	api.WriteProblem(w, api.ErrInternal(
+		"Gregale could not render this dashboard page.",
+	).WithHint("Reload the page; if it still fails, contact support."))
 }
 
 // dashboardAccountView adapts state.Account into the dashboard's
@@ -2572,6 +2579,7 @@ func (s *server) renderOrgDetail(w http.ResponseWriter, r *http.Request, log *sl
 		}
 		data.Invitations = items
 	}
+	populateOrgActivity(r.Context(), r, log, s.store, org, &data)
 
 	page := dashboard.Page{
 		Title:   org.Name,
@@ -2581,6 +2589,99 @@ func (s *server) renderOrgDetail(w http.ResponseWriter, r *http.Request, log *sl
 	}
 	if err := dashboard.Render(w, log, httpsec.NonceFromContext(r.Context()), page); err != nil {
 		renderProblem(w, log, err)
+	}
+}
+
+const orgDashboardActivityPageSize = 25
+
+// populateOrgActivity reads the customer-safe activity projection for this
+// organization. The membership check in renderOrgDetail has already passed;
+// every query remains pinned to the authoritative org ID rather than a URL
+// parameter.
+func populateOrgActivity(ctx context.Context, r *http.Request, log *slog.Logger, store state.Store, org state.Org, data *dashboard.OrgDetailData) {
+	query := r.URL.Query()
+	kindPrefix := query.Get("activity_kind_prefix")
+	if !validDashboardActivityKindPrefix(kindPrefix) {
+		data.ActivityError = "unsupported event type filter"
+		return
+	}
+	actorType := query.Get("activity_actor_type")
+	if !validDashboardActivityActor(actorType) {
+		data.ActivityError = "unsupported actor filter"
+		return
+	}
+	data.ActivityKindPrefix = kindPrefix
+	data.ActivityActorType = actorType
+
+	orgID, err := uuid.Parse(org.ID)
+	if err != nil {
+		log.Warn("dashboard renderOrgDetail: invalid organization id for activity", "org_id", org.ID, "err", err)
+		data.ActivityError = "timeline is temporarily unavailable"
+		return
+	}
+	activityStore, ok := store.(state.OrgActivityStore)
+	if !ok {
+		data.ActivityError = "timeline is unavailable for this storage backend"
+		return
+	}
+	filter := state.OrgActivityFilter{OrgID: orgID, KindPrefix: kindPrefix, ActorType: state.OrgActivityActorType(actorType), Limit: orgDashboardActivityPageSize + 1}
+	if rawBefore := query.Get("activity_before"); rawBefore != "" {
+		key, decodeErr := cursor.Decode(rawBefore)
+		id, idErr := strconv.ParseInt(key.ID, 10, 64)
+		if decodeErr != nil || idErr != nil || id < 1 {
+			data.ActivityError = "invalid activity page cursor; clear the filters to start again"
+			return
+		}
+		filter.Before = &state.OrgActivityCursor{OccurredAt: key.CreatedAt, ID: id}
+	}
+	rows, err := activityStore.ListOrgActivity(ctx, filter)
+	if err != nil {
+		log.Warn("dashboard renderOrgDetail: ListOrgActivity", "org_id", org.ID, "err", err)
+		data.ActivityError = "timeline is temporarily unavailable"
+		return
+	}
+	hasNext := len(rows) > orgDashboardActivityPageSize
+	if hasNext {
+		rows = rows[:orgDashboardActivityPageSize]
+	}
+	data.Activity = make([]dashboard.OrgActivityItem, 0, len(rows))
+	for _, row := range rows {
+		data.Activity = append(data.Activity, dashboard.OrgActivityItem{
+			OccurredAt: row.OccurredAt.UTC().Format("2006-01-02 15:04 MST"),
+			Kind:       row.Kind,
+			Summary:    orgActivitySummary(row),
+		})
+	}
+	if hasNext && len(rows) > 0 {
+		last := rows[len(rows)-1]
+		values := url.Values{}
+		if kindPrefix != "" {
+			values.Set("activity_kind_prefix", kindPrefix)
+		}
+		if actorType != "" {
+			values.Set("activity_actor_type", actorType)
+		}
+		values.Set("activity_before", cursor.Encode(cursor.Key{CreatedAt: last.OccurredAt, ID: strconv.FormatInt(last.ID, 10)}))
+		data.ActivityNextURL = r.URL.Path + "?" + values.Encode()
+	}
+}
+
+func validDashboardActivityKindPrefix(prefix string) bool {
+	switch prefix {
+	case "", "app.", "deploy.", "env.", "domain.":
+		return true
+	default:
+		return false
+	}
+}
+
+func validDashboardActivityActor(actor string) bool {
+	switch state.OrgActivityActorType(actor) {
+	case "", state.OrgActivityActorUser, state.OrgActivityActorAPIKey,
+		state.OrgActivityActorGitHub, state.OrgActivityActorSystem, state.OrgActivityActorOperator:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -3075,16 +3176,23 @@ func severityOrdinal(s string) int {
 func dashboardDeploymentItem(d state.Deployment) dashboard.DeploymentItem {
 	repoURL, commitURL, checksURL, commitSHA, commitShort := githubDeploymentLinks(d.SourceURL, d.CommitSHA)
 	return dashboard.DeploymentItem{
-		ID:                d.ID,
-		Status:            string(d.Status),
-		Kind:              string(d.Kind),
-		CreatedAt:         d.CreatedAt.UTC().Format(time.RFC3339),
-		Error:             d.Error,
-		ErrorCode:         d.ErrorCode,
-		ErrorHint:         d.ErrorHint,
-		ErrorWhy:          d.ErrorWhy,
-		ErrorFix:          d.ErrorFix,
-		ErrorRelevantLogs: d.ErrorRelevantLogs,
+		ID:                    d.ID,
+		Revision:              d.Revision, // ADR-198
+		Status:                string(d.Status),
+		Kind:                  string(d.Kind),
+		CreatedAt:             d.CreatedAt.UTC().Format(time.RFC3339),
+		RolloutState:          state.NormalizeRolloutState(d.RolloutState),
+		ServiceHandoffAction:  d.ServiceRolloutHandoff.Action,
+		ServiceHandoffPhase:   d.ServiceRolloutHandoff.Phase,
+		ServiceHandoffRetries: d.ServiceRolloutHandoff.RetryCount,
+		ServiceHandoffMissing: append([]string(nil), d.ServiceRolloutHandoff.MissingGateways...),
+		ServiceHandoffError:   d.ServiceRolloutHandoff.LastError,
+		Error:                 d.Error,
+		ErrorCode:             d.ErrorCode,
+		ErrorHint:             d.ErrorHint,
+		ErrorWhy:              d.ErrorWhy,
+		ErrorFix:              d.ErrorFix,
+		ErrorRelevantLogs:     d.ErrorRelevantLogs,
 		// Issue #606 / SAFE-RELEASES-E.1: structured deployer
 		// attribution surfaced on the dashboard deploy detail
 		// page. Server-stamped from the HTTP request context
@@ -3336,7 +3444,14 @@ func (s *server) renderDomainDoctor(w http.ResponseWriter, r *http.Request, log 
 	report, err := s.buildDoctorReport(ctx, d)
 	if err != nil {
 		log.Warn("dashboard renderDomainDoctor: buildDoctorReport failed", "domain", domain, "err", err)
-		http.Error(w, "doctor unavailable", http.StatusServiceUnavailable)
+		api.WriteProblemForRequest(w, r, api.NewProblem(
+			http.StatusServiceUnavailable,
+			api.CodeDoctorUnavailable,
+			"Domain diagnostics temporarily unavailable",
+			"Gregale could not complete the domain checks right now.",
+		).WithHeader("Retry-After", "30").
+			WithHint("Wait a moment, then run the domain check again.").
+			WithDocs("https://gregale.dev/docs/domains/doctor"))
 		return
 	}
 	view := dashboard.DomainDoctorView{

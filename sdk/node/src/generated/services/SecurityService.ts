@@ -8,6 +8,8 @@ import type { AppSecurityRequest } from '../models/AppSecurityRequest.js';
 import type { AppSecurityResponse } from '../models/AppSecurityResponse.js';
 import type { AppStaticEgressIPResponse } from '../models/AppStaticEgressIPResponse.js';
 import type { AppTrustedSignerListResponse } from '../models/AppTrustedSignerListResponse.js';
+import type { SecurityQuarantineRecoveryRequest } from '../models/SecurityQuarantineRecoveryRequest.js';
+import type { SecurityQuarantineRecoveryResponse } from '../models/SecurityQuarantineRecoveryResponse.js';
 import type { SetAppStaticEgressIPRequest } from '../models/SetAppStaticEgressIPRequest.js';
 import type { TrustedSigner } from '../models/TrustedSigner.js';
 import type { CancelablePromise } from '../core/CancelablePromise.js';
@@ -41,9 +43,9 @@ export class SecurityService {
       errors: {
         401: `code: unauthorized`,
         404: `code: app_not_found — slug does not exist for the authenticated account.`,
-        429: `429. Two response shapes:
-        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
-        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        429: `429 application/problem+json response. Authentication throttling uses
+        \`auth_rate_limited\`; plan and usage limits use their specific stable
+        codes such as \`plan_limit_concurrency\` and \`quota_exhausted\`.
         `,
       },
     });
@@ -54,8 +56,9 @@ export class SecurityService {
    * flag and deploy-time posture policy. Mounted with
    * `authLimited → requireMFA → requireScope(ScopesAdminOnly...)`.
    * `security_policy=enforce` rejects new deploys while high-severity
-   * posture findings remain; `warn` is advisory and `off` preserves
-   * historical behavior.
+   * configuration findings remain; live-image evidence findings remain
+   * visible but do not block the replacement needed for recovery. `warn`
+   * is advisory and `off` preserves historical behavior.
    *
    * Each field is optional; omitted fields are unchanged and supplied
    * fields are applied atomically.
@@ -88,6 +91,50 @@ export class SecurityService {
         401: `code: unauthorized`,
         403: `code: forbidden — caller is authenticated but lacks the required scope, OR plan_limit_trusted_signers / plan_limit_secret / etc. when the resource count would exceed the plan cap.`,
         404: `code: app_not_found — slug does not exist for the authenticated account.`,
+        500: `code: capacity — server-side error; retry with backoff.`,
+      },
+    });
+  }
+  /**
+   * Recover an app from image-scan quarantine.
+   * Restores an app to active only when the selected deployment is live,
+   * newer than the recorded security quarantine, uses a different image
+   * digest, and carries complete digest-matched scan evidence with zero
+   * HIGH, CRITICAL, or UNKNOWN findings. Every live canary deployment is
+   * checked before traffic is restored. The transition is idempotent and
+   * emits an audited security recovery event.
+   * Requires deploy-write scope and MFA.
+   *
+   * @returns SecurityQuarantineRecoveryResponse The app was restored to active.
+   * @throws ApiError
+   */
+  public static recoverAppSecurityQuarantine({
+    slug,
+    requestBody,
+  }: {
+    /**
+     * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
+     */
+    slug: string,
+    requestBody: SecurityQuarantineRecoveryRequest,
+  }): CancelablePromise<SecurityQuarantineRecoveryResponse> {
+    return __request(OpenAPI, {
+      method: 'POST',
+      url: '/v1/apps/{slug}/security/recover',
+      path: {
+        'slug': slug,
+      },
+      body: requestBody,
+      mediaType: 'application/json',
+      errors: {
+        400: `code: validation_failed | source_invalid | build_undetected | handler_missing | image_required | cron_invalid | secret_invalid_key`,
+        401: `code: unauthorized`,
+        404: `code: app_not_found — slug does not exist for the authenticated account.`,
+        409: `The replacement deployment is not yet eligible for recovery.`,
+        429: `429 application/problem+json response. Authentication throttling uses
+        \`auth_rate_limited\`; plan and usage limits use their specific stable
+        codes such as \`plan_limit_concurrency\` and \`quota_exhausted\`.
+        `,
         500: `code: capacity — server-side error; retry with backoff.`,
       },
     });

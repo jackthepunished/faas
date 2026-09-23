@@ -160,6 +160,9 @@ type OpsMetrics struct {
 	// operators distinguish a healthy rollout from a service that is
 	// below its desired serving capacity without scraping scheduler logs.
 	serviceReplicaStatus *prometheus.GaugeVec
+	// serviceRolloutHandoffPhaseDuration measures routing and request-drain
+	// barriers with closed labels and no customer identifiers.
+	serviceRolloutHandoffPhaseDuration *prometheus.HistogramVec
 	// daemonRestartCount (issue #573 / ADR-128) is the per-(daemon,
 	// version) counter that records how many times systemd has
 	// restarted THIS process in its lifetime. The producer is the
@@ -271,6 +274,17 @@ type OpsMetrics struct {
 	// cluster plan's "Decisions baked in" §2 (Prometheus
 	// cardinality discipline).
 	gatewayInflightRequests *prometheus.GaugeVec
+	// egressCircuitState (ADR-201 §3) is schedd-emitted, so it belongs on
+	// the shared OpsMetrics registry rather than the gatewayd-local one.
+	// The four gateway-side ADR-201 metrics live in pkg/gateway.Metrics
+	// instead — per the rule recorded at pkg/gateway/metrics.go:48, a
+	// wire-side mirror is not added without a cross-daemon consumer.
+	//
+	// Bounded by Limits.EgressCircuitBreakersPerApp
+	// (≤50 per app), so {app_id, upstream_hash} is safe. upstream_hash is
+	// the §11-redacted identifier — the plaintext host must never reach a
+	// label.
+	egressCircuitState *prometheus.GaugeVec
 	// wakeSnapshotTier (issue #470 / PR C / ADR-074) — closed-set
 	// counter for the warm-vs-init-vs-cold-boot choice Engine.usableSnapshotForWake
 	// makes on every wake. Labels ∈ {warm, init, cold_boot_fallback}.
@@ -1335,6 +1349,10 @@ type OpsMetrics struct {
 	// {__unknown__, <custom name>} admission per the
 	// accountLabelSet precedent at the bottom of this file.
 	sidecarRestartTotal *prometheus.CounterVec
+	// sidecarHealthTransitionsTotal counts guest-init sidecar lifecycle
+	// transitions by status. Status is a closed five-value enum, so the
+	// additional label does not create unbounded cardinality.
+	sidecarHealthTransitionsTotal *prometheus.CounterVec
 	// scaleUpDecisions: per-app scale-up trigger decisions (issue #169 /
 	// #172). Counter labelled by app_id and outcome ∈ {admit,
 	// reject_at_cap, no_signal}. App cardinality is bounded
@@ -1343,6 +1361,18 @@ type OpsMetrics struct {
 	// series surface in /metrics from boot (same precedent as
 	// stripePushDur / buildDur).
 	scaleUpDecisions *prometheus.CounterVec
+	// scaleUpWinningSignal: which declared target produced the highest
+	// desired count on an admit (ADR-194). See the CounterOpts below for
+	// why this is a separate series rather than a label.
+	scaleUpWinningSignal *prometheus.CounterVec
+	// scheduledFloorActive: per-app floor from an open ADR-195 schedule.
+	scheduledFloorActive *prometheus.GaugeVec
+	// appOwnershipChecks counts every ownsApp decision, labelled by
+	// outcome. It is the consumer-side half of the broadcast-amplification
+	// measurement: pg_notify has no routing, so every schedd in the fleet
+	// receives every app-scoped notification and all but the owner discard
+	// it here. The not_owned rate is that discarded work, made countable.
+	appOwnershipChecks *prometheus.CounterVec
 	// scaleDownDecisions: per-app aggressive-reaper decisions
 	// (issue #171). Counter labelled by app_id and outcome ∈ {park,
 	// keep}; one observation per app per 10 s reaper tick that ran
@@ -1869,7 +1899,11 @@ type OpsMetrics struct {
 	dlqReplayedTotal *prometheus.CounterVec
 	// dlqPurgedTotal counts operator acknowledgement/purge outcomes.
 	dlqPurgedTotal *prometheus.CounterVec
-	queue          *queueMetrics
+	// dlqRetentionPurgedTotal counts unified failed-events projection rows
+	// removed by the scheduler retention sweep.
+	dlqRetentionPurgedTotal prometheus.Counter
+	queue                   *queueMetrics
+	delayedTasks            *delayedTaskMetrics
 	// auditLogWriteTotal (PR-#TBD / C5): per-(endpoint, kind)
 	// counter incremented on every successful events-table
 	// append at pkg/audit.Auditor.Emit. Splits the legacy
@@ -1921,6 +1955,88 @@ type OpsMetrics struct {
 	// owning account became non-active. The scheduler repairs the instance in
 	// the same path; this counter preserves an alertable record of the breach.
 	accountLifecycleViolations prometheus.Counter
+	// grpcClientCallsWithoutDeadline (ADR-190): unary RPCs issued through
+	// wire.DialContext whose caller set no deadline. The interceptor
+	// applies FAAS_GRPC_DEFAULT_DEADLINE; this counter, labelled by full
+	// gRPC method, is how the remaining unbudgeted call sites are found.
+	// Any non-zero series is a code fix waiting to happen, not an alert.
+	grpcClientCallsWithoutDeadline *prometheus.CounterVec
+	// loopStalled / loopLastBeatAgeSeconds (ADR-190): per-loop
+	// liveness published by wire.StartWatchdog from the daemon's
+	// Liveness registry. loop is a closed per-daemon set ("runtime"
+	// everywhere; "main" on schedd; "sweep" on vmmd). stalled=1 means
+	// the loop is past its budget and the systemd watchdog ping is
+	// suspended — the unit restarts after WatchdogSec unless the loop
+	// recovers first. Backs the FaasDaemonLoopStalled alert.
+	loopStalled            *prometheus.GaugeVec
+	loopLastBeatAgeSeconds *prometheus.GaugeVec
+	// dbNotifyHubReconnects / dbNotifyHubDropped (ADR-190): health of
+	// the per-daemon LISTEN hub (pkg/db/notify_hub.go). Reconnects
+	// count lost LISTEN connections; dropped counts notifications a
+	// subscriber could not buffer (the durable source + safety tick
+	// recover the work, but a sustained rate means a consumer is
+	// falling behind). Installed via db.SetNotifyHubObserver in
+	// RegisterDefaultOps.
+	dbNotifyHubReconnects prometheus.Counter
+	dbNotifyHubDropped    *prometheus.CounterVec
+	dbNotifyHubDelivered  *prometheus.CounterVec
+	// loopWork / loopWorkDuration (ADR-191): schedd's bounded off-loop
+	// work pool. kind is the closed task set (prime, restart,
+	// app_reconcile, deployment_reconcile, job_cancel); outcome is
+	// queued / inline / dropped / coalesced / panicked. A sustained
+	// `dropped` rate means a kind's slot budget is too small for the
+	// notification rate; any `panicked` is a bug.
+	loopWork         *prometheus.CounterVec
+	loopWorkDuration *prometheus.HistogramVec
+	// instanceDivergence (ADR-191): rows this schedd believes are live
+	// that the owning vmmd did not report, after the confirm-twice and
+	// grace gates. outcome ∈ {detected, failed, conflict, error,
+	// suppressed}. `suppressed` is the report-only mode's count of what
+	// enforcement would have acted on.
+	instanceDivergence *prometheus.CounterVec
+}
+
+// LoopWork returns the per-(kind, outcome) counter for schedd's off-loop
+// work pool (ADR-191). nil-safe.
+func (m *OpsMetrics) LoopWork(kind, outcome string) prometheus.Counter {
+	if m == nil || m.loopWork == nil {
+		return nil
+	}
+	return m.loopWork.WithLabelValues(kind, outcome)
+}
+
+// ObserveLoopWorkDuration records how long one off-loop task ran
+// (ADR-191). nil-safe.
+func (m *OpsMetrics) ObserveLoopWorkDuration(kind string, seconds float64) {
+	if m == nil || m.loopWorkDuration == nil {
+		return
+	}
+	m.loopWorkDuration.WithLabelValues(kind).Observe(seconds)
+}
+
+// InstanceDivergence returns the per-outcome counter for the instance
+// divergence reconciler (ADR-191). nil-safe.
+func (m *OpsMetrics) InstanceDivergence(outcome string) prometheus.Counter {
+	if m == nil || m.instanceDivergence == nil {
+		return nil
+	}
+	return m.instanceDivergence.WithLabelValues(outcome)
+}
+
+// HubReconnect implements db.NotifyHubObserver. nil-safe.
+func (m *OpsMetrics) HubReconnect() {
+	if m == nil || m.dbNotifyHubReconnects == nil {
+		return
+	}
+	m.dbNotifyHubReconnects.Inc()
+}
+
+// HubDropped implements db.NotifyHubObserver. nil-safe.
+func (m *OpsMetrics) HubDropped(channel string) {
+	if m == nil || m.dbNotifyHubDropped == nil {
+		return
+	}
+	m.dbNotifyHubDropped.WithLabelValues(channel).Inc()
 }
 
 // NewOpsMetrics builds an OpsMetrics keyed on the per-daemon prefix — e.g.
@@ -1929,6 +2045,7 @@ type OpsMetrics struct {
 func NewOpsMetrics(prefix string) *OpsMetrics {
 	reg := prometheus.NewRegistry()
 	queue := newQueueMetrics(prefix)
+	delayedTasks := newDelayedTaskMetrics(prefix)
 	ops := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: prefix + "_ops_total",
 		Help: "Count of operations, labelled by op name and terminal status code.",
@@ -2064,6 +2181,18 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	for _, app := range []string{labelAppUnknown, otherAppLabel} {
 		for _, state := range serviceReplicaMetricStates {
 			serviceReplicaStatus.WithLabelValues(app, state)
+		}
+	}
+	serviceRolloutHandoffPhaseDuration := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    prefix + "_service_rollout_handoff_phase_duration_seconds",
+		Help:    "Duration of zero-downtime service rollout handoff barriers, labelled by action in {promote,abort}, phase in {routing,draining}, and outcome in {success,timeout,error}. Labels are closed and contain no customer identifiers.",
+		Buckets: []float64{0.01, 0.1, 0.5, 1, 2, 5, 10, 15, 25, 30, 60},
+	}, []string{"action", "phase", "outcome"})
+	for _, action := range []string{"promote", "abort"} {
+		for _, phase := range []string{"routing", "draining"} {
+			for _, outcome := range []string{"success", "timeout", "error"} {
+				serviceRolloutHandoffPhaseDuration.WithLabelValues(action, phase, outcome)
+			}
 		}
 	}
 	// Issue #573 / ADR-128: per-(daemon, version) restart counter.
@@ -3186,6 +3315,10 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_sidecar_restart_total",
 		Help: "Count of sidecar restart cycles, per (app, sidecar) — incremented by vmmd's dispatchSidecarRestart (PR-C §4) on every guest-init Supervisor.OnCrash event for an essential sidecar. Bounded by apps × SidecarCapMax (issue #463 / ADR-069 cap = 2).",
 	}, []string{"app", "sidecar"})
+	sidecarHealthTransitionsTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_sidecar_health_transition_total",
+		Help: "Count of sidecar lifecycle health transitions, per (app, sidecar, status), emitted by guest-init over the vmmd event channel.",
+	}, []string{"app", "sidecar", "status"})
 	// Issue #279 (PR-B, CPU-hour visibility): cumulative
 	// CPU-seconds per (app, node), sourced from the vmmd
 	// cpu_seconds wire field. Sum rollup (cumulative work,
@@ -3245,6 +3378,38 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_scale_up_decisions_total",
 		Help: "Per-app scale-up trigger decisions. outcome ∈ {admit, reject_at_cap, no_signal, cooldown_held, min_floor_already, overage_cap_reached}; app label is the apps.id.",
 	}, []string{"app", "outcome"})
+	// ADR-194 shipped a multi-signal arbiter but no way to see which
+	// signal won. `_scale_up_decisions_total{outcome="admit"}` answers
+	// "did it scale"; with a list of declared targets that is no longer a
+	// complete answer, and an operator tuning a policy needs to know WHICH
+	// target is binding before changing any of them.
+	//
+	// A separate counter rather than a `signal` label on
+	// _scale_up_decisions_total: adding a dimension to an existing series
+	// breaks every dashboard and recording rule already summing it.
+	scaleUpWinningSignal := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_scale_up_winning_signal_total",
+		Help: "Per-app admissions attributed to the scaling signal that produced the highest desired instance count (ADR-194 arbitration). metric ∈ the closed api.ScalingMetrics() set. Sum over `metric` equals _scale_up_decisions_total{outcome=\"admit\"} for apps scaled by the targets trigger. Use this to find which declared target is actually binding before tuning a policy.",
+	}, []string{"app", "metric"})
+	// ADR-195 scheduled floors are invisible in the existing floor
+	// metrics: _meterd_floor_applied_total tells an operator a floor was
+	// applied and billed, not that a SCHEDULE raised it. Without this
+	// gauge the only way to answer "is the 08:00 window actually open
+	// right now?" is to re-evaluate the cron by hand — and a scheduled
+	// floor is billed, so "is it on when it should be" is a revenue
+	// question, not just an operational one.
+	scheduledFloorActive := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: prefix + "_scheduled_floor_instances",
+		Help: "Per-app warm floor currently demanded by an open ADR-195 scaling schedule, or 0 when no window is open. Compare against the app's static min_instances to see which one is binding; a persistent non-zero value on an app whose window should have closed means the cron or its timezone is not what the author intended.",
+	}, []string{"app"})
+	appOwnershipChecks := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_app_ownership_checks_total",
+		Help: "schedd ownsApp decisions, outcome ∈ {owned, not_owned}. ADR-062 shards apps across schedds by apps.node_id, but pg_notify has no routing: every app-scoped notification reaches every schedd in the fleet and all but the owner discard it. `not_owned` is that discarded work. The ratio not_owned/(owned+not_owned) is the broadcast amplification the fleet pays, and it should approach (N-1)/N as nodes are added — measure it before deciding whether per-owner notify channels are worth the change.",
+	}, []string{"outcome"})
+	// Closed two-value set: render zero from boot rather than appearing only
+	// once a fleet is large enough for the discard path to fire.
+	appOwnershipChecks.WithLabelValues("owned")
+	appOwnershipChecks.WithLabelValues("not_owned")
 	scaleUpAdmitRPS := prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name: prefix + "_scale_up_admit_rps",
 		Help: "Per-instance RPS at the moment the trigger admitted a new instance. Sized to the per-instance RPS target range (1..1000); p95/p99 is the spec §12 'scale-up aggressiveness' diagnostic.",
@@ -3512,7 +3677,8 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	commonCollectors := []prometheus.Collector{
 		queue.depth, queue.inFlight, queue.oldestAge, queue.deadLetter,
 		queue.bindingDepth, queue.bindingInFlight, queue.bindingLagSeconds, queue.bindingDeadLetter, queue.bindingWorkerDemand, queue.bindingThrottled,
-		ops, dur, watchdogKills, warmSnapshotErrors, warmPoolSize, warmPoolResumeTotal, warmupErrors, livenessRestarts, workloadOOMKills, serviceReplicaStatus, daemonRestartCount, daemonBuildInfo, daemonUptimeSeconds, daemonReady, daemonReadyReason, faasDeployVersion, bridgeFramingTotal, guestInitDuration, wakeSnapshotTier, executionActive, executionTotal, executionPhaseDuration, executionFailures, executionOutputBytes, executionSweeps, executionQueueDepth, executionQueueOldestWait, executionWorkers, wakeFailure, wakeLatency, guestTailSeconds, guestTailFailedTotal, tailCapReached, evictedPriority, evictionFiredTotal, eventsWriteFail, auditWriteFail, cveCheckTotal, cvesOpenTotal,
+		delayedTasks.dispatchTotal, delayedTasks.scheduleLagSeconds,
+		ops, dur, watchdogKills, warmSnapshotErrors, warmPoolSize, warmPoolResumeTotal, warmupErrors, livenessRestarts, workloadOOMKills, serviceReplicaStatus, serviceRolloutHandoffPhaseDuration, daemonRestartCount, daemonBuildInfo, daemonUptimeSeconds, daemonReady, daemonReadyReason, faasDeployVersion, bridgeFramingTotal, guestInitDuration, wakeSnapshotTier, executionActive, executionTotal, executionPhaseDuration, executionFailures, executionOutputBytes, executionSweeps, executionQueueDepth, executionQueueOldestWait, executionWorkers, wakeFailure, wakeLatency, guestTailSeconds, guestTailFailedTotal, tailCapReached, evictedPriority, evictionFiredTotal, eventsWriteFail, auditWriteFail, cveCheckTotal, cvesOpenTotal,
 		writeRedirectTotal, writeRedirectLatency,
 		auditWriteDur, cronFireNowDispatchDur, accountOrgMismatch, requestFailures, requestTotal, stripePushDur, paddlePushDur, polarPushDur,
 		buildDur, buildQueueWait, buildCacheOutcome, builderWarmRestoreTotal,
@@ -3543,7 +3709,9 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		instanceCPUSecondsTotal,
 		instanceStatsCollectDur, instanceStatsPartialErrors,
 		sidecarRestartTotal,
-		scaleUpDecisions, scaleDownDecisions, scaleUpAdmitRPS, sseClients,
+		sidecarHealthTransitionsTotal,
+		scaleUpDecisions, scaleUpWinningSignal, scheduledFloorActive, scaleDownDecisions, scaleUpAdmitRPS, sseClients,
+		appOwnershipChecks,
 		egressDeny, egressDenied,
 		failedLoginTotal, failedLoginDropped,
 		failedLoginAuditWriteFailures,
@@ -3700,7 +3868,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// Only imaged increments via ObserveDeployStageDuration.
 	deployStageDuration := prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    prefix + "_deploy_stage_duration_seconds",
-		Help:    "Per-deploy stage wall-clock duration in seconds (ADR-117 §Production-ready follow-on). One observation per `transitionWithStage` write (pkg/imaged/handler.go). stage ∈ {source_download, dependency_restore, image_build, security_scan, snapshot_prepare, readiness}; status ∈ {completed, failed}. Buckets skew to the long tail (300s) so a stalled image_build surfaces as a top-bucket observation rather than +Inf.",
+		Help:    "Per-deploy stage wall-clock duration in seconds (ADR-117 §Production-ready follow-on). One observation per successful stage closure in imaged. stage ∈ {source_download, dependency_restore, image_build, security_scan, snapshot_prepare, readiness}; status ∈ {completed, failed}. Buckets skew to the long tail (300s) so a stalled image_build surfaces as a top-bucket observation rather than +Inf.",
 		Buckets: []float64{0.1, 0.5, 1, 2, 5, 10, 30, 60, 120, 300},
 	}, []string{"stage", "status"})
 	commonCollectors = append(commonCollectors, deployStageDuration)
@@ -4132,7 +4300,17 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	gatewayInflightRequests.WithLabelValues("gatewayd-public", "http")
 	gatewayInflightRequests.WithLabelValues("gatewayd-public", "upgrade")
 	gatewayInflightRequests.WithLabelValues("gatewayd-public", "control")
-	commonCollectors = append(commonCollectors, gatewayDrainWaitSeconds, gatewayInflightRequests)
+	// ── ADR-201 §3 egress circuit state ──────────────────────────────
+	// Not pre-instantiated: the {app_id, upstream_hash} pair cannot be
+	// enumerated at boot. Series surface as customers opt upstreams in, and
+	// ClearEgressCircuitState drops them when a row is retired so a deleted
+	// upstream cannot leave a stale gauge asserting a dependency is broken.
+	egressCircuitState := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: prefix + "_egress_circuit_state",
+		Help: "ADR-201 §3 egress circuit state per declared upstream: 0=closed, 1=half_open, 2=open. While 2, the app's NEW connections to that upstream are rejected with a TCP reset instead of hanging. Labelled by {app_id, upstream_hash}; upstream_hash is the §11-redacted host identifier and the plaintext host never appears. Bounded by Limits.EgressCircuitBreakersPerApp (≤50/app).",
+	}, []string{"app_id", "upstream_hash"})
+	commonCollectors = append(commonCollectors, gatewayDrainWaitSeconds, gatewayInflightRequests,
+		egressCircuitState)
 	// Issue #757 / ADR-118 commit 9: ESM metric collectors. All
 	// three are pre-instantiated at boot from the closed sets
 	// below so the rows surface in /metrics from process start —
@@ -4214,6 +4392,10 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: "faas_dlq_purged_total",
 		Help: "Count of dead-letter purge attempts, labelled by bounded app and closed status.",
 	}, []string{"app", "status"})
+	dlqRetentionPurgedTotal := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "faas_dlq_retention_purged_total",
+		Help: "Count of unified failed-events projection rows removed by the scheduler retention sweep. Source rows and audit events are not deleted.",
+	})
 	for _, app := range []string{labelAppUnknown, otherAppLabel} {
 		for _, kind := range []string{"dead_letter", "poison_record", "max_attempts", "broker_error", "rate_limited", "timeout", "failed", "other"} {
 			dlqEventsTotal.WithLabelValues(app, kind)
@@ -4223,7 +4405,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 			dlqPurgedTotal.WithLabelValues(app, status)
 		}
 	}
-	commonCollectors = append(commonCollectors, dlqEventsTotal, dlqReplayedTotal, dlqPurgedTotal)
+	commonCollectors = append(commonCollectors, dlqEventsTotal, dlqReplayedTotal, dlqPurgedTotal, dlqRetentionPurgedTotal)
 
 	// PR-#TBD / C5 — operator-action observability layer
 	// (PR #1106 P2d follow-on). Four new series feed the
@@ -4380,6 +4562,45 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		Name: prefix + "_account_lifecycle_violations_total",
 		Help: "Count of live or waking instances reconciled after their owning account became suspended or deletion-pending.",
 	})
+	grpcClientCallsWithoutDeadline := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_grpc_client_calls_without_deadline_total",
+		Help: "Unary gRPC calls issued through wire.DialContext with no caller deadline (ADR-190). The interceptor bounded the call with FAAS_GRPC_DEFAULT_DEADLINE; each labelled method is a call site that still needs an explicit budget.",
+	}, []string{"method"})
+	loopStalled := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: prefix + "_loop_stalled",
+		Help: "1 when the named daemon loop has not beaten within its budget (ADR-190). While any loop is stalled the systemd watchdog ping is suspended and the unit restarts after WatchdogSec. loop is a small closed per-daemon set.",
+	}, []string{"loop"})
+	loopLastBeatAgeSeconds := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: prefix + "_loop_last_beat_age_seconds",
+		Help: "Seconds since the named daemon loop last reported progress (ADR-190). Sampled once per second by wire.StartWatchdog.",
+	}, []string{"loop"})
+	dbNotifyHubReconnects := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: prefix + "_db_notify_hub_reconnects_total",
+		Help: "Times the daemon's single LISTEN connection was lost and re-established (ADR-190). A steady rate means Postgres is dropping idle connections or restarting.",
+	})
+	dbNotifyHubDropped := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_db_notify_hub_dropped_total",
+		Help: "Notifications dropped because a subscriber's fan-out buffer was full (ADR-190), labelled by channel. Consumers recover from their durable table on the next safety tick; a sustained rate means that consumer is falling behind.",
+	}, []string{"channel"})
+	dbNotifyHubDelivered := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_db_notify_hub_delivered_total",
+		Help: "Notifications this daemon's LISTEN hub handed to a subscriber, by channel. pg_notify carries no routing, so one emit fans out to every interested subscriber on every daemon on every node. Summed fleet-wide and divided by the emit rate this is the broadcast amplification factor; read next to schedd_app_ownership_checks_total{outcome=\"not_owned\"}, which counts the share of that fan-out the receiving schedd then discards. Together they price per-owner notify channels before anyone builds them.",
+	}, []string{"channel"})
+	loopWork := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_loop_work_total",
+		Help: "Tasks schedd's notification loop handed to its bounded off-loop work pool (ADR-191), labelled by kind and outcome ∈ {queued, inline, dropped, coalesced, panicked}. `dropped` is benign in isolation (the durable table plus a safety ticker retries) but a sustained rate means the kind's slot budget is too small; any `panicked` is a bug.",
+	}, []string{"kind", "outcome"})
+	loopWorkDuration := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name: prefix + "_loop_work_duration_seconds",
+		Help: "How long one off-loop task ran (ADR-191), labelled by kind. The prime bucket carries cold boot plus snapshot capture, so its tail is tens of seconds by design.",
+		// Reconciles are millisecond-scale database work; prime is
+		// tens of seconds. One set of buckets has to span both.
+		Buckets: []float64{0.005, 0.025, 0.1, 0.5, 1, 5, 15, 30, 60, 120},
+	}, []string{"kind"})
+	instanceDivergence := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: prefix + "_instance_divergence_total",
+		Help: "Instances schedd believes are live that the owning vmmd did not report, after the grace and confirm-twice gates (ADR-191). outcome ∈ {suppressed, failed, conflict, error}. `suppressed` is report-only mode counting what enforcement would have acted on; a non-zero rate means rows and reality have drifted and customers may be billed for VMs that no longer exist.",
+	}, []string{"outcome"})
 	commonCollectors = append(commonCollectors,
 		uploadSessionCreatedTotal,
 		uploadSessionCommittedTotal,
@@ -4387,6 +4608,15 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		uploadSessionReaperRowsDeletedTotal,
 		uploadSessionReaperFailedTotal,
 		accountLifecycleViolations,
+		grpcClientCallsWithoutDeadline,
+		loopStalled,
+		loopLastBeatAgeSeconds,
+		dbNotifyHubReconnects,
+		dbNotifyHubDelivered,
+		dbNotifyHubDropped,
+		loopWork,
+		loopWorkDuration,
+		instanceDivergence,
 	)
 	// Pre-instantiate {plan} closed-set series so /metrics surfaces
 	// zero values from boot. Plan enum mirrors the four-value
@@ -4808,6 +5038,9 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 	// leaks through (should never happen — guest-init always
 	// stamps the sidecar's name).
 	sidecarRestartTotal.WithLabelValues("", "")
+	for _, status := range []string{"starting", "healthy", "unhealthy", "restarting", "failed"} {
+		sidecarHealthTransitionsTotal.WithLabelValues("", "", status)
+	}
 	// issue #301 (ADR-043, per-plan CPU fairness observability):
 	// pre-instantiate the ("other", "other") overflow row so the
 	// dashboard panel selector {app_id!="other"} never sees "no
@@ -4832,6 +5065,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		livenessRestarts:                           livenessRestarts,
 		workloadOOMKills:                           workloadOOMKills,
 		serviceReplicaStatus:                       serviceReplicaStatus,
+		serviceRolloutHandoffPhaseDuration:         serviceRolloutHandoffPhaseDuration,
 		daemonRestartCount:                         daemonRestartCount,
 		daemonBuildInfo:                            daemonBuildInfo,
 		daemonUptimeSeconds:                        daemonUptimeSeconds,
@@ -4843,6 +5077,7 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		wakeRPCDuration:                            wakeRPCDuration,
 		gatewayDrainWaitSeconds:                    gatewayDrainWaitSeconds,
 		gatewayInflightRequests:                    gatewayInflightRequests,
+		egressCircuitState:                         egressCircuitState,
 		wakeSnapshotTier:                           wakeSnapshotTier,
 		executionActive:                            executionActive,
 		executionTotal:                             executionTotal,
@@ -4988,8 +5223,12 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		instanceStatsCollectDur:                               instanceStatsCollectDur,
 		instanceStatsPartialErrors:                            instanceStatsPartialErrors,
 		sidecarRestartTotal:                                   sidecarRestartTotal,
+		sidecarHealthTransitionsTotal:                         sidecarHealthTransitionsTotal,
 		cpuStatsCollectDur:                                    cpuStatsCollectDurLocal,
 		scaleUpDecisions:                                      scaleUpDecisions,
+		scaleUpWinningSignal:                                  scaleUpWinningSignal,
+		scheduledFloorActive:                                  scheduledFloorActive,
+		appOwnershipChecks:                                    appOwnershipChecks,
 		scaleDownDecisions:                                    scaleDownDecisions,
 		floorReconcileDecisions:                               floorReconcileDecisions,
 		floorReconcileErrors:                                  floorReconcileErrors,
@@ -5049,7 +5288,9 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		dlqEventsTotal:                                        dlqEventsTotal,
 		dlqReplayedTotal:                                      dlqReplayedTotal,
 		dlqPurgedTotal:                                        dlqPurgedTotal,
+		dlqRetentionPurgedTotal:                               dlqRetentionPurgedTotal,
 		queue:                                                 queue,
+		delayedTasks:                                          delayedTasks,
 		auditLogWriteTotal:                                    auditLogWriteTotal,
 		auditLogWriteFailuresTotal:                            auditLogWriteFailuresTotal,
 		operatorActionTraceCompletenessRatio:                  operatorActionTraceCompletenessRatio,
@@ -5061,6 +5302,15 @@ func NewOpsMetrics(prefix string) *OpsMetrics {
 		uploadSessionReaperRowsDeletedTotal:                 uploadSessionReaperRowsDeletedTotal,
 		uploadSessionReaperFailedTotal:                      uploadSessionReaperFailedTotal,
 		accountLifecycleViolations:                          accountLifecycleViolations,
+		grpcClientCallsWithoutDeadline:                      grpcClientCallsWithoutDeadline,
+		loopStalled:                                         loopStalled,
+		loopLastBeatAgeSeconds:                              loopLastBeatAgeSeconds,
+		dbNotifyHubReconnects:                               dbNotifyHubReconnects,
+		dbNotifyHubDelivered:                                dbNotifyHubDelivered,
+		dbNotifyHubDropped:                                  dbNotifyHubDropped,
+		loopWork:                                            loopWork,
+		loopWorkDuration:                                    loopWorkDuration,
+		instanceDivergence:                                  instanceDivergence,
 	}
 }
 
@@ -5095,6 +5345,30 @@ func (m *OpsMetrics) ObserveDrainWait(daemon, outcome string, seconds float64) {
 		return
 	}
 	m.gatewayDrainWaitSeconds.WithLabelValues(daemon, outcome).Observe(seconds)
+}
+
+// SetEgressCircuitState publishes the ADR-201 §3 state for one declared
+// upstream: 0=closed, 1=half_open, 2=open.
+//
+// upstreamHash MUST be data_upstreams.host_redacted_hash. Passing a plaintext
+// host here would put a customer's database hostname into a Prometheus label,
+// which is exactly the §11 leak the redacted hash exists to prevent.
+// Nil-safe.
+func (m *OpsMetrics) SetEgressCircuitState(appID, upstreamHash string, state float64) {
+	if m == nil || m.egressCircuitState == nil {
+		return
+	}
+	m.egressCircuitState.WithLabelValues(appID, upstreamHash).Set(state)
+}
+
+// ClearEgressCircuitState drops the series for a retired upstream, so a
+// deleted data_upstreams row does not leave a stale gauge asserting that a
+// dependency is broken forever. Nil-safe.
+func (m *OpsMetrics) ClearEgressCircuitState(appID, upstreamHash string) {
+	if m == nil || m.egressCircuitState == nil {
+		return
+	}
+	m.egressCircuitState.DeleteLabelValues(appID, upstreamHash)
 }
 
 // SetInflightRequests (issue #587 / PR-A) sets the per-daemon
@@ -5182,6 +5456,28 @@ func (m *OpsMetrics) SetServiceReplicaStatus(app string, desired, ready, startin
 	for i, state := range serviceReplicaMetricStates {
 		m.serviceReplicaStatus.WithLabelValues(app, state).Set(float64(values[i]))
 	}
+}
+
+// ObserveServiceRolloutHandoffPhase records one terminal barrier attempt.
+// Inputs are normalized onto closed sets so an accidental error string cannot
+// create unbounded Prometheus series. Nil-safe for scheduler unit fixtures.
+func (m *OpsMetrics) ObserveServiceRolloutHandoffPhase(action, phase, outcome string, seconds float64) {
+	if m == nil || m.serviceRolloutHandoffPhaseDuration == nil {
+		return
+	}
+	if action != "promote" && action != "abort" {
+		action = "promote"
+	}
+	if phase != "routing" && phase != "draining" {
+		phase = "routing"
+	}
+	if outcome != "success" && outcome != "timeout" && outcome != "error" {
+		outcome = "error"
+	}
+	if seconds < 0 {
+		seconds = 0
+	}
+	m.serviceRolloutHandoffPhaseDuration.WithLabelValues(action, phase, outcome).Observe(seconds)
 }
 
 // RecordDaemonRestart (issue #573 / ADR-128) records the systemd
@@ -8403,6 +8699,32 @@ func (m *OpsMetrics) ObserveScaleUp(app, outcome string) {
 	m.scaleUpDecisions.WithLabelValues(app, outcome).Inc()
 }
 
+// SetScheduledFloor records the warm floor an open ADR-195 schedule is
+// currently demanding for an app, or 0 when no window is open.
+//
+// Emitted every floor tick rather than only when a window opens, so the
+// series returns to zero on its own when a window closes. A gauge that only
+// ever went up would leave a closed window looking permanently open.
+func (m *OpsMetrics) SetScheduledFloor(app string, instances int) {
+	if m == nil {
+		return
+	}
+	m.scheduledFloorActive.WithLabelValues(app).Set(float64(instances))
+}
+
+// ObserveScaleUpWinningSignal attributes one admission to the scaling metric
+// that produced the highest desired count (ADR-194 arbitration).
+//
+// Called only on the admit branch: a no_signal or cooldown_held tick has no
+// winner, and emitting one would make the sum diverge from
+// _scale_up_decisions_total{outcome="admit"}.
+func (m *OpsMetrics) ObserveScaleUpWinningSignal(app, metric string) {
+	if m == nil || metric == "" {
+		return
+	}
+	m.scaleUpWinningSignal.WithLabelValues(app, metric).Inc()
+}
+
 // ObserveScaleDown records one reaper scale-down decision per app
 // per 10 s reaper tick that ran the new code path. outcome ∈
 // {park, keep, min_floor_already, cooldown_held}; emitted by both
@@ -8461,6 +8783,16 @@ func (m *OpsMetrics) ObserveSidecarRestart(app, sidecar string) {
 		return
 	}
 	m.sidecarRestartTotal.WithLabelValues(app, sidecar).Inc()
+}
+
+// ObserveSidecarHealth records one guest-init sidecar lifecycle transition.
+// Status is validated at the vmmd dispatch boundary; keeping the method
+// nil-safe preserves the existing no-metrics local-dev path.
+func (m *OpsMetrics) ObserveSidecarHealth(app, sidecar, status string) {
+	if m == nil {
+		return
+	}
+	m.sidecarHealthTransitionsTotal.WithLabelValues(app, sidecar, status).Inc()
 }
 
 // ObserveScaleUpAdmitRPS records the per-instance RPS at the moment
@@ -9786,6 +10118,15 @@ func (m *OpsMetrics) ObserveDLQPurge(app, status string) {
 	m.dlqPurgedTotal.WithLabelValues(m.appLabel(app), dlqOperationStatusLabel(status)).Inc()
 }
 
+// ObserveDLQRetention records rows removed by automatic Failed Events
+// projection retention. n <= 0 is a no-op.
+func (m *OpsMetrics) ObserveDLQRetention(n int) {
+	if m == nil || m.dlqRetentionPurgedTotal == nil || n <= 0 {
+		return
+	}
+	m.dlqRetentionPurgedTotal.Add(float64(n))
+}
+
 func dlqErrorKindLabel(kind string) string {
 	switch kind {
 	case "dead_letter", "poison_record", "max_attempts", "broker_error", "rate_limited", "timeout", "failed":
@@ -9827,4 +10168,26 @@ func (m *OpsMetrics) ESMRecordsCounterForTest(source string) (prometheus.Counter
 		return nil, errors.New("OpsMetrics.esmRecordsConsumedTotal not initialised")
 	}
 	return m.esmRecordsConsumedTotal.GetMetricWithLabelValues(source)
+}
+
+// ObserveAppOwnership records one ownsApp decision. owned=false is a
+// notification this schedd received and discarded because another schedd owns
+// the app — the per-event cost of pg_notify having no routing. Nil-safe.
+func (m *OpsMetrics) ObserveAppOwnership(owned bool) {
+	if m == nil || m.appOwnershipChecks == nil {
+		return
+	}
+	outcome := "not_owned"
+	if owned {
+		outcome = "owned"
+	}
+	m.appOwnershipChecks.WithLabelValues(outcome).Inc()
+}
+
+// HubDelivered implements db.NotifyHubObserver. nil-safe.
+func (m *OpsMetrics) HubDelivered(channel string) {
+	if m == nil || m.dbNotifyHubDelivered == nil {
+		return
+	}
+	m.dbNotifyHubDelivered.WithLabelValues(channel).Inc()
 }

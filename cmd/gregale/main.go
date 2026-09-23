@@ -178,8 +178,12 @@ func run(args []string) (status int) {
 		return cmdWhoami()
 	case "add":
 		return cmdAdd(args[1:])
+	case "bindings":
+		return cmdBindings(args[1:])
 	case "deploy":
 		return cmdDeployTarball(args[1:])
+	case "diff":
+		return environmentDiff(args[1:])
 	case "dev":
 		return cmdDev(args[1:])
 	case "canary":
@@ -377,6 +381,8 @@ func run(args []string) (status int) {
 		return cmdCrons(args[1:])
 	case "triggers":
 		return cmdTriggers(args[1:])
+	case "workers":
+		return cmdWorkers(args[1:])
 	case "delayed-task":
 		// Tier D: scheduled-at deferred invocations (issue #557 /
 		// ADR-072 sibling). Mirrors crons for dispatcher shape
@@ -466,6 +472,10 @@ func run(args []string) (status int) {
 		// EPIC #1278: publish a tenant-scoped CloudEvents envelope into
 		// the internal matcher and async fan-out path.
 		return cmdEvents(args[1:])
+	case "send":
+		return cmdSend(args[1:])
+	case "deliver":
+		return cmdDeliver(args[1:])
 	case "debug":
 		// ADR-127: production debugger (request evidence, regression
 		// watch, deployment compare, safe replay, and incident bundles).
@@ -613,7 +623,7 @@ func printLocalCommandHelp(w io.Writer, command cliCommand) {
 			_, _ = fmt.Fprintf(w, "  --%-16s %s\n", flag.Name, flag.Short)
 		}
 	}
-	_, _ = fmt.Fprintf(w, "\nDocs: %s/%s\n", docsURL, command.DocSlug)
+	_, _ = fmt.Fprintf(w, "\nDocs: %s\n", docsURLForTopic(command.DocSlug))
 }
 
 func printLocalSubcommandHelp(w io.Writer, command cliCommand, sub cliSub) {
@@ -628,5 +638,5 @@ func printLocalSubcommandHelp(w io.Writer, command cliCommand, sub cliSub) {
 			_, _ = fmt.Fprintf(w, "  --%-16s %s\n", flag.Name, flag.Short)
 		}
 	}
-	_, _ = fmt.Fprintf(w, "\nDocs: %s/%s\n", docsURL, command.DocSlug)
+	_, _ = fmt.Fprintf(w, "\nDocs: %s\n", docsURLForTopic(command.DocSlug))
 }

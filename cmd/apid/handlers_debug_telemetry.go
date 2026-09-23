@@ -22,15 +22,17 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/debugger"
+	"github.com/onebox-faas/faas/pkg/safetext"
 	"github.com/onebox-faas/faas/pkg/state"
 	"github.com/onebox-faas/faas/pkg/state/sqlc"
+	pkgtrace "github.com/onebox-faas/faas/pkg/trace"
 )
 
 // debugTelemetryListHandler — GET /v1/apps/{slug}/debug/requests
@@ -1653,10 +1655,7 @@ func boundDebugEvidenceText(value string, maxBytes int) string {
 	if len(value) <= maxBytes {
 		return value
 	}
-	value = value[:maxBytes]
-	for !utf8.ValidString(value) {
-		value = value[:len(value)-1]
-	}
+	value = safetext.Truncate(value, maxBytes)
 	return value
 }
 
@@ -1712,6 +1711,12 @@ func debugTelemetryRowToItem(row sqlc.ListRequestTelemetryByAppRow) api.DebugTel
 		row.GuestOutcome,
 		row.GuestErrorClass,
 		row.ConsumerID,
+		row.NodeID,
+		row.Region,
+		row.CommitSha,
+		row.DeploymentTag,
+		row.DeploymentCreatedAt,
+		row.ImageDigest,
 	)
 }
 
@@ -1734,6 +1739,12 @@ func debugTelemetryGetRowToItem(row sqlc.GetRequestTelemetryByAppAndIdentifierRo
 		row.GuestOutcome,
 		row.GuestErrorClass,
 		row.ConsumerID,
+		row.NodeID,
+		row.Region,
+		row.CommitSha,
+		row.DeploymentTag,
+		row.DeploymentCreatedAt,
+		row.ImageDigest,
 	)
 }
 
@@ -1748,23 +1759,30 @@ func debugTelemetryItemFromFields(
 	wakeID, instanceID pgtype.Text,
 	guestDurationMS int32, guestRuntime, guestOutcome, guestErrorClass string,
 	consumerID pgtype.UUID,
+	nodeID, region, commitSHA, deploymentTag, deploymentCreatedAt, imageDigest string,
 ) api.DebugTelemetryRequestItem {
 	item := api.DebugTelemetryRequestItem{
 		// pgtype.UUID -> hyphenated hex string. Falls back to "" when
 		// Valid=false so the JSON renders "" rather than the driver's
 		// base64 zero-bytes shape.
-		ID:           uuidFromPg(id),
-		DeploymentID: uuidFromPg(deploymentID),
-		Route:        route,
-		Method:       method,
-		Status:       int(status),
-		LatencyMS:    int(latencyMS),
-		Count:        int(count),
-		ColdBoot:     coldBoot,
-		ReceivedAt:   timeFromPg(receivedAt),
-		WakeID:       textFromPg(wakeID),
-		InstanceID:   textFromPg(instanceID),
-		ConsumerID:   uuidFromPg(consumerID),
+		ID:                  uuidFromPg(id),
+		DeploymentID:        uuidFromPg(deploymentID),
+		Route:               route,
+		Method:              method,
+		Status:              int(status),
+		LatencyMS:           int(latencyMS),
+		Count:               int(count),
+		ColdBoot:            coldBoot,
+		ReceivedAt:          timeFromPg(receivedAt),
+		WakeID:              textFromPg(wakeID),
+		InstanceID:          textFromPg(instanceID),
+		ConsumerID:          uuidFromPg(consumerID),
+		NodeID:              nodeID,
+		Region:              region,
+		CommitSHA:           commitSHA,
+		DeploymentTag:       deploymentTag,
+		DeploymentCreatedAt: deploymentCreatedAt,
+		ImageDigest:         imageDigest,
 	}
 	if traceID.Valid {
 		s := traceID.String
@@ -2663,13 +2681,17 @@ func (s *server) enqueueDebugReplay(ctx context.Context, app state.App, acct sta
 	if err != nil {
 		return debugReplayEnqueueResult{}, api.ErrCapacity("build debug replay envelope")
 	}
+	headerBytes, err = pkgtrace.MergeHeaders(ctx, headerBytes)
+	if err != nil {
+		return debugReplayEnqueueResult{}, api.ErrCapacity("build debug replay trace envelope")
+	}
 	inv, err := s.store.EnqueueInvocation(ctx, state.Invocation{
 		AppID:     app.ID,
 		AccountID: acct.ID,
 		Source:    state.InvocationReplay,
 		Method:    row.Method,
 		Path:      row.Route,
-		Payload:   json.RawMessage("{}"),
+		Payload:   nil,
 		Headers:   headerBytes,
 		DueAt:     now,
 	})

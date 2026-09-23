@@ -6,10 +6,13 @@ Generated from the CLI's command manifest by `gregale man --markdown`. Do not ed
 |---|---|
 | [`account`](#account) | Manage the local account (account export\|delete\|restore\|status\|dpa\|slo) |
 | [`add`](#add) | Provision and bind managed resources to an app |
+| [`bindings`](#bindings) | List PostgreSQL, object-storage, and queue bindings for an app |
 | [`capabilities`](#capabilities) | Show feature maturity and plan availability |
 | [`alerts`](#alerts) | Per-app alert rules (alerts list\|add\|info\|update\|rm\|rotate-secret\|preset --app &lt;slug&gt;) |
 | [`audit-events`](#audit-events) | Audit-log query (audit-events list\|get &lt;id&gt;) |
-| [`events`](#events) | Publish tenant-scoped events to the internal router |
+| [`events`](#events) | Publish events and inspect subscriptions and deliveries |
+| [`send`](#send) | Reliably send work to another Gregale application |
+| [`deliver`](#deliver) | Reliably deliver an event to a registered webhook |
 | [`apps`](#apps) | List your apps |
 | [`app`](#app) | Get/update one app (gregale app &lt;slug&gt; [scale\|rename &lt;new&gt;\|restart\|--profile NAME\|--ram N\|…]) |
 | [`billing`](#billing) | Manage billing (portal, invoices, subscription, card on file) |
@@ -20,21 +23,23 @@ Generated from the CLI's command manifest by `gregale man --markdown`. Do not ed
 | [`cors`](#cors) | Configure CORS for an app (allow\|ls\|rm\|show) |
 | [`crons`](#crons) | Manage scheduled requests |
 | [`triggers`](#triggers) | Manage unified event triggers (broker mappings + cron-linked rows) |
+| [`workers`](#workers) | Inspect and manage background worker pools |
 | [`jobs`](#jobs) | Manage jobs (run-to-completion workloads) |
 | [`workflows`](#workflows) | Manage durable execution workflows |
 | [`dashboard`](#dashboard) | Open the account dashboard in your browser |
 | [`doctor`](#doctor) | Preflight local source or OCI image metadata; runtime checks are skipped |
-| [`delayed-task`](#delayed-task) | Schedule a deferred invocation (delayed-task add\|get\|cancel) |
+| [`delayed-task`](#delayed-task) | Schedule and inspect deferred invocations |
 | [`deployments`](#deployments) | List deployments (--app SLUG or linked context \| --limit N \| --before C \| --all \| --wide) |
 | [`deployment`](#deployment) | Get, summarize, or wait for one deployment (&lt;id&gt; \| summary &lt;id&gt; \| wait &lt;id&gt; \| set-min-instances &lt;id&gt;) |
 | [`deploys`](#deploys) | Deployment drill-downs (deploys show\|status\|cancel\|reorder\|clear\|clear-obsolete\|retry) |
 | [`deploy`](#deploy) | Deploy an app or project (--path DIR \| --image REF \| --tarball PATH \| --repo OWNER/NAME --ref REF \| --github \| --template NAME) |
 | [`domains`](#domains) | Manage custom domains |
 | [`dev`](#dev) | Sync the dirty working tree to a stable remote developer environment (name defaults to linked context) |
+| [`diff`](#diff) | Compare two named environments in the linked project |
 | [`preview`](#preview) | Manage preview environments (Mega-C PR-1 / issue #961 leaf 3) |
 | [`edge-rules`](#edge-rules) | Per-app edge rules (edge-rules list\|create\|get\|update\|rm --app &lt;slug&gt;) |
 | [`openapi`](#openapi) | Manage app OpenAPI docs + pre-publish schema-drift checks |
-| [`env`](#env) | Pull/push .env &lt;-&gt; sealed secrets (--app &lt;slug&gt; or linked context) |
+| [`env`](#env) | Clone project environments or manage app runtime env/secrets |
 | [`init`](#init) | Scaffold a reference project from a built-in template (--template NAME --path DIR [--deploy]) |
 | [`inspect`](#inspect) | Explain an app from its runtime, deployment, API, data, scaling, and release signals (slug defaults to linked context) |
 | [`invoke`](#invoke) | Functional smoke test (invoke [--async] &lt;slug&gt; [--payload J\|@file\|-]; slug defaults to linked context) |
@@ -52,12 +57,12 @@ Generated from the CLI's command manifest by `gregale man --markdown`. Do not ed
 | [`unlink`](#unlink) | Remove the linked project from this checkout |
 | [`context`](#context) | Show the linked project and default app context |
 | [`signup`](#signup) | Create a new account (signup [--email-only EMAIL \| --password-stdin]) |
-| [`logs`](#logs) | Read app or deployment logs (gregale logs &lt;slug&gt;; slug defaults to linked context) |
+| [`logs`](#logs) | Query runtime logs and HTTP request events (slug defaults to linked context) |
 | [`metrics`](#metrics) | Per-app or account-wide metrics (slug defaults to linked context) |
 | [`analytics`](#analytics) | Historical request analytics (analytics &lt;slug&gt; [--since 24h] [--by route\|country\|referrer_host\|ua_family\|status]; slug defaults to linked context) |
 | [`mfa`](#mfa) | Manage account MFA (mfa enroll\|confirm\|verify\|recover\|disable) |
 | [`open`](#open) | Open the app&#39;s URL (slug defaults to linked context) |
-| [`orgs`](#orgs) | Manage orgs + members (orgs ls\|create\|info\|rm\|members ...\|keys ...\|transfer-ownership\|seat-usage\|invitations ...\|me) |
+| [`orgs`](#orgs) | Manage orgs, members, and workspace activity |
 | [`overage-cap`](#overage-cap) | Set / clear the account&#39;s overage cap (--clear \| &lt;cents&gt;) |
 | [`park`](#park) | Park an app cold (kill all live instances) |
 | [`plan`](#plan) | Change plan (free\|hobby\|pro\|scale); paid upgrades open the provider checkout |
@@ -80,9 +85,9 @@ Generated from the CLI's command manifest by `gregale man --markdown`. Do not ed
 | [`wake-timeline`](#wake-timeline) | Walk the per-wake event stream (wake-timeline &lt;slug&gt; &lt;wake-id&gt; [--since RFC3339] [--limit N] [--all]; slug defaults to linked context) |
 | [`throttle-suggestions`](#throttle-suggestions) | Per-route throttle recommendations + dry-run preview (gregale throttle-suggestions &lt;slug&gt; [--range 5m] [--dry-run --candidate-rps N --candidate-burst N]) |
 | [`wake`](#wake) | Wake a parked app (pulls out of snapshot) |
-| [`traffic`](#traffic) | Manage deployment traffic split (issue #556; Pro/Scale only) |
-| [`mirror`](#mirror) | Manage traffic mirroring (mirror list\|create\|info\|update\|rm\|summary --app &lt;slug&gt;; issue #72 / ADR-124; Pro/Scale only) |
-| [`cache`](#cache) | Manage response cache (cache purge &lt;slug&gt; [--path GLOB]) |
+| [`traffic`](#traffic) | Manage deployment traffic split (available on every plan) |
+| [`mirror`](#mirror) | Manage traffic mirroring and sanitized replay (Pro/Scale only) |
+| [`cache`](#cache) | Declare or purge response caching (cache GET /path/:id for 30s) |
 | [`upload-cache`](#upload-cache) | Inspect or clean resumable source-upload recovery state |
 | [`webhooks`](#webhooks) | Manage outbound webhooks (webhooks list\|add\|info\|update\|rm\|deliveries\|retry\|rotate-secret) |
 | [`whoami`](#whoami) | Show the authenticated account |
@@ -161,6 +166,13 @@ Provision or attach object storage and inject sealed S3 settings
 | `--label <LABEL>` | bucket-scoped compute credential label |  |
 | `--prefix <PREFIX>` | injected storage secret prefix |  |
 | `--wait-timeout <DURATION>` | readiness timeout |  |
+
+
+## bindings
+
+List PostgreSQL, object-storage, and queue bindings for an app
+
+`gregale bindings <app>`
 
 
 ## capabilities
@@ -245,7 +257,7 @@ Show one audit event
 
 ## events
 
-Publish tenant-scoped events to the internal router
+Publish events and inspect subscriptions and deliveries
 
 `gregale events [<subcommand>]`
 
@@ -260,6 +272,51 @@ Publish one event (SOURCE TYPE can be positional; ID is generated by default)
 | `--type <TYPE>` | event type (or second positional argument) |  |
 | `--data <J|@file|->` | JSON event data (inline \| @file \| -) | required |
 | `--time <RFC3339>` | event time (RFC3339; defaults to server time) |  |
+
+### events subscriptions
+
+List subscriptions reconciled from the app manifest
+
+### events deliveries
+
+Inspect event delivery lifecycle
+
+| Flag | Meaning | |
+|---|---|---|
+| `--event-id <ID>` | filter by published event id |  |
+| `--state <STATE>` | filter by delivery state |  |
+| `--before <ID>` | pagination cursor |  |
+| `--limit <N>` | max deliveries (1..200) |  |
+
+
+## send
+
+Reliably send work to another Gregale application
+
+`gregale send <target-app> --type <TYPE> --data <J|@file|-> [--id <ID>] [--source <SOURCE>] [--time <RFC3339>] [--queue-name <QUEUE>] [--idempotency-key <KEY>]`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--type <TYPE>` | event type | required |
+| `--data <J|@file|->` | JSON event data (inline \| @file \| -) | required |
+| `--id <ID>` | stable event id |  |
+| `--source <SOURCE>` | event source |  |
+| `--time <RFC3339>` | event time |  |
+| `--queue-name <QUEUE>` | target logical queue name |  |
+| `--idempotency-key <KEY>` | stable key for retrying an uncertain send |  |
+
+
+## deliver
+
+Reliably deliver an event to a registered webhook
+
+`gregale deliver <source-app> <webhook-id|url> --type <TYPE> --data <J|@file|-> [--idempotency-key <KEY>]`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--type <TYPE>` | event type | required |
+| `--data <J|@file|->` | JSON event data (inline \| @file \| -) | required |
+| `--idempotency-key <KEY>` | stable key for retrying an uncertain delivery |  |
 
 
 ## apps
@@ -305,7 +362,7 @@ Delete one app (positional: &lt;slug&gt;)
 
 Get/update one app (gregale app &lt;slug&gt; [scale|rename &lt;new&gt;|restart|--profile NAME|--ram N|…])
 
-`gregale app <slug> [<subcommand>] [--profile <micro|small|medium|large|xlarge>] [--ram <MB>] [--max-concurrency <N>] [--concurrency-overflow <value>] [--max-queue-wait-ms <N>] [--wake-max-queue-depth <N>] [--wake-max-queue-wait-seconds <N>] [--request-timeout <SEC>] [--require-signed <value>] [--security-policy <value>] [--only-declared-routes] [--no-only-declared-routes]`
+`gregale app <slug> [<subcommand>] [--profile <micro|small|medium|large|xlarge>] [--ram <MB>] [--max-concurrency <N>] [--concurrency-overflow <value>] [--max-queue-depth <N>] [--max-queue-wait <DURATION>] [--max-queue-wait-ms <N>] [--wake-max-queue-depth <N>] [--wake-max-queue-wait-seconds <N>] [--request-timeout <SEC>] [--require-signed <value>] [--security-policy <value>] [--only-declared-routes] [--no-only-declared-routes]`
 
 | Flag | Meaning | |
 |---|---|---|
@@ -313,6 +370,8 @@ Get/update one app (gregale app &lt;slug&gt; [scale|rename &lt;new&gt;|restart|-
 | `--ram <MB>` | set RAM in MB |  |
 | `--max-concurrency <N>` | set max_concurrency |  |
 | `--concurrency-overflow <value>` | set saturated concurrency behavior | one of `queue` · `drop` |
+| `--max-queue-depth <N>` | set maximum warm-saturation waiters |  |
+| `--max-queue-wait <DURATION>` | set maximum warm-saturation wait as a duration |  |
 | `--max-queue-wait-ms <N>` | set maximum queued concurrency wait |  |
 | `--wake-max-queue-depth <N>` | set per-app cold-wake waiter cap |  |
 | `--wake-max-queue-wait-seconds <N>` | set per-app cold-wake wait budget |  |
@@ -485,6 +544,7 @@ Bind GitHub, configure previews, and write an Actions workflow
 | `--preview` | enable pull-request previews |  |
 | `--no-preview` | disable pull-request previews |  |
 | `--preview-ttl-hours <HOURS>` | preview lease in hours (1-720) |  |
+| `--preview-service-policy <POLICY>` | preview-to-production service calls: deny\|allow_marked | one of `deny` · `allow_marked` |
 | `--root-dir <DIR>` | repository-relative source root for the root workload |  |
 | `--ignore <PATHS>` | comma-separated ignored change paths |  |
 | `--rollout <MODE>` | production rollout mode: standard\|safe (safe requires Pro/Scale) | one of `standard` · `safe` |
@@ -653,6 +713,49 @@ List dead-letter records
 Show per-state trigger metrics
 
 
+## workers
+
+Inspect and manage background worker pools
+
+`gregale workers [<subcommand>] [<slug>]`
+
+### workers list
+
+List background worker pools
+
+### workers status
+
+Show real-time status and autoscaling for a worker pool
+
+| Flag | Meaning | |
+|---|---|---|
+| `--app <slug>` | app slug (optional; defaults to linked context) |  |
+
+### workers logs
+
+Tail logs for a background worker pool
+
+| Flag | Meaning | |
+|---|---|---|
+| `--follow` | follow new log lines |  |
+| `--grep <SUBSTR>` | filter log lines by substring |  |
+| `--since <RFC3339>` | filter log lines after timestamp |  |
+| `--level <LEVEL>` | filter log lines by level (info\|warn\|error) |  |
+
+### workers scale
+
+Adjust scaling bounds and graceful drain for a worker pool
+
+| Flag | Meaning | |
+|---|---|---|
+| `--min <N>` | min worker replicas (0 = scale-to-zero) |  |
+| `--max <N>` | max worker replicas |  |
+| `--target <N>` | target messages per worker |  |
+| `--metric <METRIC>` | autoscaling metric (queue_lag \| queue_depth) |  |
+| `--drain-timeout <DURATION>` | shutdown grace duration (e.g. 90s, 2m) |  |
+| `--stop-signal <SIG>` | stop signal (e.g. SIGTERM, SIGINT, SIGQUIT) |  |
+
+
 ## jobs
 
 Manage jobs (run-to-completion workloads)
@@ -767,13 +870,41 @@ Preflight local source or OCI image metadata; runtime checks are skipped
 
 ## delayed-task
 
-Schedule a deferred invocation (delayed-task add|get|cancel)
+Schedule and inspect deferred invocations
 
 `gregale delayed-task [<subcommand>]`
 
 ### delayed-task add
 
 Schedule a deferred invocation
+
+| Flag | Meaning | |
+|---|---|---|
+| `--app <SLUG>` | app slug | required |
+| `--scheduled-at <RFC3339>` | absolute dispatch time; exclusive with --delay |  |
+| `--delay <DURATION>` | relative delay such as 30m; exclusive with --scheduled-at |  |
+| `--payload <JSON|@FILE|->` | JSON request payload |  |
+| `--method <METHOD>` | HTTP method (default POST) |  |
+| `--path <PATH>` | app path (default /) |  |
+| `--header <NAME:VALUE>` | request header (repeatable) |  |
+| `--max-attempts <N>` | maximum delivery attempts |  |
+| `--retry-base-seconds <N>` | base retry delay in seconds |  |
+| `--retry-max-seconds <N>` | maximum retry delay in seconds |  |
+| `--retry-jitter-seconds <N>` | retry jitter fraction (0..1) |  |
+| `--retention <DURATION>` | terminal result retention |  |
+| `--on-success-webhook <ID>` | success webhook subscription |  |
+| `--on-failure-webhook <ID>` | failure webhook subscription |  |
+| `--idempotency-key <KEY>` | stable create retry key |  |
+
+### delayed-task list
+
+List delayed tasks for an app
+
+| Flag | Meaning | |
+|---|---|---|
+| `--app <SLUG>` | app slug | required |
+| `--limit <N>` | page size (1-200) |  |
+| `--before <ID>` | pagination cursor |  |
 
 ### delayed-task get
 
@@ -807,10 +938,11 @@ List deployments (--app SLUG or linked context | --limit N | --before C | --all 
 
 Get, summarize, or wait for one deployment (&lt;id&gt; | summary &lt;id&gt; | wait &lt;id&gt; | set-min-instances &lt;id&gt;)
 
-`gregale deployment [<subcommand>] <id> [--show-scan] [--min <N>]`
+`gregale deployment [<subcommand>] <id|vN> [--app <SLUG>] [--show-scan] [--min <N>]`
 
 | Flag | Meaning | |
 |---|---|---|
+| `--app <SLUG>` | app slug; only needed to resolve a vN revision outside a linked project |  |
 | `--show-scan` | include the per-deploy grype scan payload |  |
 | `--min <N>` | min_instances floor (&gt;= 0) |  |
 
@@ -841,7 +973,11 @@ Set the per-deployment cold-wake floor
 
 Deployment drill-downs (deploys show|status|cancel|reorder|clear|clear-obsolete|retry)
 
-`gregale deploys [<subcommand>] <id>`
+`gregale deploys [<subcommand>] <id|vN> [--app <SLUG>]`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--app <SLUG>` | app slug; only needed to resolve a vN revision outside a linked project |  |
 
 ### deploys show
 
@@ -876,7 +1012,7 @@ Retry a failed deployment from a specific stage (--from=&lt;stage&gt;)
 
 Deploy an app or project (--path DIR | --image REF | --tarball PATH | --repo OWNER/NAME --ref REF | --github | --template NAME)
 
-`gregale deploy [--image <REF>] [--tarball <PATH>] [--path <DIR>] [--worktree] [--repo <OWNER/NAME>] [--repository <OWNER/NAME>] [--install-id <N>] [--production-branch <BRANCH>] [--ref <REF>] [--github] [--template <NAME>] [--dockerfile] [--runtime <RUNTIME>] [--handler <HANDLER>] [--name <SLUG>] [--profile <PROFILE>] [--vcpu <N>] [--function] [--app] [--yes] [--only <SLUGS>] [--project] [--environment <SLUG>] [--reason <text>] [--tag <TAG>] [--deployed-by <NAME>] [--pr-number <N>] [--exclude <SLUGS>] [--show-affected] [--persist-exclude] [--project-slug <SLUG>] [--canary-preset <PRESET>] [--canary-stages <STAGES>] [--safe] [--require-authn] [--no-require-authn] [--app-protocol <PROTOCOL>] [--traffic-percent <PERCENT>] [--no-triggers] [--wait] [--no-wait] [--create-only] [--timeout <SECONDS>] [--idempotency-key <KEY>] [--secrets-file <PATH>] [--secret-scan <on|off>] [--diff] [--dry-run] [--plan] [--strict] [--lenient] [--server-diff] [--doctor-strict] [--no-doctor]`
+`gregale deploy [--image <REF>] [--tarball <PATH>] [--path <DIR>] [--worktree] [--repo <OWNER/NAME>] [--repository <OWNER/NAME>] [--install-id <N>] [--production-branch <BRANCH>] [--ref <REF>] [--github] [--template <NAME>] [--dockerfile] [--runtime <RUNTIME>] [--handler <HANDLER>] [--name <SLUG>] [--profile <PROFILE>] [--vcpu <N>] [--function] [--app] [--yes] [--only <SLUGS>] [--project] [--environment <SLUG>] [--reason <text>] [--tag <TAG>] [--deployed-by <NAME>] [--pr-number <N>] [--exclude <SLUGS>] [--show-affected] [--persist-exclude] [--project-slug <SLUG>] [--canary-preset <PRESET>] [--canary-stages <STAGES>] [--safe] [--require-authn] [--no-require-authn] [--app-protocol <PROTOCOL>] [--traffic-percent <PERCENT>] [--no-traffic] [--no-triggers] [--wait] [--no-wait] [--create-only] [--timeout <SECONDS>] [--idempotency-key <KEY>] [--secrets-file <PATH>] [--secret-scan <on|off>] [--diff] [--dry-run] [--plan] [--strict] [--lenient] [--server-diff] [--doctor-strict] [--no-doctor]`
 
 | Flag | Meaning | |
 |---|---|---|
@@ -890,7 +1026,7 @@ Deploy an app or project (--path DIR | --image REF | --tarball PATH | --repo OWN
 | `--production-branch <BRANCH>` | production branch for a project binding |  |
 | `--ref <REF>` | git ref for --repo (branch, tag, or 40-char SHA) |  |
 | `--github` | emit a GitHub Actions workflow snippet for the Gregale deploy action |  |
-| `--template <NAME>` | scaffold from a built-in template | one of `hello-node` · `hello-python` · `hello-go` · `cron-example` · `function-node` · `function-python` · `function-go` · `function-node24` · `function-python313` · `s3-uploader` · `slack-bot` · `rest-api-postgres` · `cron-worker` · `webhook-receiver` · `ai-chat` |
+| `--template <NAME>` | scaffold from a built-in template | one of `hello-node` · `hello-python` · `hello-go` · `cron-example` · `function-node` · `function-python` · `function-go` · `function-node24` · `function-python313` · `event-worker` · `queue-worker` · `s3-uploader` · `slack-bot` · `rest-api-postgres` · `cron-worker` · `webhook-receiver` · `ai-chat` |
 | `--dockerfile` | build with the supplied Dockerfile inside --tarball |  |
 | `--runtime <RUNTIME>` | function runtime | one of `node22` · `python312` · `go124` · `go124-alpine` · `node24` · `python313` |
 | `--handler <HANDLER>` | function handler |  |
@@ -913,11 +1049,12 @@ Deploy an app or project (--path DIR | --image REF | --tarball PATH | --repo OWN
 | `--project-slug <SLUG>` | kebab slug for the project (one-key provision) |  |
 | `--canary-preset <PRESET>` | canary ladder preset | one of `none` · `slow` · `balanced` · `aggressive` · `1-10-50-100` · `custom` |
 | `--canary-stages <STAGES>` | custom percent@duration canary stages |  |
-| `--safe` | deploy with the balanced health-gated rollout and first-wake 5xx rollback (Pro/Scale only) |  |
+| `--safe` | deploy with the balanced health-gated rollout and first-wake 5xx rollback |  |
 | `--require-authn` | require bearer auth on every request |  |
 | `--no-require-authn` | drop the token requirement |  |
 | `--app-protocol <PROTOCOL>` | wire protocol selector | one of `http1` · `http2` · `grpc` |
 | `--traffic-percent <PERCENT>` | deployment traffic split weight (0-100) |  |
+| `--no-traffic` | stage with 0% production traffic and print the preview URL |  |
 | `--no-triggers` | skip gregale.yaml trigger fan-out |  |
 | `--wait` | wait for deployment to become live (default) |  |
 | `--no-wait` | return after deployment is queued |  |
@@ -979,13 +1116,14 @@ Show durable TLS status for all domains
 
 Sync the dirty working tree to a stable remote developer environment (name defaults to linked context)
 
-`gregale dev [<subcommand>] [--path <DIR>] [--name <PROJECT>] [--env-file <PATH>] [--once] [--stop] [--no-logs] [--open]`
+`gregale dev [<subcommand>] [--path <DIR>] [--name <PROJECT>] [--env-file <PATH>] [--service-override-file <PATH>] [--once] [--stop] [--no-logs] [--open]`
 
 | Flag | Meaning | |
 |---|---|---|
 | `--path <DIR>` | source directory |  |
 | `--name <PROJECT>` | developer-session project name |  |
 | `--env-file <PATH>` | sync KEY=VALUE entries as developer secrets |  |
+| `--service-override-file <PATH>` | sync validated service URLs as developer secrets |  |
 | `--once` | deploy once and exit |  |
 | `--stop` | tear down the developer environment |  |
 | `--no-logs` | do not attach the live runtime log stream |  |
@@ -1014,12 +1152,24 @@ preflight a project and prepare the first developer environment
 | `--path <DIR>` | source directory |  |
 | `--name <PROJECT>` | developer-session project name |  |
 | `--env-file <PATH>` | validate and sync developer secrets |  |
+| `--service-override-file <PATH>` | validate and sync service URLs |  |
 | `--start` | start after preflight |  |
 | `--once` | sync once and exit |  |
 | `--no-logs` | do not attach runtime logs |  |
 | `--open` | open the verified URL |  |
 | `--postgres` | provision an isolated PostgreSQL database |  |
 | `--postgres-region <REGION>` | choose managed database placement |  |
+
+
+## diff
+
+Compare two named environments in the linked project
+
+`gregale diff <from-environment> <to-environment> [--project <SLUG>]`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--project <SLUG>` | project slug (defaults to linked project) |  |
 
 
 ## preview
@@ -1081,7 +1231,7 @@ Per-app edge rules (edge-rules list|create|get|update|rm --app &lt;slug&gt;)
 | Flag | Meaning | |
 |---|---|---|
 | `--app <slug>` | app slug | required |
-| `--kind <value>` | rule kind | one of `route` · `rewrite` · `redirect` · `headers` · `cors` · `jwt` · `ip` · `validate` · `limit` · `geo` · `maintenance` · `throttle` · `budget` · `cache` · `respond` |
+| `--kind <value>` | rule kind | one of `route` · `rewrite` · `redirect` · `headers` · `cors` · `jwt` · `ip` · `validate` · `limit` · `geo` · `maintenance` · `throttle` · `budget` · `cache` · `respond` · `retry` · `circuit_breaker` · `async` |
 
 ### edge-rules list
 
@@ -1090,7 +1240,7 @@ List edge rules
 | Flag | Meaning | |
 |---|---|---|
 | `--app <slug>` | filter to a single app slug |  |
-| `--kind <value>` | filter to a single kind | one of `route` · `rewrite` · `redirect` · `headers` · `cors` · `jwt` · `ip` · `validate` · `limit` · `geo` · `maintenance` · `throttle` · `budget` · `cache` · `respond` |
+| `--kind <value>` | filter to a single kind | one of `route` · `rewrite` · `redirect` · `headers` · `cors` · `jwt` · `ip` · `validate` · `limit` · `geo` · `maintenance` · `throttle` · `budget` · `cache` · `respond` · `retry` · `circuit_breaker` · `async` |
 
 ### edge-rules create
 
@@ -1161,13 +1311,24 @@ Remove the imported app OpenAPI document
 
 ## env
 
-Pull/push .env &lt;-&gt; sealed secrets (--app &lt;slug&gt; or linked context)
+Clone project environments or manage app runtime env/secrets
 
 `gregale env [<subcommand>] [--app <slug>]`
 
 | Flag | Meaning | |
 |---|---|---|
 | `--app <slug>` | app slug (defaults to linked context) |  |
+
+### env create
+
+Clone a project environment with isolated managed data by default
+
+| Flag | Meaning | |
+|---|---|---|
+| `--from <ENV>` | source environment | required |
+| `--project <SLUG>` | project slug (defaults to linked project) |  |
+| `--protected` | protect the new environment |  |
+| `--share-resources` | use source managed data with fresh target credentials instead of isolating it |  |
 
 ### env pull
 
@@ -1184,7 +1345,7 @@ Push KEY=VALUE pairs to sealed secrets (use --restart to apply now)
 | Flag | Meaning | |
 |---|---|---|
 | `--scope <SCOPE>` | env scope (defaults to linked project environment) |  |
-| `--restart` | restart app after applying changes (otherwise changes apply on next wake) |  |
+| `--restart` | restart app after applying changes (otherwise changes apply on next cold wake) |  |
 
 ### env diff
 
@@ -1199,7 +1360,7 @@ Scaffold a reference project from a built-in template (--template NAME --path DI
 
 | Flag | Meaning | |
 |---|---|---|
-| `--template <NAME>` | template name | required; one of `hello-node` · `hello-python` · `hello-go` · `cron-example` · `function-node` · `function-python` · `function-go` · `function-node24` · `function-python313` · `s3-uploader` · `slack-bot` · `rest-api-postgres` · `cron-worker` · `webhook-receiver` · `ai-chat` |
+| `--template <NAME>` | template name | required; one of `hello-node` · `hello-python` · `hello-go` · `cron-example` · `function-node` · `function-python` · `function-go` · `function-node24` · `function-python313` · `event-worker` · `queue-worker` · `s3-uploader` · `slack-bot` · `rest-api-postgres` · `cron-worker` · `webhook-receiver` · `ai-chat` |
 | `--path <DIR>` | target directory | required |
 | `--deploy` | deploy after scaffolding |  |
 | `--name <SLUG>` | app slug used with --deploy |  |
@@ -1336,7 +1497,13 @@ Export a redacted incident bundle with coverage (bundle &lt;slug&gt; &lt;request
 
 Look up a W3C trace through the account trace index
 
-`gregale trace <trace-id>`
+`gregale trace <trace-id> [--watch] [--interval <DURATION>] [--timeout <DURATION>]`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--watch` | poll until linked invocations reach a terminal state |  |
+| `--interval <DURATION>` | poll interval (default 1s) |  |
+| `--timeout <DURATION>` | maximum watch duration (default 5m) |  |
 
 
 ## invitations
@@ -1447,17 +1614,24 @@ Create a new account (signup [--email-only EMAIL | --password-stdin])
 
 ## logs
 
-Read app or deployment logs (gregale logs &lt;slug&gt;; slug defaults to linked context)
+Query runtime logs and HTTP request events (slug defaults to linked context)
 
-`gregale logs [<slug>] [--follow] [--deployment <ID>] [--grep <SUBSTR>] [--since <RFC3339>] [--level <LEVEL>] [--explain] [--archive] [--instance <ID>] [--date <YYYY-MM-DD>]`
+`gregale logs [<slug>] [--follow] [--deployment <ID>] [--release <ID|vN>] [--source <SOURCE>] [--grep <SUBSTR>] [--since <15m|3d|RFC3339>] [--level <LEVEL>] [--status <100..599>] [--route <PATH>] [--request <ID>] [--limit <N>] [--all] [--explain] [--archive] [--instance <ID>] [--date <YYYY-MM-DD>]`
 
 | Flag | Meaning | |
 |---|---|---|
 | `--follow` | stream logs until interrupted |  |
-| `--deployment <ID>` | deployment id (default: latest) |  |
+| `--deployment <ID>` | deployment id or vN revision (default: latest) |  |
+| `--release <ID|vN>` | release id or revision (alias for --deployment) |  |
+| `--source <SOURCE>` | log source | one of `runtime` · `http` |
 | `--grep <SUBSTR>` | only show lines containing this substring |  |
-| `--since <RFC3339>` | only show lines at or after this RFC3339 timestamp |  |
+| `--since <15m|3d|RFC3339>` | lookback duration or RFC3339 timestamp |  |
 | `--level <LEVEL>` | only show lines at this level | one of `info` · `warn` · `error` |
+| `--status <100..599>` | only show HTTP requests with this status |  |
+| `--route <PATH>` | only show HTTP requests for this route |  |
+| `--request <ID>` | show one HTTP request by public request id or row id |  |
+| `--limit <N>` | HTTP request page size (1..200) |  |
+| `--all` | read every retained HTTP request page |  |
 | `--explain` | summarize the last failure and common error patterns |  |
 | `--archive` | read durable logs for one instance and UTC day |  |
 | `--instance <ID>` | instance id for --archive |  |
@@ -1529,7 +1703,7 @@ Open a CLI docs page (open docs [&lt;slug&gt;])
 
 ## orgs
 
-Manage orgs + members (orgs ls|create|info|rm|members ...|keys ...|transfer-ownership|seat-usage|invitations ...|me)
+Manage orgs, members, and workspace activity
 
 `gregale orgs [<subcommand>]`
 
@@ -1544,6 +1718,19 @@ Create an org
 ### orgs info
 
 Show one org
+
+### orgs activity
+
+Show the global infrastructure timeline
+
+| Flag | Meaning | |
+|---|---|---|
+| `--org <SLUG>` | organization slug | required |
+| `--before <CURSOR>` | pagination cursor |  |
+| `--kind-prefix <PREFIX>` | filter by activity kind prefix |  |
+| `--actor-type <TYPE>` | filter by actor category | one of `user` · `api_key` · `github` · `system` · `operator` |
+| `--app-id <UUID>` | filter by application UUID |  |
+| `--limit <N>` | page size (1..100) |  |
 
 ### orgs rm
 
@@ -1643,7 +1830,7 @@ Show queue state
 
 ### queue status
 
-Alias for queue state
+Show queue depth, scaling, bindings, and liveness
 
 ### queue peek
 
@@ -1666,6 +1853,10 @@ Configure a simple push workload with queue-depth scaling
 | `--queue-name <QUEUE>` | logical queue name |  |
 | `--target-depth <N>` | messages per worker before scaling out |  |
 | `--max-concurrency <N>` | maximum concurrent deliveries per worker |  |
+| `--max-attempts <N>` | maximum delivery attempts (0 uses the plan default) |  |
+| `--retry-base-seconds <N>` | base retry delay in seconds |  |
+| `--retry-max-seconds <N>` | maximum retry delay in seconds |  |
+| `--retry-jitter-seconds <N>` | retry jitter in seconds (0..1) |  |
 | `--force` | replace an existing default binding on another queue |  |
 
 ### queue bindings
@@ -1832,11 +2023,11 @@ Rotate, finalize, or inspect static bearer auth (auth rotate|finalize|status)
 
 Re-promote the previous deployment
 
-`gregale rollback <slug> [--to <deployment_id>] [--json]`
+`gregale rollback <slug> [--to <deployment_id|vN>] [--json]`
 
 | Flag | Meaning | |
 |---|---|---|
-| `--to <deployment_id>` | target deployment id |  |
+| `--to <deployment_id|vN>` | target deployment id or vN revision (e.g. v41) |  |
 | `--json` | machine-readable output |  |
 
 
@@ -1920,6 +2111,7 @@ Set a sealed secret
 | Flag | Meaning | |
 |---|---|---|
 | `--scope <SCOPE>` | env scope to write (defaults to linked project environment) |  |
+| `--restart` | restart the app and apply updated secrets now |  |
 
 ### secrets unset
 
@@ -1940,6 +2132,7 @@ Re-seal one secret under the current host key
 | Flag | Meaning | |
 |---|---|---|
 | `--scope <SCOPE>` | env scope to rotate (defaults to linked project environment) |  |
+| `--restart` | restart the app and apply the rotated secret now |  |
 
 
 ## slo
@@ -2077,7 +2270,7 @@ Wake a parked app (pulls out of snapshot)
 
 ## traffic
 
-Manage deployment traffic split (issue #556; Pro/Scale only)
+Manage deployment traffic split (available on every plan)
 
 `gregale traffic [<subcommand>]`
 
@@ -2087,8 +2280,19 @@ Set the traffic split for a deployment
 
 | Flag | Meaning | |
 |---|---|---|
-| `--deployment <ID>` | deployment id to set the traffic split on | required |
+| `--app <SLUG>` | app slug; only needed to resolve a vN revision outside a linked project |  |
+| `--deployment <ID>` | deployment id or vN revision to set the traffic split on | required |
 | `--percent <N>` | traffic weight in [0, 100]; -1 = unset (server default 100) | required |
+
+### traffic promote
+
+Promote a live deployment to 100% production traffic
+
+| Flag | Meaning | |
+|---|---|---|
+| `--app <SLUG>` | app slug; only needed to resolve a vN revision outside a linked project |  |
+| `--deployment <ID>` | deployment id or vN revision to promote | required |
+| `--if-serving <ID>` | require this deployment id or vN revision to remain at 100% traffic |  |
 
 ### traffic status
 
@@ -2097,7 +2301,7 @@ Show live deployment traffic weights for an app
 
 ## mirror
 
-Manage traffic mirroring (mirror list|create|info|update|rm|summary --app &lt;slug&gt;; issue #72 / ADR-124; Pro/Scale only)
+Manage traffic mirroring and sanitized replay (Pro/Scale only)
 
 `gregale mirror [<subcommand>]`
 
@@ -2116,10 +2320,10 @@ Create a mirror rule
 | Flag | Meaning | |
 |---|---|---|
 | `--app <slug>` | app slug | required |
-| `--source <ID>` | source deployment id (live) | required |
-| `--mirror <ID>` | mirror deployment id (live; same app) | required |
+| `--source <ID>` | source deployment id or vN revision (live) | required |
+| `--mirror <ID>` | mirror deployment id or vN revision (live; same app) | required |
 | `--percent <N>` | fan-out percent in [0, 100]; 100 = every request |  |
-| `--include-body` | include request/response bodies in the comparison ledger |  |
+| `--include-body` | include request/response body hashes in the comparison ledger |  |
 | `--redact-header <NAME>` | extra header name to redact (repeatable) |  |
 
 ### mirror info
@@ -2142,8 +2346,8 @@ Patch a mirror rule (patch semantics)
 | `--percent <N>` | new percent in [0, 100] |  |
 | `--enable` | enable the rule (mutually exclusive with --disable) |  |
 | `--disable` | disable the rule (mutually exclusive with --enable) |  |
-| `--include-body` | enable body capture (mutually exclusive with --no-include-body) |  |
-| `--no-include-body` | disable body capture |  |
+| `--include-body` | enable body-hash comparison (mutually exclusive with --no-include-body) |  |
+| `--no-include-body` | disable body-hash comparison |  |
 | `--redact-header <NAME>` | extra header name to redact (repeatable) |  |
 | `--clear-redact` | clear the customer&#39;s redact_headers list (drop to always-stripped only) |  |
 
@@ -2166,16 +2370,53 @@ Aggregate mirror drift counts over a window
 | `--id <ID>` | mirror rule id | required |
 | `--window <WINDOW>` | summary window: 1h \| 24h \| 7d (default 1h) | one of `1h` · `24h` · `7d` |
 
+### mirror replay
+
+Replay a sanitized historical request corpus
+
+| Flag | Meaning | |
+|---|---|---|
+| `--app <slug>` | app slug | required |
+| `--id <ID>` | mirror rule id | required |
+| `--file <PATH>` | corpus JSON file, or - for stdin | required |
+| `--allow-unsafe-methods` | allow POST, PUT, PATCH, and DELETE |  |
+
 
 ## cache
 
-Manage response cache (cache purge &lt;slug&gt; [--path GLOB])
+Declare or purge response caching (cache GET /path/:id for 30s)
 
-`gregale cache [<subcommand>] <slug>`
+`gregale cache [<subcommand>]`
+
+### cache GET
+
+Cache GET responses for a route
+
+| Flag | Meaning | |
+|---|---|---|
+| `--app <SLUG>` | app slug (defaults to linked project context) |  |
+| `--host <HOST>` | hostname override |  |
+| `--stale-while-revalidate <DURATION>` | serve stale while refreshing |  |
+| `--stale-if-error <DURATION>` | serve stale when the origin fails |  |
+| `--vary-on <HEADER>` | header included in the cache key | one of `Accept-Language` · `Accept-Encoding` |
+| `--priority <N>` | match priority (lower wins) |  |
+
+### cache HEAD
+
+Cache HEAD responses for a route
+
+| Flag | Meaning | |
+|---|---|---|
+| `--app <SLUG>` | app slug (defaults to linked project context) |  |
+| `--host <HOST>` | hostname override |  |
+| `--stale-while-revalidate <DURATION>` | serve stale while refreshing |  |
+| `--stale-if-error <DURATION>` | serve stale when the origin fails |  |
+| `--vary-on <HEADER>` | header included in the cache key | one of `Accept-Language` · `Accept-Encoding` |
+| `--priority <N>` | match priority (lower wins) |  |
 
 ### cache purge
 
-Purge cached responses for an app
+Purge cached responses: cache purge &lt;slug&gt; [--path GLOB]
 
 | Flag | Meaning | |
 |---|---|---|

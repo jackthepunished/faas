@@ -32,6 +32,26 @@ last poll/success/error timestamps, the last error text, and broker-native lag
 when the source exposes it. A stale snapshot means schedd has not completed a
 poll in 30 seconds; use the schedd metrics for fleet-wide liveness and alerting.
 
+For the common operator workflow, the `gregale queue status <slug>` command
+combines app queue state, the scaling target, every binding's consumer
+liveness, broker lag, dead letters, and the last consumer error. Use `--json`
+for automation. The command is read-only and does not lease or acknowledge
+messages.
+
+## Simple workload setup
+
+For the common worker/job case, `gregale queue setup <slug>` (or
+`PUT /v1/apps/{slug}/queue-workload`) is the one-step path. The control plane
+idempotently converges the app's `default` push binding, consumer projection,
+and `queue_depth` scaling target (defaults: queue `default`, target depth 10,
+per-worker concurrency 1). Use `--queue-name`, `--target-depth`, and
+`--max-concurrency` for routine overrides. Retry behavior can be configured in
+the same command with `--max-attempts`, `--retry-base-seconds`,
+`--retry-max-seconds`, and `--retry-jitter-seconds`; omitted retry flags keep
+the plan defaults. `--force` is required to move an existing default binding
+to another queue. Advanced bindings and policies remain available through the
+individual queue APIs.
+
 `FaasDurableQueueStalled` means work is present but the oldest pending item
 has been waiting for more than five minutes. Check queue-depth scaling,
 worker admission capacity, and the schedd lease-recovery log. A non-zero

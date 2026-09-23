@@ -34,6 +34,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/dependencytrace"
 	"github.com/onebox-faas/faas/pkg/httpjson"
 	"github.com/onebox-faas/faas/pkg/middleware"
+	"github.com/onebox-faas/faas/pkg/safetext"
 	"github.com/onebox-faas/faas/pkg/sched/floor"
 	"github.com/onebox-faas/faas/pkg/sched/flowcount"
 	"github.com/onebox-faas/faas/pkg/sched/prewarm"
@@ -44,6 +45,13 @@ import (
 	pkgtrace "github.com/onebox-faas/faas/pkg/trace"
 	"github.com/onebox-faas/faas/pkg/wire"
 )
+
+// invocationFailureDetailMaxBytes bounds the failure detail copied from a
+// failed invocation's body into the invocation record. The body is
+// application output, so it is truncated with safetext.Ellipsis: the cut
+// lands on a rune boundary and the ellipsis is charged to the budget rather
+// than pushing the result three bytes past it.
+const invocationFailureDetailMaxBytes = 512
 
 // reaperParkTimeout bounds the synchronous Engine.Park call made by the
 // scheduler loop. Firecracker snapshot creation is normally fast, but a
@@ -82,7 +90,8 @@ type Loop struct {
 	// triggerPollers caches one triggerSource per trigger id. The
 	// cache is invalidated by NotifyTriggerChanged (commit #16);
 	// for now we never rebuild within a process lifetime.
-	triggerPollers map[string]triggerSource
+	triggerPollersMu sync.Mutex
+	triggerPollers   map[string]triggerSource
 	// triggerSecretIdentities opens Kafka credentials only in the
 	// short-lived trigger copy passed to a poller factory. Current and
 	// previous identities coexist here during host-key rotation.
@@ -97,43 +106,46 @@ type Loop struct {
 	// doesn't sit for a full 1s tick before the first batch.
 	triggerWakeup     chan struct{}
 	triggerWakeupOnce sync.Once
-	// primeSlots bounds how many snapshot_prime handlers run off the
-	// main select goroutine. Prime is the one notification handler that
-	// does VM work (cold boot + snapshot), so it is the only one that
-	// can stall the shared loop for tens of seconds; every other case
-	// in handleNotification is a cheap DB or cache operation and stays
-	// inline. See dispatchPrime.
-	primeSlots            chan struct{}
-	primeSlotsOnce        sync.Once
-	primeInFlightMu       sync.Mutex
-	primeInFlight         map[string]struct{}
+	// work is the bounded off-loop task pool (ADR-191). It owns every
+	// handler arm that must not run on the select goroutine: the
+	// snapshot_prime VM work that used to have its own slot pool, plus
+	// the four reconcile arms that used to escape with an unbounded
+	// `go func`. Lazily built by workPool() so a Loop constructed
+	// without Run (tests) still dispatches.
+	work                  *workPool
+	workOnce              sync.Once
 	now                   func() time.Time
 	flowCounts            FlowCounter
-	ops                   *wire.OpsMetrics                    // issue #171 shared registry; nil safe
-	audit                 *audit.Auditor                      // cron-fired audit row writer; nil opts out (no row written)
-	watchdog              *Watchdog                           // §6.1 watchdog; nil means "no watchdog" (tests can opt out)
-	retention             *Retention                          // §17 retention sweep; nil means "no retention" (tests can opt out)
-	invocationsRetention  *InvocationsRetention               // ADR-134 PR-B: invocations retention + deadline-breach sweep; nil opts out
-	triggersRetention     *TriggersRetention                  // ADR-134 PR-E: trigger_records retention sweep; nil opts out
-	heartbeat             *Heartbeat                          // issue #97 / ADR-025 axis 3 (PR #114) per-node liveness; nil opts out
-	diskDrift             *DiskDrift                          // PR scale-out readiness #3 read-only /srv/fc/snap vs DB drift sweep; nil opts out
-	migratingWatchdog     *MigratingWatchdog                  // Tier A6 / ADR-067 wedged-migration self-healer; nil opts out
-	deadNodeReconciler    *DeadNodeReconciler                 // dead-node billing-leak self-healer; nil opts out (no ticker arm)
-	instStats             InstanceStatsPoller                 // issue #170 / PR-A per-{app,node} metrics poller; nil opts out
-	instanceActivity      InstanceActivityReader              // fresh per-instance request activity used by scale-in; nil opts out
-	scaleup               *scaleup.Trigger                    // issue #169 / #172 reactive scale-up trigger; nil opts out
-	scaleupMu             sync.Mutex                          // serializes asynchronous scale-up ticks
-	scaleupRunning        bool                                // true while one scale-up tick is in flight
-	targets               *targets.Trigger                    // issue #462 (PR-C) concurrent_requests target trigger; nil opts out
-	floor                 *floor.Trigger                      // issue #557 / ADR-071 proactive min-instances floor reconciler; nil opts out
-	prewarm               *prewarm.Trigger                    // scheduled/predicted demand-window capacity restore; nil opts out
-	recentLoad            *recentload.RecentLoad              // issue #171 aggressive-reaper signal mirror; nil opts out
-	livenessWindow        *LivenessWindow                     // issue #554 / ADR-078 per-deployment liveness-restart tracker; nil opts out (Engine does not call ParkDeployment)
-	appDelete             *AppDeleteSubscriber                // ADR-098 app_delete handler; nil = no-op dispatch (tests / opt-out)
-	privateNetwork        *PrivateNetworkAttachmentSubscriber // durable private-route detach handler; nil = no-op dispatch
-	privateNetworkPeering *PrivateNetworkPeeringSubscriber    // durable peering withdrawal/replay handler; nil = no-op dispatch
-	reaperAggressive      bool                                // issue #171 FAAS_REAPER_AGGRESSIVE; default ON; false = skip the new path
-	reaperParkCap         int                                 // issue #171 per-app per-tick park cap; default MaxParksPerTickPerApp
+	ops                   *wire.OpsMetrics                        // issue #171 shared registry; nil safe
+	audit                 *audit.Auditor                          // cron-fired audit row writer; nil opts out (no row written)
+	watchdog              *Watchdog                               // §6.1 watchdog; nil means "no watchdog" (tests can opt out)
+	liveness              *wire.Liveness                          // ADR-190 main-loop progress beats; nil opts out
+	retention             *Retention                              // §17 retention sweep; nil means "no retention" (tests can opt out)
+	deadLetterRetention   *DeadLetterRetention                    // unified Failed Events projection retention
+	invocationsRetention  *InvocationsRetention                   // ADR-134 PR-B: invocations retention + deadline-breach sweep; nil opts out
+	triggersRetention     *TriggersRetention                      // ADR-134 PR-E: trigger_records retention sweep; nil opts out
+	heartbeat             *Heartbeat                              // issue #97 / ADR-025 axis 3 (PR #114) per-node liveness; nil opts out
+	diskDrift             *DiskDrift                              // PR scale-out readiness #3 read-only /srv/fc/snap vs DB drift sweep; nil opts out
+	migratingWatchdog     *MigratingWatchdog                      // Tier A6 / ADR-067 wedged-migration self-healer; nil opts out
+	deadNodeReconciler    *DeadNodeReconciler                     // dead-node billing-leak self-healer; nil opts out (no ticker arm)
+	instanceDivergence    *DeadNodeReconciler                     // ADR-191 vmmd-vs-row divergence sweep; nil opts out (no ticker arm)
+	instStats             InstanceStatsPoller                     // issue #170 / PR-A per-{app,node} metrics poller; nil opts out
+	instanceActivity      InstanceActivityReader                  // fresh per-instance request activity used by scale-in; nil opts out
+	scaleup               *scaleup.Trigger                        // issue #169 / #172 reactive scale-up trigger; nil opts out
+	scaleupMu             sync.Mutex                              // serializes asynchronous scale-up ticks
+	scaleupRunning        bool                                    // true while one scale-up tick is in flight
+	targets               *targets.Trigger                        // issue #462 (PR-C) concurrent_requests target trigger; nil opts out
+	floor                 *floor.Trigger                          // issue #557 / ADR-071 proactive min-instances floor reconciler; nil opts out
+	prewarm               *prewarm.Trigger                        // scheduled/predicted demand-window capacity restore; nil opts out
+	recentLoad            *recentload.RecentLoad                  // issue #171 aggressive-reaper signal mirror; nil opts out
+	livenessWindow        *LivenessWindow                         // issue #554 / ADR-078 per-deployment liveness-restart tracker; nil opts out (Engine does not call ParkDeployment)
+	appDelete             *AppDeleteSubscriber                    // ADR-098 app_delete handler; nil = no-op dispatch (tests / opt-out)
+	privateNetwork        *PrivateNetworkAttachmentSubscriber     // durable private-route detach handler; nil = no-op dispatch
+	privateNetworkPolicy  *PrivateNetworkPolicySubscriber         // durable network policy convergence handler; nil = no-op dispatch
+	privateNetworkPeering *PrivateNetworkPeeringSubscriber        // durable peering withdrawal/replay handler; nil = no-op dispatch
+	privateNetworkDelete  *PrivateNetworkFabricDeletionSubscriber // durable node-fabric teardown handler; nil = no-op dispatch
+	reaperAggressive      bool                                    // issue #171 FAAS_REAPER_AGGRESSIVE; default ON; false = skip the new path
+	reaperParkCap         int                                     // issue #171 per-app per-tick park cap; default MaxParksPerTickPerApp
 	// lastFloorByApp (issue #557 closure / ADR-072): per-app
 	// effective floor from the previous reaper tick, used to emit
 	// `instances.parked_min_instances_released` when the floor
@@ -151,6 +163,10 @@ type Loop struct {
 	// process-local: the durable event row is the source of truth and a schedd
 	// restart may emit one fresh observation.
 	runningReasonStates map[string]runningReasonState
+	// serviceRolloutRecoveryCursor rotates the durable recovery walk so a
+	// permanently unavailable gateway cannot let the oldest eight rollouts
+	// monopolise the deployment-reconcile worker slots forever.
+	serviceRolloutRecoveryCursor int
 	// brokerAccountor (issue #757 / ADR-118 commit 8) — the
 	// per-tick broker-egress accounting seam. nil opts out
 	// (noop-on-nil semantics; the dispatch hot path guards
@@ -188,11 +204,15 @@ type Loop struct {
 }
 
 func NewLoop(pool *pgxpool.Pool, engine *Engine, log *slog.Logger) *Loop {
-	return &Loop{
+	l := &Loop{
 		pool: pool, engine: engine, log: log,
 		now:        time.Now,
 		flowCounts: noopFlowCounter{},
 	}
+	if engine != nil {
+		engine.SetBrokerLagReader(l)
+	}
+	return l
 }
 
 // WithJobsDispatched opts the Loop into the jobs dispatch + reaper
@@ -243,12 +263,56 @@ func (l *Loop) WithWatchdog(w *Watchdog) *Loop {
 	return l
 }
 
+// MainLoopName is the Liveness loop name Run beats on every select
+// iteration. MainLoopBudget is its stall budget.
+//
+// ADR-191 moved Prime and the four reconcile arms onto the bounded work
+// pool, so the longest thing that still runs on this goroutine is
+// handleAppWake. That one stays inline deliberately: its error decides
+// whether the durable notification is acknowledged, and moving it off
+// the loop means re-plumbing outbox ack through the worker. EnsureWake
+// can legitimately cold-boot at ColdBootTimeout (35 s) plus admission,
+// so 60 s is the honest ceiling — down from the 180 s the loop needed
+// when a Scale-plan Prime ran here.
+//
+// The prime path can still land inline when all four prime slots are
+// busy (workSpecs: overflowInline, because dropping strands a
+// deployment in `snapshotting`). That is rare, bounded by
+// SnapshotTimeout, and a watchdog restart is the correct outcome if it
+// somehow exceeds a minute — the daemon has stopped scheduling either
+// way.
+const (
+	MainLoopName   = "main"
+	MainLoopBudget = 60 * time.Second
+)
+
+// WithLiveness (ADR-190) attaches the daemon's Liveness registry.
+// Run registers MainLoopName with MainLoopBudget and beats it at the
+// top of every select iteration, so a handler that blocks the single
+// notify goroutine (the 2026-09-03 PauseAndSnapshot wedge) stops the
+// beat and the systemd watchdog restarts schedd. nil opts out.
+func (l *Loop) WithLiveness(lv *wire.Liveness) *Loop {
+	l.liveness = lv
+	return l
+}
+
+// beatMain is the nil-safe Beat used inside Run.
+func (l *Loop) beatMain() { l.liveness.Beat(MainLoopName) }
+
 // WithRetention attaches the §17 retention sweep (PR #74). Same opt-out
 // shape as WithWatchdog: nil means no ticker fires the retention case.
 // Production wires NewRetention(store, log); the default retention
 // window + interval live in pkg/api/limits.
 func (l *Loop) WithRetention(r *Retention) *Loop {
 	l.retention = r
+	return l
+}
+
+// WithDeadLetterRetention attaches the unified Failed Events projection
+// retention sweep. It shares the hourly retention ticker with instance and
+// workflow history cleanup.
+func (l *Loop) WithDeadLetterRetention(r *DeadLetterRetention) *Loop {
+	l.deadLetterRetention = r
 	return l
 }
 
@@ -293,11 +357,26 @@ func (l *Loop) WithPrivateNetworkAttachmentSubscriber(s *PrivateNetworkAttachmen
 	return l
 }
 
+// WithPrivateNetworkPolicySubscriber attaches the durable network policy
+// convergence handler to the loop's existing LISTEN connection and replay
+// worker.
+func (l *Loop) WithPrivateNetworkPolicySubscriber(s *PrivateNetworkPolicySubscriber) *Loop {
+	l.privateNetworkPolicy = s
+	return l
+}
+
 // WithPrivateNetworkPeeringSubscriber attaches the durable peering mutation
 // handler to the loop's existing LISTEN connection. The same handler is used
 // by the outbox replay worker so delete withdrawals remain retryable.
 func (l *Loop) WithPrivateNetworkPeeringSubscriber(s *PrivateNetworkPeeringSubscriber) *Loop {
 	l.privateNetworkPeering = s
+	return l
+}
+
+// WithPrivateNetworkFabricDeletionSubscriber attaches the durable node-local
+// fabric teardown handler used after a Gregale-owned network is deleted.
+func (l *Loop) WithPrivateNetworkFabricDeletionSubscriber(s *PrivateNetworkFabricDeletionSubscriber) *Loop {
+	l.privateNetworkDelete = s
 	return l
 }
 
@@ -524,6 +603,9 @@ func (l *Loop) WithScaleUp(t *scaleup.Trigger) *Loop {
 // via nil. The trigger's own Interval() governs the cadence.
 func (l *Loop) WithTargets(t *targets.Trigger) *Loop {
 	l.targets = t
+	if t != nil {
+		t.WithBrokerLagReader(l)
+	}
 	return l
 }
 
@@ -631,6 +713,16 @@ func (l *Loop) WithDeadNodeReconciler(r *DeadNodeReconciler) *Loop {
 	return l
 }
 
+// WithInstanceDivergence attaches the ADR-191 sweep that finds live rows
+// the owning vmmd is not reporting. Same nil-skip semantics as the
+// dead-node reconciler: nil means no ticker arm fires and the counter
+// stays at zero. The two sweeps cannot collide — this one acts only on
+// nodes that reported, the other only on nodes that went silent.
+func (l *Loop) WithInstanceDivergence(r *DeadNodeReconciler) *Loop {
+	l.instanceDivergence = r
+	return l
+}
+
 // Run blocks until ctx is cancelled. It owns three event sources: the LISTEN
 // subscriber, the reaper tick, and the cron tick.
 func (l *Loop) Run(ctx context.Context) error {
@@ -644,13 +736,14 @@ func (l *Loop) Run(ctx context.Context) error {
 	notif, err := db.SubscribeWithReconnect(ctx, l.pool, []string{
 		db.NotifyAppChanged,
 		db.NotifyAppWake,
+		db.NotifyRuntimeConfigRestart,
 		db.NotifyDeploymentChanged,
 		db.NotifySnapshotPrime,
 		db.NotifyCronRunNow,                      // PR-D / issue #791: multiplexed on the cron loop's existing LISTEN; zero extra pool connections.
 		db.NotifyAppDelete,                       // ADR-098: multiplexed on the cron loop's existing LISTEN; same zero-cost pattern as NotifyCronRunNow. Saves a 7th long-term pool subscriber (the standalone one tipped pool.MaxConns=8 over the edge and starved the async-invoke drain's BeginTx under e2e query bursts).
 		db.NotifyJobChanged,                      // issue #1184: wake job dispatch and reconcile cancelled task VMs on the existing LISTEN.
 		db.NotifyPrivateNetworkAttachmentChanged, // durable detach cleanup; replayed if this LISTEN delivery is missed.
-		db.NotifyPrivateNetworkChanged,           // durable peering activation/withdrawal; replayed if this LISTEN delivery is missed.
+		db.NotifyPrivateNetworkChanged,           // durable network policy/peering mutation; replayed if this LISTEN delivery is missed.
 		db.NotifyEventPublished,                  // Workstream B event matcher/fanout wakeup.
 		// PR #1099 P2 redesign: multiplexed onto the existing
 		// LISTEN. Same zero-cost pattern as NotifyCronRunNow +
@@ -658,6 +751,7 @@ func (l *Loop) Run(ctx context.Context) error {
 		// handler arm, one extra safety ticker. No additional
 		// pool subscriber.
 		db.NotifyOperatorIntent,
+		db.NotifyInstanceFailureRelayed, // issue #3359: vmmd reports relayed by the hosting schedd to the app's owner.
 	}, l.log)
 	if err != nil {
 		return err
@@ -686,6 +780,12 @@ func (l *Loop) Run(ctx context.Context) error {
 	// two SELECTs over partial indexes — and bounded by the
 	// completeness ticker that fires every 60s afterward.
 	l.runOperatorIntentCompletenessTick(ctx)
+
+	// Service rollout rows are the durable recovery ledger for a routing
+	// handoff. Reconcile once at startup so a schedd exit between publishing
+	// weights, collecting gateway acknowledgements, draining requests, and
+	// finalising does not strand the rollout until another deployment event.
+	l.runServiceRolloutRecovery(ctx)
 
 	reaperT := time.NewTicker(10 * time.Second)
 	defer reaperT.Stop()
@@ -742,7 +842,7 @@ func (l *Loop) Run(ctx context.Context) error {
 	// the watchdog has had a chance to stamp its first batch.
 	var retentionT *time.Ticker
 	var retentionFirst <-chan time.Time
-	if l.retention != nil {
+	if l.retention != nil || l.deadLetterRetention != nil {
 		t := time.NewTicker(api.DefaultRetentionInterval)
 		defer t.Stop()
 		retentionT = t
@@ -928,6 +1028,13 @@ func (l *Loop) Run(ctx context.Context) error {
 		deadNodeReconcilerT = time.NewTicker(l.deadNodeReconciler.interval)
 		defer deadNodeReconcilerT.Stop()
 	}
+	// Instance divergence sweep ticker (ADR-191). Same nil-opts-out
+	// shape as the dead-node reconciler above.
+	var instanceDivergenceT *time.Ticker
+	if l.instanceDivergence != nil {
+		instanceDivergenceT = time.NewTicker(l.instanceDivergence.interval)
+		defer instanceDivergenceT.Stop()
+	}
 	// Jobs dispatch + stuck-job reaper tickers (Mega-1, issue
 	// #1184 Workstream A). Both gated on jobsDispatched so a
 	// FAAS_JOBS_DISPATCH=0 cluster never ticks. 1s matches the
@@ -974,6 +1081,8 @@ func (l *Loop) Run(ctx context.Context) error {
 	eventFanoutT := time.NewTicker(5 * time.Second)
 	defer eventFanoutT.Stop()
 	l.runEventFanoutSweep(ctx)
+	serviceRolloutRecoveryT := time.NewTicker(time.Duration(api.ServiceRolloutRecoveryIntervalSeconds) * time.Second)
+	defer serviceRolloutRecoveryT.Stop()
 
 	// Make sure the triggerWakeup channel exists before any
 	// wakeup can race the first select iteration. WakeupTriggers
@@ -985,7 +1094,15 @@ func (l *Loop) Run(ctx context.Context) error {
 		l.triggerWakeup = make(chan struct{}, 1)
 	})
 
+	// ADR-190: register the main loop once every ticker exists, so a
+	// beat gap is measured against the loop's real cadence. The 1 s
+	// watchdog/trigger tickers guarantee an iteration at least once
+	// a second when the goroutine is free; a missing beat means a
+	// handler arm is blocking it.
+	l.liveness.Register(MainLoopName, MainLoopBudget)
+
 	for {
+		l.beatMain()
 		select {
 		case <-ctx.Done():
 			return nil
@@ -997,6 +1114,11 @@ func (l *Loop) Run(ctx context.Context) error {
 			if n.Channel == db.NotifyAppWake {
 				if err := l.handleAppWake(ctx, n); err != nil {
 					l.log.Warn("sched: explicit app wake failed; leaving durable request pending", "err", err)
+					continue
+				}
+			} else if n.Channel == db.NotifyRuntimeConfigRestart {
+				if err := l.handleRuntimeConfigRestart(ctx, n); err != nil {
+					l.log.Warn("sched: runtime config restart failed; leaving durable request pending", "err", err)
 					continue
 				}
 			} else if n.Channel == db.NotifyPrivateNetworkAttachmentChanged {
@@ -1043,6 +1165,8 @@ func (l *Loop) Run(ctx context.Context) error {
 			l.runMigratingReconcile(ctx)
 		case <-deadNodeTick(deadNodeReconcilerT):
 			l.runDeadNodeReconcile(ctx)
+		case <-deadNodeTick(instanceDivergenceT):
+			l.runInstanceDivergence(ctx)
 		case <-jobsTick(jobsDispatchT):
 			l.runJobsDispatchTick(ctx)
 		case <-jobsTick(jobsReaperT):
@@ -1059,9 +1183,11 @@ func (l *Loop) Run(ctx context.Context) error {
 			// this the channel is set to nil so subsequent ticks
 			// exclusively come from retentionT (the 1h ticker).
 			l.runRetention(ctx)
+			l.runDeadLetterRetention(ctx)
 			retentionFirst = nil
 		case <-retentionTick(retentionT):
 			l.runRetention(ctx)
+			l.runDeadLetterRetention(ctx)
 		case <-invocationsRetentionTick(invocationsRetentionT):
 			l.runInvocationsRetention(ctx)
 		case <-triggersRetentionTick(triggersRetentionT):
@@ -1099,6 +1225,8 @@ func (l *Loop) Run(ctx context.Context) error {
 			l.runTriggerTick(ctx)
 		case <-eventFanoutT.C:
 			l.runEventFanoutSweep(ctx)
+		case <-serviceRolloutRecoveryT.C:
+			l.runServiceRolloutRecovery(ctx)
 		case <-l.triggerWakeup:
 			// Same arm as the 1s ticker. The wake channel is
 			// buffered-size-1 so a burst of broker deliveries
@@ -1106,6 +1234,40 @@ func (l *Loop) Run(ctx context.Context) error {
 			l.runTriggerTick(ctx)
 		}
 	}
+}
+
+// runServiceRolloutRecovery replays every durable zero-step rollout through
+// the same bounded worker and per-app mutex used by notification-driven
+// reconciliation. Submitting with the deployment id coalesces a concurrent
+// deployment_changed delivery instead of running a duplicate handoff.
+func (l *Loop) runServiceRolloutRecovery(ctx context.Context) {
+	if l == nil || l.engine == nil || l.engine.store == nil {
+		return
+	}
+	rollouts, err := l.engine.store.ListServiceRolloutsInFlight(ctx, l.engine.OwnerNodeID())
+	if err != nil {
+		if !errors.Is(err, context.Canceled) {
+			l.log.Warn("sched: list service rollouts for recovery", "err", err)
+		}
+		return
+	}
+	if len(rollouts) == 0 {
+		l.serviceRolloutRecoveryCursor = 0
+		return
+	}
+	start := l.serviceRolloutRecoveryCursor % len(rollouts)
+	limit := workSpecs[workDeploymentReconcile].slots
+	if limit > len(rollouts) {
+		limit = len(rollouts)
+	}
+	for i := 0; i < limit; i++ {
+		rollout := rollouts[(start+i)%len(rollouts)]
+		deploymentID := rollout.ID
+		l.submitWork(workDeploymentReconcile, deploymentID, func() {
+			l.engine.ReconcileServiceDeployment(context.WithoutCancel(ctx), deploymentID)
+		})
+	}
+	l.serviceRolloutRecoveryCursor = (start + limit) % len(rollouts)
 }
 
 // watchdogTick is a helper that turns a nil-ticker's channel into a
@@ -1380,6 +1542,9 @@ func (l *Loop) runWatchdog(ctx context.Context) {
 // swallowed (the sweep itself is idempotent + redelivery-safe; an
 // error means a transient store outage, not a permanent fault).
 func (l *Loop) runRetention(ctx context.Context) {
+	if l.retention == nil {
+		return
+	}
 	deleted, err := l.retention.SweepOnce(ctx)
 	if err != nil {
 		l.log.Warn("retention: sweep failed", "err", err)
@@ -1387,6 +1552,22 @@ func (l *Loop) runRetention(ctx context.Context) {
 	}
 	if deleted > 0 {
 		l.log.Info("retention: swept", "deleted", deleted)
+	}
+}
+
+// runDeadLetterRetention dispatches one unified Failed Events projection
+// retention sweep. Errors are logged and retried on the next hourly tick.
+func (l *Loop) runDeadLetterRetention(ctx context.Context) {
+	if l.deadLetterRetention == nil {
+		return
+	}
+	deleted, err := l.deadLetterRetention.SweepOnce(ctx)
+	if err != nil {
+		l.log.Warn("dead-letter retention: sweep failed", "err", err)
+		return
+	}
+	if deleted > 0 {
+		l.log.Info("dead-letter retention: swept", "deleted", deleted)
 	}
 }
 
@@ -1494,6 +1675,18 @@ func (l *Loop) runDeadNodeReconcile(ctx context.Context) {
 	_ = reconciled
 }
 
+// runInstanceDivergence dispatches one ADR-191 sweep. Same dispatch
+// shape and same swallow-on-cancel rule as runDeadNodeReconcile above;
+// per-row outcomes live on the instance_divergence_total metric.
+func (l *Loop) runInstanceDivergence(ctx context.Context) {
+	if l.instanceDivergence == nil {
+		return
+	}
+	if _, err := l.instanceDivergence.handle(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		l.log.Warn("instance divergence: tick failed", "err", err)
+	}
+}
+
 // runScaleUp dispatches one tick of the per-app reactive scale-up
 // trigger (issue #169 / #172). The tick runs asynchronously because
 // its optional Prometheus scrape can otherwise hold the scheduler loop
@@ -1599,6 +1792,24 @@ func retryableSnapshotPrimeError(err error) bool {
 	}
 }
 
+// workPool returns the loop's bounded off-loop task pool, building it on
+// first use (ADR-191). Lazy because tests construct a Loop and call
+// handleNotification directly without ever entering Run.
+func (l *Loop) workPool() *workPool {
+	l.workOnce.Do(func() {
+		if l.work == nil {
+			l.work = newWorkPool(l.log, l.ops)
+		}
+	})
+	return l.work
+}
+
+// submitWork hands one task to the pool. Thin wrapper so every call site
+// reads the same and the nil-Loop case stays impossible.
+func (l *Loop) submitWork(kind workKind, key string, fn func()) {
+	l.workPool().submit(kind, key, fn)
+}
+
 // dispatchPrime runs Engine.Prime off the loop's select goroutine.
 //
 // Prime does real VM work — cold boot then snapshot — so it can occupy
@@ -1628,28 +1839,7 @@ func retryableSnapshotPrimeError(err error) bool {
 // Durable replay can race a still-running LISTEN delivery, so a deployment
 // already in flight is coalesced before it consumes another prime slot.
 func (l *Loop) dispatchPrime(ctx context.Context, appID, deploymentID string) {
-	primeKey := appID + "\x00" + deploymentID
-	l.primeInFlightMu.Lock()
-	if l.primeInFlight == nil {
-		l.primeInFlight = make(map[string]struct{})
-	}
-	if _, exists := l.primeInFlight[primeKey]; exists {
-		l.primeInFlightMu.Unlock()
-		l.log.Debug("sched: duplicate snapshot prime coalesced", "app", appID, "deployment", deploymentID)
-		return
-	}
-	l.primeInFlight[primeKey] = struct{}{}
-	l.primeInFlightMu.Unlock()
-
-	l.primeSlotsOnce.Do(func() {
-		l.primeSlots = make(chan struct{}, maxConcurrentPrimes)
-	})
-	run := func() {
-		defer func() {
-			l.primeInFlightMu.Lock()
-			delete(l.primeInFlight, primeKey)
-			l.primeInFlightMu.Unlock()
-		}()
+	l.submitWork(workPrime, appID+"\x00"+deploymentID, func() {
 		var err error
 		attempts := 0
 		for attempt := 1; attempt <= maxSnapshotPrimeAttempts; attempt++ {
@@ -1668,38 +1858,20 @@ func (l *Loop) dispatchPrime(ctx context.Context, appID, deploymentID string) {
 			l.log.Warn("sched: prime failed", "app", appID, "deployment", deploymentID, "attempts", attempts, "err", err)
 			l.engine.markPrimeFailed(ctx, deploymentID, err)
 		}
-	}
-	select {
-	case l.primeSlots <- struct{}{}:
-		go func() {
-			defer func() { <-l.primeSlots }()
-			run()
-		}()
-	default:
-		l.log.Warn("sched: prime slots saturated; running inline",
-			"app", appID, "deployment", deploymentID, "slots", maxConcurrentPrimes)
-		run()
-	}
+	})
 }
 
-// waitPrimes blocks until every prime dispatched by dispatchPrime has
-// returned. It acquires all slots (so no worker can hold one) and then
-// releases them.
+// waitPrimes blocks until every task dispatched off the loop has
+// returned.
 //
-// Tests need this because dispatchPrime moved Prime off the caller's
-// goroutine: a test that calls handleNotification and asserts on the
-// resulting rows would otherwise race the worker. Production has no
-// caller — the loop is never "done" with primes.
+// Tests need this because the work pool moves handler bodies off the
+// caller's goroutine: a test that calls handleNotification and asserts on
+// the resulting rows would otherwise race the worker. Production has no
+// caller — the loop is never "done".
+//
+// Named for its original prime-only scope; it now drains every kind.
 func (l *Loop) waitPrimes() {
-	l.primeSlotsOnce.Do(func() {
-		l.primeSlots = make(chan struct{}, maxConcurrentPrimes)
-	})
-	for i := 0; i < maxConcurrentPrimes; i++ {
-		l.primeSlots <- struct{}{}
-	}
-	for i := 0; i < maxConcurrentPrimes; i++ {
-		<-l.primeSlots
-	}
+	l.workPool().drain()
 }
 
 // HandleNotification exposes the existing notification dispatcher to the
@@ -1715,6 +1887,9 @@ func (l *Loop) HandleDurableNotification(ctx context.Context, n db.Notification)
 	if n.Channel == db.NotifyAppWake {
 		return l.handleAppWake(ctx, n)
 	}
+	if n.Channel == db.NotifyRuntimeConfigRestart {
+		return l.handleRuntimeConfigRestart(ctx, n)
+	}
 	if n.Channel == db.NotifyPrivateNetworkAttachmentChanged {
 		if l.privateNetwork == nil {
 			return nil
@@ -1722,12 +1897,44 @@ func (l *Loop) HandleDurableNotification(ctx context.Context, n db.Notification)
 		return l.privateNetwork.Handle(ctx, n)
 	}
 	if n.Channel == db.NotifyPrivateNetworkChanged {
+		if l.privateNetworkDelete != nil {
+			if err := l.privateNetworkDelete.Handle(ctx, n); err != nil {
+				return err
+			}
+		}
+		if l.privateNetworkPolicy != nil {
+			if err := l.privateNetworkPolicy.Handle(ctx, n); err != nil {
+				return err
+			}
+		}
 		if l.privateNetworkPeering == nil {
 			return nil
 		}
 		return l.privateNetworkPeering.Handle(ctx, n)
 	}
 	l.handleNotification(ctx, n)
+	return nil
+}
+
+func (l *Loop) handleRuntimeConfigRestart(ctx context.Context, n db.Notification) error {
+	var payload struct {
+		AppID  string `json:"app_id"`
+		WakeID string `json:"wake_id"`
+	}
+	if err := json.Unmarshal([]byte(n.Payload), &payload); err != nil {
+		return fmt.Errorf("sched: decode runtime config restart payload: %w", err)
+	}
+	if payload.AppID == "" || payload.WakeID == "" {
+		return errors.New("sched: runtime config restart payload requires app_id and wake_id")
+	}
+	out, err := l.engine.RefreshRuntimeConfig(ctx, payload.AppID, payload.WakeID)
+	if err != nil {
+		return fmt.Errorf("sched: runtime config restart %s: %w", payload.WakeID, err)
+	}
+	if out.Instance != nil {
+		l.log.Info("sched: runtime configuration applied", "app", payload.AppID,
+			"wake_id", out.Instance.WakeID, "instance", out.Instance.InstanceID)
+	}
 	return nil
 }
 
@@ -1796,7 +2003,8 @@ func (l *Loop) handleNotification(ctx context.Context, n db.Notification) {
 			// Restart can include a snapshot capture and a cold boot. Keep
 			// the notification loop responsive while the engine's restart
 			// single-flight coalesces duplicate requests for this app.
-			go func(appID, wakeID string) {
+			appID, wakeID := p.AppID, p.WakeID
+			l.submitWork(workRestart, appID, func() {
 				out, err := l.engine.RestartApp(context.WithoutCancel(ctx), appID, wakeID)
 				if err != nil {
 					l.log.Warn("sched: restart app failed", "app", appID, "err", err)
@@ -1805,12 +2013,12 @@ func (l *Loop) handleNotification(ctx context.Context, n db.Notification) {
 				if out.Instance != nil {
 					l.log.Info("sched: app restarted", "app", appID, "wake_id", out.Instance.WakeID)
 				}
-			}(p.AppID, p.WakeID)
+			})
 			return
 		}
 		if p.AppID != "" {
 			appID, lifecycleChanged := p.AppID, p.LifecycleChanged
-			go func(appID string, lifecycleChanged bool) {
+			l.submitWork(workAppReconcile, appID, func() {
 				reconcileCtx := context.WithoutCancel(ctx)
 				if lifecycleChanged {
 					l.engine.ReconcileServiceApp(reconcileCtx, appID)
@@ -1819,7 +2027,7 @@ func (l *Loop) handleNotification(ctx context.Context, n db.Notification) {
 				if err := l.engine.ReconcileWarmPool(reconcileCtx, appID); err != nil {
 					l.log.Warn("sched: warm pool reconcile", "app", appID, "err", err)
 				}
-			}(appID, lifecycleChanged)
+			})
 		}
 		l.log.Debug("app_changed", "payload", n.Payload)
 	case db.NotifyDeploymentChanged:
@@ -1845,16 +2053,21 @@ func (l *Loop) handleNotification(ctx context.Context, n db.Notification) {
 				// instances are still owned by schedd. Drain them before the
 				// next request sees the new live revision; otherwise a Free
 				// one-instance plan can return plan_limit_concurrency.
-				go func(id string) {
-					reconcileCtx := context.WithoutCancel(ctx)
-					l.engine.drainDeploymentInstances(reconcileCtx, id, true)
-				}(deploymentID)
+				// Distinct coalescing key from the reconcile submission
+				// below: both are keyed on the same deployment id, and a
+				// shared key would make the reconcile look like a
+				// duplicate of the drain and swallow it.
+				id := deploymentID
+				l.submitWork(workDeploymentReconcile, "drain\x00"+id, func() {
+					l.engine.drainDeploymentInstances(context.WithoutCancel(ctx), id, true)
+				})
 			}
 			// Live activates the new mode. Failed/superseded/cancelled signals
 			// drain a worker that may have proved readiness immediately before
 			// activation failed, while preserving the prior live generation.
 			appID := p.AppID
-			go func(id string) {
+			id := deploymentID
+			l.submitWork(workDeploymentReconcile, id, func() {
 				reconcileCtx := context.WithoutCancel(ctx)
 				l.engine.ReconcileServiceDeployment(reconcileCtx, id)
 				l.engine.ReconcileWorkerDeployment(reconcileCtx, id)
@@ -1863,7 +2076,7 @@ func (l *Loop) handleNotification(ctx context.Context, n db.Notification) {
 						l.log.Warn("sched: warm pool reconcile after deployment", "app", appID, "deployment", id, "err", err)
 					}
 				}
-			}(deploymentID)
+			})
 		}
 		l.log.Debug("deployment_changed", "payload", n.Payload)
 	case db.NotifySnapshotPrime:
@@ -1888,6 +2101,12 @@ func (l *Loop) handleNotification(ctx context.Context, n db.Notification) {
 		// matches the build_queued notify-loss defense pattern
 		// (cmd/imaged consumer: subscriber re-reads the row).
 		l.drainPendingFireNowRequests(ctx)
+	case db.NotifyInstanceFailureRelayed:
+		// Issue #3359: a peer schedd hosts one of this schedd's instances
+		// and relayed vmmd's terminal failure report. Non-owners discard.
+		if err := l.engine.HandleRelayedInstanceFailure(ctx, n.Payload); err != nil {
+			l.log.Warn("sched: relayed instance failure", "err", err)
+		}
 	case db.NotifyAppDelete:
 		// ADR-098: app was deleted. Evict any in-flight wake for
 		// the deleted app via the wake coordinator's Forget so
@@ -1920,11 +2139,12 @@ func (l *Loop) handleNotification(ctx context.Context, n db.Notification) {
 			return
 		}
 		if p.Kind == "run_cancelled" && p.RunID != "" {
-			go func() {
-				if err := l.engine.ReconcileCancelledJobRun(context.WithoutCancel(ctx), p.RunID); err != nil {
-					l.log.Warn("sched: cancelled job cleanup failed", "run", p.RunID, "err", err)
+			runID := p.RunID
+			l.submitWork(workJobCancel, runID, func() {
+				if err := l.engine.ReconcileCancelledJobRun(context.WithoutCancel(ctx), runID); err != nil {
+					l.log.Warn("sched: cancelled job cleanup failed", "run", runID, "err", err)
 				}
-			}()
+			})
 		}
 		if l.jobsDispatched && (p.Kind == "created" || p.Kind == "run_created" || p.Kind == "updated") {
 			l.runJobsDispatchTick(ctx)
@@ -2503,6 +2723,10 @@ func reaperInstanceState(s state.State) bool {
 	switch s {
 	case state.StateRunning, state.StateWaking, state.StateColdBooting, state.StateSnapshotting, state.StateWarm:
 		return true
+	case state.StateDraining:
+		// A durable runtime-config refresh owns this row until route and
+		// in-flight request drains finish; idle reaping must not park it.
+		return false
 	default:
 		return false
 	}
@@ -3134,10 +3358,7 @@ func (h *httpGatewaySynth) InvokeWithWake(ctx context.Context, appID string, inv
 func (h *httpGatewaySynth) invoke(ctx context.Context, appID string, inv state.Invocation, wake *WakeResult) (state.Invocation, error) {
 	out, statusCode, err := h.invokeWithStatus(ctx, appID, inv, wake)
 	if err == nil && out.State == state.InvocationFailed {
-		detail := strings.TrimSpace(string(out.Result))
-		if len(detail) > 512 {
-			detail = detail[:512] + "…"
-		}
+		detail := safetext.Ellipsis(strings.TrimSpace(string(out.Result)), invocationFailureDetailMaxBytes)
 		if detail == "" {
 			detail = http.StatusText(statusCode)
 		}
@@ -3596,6 +3817,11 @@ func (l *Loop) dispatchCronLocked(ctx context.Context, c state.Cron, now time.Ti
 	// "last_fired_at" semantics (kept on the crons table; both
 	// surfaces are still served per the chosen plan).
 	cronID := c.ID
+	cronHeaders, err := json.Marshal(pkgtrace.MergeHeaderMap(ctx, map[string]string{"x-faas-cron": "true"}))
+	if err != nil {
+		l.log.Warn("cron: encode trace context", "cron_id", c.ID, "err", err)
+		return CronRun{}, true
+	}
 	inv := state.Invocation{
 		AppID:     c.AppID,
 		AccountID: acct.ID,
@@ -3603,7 +3829,7 @@ func (l *Loop) dispatchCronLocked(ctx context.Context, c state.Cron, now time.Ti
 		Method:    "POST",
 		Path:      c.Path,
 		CronID:    &cronID,
-		Headers:   json.RawMessage(`{"x-faas-cron":"true"}`),
+		Headers:   cronHeaders,
 		DueAt:     now,
 	}
 	enq, err := l.engine.Store().EnqueueInvocation(ctx, inv)

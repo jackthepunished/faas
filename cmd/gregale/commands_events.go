@@ -15,20 +15,121 @@ import (
 )
 
 // cmdEvents exposes the customer-facing internal event fabric. Publishing is
-// deliberately a single leaf for now: subscriptions are declared in the
-// deployment manifest, while this command is the producer-side smoke path.
+// the producer path; subscriptions reads back the declarations reconciled
+// from the deployment manifest.
 func cmdEvents(args []string) int {
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: gregale events <publish>", "events")
+		PrintUsage(os.Stderr, "usage: gregale events <publish|subscriptions|deliveries>", "events")
 		return 1
 	}
 	switch args[0] {
 	case "publish":
 		return cmdEventsPublish(args[1:])
+	case "subscriptions", "list":
+		return cmdEventsSubscriptions(args[1:])
+	case "deliveries":
+		return cmdEventsDeliveries(args[1:])
 	default:
 		PrintUsage(os.Stderr, fmt.Sprintf("unknown events subcommand: %s", args[0]), "events")
 		return 1
 	}
+}
+
+// cmdEventsDeliveries implements `gregale events deliveries <app>`. It is a
+// focused operational view for event-triggered invocations; users do not need
+// to correlate the account-wide invocation ledger by hand.
+func cmdEventsDeliveries(args []string) int {
+	flags, positional := splitArgsForFlags(args)
+	fs := newFlagSet("events deliveries", flag.ContinueOnError)
+	eventID := fs.String("event-id", "", "filter by exact published event id")
+	deliveryState := fs.String("state", "", "filter by delivery state (pending|dispatching|completed|failed|dead_letter)")
+	before := fs.String("before", "", "pagination cursor (NextBefore from a prior call)")
+	limit := fs.Int("limit", 20, "max deliveries (1..200)")
+	if err := fs.Parse(flags); err != nil {
+		return 1
+	}
+	if len(positional) != 1 || rejectUnexpectedFlagArgs(fs) || validateCLILimit("limit", *limit, 200) != nil {
+		PrintUsage(os.Stderr, "usage: gregale events deliveries <app> [--event-id ID] [--state STATE] [--before ID] [--limit N]", "events")
+		return 1
+	}
+	client, err := authedClient()
+	if err != nil {
+		return printErr("Not logged in", err)
+	}
+	resp, err := client.ListEventDeliveries(context.Background(), positional[0], *eventID, *deliveryState, *before, *limit)
+	if err != nil {
+		return printErr("Could not list event deliveries", err)
+	}
+	if jsonOutput {
+		return jsonOut(writeJSON(resp))
+	}
+	if len(resp.Deliveries) == 0 {
+		_, _ = fmt.Fprintln(osStdout, "(no event deliveries)")
+		return 0
+	}
+	_, _ = fmt.Fprintln(osStdout, "INVOCATION\tEVENT\tSOURCE\tTYPE\tSTATE\tATTEMPTS\tCREATED\tERROR")
+	for _, delivery := range resp.Deliveries {
+		_, _ = fmt.Fprintf(osStdout, "%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\n",
+			delivery.InvocationID,
+			delivery.EventID,
+			delivery.EventSource,
+			delivery.EventType,
+			delivery.State,
+			delivery.Attempts,
+			delivery.CreatedAt.Format(time.RFC3339),
+			oneLine(delivery.LastError),
+		)
+	}
+	if resp.NextBefore != "" {
+		_, _ = fmt.Fprintf(osStdout, "... more — pass --before %s\n", resp.NextBefore)
+	}
+	return 0
+}
+
+// cmdEventsSubscriptions implements `gregale events subscriptions <app>`.
+// It gives simple users a direct answer to "what will receive this event?"
+// without requiring them to inspect deployment YAML or internal tables.
+func cmdEventsSubscriptions(args []string) int {
+	flags, positional := splitArgsForFlags(args)
+	fs := newFlagSet("events subscriptions", flag.ContinueOnError)
+	if err := fs.Parse(flags); err != nil {
+		return 1
+	}
+	if len(positional) != 1 || rejectUnexpectedFlagArgs(fs) {
+		PrintUsage(os.Stderr, "usage: gregale events subscriptions <app>", "events")
+		return 1
+	}
+	client, err := authedClient()
+	if err != nil {
+		return printErr("Not logged in", err)
+	}
+	resp, err := client.ListEventSubscriptions(context.Background(), positional[0])
+	if err != nil {
+		return printErr("Could not list event subscriptions", err)
+	}
+	if jsonOutput {
+		return jsonOut(writeJSON(resp))
+	}
+	if len(resp.Subscriptions) == 0 {
+		_, _ = fmt.Fprintln(osStdout, "(no event subscriptions)")
+		return 0
+	}
+	_, _ = fmt.Fprintln(osStdout, "ID\tSOURCE\tTYPE\tFILTER\tENABLED\tUPDATED")
+	for _, subscription := range resp.Subscriptions {
+		filter := string(subscription.Filter)
+		if filter == "" {
+			filter = "{}"
+		}
+		_, _ = fmt.Fprintf(osStdout, "%s\t%s\t%s\t%s\t%t\t%s\n",
+			subscription.ID,
+			subscription.Source,
+			subscription.Type,
+			filter,
+			subscription.Enabled,
+			subscription.UpdatedAt.Format(time.RFC3339),
+		)
+	}
+	return 0
 }
 
 // cmdEventsPublish implements `gregale events publish`. The server owns

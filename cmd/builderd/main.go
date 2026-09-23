@@ -234,6 +234,9 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// series real rather than a throwaway (ADR-030).
 	wire.BootStamps(ctx, "builderd", ops)
 	wire.RegisterDefaultOps(ops)
+	// ADR-190 follow-up: export this pool's live statistics so the
+	// DaemonMaxConnections cap above is measurable rather than arithmetic.
+	wire.RegisterPoolMetrics(ops, pool)
 	builderdProbe.SetReadyObserver(func(ready bool, reason string) {
 		ops.MarkReady("builderd", ready, reason)
 	})
@@ -263,6 +266,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		MetricsAddr:         cfg.MetricsAddr,
 		BuildTimeoutSeconds: cfg.BuildTimeoutSeconds,
 		FairnessWindow:      cfg.FairnessWindow,
+		CacheAffinityGrace:  cfg.CacheAffinityGrace,
 		WarmIdle:            cfg.WarmIdle,
 		// ADR-038: BuilderNodeID is stamped onto every
 		// build_provenance row builderd writes. Defaulted to
@@ -315,7 +319,8 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 		"vmmd_target", vmmTarget,
 		"builder_base_path", builderBasePath,
 		"cache_dir", cfg.CacheDir,
-		"poll_interval", cfg.PollInterval)
+		"poll_interval", cfg.PollInterval,
+		"cache_affinity_grace", cfg.CacheAffinityGrace)
 
 	// LISTEN/NOTIFY is the low-latency hint path, not the durable queue. Keep
 	// both build processing and cancellation work bounded so a notification
@@ -439,6 +444,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 
 	notifyStop := daemonunit.NotifyReadyWhen(ctx, builderdProbe.ReadyFunc())
 	defer notifyStop()
+	defer wire.StartWatchdog(ctx, wire.NewLiveness(), ops, log)()
 
 	for {
 		select {

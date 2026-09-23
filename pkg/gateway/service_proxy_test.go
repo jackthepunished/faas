@@ -10,6 +10,15 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/onebox-faas/faas/pkg/circuit"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
 type serviceProxyProvider struct {
@@ -32,12 +41,14 @@ func TestServiceProxyRetriesStaleGETAndCachesLease(t *testing.T) {
 	var seenInstance atomic.Value
 	proxy := NewServiceProxy(ServiceProxyConfig{
 		Provider: provider,
-		Resolve:  func(context.Context, string) (string, bool, error) { return "app-orders", true, nil },
-		Authorize: func(_ context.Context, caller, target string) error {
+		Resolve: func(context.Context, string, string) (ServiceTarget, bool, error) {
+			return ServiceTarget{AppID: "app-orders"}, true, nil
+		},
+		Authorize: func(_ context.Context, caller, target string) (ServiceCaller, error) {
 			if caller != "app-client" || target != "app-orders" {
-				return errors.New("unexpected authorization input")
+				return ServiceCaller{}, errors.New("unexpected authorization input")
 			}
-			return nil
+			return ServiceCaller{AppID: caller}, nil
 		},
 		Forward: func(target Target) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -82,13 +93,57 @@ func TestServiceProxyRetriesStaleGETAndCachesLease(t *testing.T) {
 	}
 }
 
+func TestServiceProxyHonorsAggregateRetryBudget(t *testing.T) {
+	provider := &serviceProxyProvider{snapshot: ServiceEndpointsSnapshot{AppID: "app-orders", Endpoints: []ServiceEndpoint{
+		{InstanceID: "instance-a", NodeID: "node-a", Port: 8080},
+		{InstanceID: "instance-b", NodeID: "node-b", Port: 8081},
+	}}}
+	now := time.Unix(100, 0)
+	metrics := NewMetrics()
+	var calls atomic.Int32
+	proxy := NewServiceProxy(ServiceProxyConfig{
+		Provider: provider,
+		Resolve: func(context.Context, string, string) (ServiceTarget, bool, error) {
+			return ServiceTarget{AppID: "app-orders"}, true, nil
+		},
+		Authorize: func(context.Context, string, string) (ServiceCaller, error) { return ServiceCaller{}, nil },
+		Forward: func(Target) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				markStaleTarget(r.Context())
+				http.Error(w, "stale", http.StatusServiceUnavailable)
+			})
+		},
+		Metrics:     metrics,
+		Now:         func() time.Time { return now },
+		RetryBudget: NewRetryBudget(time.Minute, func() time.Time { return now }),
+		// Keep endpoints selectable so this test isolates retry admission
+		// rather than the circuit breaker opening on the first failure.
+		Breaker: circuit.NewGroup(circuit.DefaultConfig(), func() time.Time { return now }),
+	})
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodGet, "http://gateway/v1/internal/services/orders/health", nil)
+		req.Header.Set(ServiceProxyCallerAppHeader, "app-client")
+		proxy.ServeHTTP(httptest.NewRecorder(), req)
+	}
+	if got := calls.Load(); got != 3 {
+		t.Fatalf("forward calls = %d, want first request retried and second capped (2+1)", got)
+	}
+	if got := labelledCounterValue(t, metrics.Registry(), "gateway_retry_exhausted_total", "reason", RetrySkipAggregate); got != 1 {
+		t.Fatalf("aggregate budget exhaustions = %v, want 1", got)
+	}
+}
+
 func TestServiceProxyRefreshesExpiredLease(t *testing.T) {
 	provider := &serviceProxyProvider{snapshot: ServiceEndpointsSnapshot{AppID: "app-orders", Endpoints: []ServiceEndpoint{{InstanceID: "instance-a", NodeID: "node-a", Port: 8080}}}}
 	now := time.Unix(100, 0)
 	proxy := NewServiceProxy(ServiceProxyConfig{
-		Provider:  provider,
-		Resolve:   func(context.Context, string) (string, bool, error) { return "app-orders", true, nil },
-		Authorize: func(context.Context, string, string) error { return nil },
+		Provider: provider,
+		Resolve: func(context.Context, string, string) (ServiceTarget, bool, error) {
+			return ServiceTarget{AppID: "app-orders"}, true, nil
+		},
+		Authorize: func(context.Context, string, string) (ServiceCaller, error) { return ServiceCaller{}, nil },
 		Forward: func(Target) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
 		},
@@ -113,12 +168,14 @@ func TestServiceProxyAuthorizationAndCallerIdentity(t *testing.T) {
 	var forwarded atomic.Bool
 	proxy := NewServiceProxy(ServiceProxyConfig{
 		Provider: provider,
-		Resolve:  func(context.Context, string) (string, bool, error) { return "app-orders", true, nil },
-		Authorize: func(_ context.Context, caller, target string) error {
+		Resolve: func(context.Context, string, string) (ServiceTarget, bool, error) {
+			return ServiceTarget{AppID: "app-orders"}, true, nil
+		},
+		Authorize: func(_ context.Context, caller, target string) (ServiceCaller, error) {
 			if caller == "app-foreign" || target != "app-orders" {
-				return ErrServiceProxyDenied
+				return ServiceCaller{}, ErrServiceProxyDenied
 			}
-			return nil
+			return ServiceCaller{AppID: caller}, nil
 		},
 		ResolveCaller: func(context.Context, string) (string, error) { return "app-client", nil },
 		Forward: func(Target) http.Handler {
@@ -155,9 +212,11 @@ func TestServiceProxyDoesNotRetryPOST(t *testing.T) {
 	provider := &serviceProxyProvider{snapshot: ServiceEndpointsSnapshot{AppID: "app-orders", Endpoints: []ServiceEndpoint{{InstanceID: "instance-a", NodeID: "node-a", Port: 8080}, {InstanceID: "instance-b", NodeID: "node-b", Port: 8080}}}}
 	var calls atomic.Int32
 	proxy := NewServiceProxy(ServiceProxyConfig{
-		Provider:  provider,
-		Resolve:   func(context.Context, string) (string, bool, error) { return "app-orders", true, nil },
-		Authorize: func(context.Context, string, string) error { return nil },
+		Provider: provider,
+		Resolve: func(context.Context, string, string) (ServiceTarget, bool, error) {
+			return ServiceTarget{AppID: "app-orders"}, true, nil
+		},
+		Authorize: func(context.Context, string, string) (ServiceCaller, error) { return ServiceCaller{}, nil },
 		Forward: func(target Target) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				calls.Add(1)
@@ -178,18 +237,139 @@ func TestServiceProxyDoesNotRetryPOST(t *testing.T) {
 	}
 }
 
+func TestServiceProxyAddsManagedBindingSpan(t *testing.T) {
+	previousProvider := otel.GetTracerProvider()
+	recorder := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	otel.SetTracerProvider(provider)
+	t.Cleanup(func() {
+		_ = provider.Shutdown(context.Background())
+		otel.SetTracerProvider(previousProvider)
+	})
+
+	providerBackend := &serviceProxyProvider{snapshot: ServiceEndpointsSnapshot{
+		AppID:     "app-orders",
+		Endpoints: []ServiceEndpoint{{InstanceID: "instance-a", NodeID: "node-a", Port: 8080}},
+	}}
+	proxy := NewServiceProxy(ServiceProxyConfig{
+		Provider: providerBackend,
+		Resolve: func(context.Context, string, string) (ServiceTarget, bool, error) {
+			return ServiceTarget{AppID: "app-orders"}, true, nil
+		},
+		Authorize: func(context.Context, string, string) (ServiceCaller, error) {
+			return ServiceCaller{AccountID: "d6e281f3-f5b2-436c-b4ad-8529a956609c"}, nil
+		},
+		Forward: func(_ Target) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if span := oteltrace.SpanFromContext(r.Context()); !span.SpanContext().IsValid() {
+					t.Fatal("service forward lost dependency span context")
+				}
+				w.WriteHeader(http.StatusNoContent)
+			})
+		},
+	})
+
+	rootCtx, root := provider.Tracer("test").Start(context.Background(), "request")
+	req := httptest.NewRequest(http.MethodGet, "http://gateway/v1/internal/services/orders/health", nil)
+	propagation.TraceContext{}.Inject(rootCtx, propagation.HeaderCarrier(req.Header))
+	req.Header.Set(ServiceProxyCallerAppHeader, "app-client")
+	rec := httptest.NewRecorder()
+	proxy.ServeHTTP(rec, req)
+	root.End()
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNoContent)
+	}
+	span := findEndedSpan(t, recorder.Ended(), "service.orders")
+	if span.SpanKind() != oteltrace.SpanKindClient {
+		t.Fatalf("span kind = %s, want client", span.SpanKind())
+	}
+	if span.Parent().SpanID() != root.SpanContext().SpanID() {
+		t.Fatalf("span parent = %s, want root %s", span.Parent().SpanID(), root.SpanContext().SpanID())
+	}
+	wantStrings := map[string]string{
+		"gregale.dependency.type":       "managed_binding",
+		"gregale.dependency.kind":       "service_proxy",
+		retainedSpanAccountIDAttribute:  "d6e281f3-f5b2-436c-b4ad-8529a956609c",
+		"gregale.service.name":          "orders",
+		"gregale.service.target_app_id": "app-orders",
+		"http.request.method":           http.MethodGet,
+	}
+	for key, want := range wantStrings {
+		if got := spanAttribute(span.Attributes(), key); got != attribute.StringValue(want) {
+			t.Errorf("attribute %s = %v, want %q", key, got, want)
+		}
+	}
+	if got := spanAttribute(span.Attributes(), "http.response.status_code"); got != attribute.IntValue(http.StatusNoContent) {
+		t.Errorf("http.response.status_code = %v, want %d", got, http.StatusNoContent)
+	}
+}
+
+func TestServiceProxyRecordsFailedStatusOnDependencySpan(t *testing.T) {
+	previousProvider := otel.GetTracerProvider()
+	recorder := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	otel.SetTracerProvider(provider)
+	t.Cleanup(func() {
+		_ = provider.Shutdown(context.Background())
+		otel.SetTracerProvider(previousProvider)
+	})
+
+	proxy := NewServiceProxy(ServiceProxyConfig{
+		ResolveCaller: func(context.Context, string) (string, error) { return "", nil },
+	})
+	req := httptest.NewRequest(http.MethodGet, "http://payments.svc.gregale:10080/charge", nil)
+	req.Host = "payments.svc.gregale:10080"
+	rec := httptest.NewRecorder()
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusForbidden)
+	}
+	span := findEndedSpan(t, recorder.Ended(), "service.payments")
+	if got := spanAttribute(span.Attributes(), "http.response.status_code"); got != attribute.IntValue(http.StatusForbidden) {
+		t.Errorf("http.response.status_code = %v, want %d", got, http.StatusForbidden)
+	}
+	if span.Status().Code != codes.Error {
+		t.Errorf("span status = %s, want Error", span.Status().Code)
+	}
+}
+
+func findEndedSpan(t *testing.T, spans []sdktrace.ReadOnlySpan, name string) sdktrace.ReadOnlySpan {
+	t.Helper()
+	for _, span := range spans {
+		if span.Name() == name {
+			return span
+		}
+	}
+	t.Fatalf("spans = %#v, want %q", spans, name)
+	return nil
+}
+
+func spanAttribute(attrs []attribute.KeyValue, key string) attribute.Value {
+	for _, attr := range attrs {
+		if string(attr.Key) == key {
+			return attr.Value
+		}
+	}
+	return attribute.Value{}
+}
+
 func TestServiceProxyRoutesDNSHostName(t *testing.T) {
 	provider := &serviceProxyProvider{snapshot: ServiceEndpointsSnapshot{AppID: "app-orders", Endpoints: []ServiceEndpoint{{InstanceID: "instance-a", NodeID: "node-a", Port: 8080}}}}
 	var gotPath string
 	proxy := NewServiceProxy(ServiceProxyConfig{
 		Provider: provider,
-		Resolve: func(_ context.Context, service string) (string, bool, error) {
+		Resolve: func(_ context.Context, caller, service string) (ServiceTarget, bool, error) {
+			if caller != "app-client" {
+				t.Fatalf("caller = %q, want app-client", caller)
+			}
 			if service != "orders" {
 				t.Fatalf("service = %q, want orders", service)
 			}
-			return "app-orders", true, nil
+			return ServiceTarget{AppID: "app-orders"}, true, nil
 		},
-		Authorize:     func(context.Context, string, string) error { return nil },
+		Authorize:     func(context.Context, string, string) (ServiceCaller, error) { return ServiceCaller{}, nil },
 		ResolveCaller: func(context.Context, string) (string, error) { return "app-client", nil },
 		Forward: func(Target) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -225,9 +405,11 @@ func TestParseServiceProxyHostRejectsUnsafeNames(t *testing.T) {
 
 func TestServiceProxyRejectsMalformedPathAndEmptyRegistry(t *testing.T) {
 	proxy := NewServiceProxy(ServiceProxyConfig{
-		Provider:  &serviceProxyProvider{},
-		Resolve:   func(context.Context, string) (string, bool, error) { return "app-orders", true, nil },
-		Authorize: func(context.Context, string, string) error { return nil },
+		Provider: &serviceProxyProvider{},
+		Resolve: func(context.Context, string, string) (ServiceTarget, bool, error) {
+			return ServiceTarget{AppID: "app-orders"}, true, nil
+		},
+		Authorize: func(context.Context, string, string) (ServiceCaller, error) { return ServiceCaller{}, nil },
 	})
 	for _, path := range []string{"/v1/internal/services", "/v1/internal/services/", "/v1/internal/services//health"} {
 		req := httptest.NewRequest(http.MethodGet, "http://gateway"+path, nil)

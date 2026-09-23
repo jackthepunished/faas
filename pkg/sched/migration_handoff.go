@@ -239,7 +239,9 @@ func NewMigrationHarness(
 	}
 	if newOwnerNodeID != "" {
 		if node, err := store.ComputeNodeByID(ctx, newOwnerNodeID); err == nil && node.VPCPUs > 0 {
-			h.destinationCPUBudgetMillicores = node.VPCPUs * 1000
+			// cpuBudgetMillicores is the single formula (spec §1
+			// CPUOvercommit); do not reintroduce a local copy.
+			h.destinationCPUBudgetMillicores = int(cpuBudgetMillicores(node))
 		}
 	}
 	return h
@@ -511,6 +513,29 @@ func (h *MigrationHarness) MigrateOne(ctx context.Context, instanceID, fromNodeI
 			h.rollbackStore(leaseCtx, instanceID, fromNodeID, prepared.LeaseToken)
 			h.rollbackSourceAfterCommitFailure(leaseCtx, fromNodeID, instanceID, prepared.LeaseToken)
 			return state.ErrNotFound
+		}
+		// ADR-193: the destination filled up between planning and
+		// commit. That is a race, not a fault — Phase 3 admitted
+		// against this schedd's own ledger, which cannot see what
+		// peers placed on the same node — so it takes the existing
+		// no_headroom label rather than peer_failure, and logs at
+		// Debug. The cleanup is identical to the branches above: the
+		// destination reservation must be released or the next
+		// MigrateLiveInstances tick sees that node's headroom
+		// artificially depressed.
+		if errors.Is(err, state.ErrNodeCapacity) {
+			h.cleanupAdopted(leaseCtx, instanceID)
+			h.ledger.Release(instanceID)
+			h.metrics.LiveMigrationDecisions("no_headroom").Inc()
+			h.log.Debug("sched: migrate one: Phase 4 destination at ceiling",
+				"instance_id", instanceID,
+				"from_node_id", fromNodeID,
+				"to_node_id", h.newOwnerNodeID,
+				"err", err,
+			)
+			h.rollbackStore(leaseCtx, instanceID, fromNodeID, prepared.LeaseToken)
+			h.rollbackSourceAfterCommitFailure(leaseCtx, fromNodeID, instanceID, prepared.LeaseToken)
+			return err
 		}
 		// Anything else: lease expiry (ctx.DeadlineExceeded)
 		// or a transient DB error. Bump lease_expired on the

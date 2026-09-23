@@ -4,15 +4,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/apihostingreceipt"
@@ -245,6 +250,96 @@ func TestDashboardHandler_AppsListShowsDeployRate(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("body missing %q", want)
 		}
+	}
+}
+
+func TestDashboardHandler_OrgActivityFiltersAndPaginates(t *testing.T) {
+	srv, cookie, store, _ := newAuthedDashboardServerFull(t)
+	acct, err := store.AccountByEmail(t.Context(), "alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	org, err := store.CreateOrg(t.Context(), state.Org{Slug: "activity-test", Name: "Activity Test"})
+	if err != nil {
+		t.Fatalf("create activity org: %v", err)
+	}
+	if err := store.AddOrgMember(t.Context(), org.ID, acct.ID, state.OrgRoleOwner, nil); err != nil {
+		t.Fatalf("add activity org member: %v", err)
+	}
+	orgID, err := uuid.Parse(org.ID)
+	if err != nil {
+		t.Fatalf("parse org id: %v", err)
+	}
+
+	base := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
+	for i := range 26 {
+		appendDashboardActivity(t, store, orgID, base.Add(time.Duration(i)*time.Minute),
+			"app.deployed", state.OrgActivityActorUser, fmt.Sprintf("payments-%02d", i), fmt.Sprintf("app-%02d", i))
+	}
+	appendDashboardActivity(t, store, orgID, base.Add(30*time.Minute),
+		"app.deployed", state.OrgActivityActorSystem, "system-only", "system")
+	appendDashboardActivity(t, store, orgID, base.Add(31*time.Minute),
+		"env.set", state.OrgActivityActorUser, "environment-only", "env")
+	appendDashboardActivity(t, store, uuid.New(), base.Add(32*time.Minute),
+		"app.deployed", state.OrgActivityActorUser, "other-org-secret", "foreign")
+
+	path := "/dashboard/orgs/" + org.Slug
+	values := url.Values{
+		"activity_kind_prefix": {"app."},
+		"activity_actor_type":  {"user"},
+	}
+	request := httptest.NewRequest(http.MethodGet, path+"?"+values.Encode(), nil)
+	request.AddCookie(cookie)
+	first := httptest.NewRecorder()
+	srv.ServeHTTP(first, request)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first page status = %d\n%s", first.Code, first.Body.String())
+	}
+	firstBody := first.Body.String()
+	for _, want := range []string{"Alice deployed payments-25", "Alice deployed payments-01", `option value="app." selected`, `option value="user" selected`} {
+		if !strings.Contains(firstBody, want) {
+			t.Errorf("first page missing %q\n%s", want, firstBody)
+		}
+	}
+	for _, unwanted := range []string{"payments-00", "system-only", "environment-only", "other-org-secret"} {
+		if strings.Contains(firstBody, unwanted) {
+			t.Errorf("first page unexpectedly contains %q", unwanted)
+		}
+	}
+
+	link := regexp.MustCompile(`href="([^"]*activity_before=[^"]*)"`).FindStringSubmatch(firstBody)
+	if len(link) != 2 {
+		t.Fatalf("first page has no older-activity link\n%s", firstBody)
+	}
+	nextURL, err := url.Parse(html.UnescapeString(link[1]))
+	if err != nil {
+		t.Fatalf("parse older-activity URL: %v", err)
+	}
+	if nextURL.Query().Get("activity_kind_prefix") != "app." || nextURL.Query().Get("activity_actor_type") != "user" {
+		t.Fatalf("older-activity URL did not preserve filters: %s", nextURL)
+	}
+
+	second := httptest.NewRecorder()
+	secondRequest := httptest.NewRequest(http.MethodGet, nextURL.RequestURI(), nil)
+	secondRequest.AddCookie(cookie)
+	srv.ServeHTTP(second, secondRequest)
+	if second.Code != http.StatusOK {
+		t.Fatalf("second page status = %d\n%s", second.Code, second.Body.String())
+	}
+	if body := second.Body.String(); !strings.Contains(body, "Alice deployed payments-00") || strings.Contains(body, "Alice deployed payments-01") {
+		t.Fatalf("second page did not contain only the remaining filtered activity\n%s", body)
+	}
+}
+
+func appendDashboardActivity(t *testing.T, store *state.MemStore, orgID uuid.UUID, occurredAt time.Time, kind string, actor state.OrgActivityActorType, resource, sourceID string) {
+	t.Helper()
+	_, err := store.AppendOrgActivity(t.Context(), state.OrgActivity{
+		OrgID: orgID, OccurredAt: occurredAt, Kind: kind,
+		ActorType: actor, ActorLabel: "Alice", ResourceType: "app", ResourceLabel: resource,
+		SourceType: "dashboard-test", SourceID: sourceID,
+	})
+	if err != nil {
+		t.Fatalf("append activity %q: %v", sourceID, err)
 	}
 }
 
@@ -513,6 +608,36 @@ func TestRenderProblem_PureUnit(t *testing.T) {
 	renderProblem(rec, log, errors.New("boom"))
 	if rec.Code != http.StatusInternalServerError {
 		t.Errorf("code = %d, want 500", rec.Code)
+	}
+	var problem api.Problem
+	if err := json.Unmarshal(rec.Body.Bytes(), &problem); err != nil {
+		t.Fatalf("decode problem: %v", err)
+	}
+	if problem.Code != api.CodeInternal {
+		t.Errorf("problem code = %q, want %q", problem.Code, api.CodeInternal)
+	}
+	if problem.Hint == "" {
+		t.Error("hint is empty; dashboard render failure must give a next action")
+	}
+	if strings.Contains(rec.Body.String(), "boom") {
+		t.Errorf("body leaked render error: %s", rec.Body.String())
+	}
+}
+
+func TestRenderProblem_PreservesSafeProblem(t *testing.T) {
+	rec := httptest.NewRecorder()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	renderProblem(rec, log, api.ErrValidation("Choose a valid app slug."))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	var problem api.Problem
+	if err := json.Unmarshal(rec.Body.Bytes(), &problem); err != nil {
+		t.Fatalf("decode problem: %v", err)
+	}
+	if problem.Code != api.CodeValidation || problem.Detail != "Choose a valid app slug." {
+		t.Errorf("problem = %#v, want preserved validation problem", problem)
 	}
 }
 

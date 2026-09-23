@@ -46,6 +46,7 @@ type fakeVMM struct {
 	cancels             int  // Tier A5: counts CancelLiveMigration calls
 	forceColdFallback   bool // CreateFromSnapshot reports a cold-boot fallback (ADR-005)
 	wakeErr             error
+	coldBootHook        func()
 	snapErr             error
 	snapErrSequence     []error
 	// snapDeadline / snapHasDeadline capture the ctx deadline seen by
@@ -126,6 +127,9 @@ func (f *fakeVMM) outcome(instance string, method vmmdpb.WakeMethod, requested v
 }
 
 func (f *fakeVMM) CreateColdBoot(ctx context.Context, _, instance string, app AppSpec) (*WakeOutcome, error) {
+	if f.coldBootHook != nil {
+		f.coldBootHook()
+	}
 	if d := f.sleepFor; d > 0 {
 		select {
 		case <-time.After(d):
@@ -550,6 +554,109 @@ func newEngine(t *testing.T, store state.Store, vmm RoutedVMM, notif Notifier, f
 	return e
 }
 
+func TestRefreshRuntimeConfigDestroysWithoutSnapshotAndColdBoots(t *testing.T) {
+	store := state.NewMemStore()
+	_, app, deployment := seedApp(t, store, api.PlanPro, 256, 5)
+	if _, err := store.CreateSnapshot(context.Background(), state.Snapshot{
+		DeploymentID: deployment.ID,
+		Tier:         state.SnapshotTierInit,
+		FCVersion:    "1.10.0",
+		MemBytes:     256 << 20,
+		StorageKey:   state.SnapshotCaptureMemKey(deployment.ID, state.SnapshotTierInit, "old-config"),
+	}); err != nil {
+		t.Fatalf("CreateSnapshot: %v", err)
+	}
+	vmm := &fakeVMM{}
+	engine := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+
+	first, err := engine.EnsureWake(context.Background(), app.ID, TriggerAppWake)
+	if err != nil {
+		t.Fatalf("initial wake: %v", err)
+	}
+	if first.Instance == nil || vmm.restores != 1 {
+		t.Fatalf("initial wake = %+v, restores = %d; want snapshot restore", first.Instance, vmm.restores)
+	}
+	oldInstanceID := first.Instance.InstanceID
+	vmm.coldBootHook = func() {
+		old, readErr := store.InstanceByID(context.Background(), oldInstanceID)
+		if readErr != nil {
+			t.Errorf("old instance during replacement boot: %v", readErr)
+		} else if old.State != string(state.StateRunning) {
+			t.Errorf("old instance state during replacement boot = %q, want running", old.State)
+		}
+	}
+	wakeID := uuid.NewString()
+	refreshed, err := engine.RefreshRuntimeConfig(context.Background(), app.ID, wakeID)
+	if err != nil {
+		t.Fatalf("RefreshRuntimeConfig: %v", err)
+	}
+	if refreshed.Instance == nil || refreshed.Instance.WakeID != wakeID {
+		t.Fatalf("replacement = %+v, want wake_id %s", refreshed.Instance, wakeID)
+	}
+	if vmm.destroys != 1 {
+		t.Errorf("destroys = %d, want 1", vmm.destroys)
+	}
+	if vmm.snapshots != 0 || vmm.warmSnapshots != 0 {
+		t.Errorf("snapshot calls = init:%d warm:%d, want zero", vmm.snapshots, vmm.warmSnapshots)
+	}
+	if vmm.coldBoots != 1 || vmm.restores != 1 {
+		t.Errorf("wake methods = cold:%d restore:%d, want cold:1 restore:1", vmm.coldBoots, vmm.restores)
+	}
+	if _, err := store.LatestSnapshotForTier(context.Background(), deployment.ID, state.SnapshotTierInit); !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("old snapshot remained restorable: %v", err)
+	}
+	old, err := store.InstanceByID(context.Background(), first.Instance.InstanceID)
+	if err != nil {
+		t.Fatalf("old InstanceByID: %v", err)
+	}
+	if old.State != string(state.StateStopped) {
+		t.Fatalf("old instance state = %q, want stopped", old.State)
+	}
+}
+
+func TestRefreshRuntimeConfigReplacementFailureKeepsOldInstanceServing(t *testing.T) {
+	store := state.NewMemStore()
+	_, app, _ := seedApp(t, store, api.PlanPro, 256, 1)
+	vmm := &fakeVMM{}
+	engine := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0")
+	first, err := engine.EnsureWake(context.Background(), app.ID, TriggerAppWake)
+	if err != nil || first.Instance == nil {
+		t.Fatalf("initial wake = %+v, %v", first.Instance, err)
+	}
+	vmm.wakeErr = errors.New("replacement boot failed")
+
+	if _, err := engine.RefreshRuntimeConfig(context.Background(), app.ID, uuid.NewString()); err == nil {
+		t.Fatal("RefreshRuntimeConfig succeeded after replacement boot failure")
+	}
+	old, err := store.InstanceByID(context.Background(), first.Instance.InstanceID)
+	if err != nil {
+		t.Fatalf("old InstanceByID: %v", err)
+	}
+	if old.State != string(state.StateRunning) {
+		t.Fatalf("old instance state = %q, want running", old.State)
+	}
+	if vmm.destroys != 0 {
+		t.Fatalf("destroy calls = %d, want no old VM destruction", vmm.destroys)
+	}
+}
+
+func TestRefreshRuntimeConfigForeignOwnerRemainsReplayable(t *testing.T) {
+	store := state.NewMemStore()
+	_, app, _ := seedApp(t, store, api.PlanPro, 256, 5)
+	if err := store.SetAppNodeID(context.Background(), app.ID, "box-a"); err != nil {
+		t.Fatalf("SetAppNodeID: %v", err)
+	}
+	vmm := &fakeVMM{}
+	engine := newEngine(t, store, vmm, &fakeNotifier{}, "1.10.0").WithOwnerNodeID("box-b")
+
+	if _, err := engine.RefreshRuntimeConfig(context.Background(), app.ID, uuid.NewString()); err == nil {
+		t.Fatal("foreign-owned runtime config restart returned nil; durable delivery would be acknowledged")
+	}
+	if vmm.destroys != 0 || vmm.coldBoots != 0 || vmm.restores != 0 {
+		t.Fatalf("foreign owner touched VMM: destroys=%d cold=%d restores=%d", vmm.destroys, vmm.coldBoots, vmm.restores)
+	}
+}
+
 // readScaleUp is a test helper that scrapes the closed-set
 // schedd_scale_up_decisions_total{app, outcome} counter from the
 // OpsMetrics HTTP handler. Returns 0 when the line is missing
@@ -657,7 +764,7 @@ func TestAdmitGate_Outcomes(t *testing.T) {
 		ops := wire.NewOpsMetrics("schedd")
 		e := newEngine(t, store, &fakeVMM{}, &fakeNotifier{}, "1.10.0").WithOpsMetrics(ops)
 		limits := api.MustLimitsFor(api.PlanPro)
-		got, _, _, _, _ := e.admitGate(context.Background(), &app, limits)
+		got, _, _, _, _ := e.admitGate(context.Background(), &app, limits, "")
 		if got != wakeAdmit {
 			t.Errorf("admitGate = %v, want wakeAdmit", got)
 		}
@@ -682,7 +789,7 @@ func TestAdmitGate_Outcomes(t *testing.T) {
 		e.ledger.Admit(Request{Instance: uuid.NewString(), AppID: app.ID, RAMMB: 128, Plan: api.PlanPro})
 		e.ledger.Admit(Request{Instance: uuid.NewString(), AppID: app.ID, RAMMB: 128, Plan: api.PlanPro})
 		limits := api.MustLimitsFor(api.PlanPro)
-		got, _, _, _, _ := e.admitGate(context.Background(), &app, limits)
+		got, _, _, _, _ := e.admitGate(context.Background(), &app, limits, "")
 		if got != wakeRejectAtCap {
 			t.Errorf("admitGate = %v, want wakeRejectAtCap", got)
 		}
@@ -709,7 +816,7 @@ func TestAdmitGate_Outcomes(t *testing.T) {
 			t.Fatalf("GetApp: %v", err)
 		}
 		limits := api.MustLimitsFor(api.PlanPro)
-		got, _, _, _, _ := e.admitGate(context.Background(), &reloaded, limits)
+		got, _, _, _, _ := e.admitGate(context.Background(), &reloaded, limits, "")
 		if got != wakeCooldownHeld {
 			t.Errorf("admitGate = %v, want wakeCooldownHeld", got)
 		}
@@ -734,7 +841,7 @@ func TestAdmitGate_Outcomes(t *testing.T) {
 			t.Fatalf("GetApp: %v", err)
 		}
 		limits := api.MustLimitsFor(api.PlanPro)
-		got, _, _, _, _ := e.admitGate(context.Background(), &reloaded, limits)
+		got, _, _, _, _ := e.admitGate(context.Background(), &reloaded, limits, "")
 		if got != wakeMinFloorAlready {
 			t.Errorf("admitGate = %v, want wakeMinFloorAlready", got)
 		}
@@ -759,7 +866,7 @@ func TestAdmitGate_Outcomes(t *testing.T) {
 			t.Fatalf("GetApp: %v", err)
 		}
 		limits := api.MustLimitsFor(api.PlanPro)
-		got, _, _, _, _ := e.admitGate(context.Background(), &reloaded, limits)
+		got, _, _, _, _ := e.admitGate(context.Background(), &reloaded, limits, "")
 		if got != wakeAdmit {
 			t.Errorf("admitGate = %v, want wakeAdmit (cold-start bypass)", got)
 		}
@@ -796,7 +903,7 @@ func TestAdmitGate_Outcomes(t *testing.T) {
 			WithOpsMetrics(ops).
 			WithOverageChecker(checker)
 		limits := api.MustLimitsFor(api.PlanPro)
-		got, obs, cap, _, _ := e.admitGate(context.Background(), &app, limits)
+		got, obs, cap, _, _ := e.admitGate(context.Background(), &app, limits, "")
 		if got != wakeOverageCapReached {
 			t.Errorf("admitGate = %v, want wakeOverageCapReached", got)
 		}
@@ -3812,6 +3919,29 @@ func TestEngine_StreamWarmHintsNilSink(t *testing.T) {
 // only reads e.store and e.log. Mirrors how the function is deployed at
 // Wake/ColdBoot call sites which already have a populated Engine.
 func TestLoadSealedEnvFor(t *testing.T) {
+	t.Run("delivery metadata carries the exact staged version", func(t *testing.T) {
+		s := state.NewMemStore()
+		_, app, _ := seedApp(t, s, api.PlanHobby, 256, 1)
+		if err := s.UpsertAppSecret(context.Background(), "acct", app.ID, "DB_URL", []byte("cipher-v1")); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.UpsertAppSecret(context.Background(), "acct", app.ID, "DB_URL", []byte("cipher-v2")); err != nil {
+			t.Fatal(err)
+		}
+		e := &Engine{store: s, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+		loaded, err := e.loadSealedEnvDeliveryFor(context.Background(), "acct", app.ID, api.DefaultEnvScope, nil)
+		if err != nil {
+			t.Fatalf("load delivery metadata: %v", err)
+		}
+		if len(loaded.Entries) != 1 || len(loaded.Candidates) != 1 {
+			t.Fatalf("loaded entries/candidates = %d/%d, want 1/1", len(loaded.Entries), len(loaded.Candidates))
+		}
+		candidate := loaded.Candidates[0]
+		if candidate.Scope != api.DefaultEnvScope || candidate.Key != "DB_URL" || candidate.Version != 2 {
+			t.Fatalf("candidate = %+v, want default/DB_URL/v2", candidate)
+		}
+	})
+
 	t.Run("no override returns all secrets", func(t *testing.T) {
 		s := state.NewMemStore()
 		_, app, _ := seedApp(t, s, api.PlanHobby, 256, 1)

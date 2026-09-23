@@ -54,7 +54,7 @@ const (
 // fake without spinning a real Postgres pool.
 type requestTelemetryStore interface {
 	AccountByID(ctx context.Context, id string) (state.Account, error)
-	InsertRequestTelemetry(ctx context.Context, arg sqlc.InsertRequestTelemetryParams) error
+	state.RequestTelemetryLogStore
 }
 
 // consumerUsageStore is the billing side of the receiver. PgStore and
@@ -277,29 +277,35 @@ func (r *requestTelemetryReceiver) handleOne(ctx context.Context, req *apidpb.In
 		out.Outcome = rtOutcomeDBError
 		return out
 	}
-	insertErr := r.store.InsertRequestTelemetry(ctx, sqlc.InsertRequestTelemetryParams{
-		AccountID:       state.NewPgtypeUUID(accountID),
-		AppID:           state.NewPgtypeUUID(appID),
-		DeploymentID:    state.NewPgtypeUUID(deploymentID),
-		Route:           req.GetRouteTemplate(),
-		Method:          req.GetMethod(),
-		Status:          int32(req.GetHttpStatus()),
-		LatencyMs:       int32(req.GetLatencyMs()),
-		ColdBoot:        req.GetColdBoot(),
-		TraceID:         pgtype.Text{String: req.GetTraceId(), Valid: req.GetTraceId() != ""},
-		ReceivedAt:      state.NewPgtypeTime(msToTime(req.GetReceivedAtUnixMs())),
-		Count:           int32(count),
-		UaFamily:        uaFamily,
-		ReferrerHost:    referrerHost,
-		Country:         country,
-		WakeID:          pgtype.Text{String: req.GetWakeId(), Valid: req.GetWakeId() != ""},
-		InstanceID:      pgtype.Text{String: req.GetInstanceId(), Valid: req.GetInstanceId() != ""},
-		GuestDurationMs: int32(req.GetGuestDurationMs()),
-		GuestRuntime:    guestRuntime,
-		GuestOutcome:    guestOutcome,
-		GuestErrorClass: guestErrorClass,
-		ConsumerID:      consumerID,
-	})
+	insertErr := r.store.InsertRequestTelemetryWithLogEvent(ctx, sqlc.InsertRequestTelemetryParams{
+		AccountID:           state.NewPgtypeUUID(accountID),
+		AppID:               state.NewPgtypeUUID(appID),
+		DeploymentID:        state.NewPgtypeUUID(deploymentID),
+		Route:               req.GetRouteTemplate(),
+		Method:              req.GetMethod(),
+		Status:              int32(req.GetHttpStatus()),
+		LatencyMs:           int32(req.GetLatencyMs()),
+		ColdBoot:            req.GetColdBoot(),
+		TraceID:             pgtype.Text{String: req.GetTraceId(), Valid: req.GetTraceId() != ""},
+		ReceivedAt:          state.NewPgtypeTime(msToTime(req.GetReceivedAtUnixMs())),
+		Count:               int32(count),
+		UaFamily:            uaFamily,
+		ReferrerHost:        referrerHost,
+		Country:             country,
+		WakeID:              pgtype.Text{String: req.GetWakeId(), Valid: req.GetWakeId() != ""},
+		InstanceID:          pgtype.Text{String: req.GetInstanceId(), Valid: req.GetInstanceId() != ""},
+		GuestDurationMs:     int32(req.GetGuestDurationMs()),
+		GuestRuntime:        guestRuntime,
+		GuestOutcome:        guestOutcome,
+		GuestErrorClass:     guestErrorClass,
+		ConsumerID:          consumerID,
+		NodeID:              req.GetNodeId(),
+		Region:              req.GetRegion(),
+		CommitSha:           req.GetCommitSha(),
+		DeploymentTag:       req.GetDeploymentTag(),
+		DeploymentCreatedAt: req.GetDeploymentCreatedAt(),
+		ImageDigest:         req.GetImageDigest(),
+	}, eventID)
 	if insertErr != nil {
 		if isConstraintViolation(insertErr) {
 			r.observe(rtOutcomeDBError)

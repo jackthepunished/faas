@@ -6,6 +6,7 @@ import type { DataUpstreamHistoryResponse } from '../models/DataUpstreamHistoryR
 import type { DataUpstreamListResponse } from '../models/DataUpstreamListResponse.js';
 import type { DataUpstreamResponse } from '../models/DataUpstreamResponse.js';
 import type { PutDataUpstreamRequest } from '../models/PutDataUpstreamRequest.js';
+import type { UpdateUpstreamCircuitBreakerRequest } from '../models/UpdateUpstreamCircuitBreakerRequest.js';
 import type { CancelablePromise } from '../core/CancelablePromise.js';
 import { OpenAPI } from '../core/OpenAPI.js';
 import { request as __request } from '../core/request.js';
@@ -58,9 +59,9 @@ export class UpstreamsService {
       errors: {
         401: `code: unauthorized`,
         404: `code: not_found`,
-        429: `429. Two response shapes:
-        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
-        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        429: `429 application/problem+json response. Authentication throttling uses
+        \`auth_rate_limited\`; plan and usage limits use their specific stable
+        codes such as \`plan_limit_concurrency\` and \`quota_exhausted\`.
         `,
       },
     });
@@ -120,9 +121,9 @@ export class UpstreamsService {
         402: `402 — plan_data_upstreams_not_allowed (Free plan).`,
         403: `403 — plan_limit_data_upstreams (per-app cap exceeded).`,
         404: `code: not_found`,
-        429: `429. Two response shapes:
-        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
-        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        429: `429 application/problem+json response. Authentication throttling uses
+        \`auth_rate_limited\`; plan and usage limits use their specific stable
+        codes such as \`plan_limit_concurrency\` and \`quota_exhausted\`.
         `,
       },
     });
@@ -188,9 +189,9 @@ export class UpstreamsService {
         400: `Invalid time window, bucket, or region filter.`,
         401: `code: unauthorized`,
         404: `code: not_found`,
-        429: `429. Two response shapes:
-        - \`application/problem+json\` for code-driven 429s (\`plan_limit_concurrency\`, \`quota_exhausted\`).
-        - \`text/plain\` for the authlimiter middleware (\`pkg/middleware/authlimit.go\`).
+        429: `429 application/problem+json response. Authentication throttling uses
+        \`auth_rate_limited\`; plan and usage limits use their specific stable
+        codes such as \`plan_limit_concurrency\` and \`quota_exhausted\`.
         `,
       },
     });
@@ -260,6 +261,55 @@ export class UpstreamsService {
       errors: {
         401: `code: unauthorized`,
         404: `404 — upstream_not_found.`,
+      },
+    });
+  }
+  /**
+   * Update an upstream's egress circuit-breaker policy.
+   * Opts one upstream into (or out of) egress circuit breaking, and
+   * optionally tunes its thresholds (ADR-201 §3).
+   *
+   * Enabling this grants the platform permission to REJECT your app's
+   * connections to this upstream while its circuit is open. Plaintext
+   * hosts never appear in the request or the response; upstreams are
+   * addressed by id and identified by `host_redacted_hash`.
+   *
+   * Plan-gated: accounts whose plan allows no egress breakers receive
+   * 402. The per-app cap counts only ENABLED upstreams, so turning one
+   * off, or re-saving one that is already on, is never blocked.
+   *
+   * @returns DataUpstreamResponse The updated upstream envelope.
+   * @throws ApiError
+   */
+  public static updateAppDataUpstreamCircuitBreaker({
+    slug,
+    id,
+    requestBody,
+  }: {
+    /**
+     * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
+     */
+    slug: string,
+    /**
+     * Id of the upstream whose egress circuit-breaker policy is being changed.
+     */
+    id: string,
+    requestBody: UpdateUpstreamCircuitBreakerRequest,
+  }): CancelablePromise<DataUpstreamResponse> {
+    return __request(OpenAPI, {
+      method: 'PATCH',
+      url: '/v1/apps/{slug}/upstreams/{id}/circuit-breaker',
+      path: {
+        'slug': slug,
+        'id': id,
+      },
+      body: requestBody,
+      mediaType: 'application/json',
+      errors: {
+        401: `code: unauthorized`,
+        402: `402 — the plan does not allow egress circuit breakers, or the per-app cap is reached.`,
+        404: `404 — upstream_not_found: no upstream with this id belongs to the app.`,
+        422: `422 — validation failed on the circuit-breaker body.`,
       },
     });
   }

@@ -62,6 +62,10 @@ const (
 	// DevSourceCacheMaxBytes is the aggregate node-local cache budget. Oldest
 	// source bases are evicted first; eviction is always recoverable by resend.
 	DevSourceCacheMaxBytes int64 = 4 << 30
+	// MaxDelayedTaskDelaySeconds bounds how far a one-shot invocation may be
+	// scheduled into the future. A one-year ceiling prevents effectively
+	// immortal pending rows while still covering annual workflows.
+	MaxDelayedTaskDelaySeconds = 365 * 24 * 60 * 60
 )
 
 // App CPU is expressed as sustained millicores enforced by cgroup v2 cpu.max.
@@ -509,6 +513,11 @@ type Limits struct {
 	// the max_concurrency cap is bounded). apid's updateApp handler
 	// gates the PATCH body on this flag.
 	MinInstancesAllowed bool
+	// CustomMetricsAllowed toggles ADR-202 pushed application metrics.
+	// Gated for two reasons: the push buys the same scaling capability
+	// min_instances does, and an unbounded free-tier write endpoint is an
+	// abuse surface.
+	CustomMetricsAllowed bool
 
 	// MaxInstancesAllowed (issue #462 / ADR-058) toggles the per-app
 	// ceiling on live instances. Mirrors MinInstancesAllowed: Hobby+
@@ -581,19 +590,17 @@ type Limits struct {
 	MaxSourceBytesPerInvocation int
 	AsyncInvokeAllowed          bool
 
-	// MaxQueueAttempts (issue #394 / Move 1 dead-letter) is the
-	// per-plan retry budget for queue messages that hit a transient
-	// failure during drain (pkg/sched/drain.go). Once a row's
-	// `attempts` reaches this value, the next transient failure
-	// transitions it to state='dead_letter' (terminal) instead of
-	// 'pending' (re-queued). Free = 0 means queues aren't entitled
-	// anyway (MaxQueueDepth = 0); the drain keeps the legacy
-	// infinite-retry behaviour because Free never queues. Hobby/Pro/
-	// Scale follow the same shape as the other async-event caps:
-	// small on the cheap tier, larger as we move up. The dead-letter
-	// rows are readable via GET /v1/apps/{slug}/queues/dead_letter
-	// (migrations/00060_invocations_dead_letter.sql lands the
-	// 'dead_letter' state value + partial index).
+	// MaxQueueAttempts (issue #394 / Move 1 dead-letter) is the shared
+	// per-plan total-attempt budget for durable invocations that hit a
+	// transient failure during drain (pkg/sched/drain.go). It covers async,
+	// queue, delayed-task, cron, and replay rows. Once a row's `attempts`
+	// reaches the effective value, the failure transitions it to
+	// state='dead_letter' (terminal) instead of 'pending' (re-queued).
+	// Free = 0 resolves to one original delivery and no replay; zero never
+	// means unlimited. Hobby/Pro/Scale follow the same shape as the other
+	// async-event caps: small on the cheap tier, larger as we move up. The
+	// dead-letter rows are readable via GET
+	// /v1/apps/{slug}/queues/dead_letter.
 	MaxQueueAttempts int
 
 	// MaxAsyncInvocationsPerAccount (ADR-134 PR-B) is the cap on
@@ -879,6 +886,37 @@ type Limits struct {
 	// CodePlanEdgeRuleKindQuotaReached.
 	EdgeRulesCachePerApp int
 
+	// EdgeRulesRetryPerApp caps how many kind='retry' rules one app
+	// may hold (ADR-201 §1). Per-plan: Free 0, Hobby 3, Pro 10,
+	// Scale 25.
+	//
+	// Free is 0 for a capacity reason, not a packaging one: a replay
+	// doubles the worst-case work a single request can cause, and a
+	// Free app is capped at max_concurrency 1, so there is rarely a
+	// healthy sibling to replay against in the first place. Enabling
+	// it there would spend the admission ledger without improving
+	// availability.
+	EdgeRulesRetryPerApp int
+
+	// EdgeRulesCircuitBreakerPerApp caps how many
+	// kind='circuit_breaker' rules one app may hold (ADR-201 §2).
+	// Per-plan: Free 0, Hobby 3, Pro 10, Scale 25.
+	//
+	// This gates TUNING, not protection. The breaker runs for every
+	// app on every plan with circuit.DefaultConfig; a Free customer
+	// is protected from a flapping instance exactly as a Scale
+	// customer is. What the paid tiers buy is the ability to move the
+	// thresholds, which is a knob that can also be set badly.
+	EdgeRulesCircuitBreakerPerApp int
+
+	// EgressCircuitBreakersPerApp caps how many declared upstreams one
+	// app may opt into egress breaking for (ADR-201 §3). Per-plan:
+	// Free 0, Hobby 3, Pro 10, Scale 50 — deliberately mirroring
+	// DataPlacementHintsPerApp, since a breaker can only exist for an
+	// upstream the ADR-098 capture path already recorded and Free
+	// captures none.
+	EgressCircuitBreakersPerApp int
+
 	// CorsPresetsPerAccount caps how many cors_presets rows one
 	// account may own in total (account-wide + app-scoped). The
 	// cap defends against a customer pinning one preset per
@@ -1053,6 +1091,13 @@ type Limits struct {
 	// N-apps-times-cap-per-app bypass. Both enforced in
 	// pkg/state.CreateAppWebhookIfUnderQuota.
 	WebhookPerAccount int
+	// InboundWebhookPerApp caps signature-verified public ingress endpoints on
+	// one app. Inbound endpoints have independent cardinality from outbound
+	// subscriptions because they pin different secrets and traffic paths.
+	InboundWebhookPerApp int
+	// InboundWebhookPerAccount prevents the N-apps-times-cap bypass. Creation
+	// is serialized under the owning app and account rows in the state store.
+	InboundWebhookPerAccount int
 	// LogDrainPerApp caps the number of customer runtime log destinations
 	// on one app. It follows the same plan gate as outbound webhooks.
 	LogDrainPerApp int
@@ -1253,27 +1298,47 @@ type Limits struct {
 
 	// TrafficSplit (issue #556 / traffic splitting across
 	// deployments) is the plan gate for the per-deployment
-	// traffic_percent opt-in. Pro/Scale = true; Free/Hobby =
-	// false. Differs from RequireAuthn in the Hobby tier: Hobby
-	// unlocks require_authn (issue #462 / ADR-058) but stays
-	// locked on traffic_split because the audience is more
-	// expensive — keeping N canary deployments warm is
-	// RAM-billable per running second for every "extra" live
-	// deployment, and Hobby's value-prop is "near-Free with a
-	// floor", not "production canary rollout". Apid's create
-	// + PATCH-traffic handlers reject Free/Hobby with 403
-	// plan_traffic_split_not_allowed. Column default
-	// (migration 00160) is 100, so every existing app routes
-	// 100% to its single live row regardless of plan — the
-	// gate only fires when a Free/Hobby customer tries to
-	// opt-in to a non-100 traffic_percent (which is denied).
+	// traffic_percent opt-in and the canary ladder.
+	//
+	// TRUE ON EVERY PLAN as of ADR-199. It is retained as a
+	// field rather than deleted because it is the single
+	// switch an operator flips if the rollout cost shape ever
+	// needs to be re-tiered, and because the 403
+	// plan_traffic_split_not_allowed problem code stays in the
+	// wire contract for older clients.
+	//
+	// The original Pro+ gate reasoned that keeping N canary
+	// deployments warm is RAM-billable per running second.
+	// ADR-199 answers that with RolloutConcurrencyGrant: the
+	// overlap is capped at +1 instance, lasts only while the
+	// rollout is in flight, and never bypasses the physical
+	// gates (RAM ledger invariant §6.2-2, the per-node ceiling
+	// from ADR-193, or vCPU). A customer on Free can now ship
+	// a canary; they cannot use it to hold more RAM than their
+	// plan's instance would have held anyway.
+	//
+	// Column default (migration 00160) is 100, so every app
+	// that never opts in still routes 100% to its single live
+	// row.
 	TrafficSplit bool
 
 	// RollbackOn5xxAllowed (issue #961 / ADR-118) gates the
-	// per-deployment first-wake 5xx auto-rollback opt-in. Pro and
-	// Scale unlock it; Free and Hobby retain the safe default-off
-	// behavior. The deployment column remains available to internal
-	// workers and existing rows on every plan.
+	// per-deployment first-wake 5xx auto-rollback opt-in.
+	//
+	// TRUE ON EVERY PLAN as of ADR-201. Unlike TrafficSplit, this one
+	// never had a cost argument to answer: auto-rollback consumes no
+	// extra runtime resources. It reads the first_5xx_count column the
+	// platform already increments on every deployment regardless of
+	// plan, and on threshold it flips traffic back to a snapshot that
+	// already exists. The work is strictly cheaper than the outage it
+	// prevents — a bad revision left serving burns wake and RAM
+	// seconds for as long as it stays up.
+	//
+	// The opt-in remains OFF by default on every plan (the column
+	// default is false), so nothing changes for a customer who does
+	// not ask for it. Retained as a field so an operator can re-tier
+	// it, and because plan_rollback_on_5xx_not_allowed stays in the
+	// wire contract for older clients.
 	RollbackOn5xxAllowed bool
 
 	// MirrorRuleAllowed (issue #72 / ADR-125) is the plan gate
@@ -1710,11 +1775,10 @@ var planLimits = map[Plan]Limits{
 		MaxDelayedTasksPerApp:       0,
 		MaxSourceBytesPerInvocation: 0,
 		AsyncInvokeAllowed:          false,
-		// Free: queues aren't entitled (MaxQueueDepth = 0). Value is
-		// kept at 0 for symmetry with the rest of the async-event
-		// caps. The drain falls back to legacy infinite-retry when
-		// budget == 0, but Free customers never reach the queue
-		// surface so the path is unreachable.
+		// Free: queues aren't entitled (MaxQueueDepth = 0). Value is kept
+		// at 0 for symmetry with the rest of the async-event caps; the
+		// effective-budget helper resolves it to one original delivery and
+		// no replay for other durable invocation sources.
 		MaxQueueAttempts: 0,
 		// ADR-134 PR-B: Free's per-account cap is 100 — enough for
 		// the documented Hobby-customer-trying-Free path; tighter than
@@ -1812,6 +1876,13 @@ var planLimits = map[Plan]Limits{
 		// upsell is the wake-elision guarantee. Same posture as
 		// tenant_surfaces / alert_rules / cors_presets on Free.
 		EdgeRulesCachePerApp: 0,
+		// ADR-201 traffic primitives. Retry and breaker TUNING are
+		// paid; the breaker itself runs on every plan. Egress
+		// breaking mirrors DataPlacementHintsPerApp because it can
+		// only apply to an upstream ADR-098 already captured.
+		EdgeRulesRetryPerApp:          0,
+		EdgeRulesCircuitBreakerPerApp: 0,
+		EgressCircuitBreakersPerApp:   0,
 		// CORS presets (issue #975 item #4 / Mega-Foundation #979-b,
 		// slot 00294). Free=0 mirrors the tenant_surfaces / alert_rules
 		// posture: the abstraction is the upsell, the abuse-floor tier
@@ -1865,10 +1936,12 @@ var planLimits = map[Plan]Limits{
 		// Outbound webhook subscription caps (issue #476 / ADR-076).
 		// Free has no webhooks — the handler returns 402
 		// CodePlanWebhooksNotAllowed before the store is touched.
-		WebhookPerApp:      0,
-		WebhookPerAccount:  0,
-		LogDrainPerApp:     0,
-		LogDrainPerAccount: 0,
+		WebhookPerApp:            0,
+		WebhookPerAccount:        0,
+		InboundWebhookPerApp:     0,
+		InboundWebhookPerAccount: 0,
+		LogDrainPerApp:           0,
+		LogDrainPerAccount:       0,
 		// Trigger primitive (issue #757 / ADR-0NN): Free is the
 		// abuse-floor tier — TriggersAllowed=false so a POST on a
 		// Free account gets 402 CodePlanTriggersNotAllowed before the
@@ -1952,15 +2025,30 @@ var planLimits = map[Plan]Limits{
 		// the legacy H1 path regardless; the gate only fires
 		// if a Free customer tries PATCH app_protocol=grpc.
 		AppProtocolGrpcAllowed: false,
-		// TrafficSplit (issue #556): Free does not unlock
-		// per-deployment traffic splitting. The column
-		// default (100) keeps today's behaviour — 100% to the
-		// single live row — so no existing Free customer is
-		// affected; the gate only fires when a Free customer
-		// passes a non-100 traffic_percent on create (403
-		// plan_traffic_split_not_allowed).
-		TrafficSplit:         false,
-		RollbackOn5xxAllowed: false,
+		// TrafficSplit (issue #556; opened to every plan by
+		// ADR-199): Free unlocks per-deployment traffic
+		// splitting and the canary ladder. The original
+		// Pro+ gate reasoned that keeping N canary
+		// deployments warm is RAM-billable per running
+		// second; ADR-199 answers that with the rollout
+		// concurrency grant (RolloutConcurrencyGrant) — the
+		// extra resident deployment is bounded to +1, lasts
+		// only while the rollout is in flight, and is still
+		// subject to every physical gate (RAM ledger,
+		// per-node ceiling, vCPU). A safe rollout is a
+		// correctness primitive, not a luxury tier: the
+		// customer most likely to ship a bad deploy is the
+		// one who cannot afford an outage.
+		//
+		// The column default (100) still keeps today's
+		// behaviour for every app that never opts in.
+		TrafficSplit: true,
+		// ADR-201: Free unlocks first-wake 5xx auto-rollback. It costs
+		// no extra runtime resources — the 5xx counters are already
+		// collected on every plan — and the tier least able to absorb
+		// a bad release is the one that benefits most. Still off by
+		// default; the customer must opt in per deployment.
+		RollbackOn5xxAllowed: true,
 		// Mirror (issue #72 / ADR-125): Free stays locked — see
 		// the Limits.MirrorRuleAllowed comment for the cost
 		// rationale. MirrorTargetsPerApp = 0 keeps the field
@@ -2095,8 +2183,9 @@ var planLimits = map[Plan]Limits{
 		// the dashboard's "Plan" page names "Hobby+ unlocks
 		// warm floor" so a Hobby customer opting in knows what
 		// they're paying for.
-		MinInstancesAllowed: true,
-		MaxInstancesAllowed: true,
+		MinInstancesAllowed:  true,
+		CustomMetricsAllowed: true,
+		MaxInstancesAllowed:  true,
 		// MaxMinInstances (ADR-071): Hobby gets 1 — one warm
 		// instance is the minimum the floor feature exists to
 		// deliver (the customer's "first request never pays the
@@ -2187,6 +2276,13 @@ var planLimits = map[Plan]Limits{
 		// to demonstrate the wake-elision value before the
 		// customer upgrades to Pro.
 		EdgeRulesCachePerApp: 1,
+		// ADR-201 traffic primitives. Retry and breaker TUNING are
+		// paid; the breaker itself runs on every plan. Egress
+		// breaking mirrors DataPlacementHintsPerApp because it can
+		// only apply to an upstream ADR-098 already captured.
+		EdgeRulesRetryPerApp:          3,
+		EdgeRulesCircuitBreakerPerApp: 3,
+		EgressCircuitBreakersPerApp:   3,
 		// CORS presets (issue #975 #4 / Mega-Foundation #979-b, slot
 		// 00294). Hobby is the entry paid tier — 10 presets per
 		// account, 5 per app. MaxOrigins 25 covers the typical
@@ -2226,10 +2322,12 @@ var planLimits = map[Plan]Limits{
 		DataPlacementHintsPerApp: 3,
 		// Outbound webhook subscription caps (issue #476 / ADR-076).
 		// Hobby gets 3/app, 10/account — mirrors the alert-rule ratio.
-		WebhookPerApp:      3,
-		WebhookPerAccount:  10,
-		LogDrainPerApp:     3,
-		LogDrainPerAccount: 10,
+		WebhookPerApp:            3,
+		WebhookPerAccount:        10,
+		InboundWebhookPerApp:     3,
+		InboundWebhookPerAccount: 10,
+		LogDrainPerApp:           3,
+		LogDrainPerAccount:       10,
 		// Trigger primitive (issue #757 / ADR-0NN): Hobby is the
 		// entry paid tier — unlocks the in-platform queue kind and
 		// the sqs_compat kind (the two no-external-broker shapes).
@@ -2323,17 +2421,23 @@ var planLimits = map[Plan]Limits{
 		// floor" value-prop. Customers on Hobby may PATCH
 		// app_protocol=grpc freely.
 		AppProtocolGrpcAllowed: true,
-		// TrafficSplit (issue #556): Hobby does not unlock
-		// per-deployment traffic splitting. Hobby's value-prop
-		// is "near-Free with a floor" (MinInstancesAllowed
-		// unlocked by issue #462 / ADR-058), not "production
-		// canary rollout". The 2-3 live deployment bill shape
-		// costs 2-3× the per-running-second RAM; Hobby's price
-		// point doesn't cover it. Free/Hobby see 403
-		// plan_traffic_split_not_allowed when they try to
-		// pass a non-100 traffic_percent on create or PATCH.
-		TrafficSplit:         false,
-		RollbackOn5xxAllowed: false,
+		// TrafficSplit (issue #556; opened to every plan by
+		// ADR-199): Hobby unlocks per-deployment traffic
+		// splitting and the canary ladder. The original gate
+		// priced this as a sustained "2-3 live deployment
+		// bill shape"; that is the steady-state cost of
+		// running several deployments indefinitely, not the
+		// cost of a rollout. A canary ladder is bounded by
+		// its own stage durations and collapses back to one
+		// deployment when it completes or aborts, and
+		// ADR-199's grant caps the overlap at exactly +1
+		// instance.
+		//
+		// See the Free block above for the full rationale.
+		TrafficSplit: true,
+		// ADR-201: Hobby unlocks first-wake 5xx auto-rollback — see the
+		// Free row above. Still opt-in per deployment.
+		RollbackOn5xxAllowed: true,
 		// Mirror (issue #72 / ADR-125): Free stays locked — see
 		// the Limits.MirrorRuleAllowed comment for the cost
 		// rationale. MirrorTargetsPerApp = 0 keeps the field
@@ -2433,6 +2537,7 @@ var planLimits = map[Plan]Limits{
 		// Issue #461: Pro = 5 — multi-region + CI shapes.
 		RegistryCredentialMax: 5,
 		MinInstancesAllowed:   true,
+		CustomMetricsAllowed:  true,
 		MaxInstancesAllowed:   true,
 		// MaxMinInstances (ADR-071): Pro = 3 — covers a small
 		// "always-warm fan-out for a customer-facing API" pattern
@@ -2556,6 +2661,13 @@ var planLimits = map[Plan]Limits{
 		// plus one wildcard. Same five-fold upgrade as throttle and
 		// geo so the upsell curve is single-shape.
 		EdgeRulesCachePerApp: 5,
+		// ADR-201 traffic primitives. Retry and breaker TUNING are
+		// paid; the breaker itself runs on every plan. Egress
+		// breaking mirrors DataPlacementHintsPerApp because it can
+		// only apply to an upstream ADR-098 already captured.
+		EdgeRulesRetryPerApp:          10,
+		EdgeRulesCircuitBreakerPerApp: 10,
+		EgressCircuitBreakersPerApp:   10,
 		// CORS presets (issue #975 #4 / Mega-Foundation #979-b, slot
 		// 00294). Pro is the typical SaaS tier — 50 presets per
 		// account, 15 per app, 100 origins per preset.
@@ -2593,10 +2705,12 @@ var planLimits = map[Plan]Limits{
 		DataPlacementHintsPerApp: 10,
 		// Outbound webhook subscription caps (issue #476 / ADR-076).
 		// Pro gets 10/app, 30/account — mirrors the alert-rule ratio.
-		WebhookPerApp:      10,
-		WebhookPerAccount:  30,
-		LogDrainPerApp:     10,
-		LogDrainPerAccount: 30,
+		WebhookPerApp:            10,
+		WebhookPerAccount:        30,
+		InboundWebhookPerApp:     10,
+		InboundWebhookPerAccount: 30,
+		LogDrainPerApp:           10,
+		LogDrainPerAccount:       30,
 		// Trigger primitive (issue #757 / ADR-0NN): Pro is the first
 		// tier where the external-broker kinds unlock (Kafka, NATS,
 		// Redis-streams) — the egress-allowlist tier (ADR-031) is
@@ -2786,6 +2900,7 @@ var planLimits = map[Plan]Limits{
 		// Issue #461: Scale = 20 — broad fan-out for SaaS-scale apps.
 		RegistryCredentialMax: 20,
 		MinInstancesAllowed:   true,
+		CustomMetricsAllowed:  true,
 		MaxInstancesAllowed:   true,
 		// MaxMinInstances (ADR-071): Scale = 10 — half of
 		// MaxConcurrency (20). At Scale's 1024 MB instance RAM
@@ -2919,6 +3034,13 @@ var planLimits = map[Plan]Limits{
 		// category, etc.). Pin in limits_test.go so the per-plan
 		// monotonic ladder Free < Hobby < Pro < Scale is enforced.
 		EdgeRulesCachePerApp: 20,
+		// ADR-201 traffic primitives. Retry and breaker TUNING are
+		// paid; the breaker itself runs on every plan. Egress
+		// breaking mirrors DataPlacementHintsPerApp because it can
+		// only apply to an upstream ADR-098 already captured.
+		EdgeRulesRetryPerApp:          25,
+		EdgeRulesCircuitBreakerPerApp: 25,
+		EgressCircuitBreakersPerApp:   50,
 		// CORS presets (issue #975 #4 / Mega-Foundation #979-b, slot
 		// 00294). Scale is the large-fleet tier — 250 presets per
 		// account, 50 per app, 500 origins per preset. Numbers
@@ -2965,10 +3087,12 @@ var planLimits = map[Plan]Limits{
 		DataPlacementHintsPerApp: 50,
 		// Outbound webhook subscription caps (issue #476 / ADR-076).
 		// Scale gets 25/app, 100/account — mirrors the alert-rule ratio.
-		WebhookPerApp:      25,
-		WebhookPerAccount:  100,
-		LogDrainPerApp:     25,
-		LogDrainPerAccount: 100,
+		WebhookPerApp:            25,
+		WebhookPerAccount:        100,
+		InboundWebhookPerApp:     25,
+		InboundWebhookPerAccount: 100,
+		LogDrainPerApp:           25,
+		LogDrainPerAccount:       100,
 		// Trigger primitive (issue #757 / ADR-0NN): Scale is the upper
 		// tier — caps align with the SQL CHECK ceilings (5000 records
 		// / 5 min window / 25 attempts) so a Scale customer's
@@ -3160,6 +3284,28 @@ const (
 	// billing; the tenant-slice ceiling remains the aggregate safety fence.
 	SnapshotVMOverheadMB = 256
 
+	// RolloutConcurrencyGrant (ADR-199) is the number of instances an app
+	// may exceed its plan's max_concurrency by, and ONLY while a second
+	// deployment is coming up alongside the one already serving — i.e. the
+	// overlap window of a traffic split or a canary stage.
+	//
+	// Without it, opening traffic splitting to every plan would ship a
+	// broken feature: the concurrency ledger is per-app
+	// (NodeLedger.perApp), so on Free (max_concurrency 1) the second
+	// deployment's wake hits the cap and that slice of traffic returns a
+	// plan-limit error instead of the new revision.
+	//
+	// It is exactly 1, not a per-plan value: the grant exists to make a
+	// rollout *possible*, not to widen steady-state concurrency. A 3-way
+	// split on Free still admits at most max_concurrency + 1.
+	//
+	// THIS GRANT RELAXES THE PLAN GATE ONLY. Every physical gate still
+	// applies unchanged — the RAM ledger (invariant §6.2-2), the
+	// transactional per-node ceiling (ADR-193), and vCPU admission. A node
+	// under memory pressure refuses the extra instance exactly as it would
+	// refuse any other, and the rollout simply holds at its current stage.
+	RolloutConcurrencyGrant = 1
+
 	// FloorDecisionIntervalSeconds (issue #557 / ADR-071 §Decision 1)
 	// is the cadence at which the proactive floor trigger in
 	// pkg/sched/floor wakes instances up to the per-app floor. 1 s
@@ -3344,6 +3490,19 @@ const (
 	// waiter budget. A zero value means "use the plan default".
 	WakeQueueMaxDepthMultiplier = 8
 	WakeQueueMaxWaitSeconds     = 60
+	// Warm concurrency-overflow queues are intentionally much shorter than
+	// cold-wake queues. A running API that is saturated should get a brief
+	// chance to reuse a released slot or a newly-scaled sibling, not inherit the
+	// 10-30 second cold-boot allowance and surprise callers with extreme tail
+	// latency. Depth defaults bound the memory/socket footprint independently
+	// of the wait deadline; customer overrides remain plan-capped below.
+	ConcurrencyQueueFreeDefaultDepth   = 8
+	ConcurrencyQueueHobbyDefaultDepth  = 32
+	ConcurrencyQueueProDefaultDepth    = 128
+	ConcurrencyQueueScaleDefaultDepth  = 512
+	ConcurrencyQueueFreeDefaultWait    = time.Second
+	ConcurrencyQueuePaidDefaultWait    = 2 * time.Second
+	ConcurrencyQueueMaxDepthMultiplier = 8
 	// MaxConcurrencyQueueWaitMS bounds the customer-controlled admission
 	// wait override. The zero value keeps the plan-derived default.
 	MaxConcurrencyQueueWaitMS = 120_000
@@ -3382,6 +3541,14 @@ const (
 	// values lose body-diff signal on responses with a long tail.
 	// Bumping this is a PR-grade change.
 	MirrorBodySnapshotCap = 64 * 1024
+
+	// MirrorReplayMaxRequests bounds one explicitly sanitized historical
+	// replay batch. MirrorReplayMaxBatchBytes bounds the JSON corpus accepted
+	// by the API/CLI before decoding.
+	MirrorReplayMaxRequests    = 100
+	MirrorReplayMaxBatchBytes  = 8 * 1024 * 1024
+	MirrorReplayMaxHeaders     = 32
+	MirrorReplayMaxHeaderBytes = 8 * 1024
 
 	// MirrorMaxConcurrentPerRule (issue #72 / ADR-133 / ADR-125
 	// PR-A3) is the per-rule concurrent mirror-VM cost circuit.
@@ -3516,6 +3683,82 @@ const (
 	// EdgeRuleMaintenanceRetryAfterSeconds (which is the default,
 	// not the cap).
 	MaxEdgeRuleMaintenanceRetryAfterSeconds = 24 * 60 * 60 // 86400 (24h)
+
+	// --- ADR-201 §1: kind=retry bounds -------------------------------
+	// These are global bounds, not plan quotas. The per-plan rule count
+	// is EdgeRulesRetryPerApp above.
+
+	// EdgeRuleRetryDefaultMaxAttempts is the attempt count applied when a
+	// kind=retry rule omits max_attempts. 2 = the original plus one replay.
+	EdgeRuleRetryDefaultMaxAttempts = 2
+	// EdgeRuleRetryMaxAttempts caps total attempts at 3.
+	//
+	// The bound is deliberately tight. Every replay consumes a fresh
+	// instance's concurrency slot for the duration of the request, so a
+	// generous attempt count converts one client request into a
+	// multiplier against the app's own capacity at exactly the moment the
+	// app is already losing instances. Two attempts covers the case this
+	// feature exists for — one dead peer, one healthy sibling.
+	EdgeRuleRetryMaxAttempts = 3
+	// EdgeRuleRetryDefaultMinRemainingMs is the request-budget floor below
+	// which a replay is skipped. Below this a retry mostly converts a 502
+	// into a 504 without improving the customer's outcome.
+	EdgeRuleRetryDefaultMinRemainingMs = 250
+	// MaxEdgeRuleRetryMinRemainingMs caps the floor at 30 s so a customer
+	// cannot set a value that silently disables retry for every request.
+	MaxEdgeRuleRetryMinRemainingMs = 30_000
+	// MaxEdgeRuleRetryBackoffMs caps the inter-attempt delay at 1 s. The
+	// default is 0: the failure being retried is a dead peer, and the next
+	// instance is a different process, so waiting buys nothing. The knob
+	// exists only for the case where the sibling is still waking.
+	MaxEdgeRuleRetryBackoffMs = 1_000
+	// EdgeRuleRetryDefaultBudgetPercent limits aggregate replay traffic to
+	// 10% of originals in the gateway's short per-app accounting window.
+	EdgeRuleRetryDefaultBudgetPercent = 10
+	// MaxEdgeRuleRetryBudgetPercent prevents a rule from allowing more than
+	// one replay per original through the aggregate budget.
+	MaxEdgeRuleRetryBudgetPercent = 100
+	// EdgeRuleRetryDefaultBudgetMin preserves one recovery opportunity for
+	// low-traffic apps even when the percentage rounds down.
+	EdgeRuleRetryDefaultBudgetMin = 1
+	// MaxEdgeRuleRetryBudgetMin bounds the low-traffic burst allowance.
+	MaxEdgeRuleRetryBudgetMin = 32
+
+	// DurableRetryMaxAttempts is the platform-wide safety ceiling for
+	// durable invocation delivery. It applies even when the account or app
+	// lookup needed to resolve a narrower plan budget is temporarily
+	// unavailable, so lookup failures can never turn into infinite retry.
+	DurableRetryMaxAttempts = 25
+
+	// --- ADR-201 §2: kind=circuit_breaker bounds ----------------------
+
+	// EdgeRuleCircuitDefaultFailureThreshold is the failure ratio at or
+	// above which a closed breaker opens.
+	EdgeRuleCircuitDefaultFailureThreshold = 0.5
+	// EdgeRuleCircuitDefaultMinRequests is the minimum number of
+	// observations inside the window before the ratio is consulted.
+	//
+	// This is the field most likely to be set badly. At 1 a single
+	// transport blip opens the circuit, which on an app serving one
+	// request a minute reads as a 100% failure rate — so the validator
+	// requires an explicit value rather than letting a zero mean 1.
+	EdgeRuleCircuitDefaultMinRequests = 5
+	// MaxEdgeRuleCircuitMinRequests caps the low-traffic guard. Beyond
+	// this a breaker on a low-volume route can never accumulate enough
+	// observations to trip, which is a silent no-op.
+	MaxEdgeRuleCircuitMinRequests = 1_000
+	// EdgeRuleCircuitDefaultWindowSeconds is the rolling failure window.
+	EdgeRuleCircuitDefaultWindowSeconds = 10
+	// MaxEdgeRuleCircuitWindowSeconds caps the window at 5 minutes.
+	MaxEdgeRuleCircuitWindowSeconds = 300
+	// EdgeRuleCircuitDefaultOpenSeconds is the first open interval.
+	EdgeRuleCircuitDefaultOpenSeconds = 5
+	// EdgeRuleCircuitDefaultMaxOpenSeconds caps the exponential backoff.
+	EdgeRuleCircuitDefaultMaxOpenSeconds = 60
+	// MaxEdgeRuleCircuitOpenSeconds caps both open fields at 1 hour. A
+	// longer bench outlives most instances, so the breaker would be
+	// holding state about a target that no longer exists.
+	MaxEdgeRuleCircuitOpenSeconds = 3_600
 
 	// API-key lifetime (issue #189 / IAM-5). New non-admin keys
 	// minted by createKey get `expires_at = now + DefaultAPIKeyLifetimeDays`.
@@ -3860,10 +4103,60 @@ const (
 	// but admissions are deliberately paced across ticks so one bad metric
 	// sample cannot turn into an unbounded cold-boot fan-out.
 	ScaleUpMaxBurstPerTick = 4
+	// MaxScalingTargets bounds the declared signal list on
+	// ScalingPolicy.Targets (ADR-194). The arbiter is O(n) per app per
+	// scheduler tick and n is a human-authored list, so this exists to keep
+	// a pathological manifest from inflating the sweep — not as a product
+	// limit. It is deliberately larger than the number of distinct sources
+	// that exist, so no app can hit it by declaring every real metric.
+	MaxScalingTargets = 8
+	// MaxScalingSchedules bounds the recurring windows one app may declare
+	// (ADR-195). Each schedule costs a cron parse per app per floor
+	// evaluation, and the floor is read on the wake hot path, so this is a
+	// latency bound rather than a product limit. Twelve covers a distinct
+	// window per month, which is well past any real weekly shape.
+	MaxScalingSchedules = 12
+	// MaxCustomMetricsPerApp caps distinct ADR-202 metric names per app.
+	//
+	// The bound is a LATENCY property before it is a storage one: the
+	// targets trigger reads an app's custom metrics on every tick for
+	// every app the schedd owns, so an unbounded name set multiplies the
+	// per-tick read. The (app_id, name) primary key means a push to an
+	// existing name is an upsert and cannot grow the count — only a new
+	// name can, which is where apid enforces this.
+	MaxCustomMetricsPerApp = 5
+	// CustomMetricNameMaxBytes bounds a metric name. Matches the
+	// app_custom_metrics_name_shape CHECK in the migration; the Go gate
+	// exists so the customer gets a 422 with a useful message instead of
+	// a constraint violation.
+	CustomMetricNameMaxBytes = 63
+	// CustomMetricMaxValue bounds a pushed value. A backlog larger than
+	// this is not a backlog, it is a broken producer — and without a
+	// ceiling one bad push would demand the plan cap's worth of instances
+	// on the very next tick.
+	CustomMetricMaxValue = 1e12
+	// MinScalingScheduleDurationS / MaxScalingScheduleDurationS bound a
+	// window. The floor is 60 s because the scheduler's own sweep is
+	// coarser than that, so a shorter window could close before any tick
+	// observed it — the customer would be billed for a floor that never
+	// produced an instance. The ceiling is 7 days, which lets "always
+	// warm" be expressed as a weekly window without an unbounded value.
+	MinScalingScheduleDurationS = 60
+	MaxScalingScheduleDurationS = 7 * 24 * 60 * 60
 	// ScaleDecisionEventMinIntervalSeconds bounds repeated durable scale
 	// decision events for one app. Metrics remain per-tick; the audit stream
 	// is sampled so a sustained hot app cannot flood events.
 	ScaleDecisionEventMinIntervalSeconds = 30
+	// CustomMetricFreshnessSeconds bounds how long a pushed ADR-202 value
+	// stands in for the current reading.
+	//
+	// Five minutes is deliberately longer than the broker-lag equivalent:
+	// a custom metric's pusher is customer infrastructure on a cadence
+	// Gregale does not control, and a cron that runs every minute must not
+	// look stale between runs. Past it the metric reports NO SIGNAL rather
+	// than its last value, so an app whose pusher died scales down on its
+	// other signals instead of holding the fleet at a frozen backlog.
+	CustomMetricFreshnessSeconds = 300
 
 	// Scaling policy cooldowns (issue #462 / ADR-058). The
 	// customer-facing knobs are `scale_out_cooldown_s` /
@@ -4016,6 +4309,25 @@ const (
 	// minute) while keeping the query load negligible.
 	DeadNodeReconcilerIntervalSeconds = 30
 
+	// InstanceDivergenceIntervalSeconds is the cadence of the ADR-191
+	// sweep that finds live rows the owning vmmd is not reporting.
+	// 30s matches the dead-node reconciler: both repair rows the happy
+	// path left behind, and neither is latency-sensitive.
+	InstanceDivergenceIntervalSeconds = 30
+
+	// InstanceDivergenceGraceSeconds is how long after StartedAt an
+	// instance is exempt. A just-admitted VM may not appear in the last
+	// telemetry batch yet, and acting on that race would park healthy
+	// instances during every wake burst.
+	InstanceDivergenceGraceSeconds = 60
+
+	// InstanceDivergenceTickLimit caps the per-tick write burst, the
+	// same bound and for the same reason as
+	// DeadNodeReconcilerTickLimit: a whole node's fleet diverging at
+	// once is an event to surface, not to repair in one transaction
+	// storm.
+	InstanceDivergenceTickLimit = 50
+
 	// Tier A9 (capacity-pressure-triggered cross-node app rebalance,
 	// ADR-087 — sibling to the dead-node rebalancer of ADR-064).
 	// Today apps are durably pinned to a single compute_node via
@@ -4103,6 +4415,28 @@ const (
 	GatewayDrainGraceSeconds        = 25
 	ReplicaHeartbeatIntervalSeconds = 5
 	WarmHintCacheSize               = 1000
+	// ServiceRouteConvergenceTimeoutSeconds bounds one routing-generation
+	// acknowledgement round. A timeout does not retire the predecessor; the
+	// scheduler leaves it serving and retries reconciliation.
+	ServiceRouteConvergenceTimeoutSeconds = 5
+	// ServiceRouteNotificationRetryMilliseconds is the retry cadence for the
+	// idempotent routing-generation notification while a gateway reconnects.
+	ServiceRouteNotificationRetryMilliseconds = 250
+	// ServiceReplicaDrainTimeoutSeconds bounds one attempt to observe every
+	// predecessor replica idle after all gateways adopted the new generation.
+	// Timeout is fail-safe: the predecessor remains resident and routable only
+	// to already-established requests, and reconciliation retries later.
+	ServiceReplicaDrainTimeoutSeconds = GatewayDrainGraceSeconds
+	// ServiceReplicaDrainQuietSeconds requires more than one fresh telemetry
+	// sample at zero in-flight requests before a VM can be retired.
+	ServiceReplicaDrainQuietSeconds = 2
+	// ServiceReplicaDrainPollMilliseconds is intentionally shorter than the
+	// one-second vmmd telemetry cadence without becoming a busy loop.
+	ServiceReplicaDrainPollMilliseconds = 200
+	// ServiceRolloutRecoveryIntervalSeconds bounds retry latency after a
+	// transient handoff failure or a schedd exit before finalisation. The
+	// database rollout row is the durable retry ledger.
+	ServiceRolloutRecoveryIntervalSeconds = 30
 	// WarmHintHeartbeatInterval keeps idle hint streams observable without tenant traffic.
 	WarmHintHeartbeatInterval = 30 * time.Second
 	CertSyncIntervalSeconds   = 30
@@ -4306,6 +4640,10 @@ const (
 	// hourly cadence means a row that just crossed 30d is deleted within
 	// the next hour.
 	DefaultRetentionInterval = 1 * time.Hour
+	// DefaultDeadLetterRetention is the default age of a unified failed-events
+	// projection before the scheduler removes it. Source rows remain in their
+	// terminal state and audit events are retained independently.
+	DefaultDeadLetterRetention = 30 * 24 * time.Hour
 
 	// DefaultDiskDriftInterval is the cadence for the read-only
 	// /srv/fc/snap vs DB size-tracking drift sweep (PR scale-out
@@ -4358,6 +4696,24 @@ const (
 	// tenant-crafted 1 MiB header is fine, 64 MiB is not.
 	DefaultMaxHeaderBytes = 1 << 20 // 1 MiB
 )
+
+// EffectiveRetryMaxAttempts resolves a requested durable-invocation attempt
+// count against the account plan. Zero means "inherit" on input, never
+// "unlimited" on output. Plans without a retry allowance still receive one
+// delivery attempt so the invocation can run without being replayed.
+func EffectiveRetryMaxAttempts(requested, planLimit int) int {
+	limit := planLimit
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > DurableRetryMaxAttempts {
+		limit = DurableRetryMaxAttempts
+	}
+	if requested < 1 || requested > limit {
+		return limit
+	}
+	return requested
+}
 
 // Per-plan job caps. Indexed by Plan: 0=Free 1=Hobby 2=Pro 3=Scale.
 // Lives as a var (not const) because Go does not permit array literals
@@ -4648,6 +5004,35 @@ func WakeQueueMaxDepthForPlan(p Plan) int {
 	return depth * WakeQueueMaxDepthMultiplier
 }
 
+// ConcurrencyQueueDefaultsForPlan returns the warm-instance saturation queue
+// defaults. This is deliberately separate from WakeQueueDefaultsForPlan:
+// cold boots need seconds, while an already-running API should shed overload
+// quickly enough to preserve its latency budget.
+func ConcurrencyQueueDefaultsForPlan(p Plan) (maxDepth int, maxWait time.Duration, ok bool) {
+	switch p {
+	case PlanFree:
+		return ConcurrencyQueueFreeDefaultDepth, ConcurrencyQueueFreeDefaultWait, true
+	case PlanHobby:
+		return ConcurrencyQueueHobbyDefaultDepth, ConcurrencyQueuePaidDefaultWait, true
+	case PlanPro:
+		return ConcurrencyQueueProDefaultDepth, ConcurrencyQueuePaidDefaultWait, true
+	case PlanScale:
+		return ConcurrencyQueueScaleDefaultDepth, ConcurrencyQueuePaidDefaultWait, true
+	default:
+		return 1, ConcurrencyQueueFreeDefaultWait, false
+	}
+}
+
+// ConcurrencyQueueMaxDepthForPlan is the largest customer-configurable warm
+// saturation backlog. Zero continues to mean "use the plan default".
+func ConcurrencyQueueMaxDepthForPlan(p Plan) int {
+	depth, _, ok := ConcurrencyQueueDefaultsForPlan(p)
+	if !ok {
+		depth = 1
+	}
+	return depth * ConcurrencyQueueMaxDepthMultiplier
+}
+
 // MustLimitsFor returns the limits for a plan and panics on an unknown plan.
 // Use only where the plan is already validated (DB CHECK constraint upstream).
 func MustLimitsFor(p Plan) Limits {
@@ -4731,6 +5116,16 @@ func (p Plan) MinInstancesAllowed() bool {
 		return false
 	}
 	return l.MinInstancesAllowed
+}
+
+// CustomMetricsAllowed (ADR-202) reports whether the plan may push custom
+// application metrics and scale on them.
+func (p Plan) CustomMetricsAllowed() bool {
+	l, ok := LimitsFor(p)
+	if !ok {
+		return false
+	}
+	return l.CustomMetricsAllowed
 }
 
 // QueueControlsAllowed (ADR-124) reports whether the plan may
@@ -6894,3 +7289,143 @@ const FunctionInterpreterMaxWorkers = 4
 // Startup attestation runs before the scheduler opens its readiness boundary.
 const StartupAttestationWorkers = 2
 const StartupAttestationLayerTimeout = 15 * time.Second
+
+// NodeSizing is the per-host RAM/vCPU shape derived from the machine a
+// compute node actually runs on, rather than the single-box constants.
+type NodeSizing struct {
+	MemMB              int
+	TenantSliceMaxMB   int
+	TenantBudgetMB     int
+	AdmissionCeilingMB int
+	VCPUSlots          int
+	// NonTenantReserveMB is the host OS plus platform reserve that was
+	// subtracted to reach TenantSliceMaxMB. Deployment code writes the
+	// cgroup fence from TenantSliceMaxMB, so exposing the reserve lets an
+	// operator see why a node advertises what it does without re-deriving
+	// the arithmetic by hand.
+	NonTenantReserveMB int
+	// HostCPUs is the physical CPU count probed on the host, before the
+	// spec §1 CPUOvercommit factor. compute_nodes.vpcpus must carry this
+	// value, not VCPUSlots: the placement CPU budget multiplies vpcpus by
+	// CPUOvercommit, so storing an already-overcommitted count there would
+	// apply the factor twice.
+	HostCPUs int
+}
+
+// NodeRoleShape selects which non-tenant workloads share the host, and so
+// how much RAM must be held back before the tenant slice is computed.
+type NodeRoleShape int
+
+const (
+	// NodeShapeSingleBox is the spec §13 reference: one host running the
+	// whole platform, Postgres included. Reserve is ControlPlaneReserveMB.
+	NodeShapeSingleBox NodeRoleShape = iota
+	// NodeShapeComputeOnly is a multi-box compute host. It runs vmmd,
+	// gatewayd-internal, builderd, imaged, and schedd, but NOT Postgres,
+	// apid, meterd, githubd, or gatewayd-public. See pkg/role.
+	NodeShapeComputeOnly
+)
+
+// nonTenantReserveMB is the RAM held back from tenants for a box shape.
+func nonTenantReserveMB(shape NodeRoleShape) int {
+	if shape == NodeShapeComputeOnly {
+		return ComputeNodeDaemonReserveMB + BuilderSlotReserveMB
+	}
+	return ControlPlaneReserveMB
+}
+
+// DeriveNodeSizing generalises the spec §13 RAM budget to an arbitrary host.
+//
+// The §13 table is written for the 64 GB reference box: 2,048 MB host OS
+// reserve, 6,144 MB control-plane reserve, leaving a 57,344 MB tenant slice,
+// a 56,000 MB tenant budget, and an admission ceiling at 85% of that —
+// 47,600 MB. Those are the constants above, and they were also the *defaults*
+// every compute node self-registered with, whatever hardware it was on. On a
+// 16 GiB n2-standard-4 that advertises ~3x the machine's real memory, so
+// admission enforces invariant §6.2-2 against a number the host cannot honour
+// and the node can be driven into OOM with no swap to absorb it.
+//
+// This applies the same arithmetic to the observed MemTotal, so the reference
+// box still resolves to exactly 57,344 / 56,000 / 47,600 (pinned by test) and
+// smaller hosts get the truthful, much smaller figure.
+//
+// The tenant budget keeps the spec's margin below the slice fence
+// (56,000 of 57,344) rather than admitting right up to the cgroup hard limit.
+//
+// A non-positive memTotalMB (detection failed) returns the legacy single-box
+// constants: an unknown machine must not silently become an unbounded one.
+func DeriveNodeSizing(memTotalMB, hostCPUs int) NodeSizing {
+	return DeriveNodeSizingForRole(memTotalMB, hostCPUs, NodeShapeSingleBox)
+}
+
+// DeriveNodeSizingForRole is DeriveNodeSizing with the platform reserve
+// chosen for the box shape instead of always charging the single-box
+// control-plane slice.
+//
+// The §13 reserve of 6,144 MB is the *control-plane* budget: Postgres, apid,
+// schedd, meterd, githubd, gatewayd-public, and one builder slot, all on the
+// reference box. A multi-box compute host runs none of Postgres, apid,
+// meterd, githubd, or gatewayd-public — those daemons refuse to start under
+// RoleComputeOnly (see pkg/role). Charging it the full control-plane slice
+// hands ~2.5 GB of a 16 GiB node to daemons that are not there.
+//
+// Measured on the production compute nodes, every faas daemon together holds
+// roughly 490 MB RSS and the host agents another ~390 MB, so
+// ComputeNodeDaemonReserveMB carries a wide margin over observed use. The
+// builder slot is reserved separately because builderd is a compute-only
+// daemon: spec §4.5 guarantees one 2,048 MB build VM per node, and a build
+// must never be funded out of the tenant slice.
+//
+// A control-plane or single-box host keeps the spec constant unchanged, so
+// the 64 GB reference still resolves to exactly 57,344 / 56,000 / 47,600.
+func DeriveNodeSizingForRole(memTotalMB, hostCPUs int, shape NodeRoleShape) NodeSizing {
+	reserve := nonTenantReserveMB(shape)
+	out := NodeSizing{
+		MemMB:              memTotalMB,
+		TenantSliceMaxMB:   TenantSliceMaxMB,
+		TenantBudgetMB:     TenantRAMBudgetMB,
+		AdmissionCeilingMB: RAMAdmissionCeilingMB,
+		VCPUSlots:          VCPUSlots,
+		NonTenantReserveMB: HostOSReserveMB + reserve,
+	}
+	if memTotalMB <= 0 {
+		out.MemMB = TenantRAMBudgetMB
+	} else {
+		sliceMax := memTotalMB - HostOSReserveMB - reserve
+		if sliceMax < MinTenantSliceMB {
+			// Too small to host tenants under the reserves. Report the
+			// floor rather than a negative or zero ceiling, which would
+			// fail the migration 00123 CHECK and wedge registration.
+			sliceMax = MinTenantSliceMB
+		}
+		out.TenantSliceMaxMB = sliceMax
+		out.TenantBudgetMB = sliceMax * TenantRAMBudgetMB / TenantSliceMaxMB
+		out.AdmissionCeilingMB = out.TenantBudgetMB * RAMAdmissionPercent / 100
+	}
+	if hostCPUs > 0 {
+		out.HostCPUs = hostCPUs
+		out.VCPUSlots = hostCPUs * CPUOvercommit
+	}
+	return out
+}
+
+const (
+	// RAMAdmissionPercent is the headroom guard from spec §1: schedd admits
+	// only up to this share of the tenant budget.
+	RAMAdmissionPercent = 85
+	// MinTenantSliceMB floors the derived tenant slice so a host smaller
+	// than the reserves still registers with a positive, CHECK-satisfying
+	// ceiling instead of refusing to come up.
+	MinTenantSliceMB = 1_024
+	// ComputeNodeDaemonReserveMB is the non-tenant RAM held back on a
+	// multi-box compute host for the daemons that actually run there:
+	// vmmd, gatewayd-internal, builderd, imaged, schedd, plus the host
+	// telemetry agents. Measured steady-state on the production nodes is
+	// ~880 MB across all of them; this carries margin over that without
+	// charging the absent control-plane daemons.
+	ComputeNodeDaemonReserveMB = 1_536
+	// BuilderSlotReserveMB funds the one guaranteed builder microVM on a
+	// node that runs builderd. A build must never be paid for out of the
+	// tenant slice, so it is reserved rather than admitted.
+	BuilderSlotReserveMB = 2_048
+)

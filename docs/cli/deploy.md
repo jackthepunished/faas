@@ -65,6 +65,18 @@ wait returns a non-zero exit code but retains the accepted deployment ID in
 `--json` output, along with an exact `resume_command`; resume it with
 `gregale deployment wait <deployment-id> --timeout ...`.
 
+Before changing remote state or uploading source, human-readable deploys print
+one deployment plan containing the selected source, runtime resolution,
+resource behavior, environment, and release policy. Local-source, archive,
+template, and image plans include locally inferred start, listener, and health
+details when available. A `--repo` plan names the exact repository and ref,
+marks runtime detection as remote-after-checkout, and makes clear that an
+existing app's resources are preserved. In a dirty Git checkout the plan states
+whether local changes are included. The default deploy ships committed `HEAD`;
+use `--worktree` when the plan reports that local changes are excluded. JSON
+output remains a single machine-readable deployment receipt and does not
+include this human preflight block.
+
 ## Safe production rollouts
 
 For a health-gated production release, use the opt-in safe path:
@@ -150,19 +162,26 @@ schema_version: 1
 scaling:
   min_instances: 0
   max_instances: 5
-  target:
-    metric: concurrent_requests # rps, concurrent_requests, queue_depth, or p99_latency_ms
-    value: 2
+  targets: # rps, cpu, concurrent_requests, or queue_depth
+    - metric: concurrent_requests
+      value: 2
+    - metric: cpu
+      value: 70
   scale_out_cooldown_s: 5
   scale_in_cooldown_s: 60
   concurrency_overflow: queue # queue or drop
-  max_queue_wait_ms: 2500 # 0 uses the plan default
+  max_queue_depth: 32 # warm-saturation waiters; 0 uses the plan default
+  max_queue_wait_ms: 2000 # warm-saturation wait; 0 uses the plan default
 ```
 
 `min_instances` and `max_instances` use the platform's plan limits; `0`
 means scale to zero (and a zero `max_instances` means the plan maximum).
 Cooldowns default to 5 seconds for scale-out and 60 seconds for scale-in when
-omitted. The API remains the final authority for plan gates and workload-class
+omitted. Each entry in `targets` says how much load one instance should carry;
+when several are declared the platform provisions for whichever demands the
+most instances (see [Scaling policy](../scaling-policy.md)). The singular
+`target:` form is still accepted as a one-element list.
+The API remains the final authority for plan gates and workload-class
 compatibility. A project (`--project`) deploy currently rejects the top-level
 block because scaling is app-scoped; configure each workload separately after
 project apply. Source-ref (`--repo`) deploys read and apply the block
@@ -170,7 +189,9 @@ server-side from the immutable archive before enqueueing the deployment. A local
 single-app deploy reads the block from the uploaded source.
 
 `concurrency_overflow: drop` returns HTTP 429 immediately when the app's
-concurrency boundary is saturated; `queue` preserves bounded waiting.
+concurrency boundary is saturated; `queue` preserves bounded FIFO waiting.
+The warm queue's effective plan defaults are shown by `gregale app APP`, and
+are independent of the longer `wake_max_queue_*` cold-wake limits.
 
 ## Declarative worker lifecycle
 

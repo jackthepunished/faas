@@ -96,6 +96,32 @@ func TestInit_NoEndpointIsNoOp(t *testing.T) {
 	}
 }
 
+func TestInit_LocalExporterWorksWithoutOTLPEndpoint(t *testing.T) {
+	prev := otel.GetTracerProvider()
+	t.Cleanup(func() { otel.SetTracerProvider(prev) })
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+	t.Setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "")
+
+	exporter := tracetest.NewInMemoryExporter()
+	h, err := otelinit.Init(context.Background(), otelinit.Config{
+		Name:          "test-daemon",
+		Version:       "1.0.0",
+		SpanExporters: []sdktrace.SpanExporter{exporter},
+	}, slog.Default())
+	if err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	_, span := otelinit.Tracer("test-daemon").Start(context.Background(), "local.span")
+	span.End()
+	got := exporter.GetSpans()
+	if err := h.Shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	if len(got) != 1 || got[0].Name != "local.span" {
+		t.Fatalf("exported spans = %+v, want local.span", got)
+	}
+}
+
 // TestInit_NameRequired pins the contract that a daemon's name is
 // required — the OTel service.name attribute has no zero form.
 func TestInit_NameRequired(t *testing.T) {
@@ -118,7 +144,9 @@ func TestInit_WithEndpoint_WiresProvider(t *testing.T) {
 	// Set the env to point at the test server's /v1/traces.
 	var gotBody []byte
 	var gotAuthorization string
+	var gotPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
 		if strings.HasSuffix(r.URL.Path, "/v1/traces") {
 			b, _ := io.ReadAll(r.Body)
 			gotBody = b
@@ -129,7 +157,7 @@ func TestInit_WithEndpoint_WiresProvider(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	// Strip "http://" off the front so the SDK parses it as host:port.
+	// Exercise Gregale's legacy bare host:port endpoint compatibility.
 	endpoint := strings.TrimPrefix(srv.URL, "http://")
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint)
 	t.Setenv("OTEL_EXPORTER_OTLP_TRACES_HEADERS", "Authorization=Bearer%20trace-test")
@@ -157,6 +185,9 @@ func TestInit_WithEndpoint_WiresProvider(t *testing.T) {
 
 	if len(gotBody) == 0 {
 		t.Error("expected OTLP export to land at test server")
+	}
+	if gotPath != "/v1/traces" {
+		t.Errorf("OTLP export path = %q, want /v1/traces for a bare host:port endpoint", gotPath)
 	}
 	if gotAuthorization != "Bearer trace-test" {
 		t.Errorf("Authorization = %q, want decoded bearer header", gotAuthorization)

@@ -30,12 +30,20 @@ on:
         description: "Existing pre-1.0 release tag published by release.yml"
         required: true
         type: string
+      maintenance_mode:
+        description: "Planned window with legacy writers stopped before incompatible migrations"
+        type: boolean
+        default: false
   workflow_dispatch:  # manual trigger for deliberate deployment
     inputs:
       release_tag:
         description: "Existing pre-1.0 release tag published by release.yml (for example v0.1.18-rc.1)"
         required: true
         type: string
+      maintenance_mode:
+        description: "Planned window with legacy writers stopped before incompatible migrations"
+        type: boolean
+        default: false
 
 concurrency:
   group: cd-cp-${{ inputs.release_tag }}
@@ -59,6 +67,7 @@ jobs:
       # compute hosts. Keep the shared storage.env credential read-only.
       APID_STORAGE_LIFECYCLE_ENV: ${{ secrets.COMPUTE_IMAGED_STORAGE_ENV }}
       RELEASE_TAG: ${{ inputs.release_tag }}
+      MAINTENANCE_MODE: ${{ inputs.maintenance_mode }}
       # The critical / best-effort service split is owned by
       # pkg/daemonunitspec (Entry.Critical) and shipped as
       # deploy/etc/daemons.json; the env lists that used to live here were
@@ -106,16 +115,20 @@ jobs:
           set -euo pipefail
           CANONICAL_ROOT="$RUNNER_TEMP/gregale-canonical"
           mkdir -p "$CANONICAL_ROOT"
-          gh release download "$RELEASE_TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --pattern release.tar.gz \
-            --pattern release.cosign.bundle \
-            --pattern release.sbom.json \
-            --pattern release-manifest.json \
-            --pattern production-manifest.yaml \
-            --pattern runtime-bases.env \
-            --pattern SHA256SUMS \
-            --dir "$CANONICAL_ROOT"
+          # GitHub's by-tag response can lag asset uploads while the by-ID
+          # response is current. Resolve the tag to an ID, then use the ID
+          # response for the authoritative asset list.
+          release_id="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" --jq '.id')"
+          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}")"
+          for asset in release.tar.gz release.cosign.bundle release.sbom.json \
+            release-manifest.json production-manifest.yaml runtime-bases.env SHA256SUMS; do
+            asset_url="$(jq -er --arg name "$asset" \
+              '.assets[] | select(.name == $name) | .browser_download_url' <<<"$release_json")"
+            curl --fail --silent --show-error --location \
+              --proto '=https' --tlsv1.2 --retry 3 --retry-all-errors \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              -o "$CANONICAL_ROOT/$asset" "$asset_url"
+          done
           (
             cd "$CANONICAL_ROOT"
             sha256sum -c SHA256SUMS
@@ -228,7 +241,7 @@ jobs:
         run: |
           set -euo pipefail
           BUNDLE_ROOT="${RUNNER_TEMP}/faas-release/${RELEASE_ID}"
-          mkdir -p "${BUNDLE_ROOT}/bin" "${BUNDLE_ROOT}/systemd" "${BUNDLE_ROOT}/tmpfiles.d" "${BUNDLE_ROOT}/prometheus" "${BUNDLE_ROOT}/statuspage"
+          mkdir -p "${BUNDLE_ROOT}/bin" "${BUNDLE_ROOT}/systemd" "${BUNDLE_ROOT}/optional-systemd" "${BUNDLE_ROOT}/tmpfiles.d" "${BUNDLE_ROOT}/prometheus" "${BUNDLE_ROOT}/statuspage"
           PROM_BOX_LABEL="$(ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes "root@${CP_HOST}" hostname)"
           ansible localhost -i localhost, -c local \
             -e @deploy/ansible/roles/prometheus/defaults/main.yml \
@@ -303,6 +316,12 @@ jobs:
             fi
             install -m 0644 "${src}" "${BUNDLE_ROOT}/systemd/${unit}"
           done
+          # Optional services are not members of the core activation set, but
+          # a configured service still needs its unit updated with the release
+          # and recoverable if an older deployctl incorrectly masked it.
+          install -m 0644 \
+            deploy/ansible/roles/s3_gateway_service/files/faas-s3-gatewayd.service \
+            "${BUNDLE_ROOT}/optional-systemd/faas-s3-gatewayd.service"
           # Files required before deployctl can activate outboundd. Keep the
           # role/billing overrides inside the signed bundle so the standalone
           # control-plane path applies the same public-beta posture as Ansible.
@@ -692,27 +711,36 @@ jobs:
           }
           trap cleanup_probe_proxy EXIT
           probe_proxy="socks5h://127.0.0.1:${probe_port}"
-          proxy_ready=0
-          for _ in $(seq 1 20); do
-            if curl --fail --silent --show-error --proxy "$probe_proxy" \
-              --connect-timeout 1 --max-time 3 \
-              'https://api.gregale.dev/v1/status?rollout_probe=proxy-preflight' \
-              >/dev/null; then
-              proxy_ready=1
-              break
-            fi
-            kill -0 "$probe_proxy_pid" 2>/dev/null || break
-            sleep 0.25
-          done
-          (( proxy_ready == 1 )) || {
-            echo "::error::control-plane rollout probe proxy did not become ready" >&2
-            exit 1
-          }
-          ROLLOUT_PROBE_PROXY="$probe_proxy" scripts/ci/observe_rollout_availability.sh \
+          baseline_samples=3
+          if [[ "$MAINTENANCE_MODE" == "true" ]]; then
+            # Legacy writers are intentionally stopped before migration; the
+            # public endpoint cannot provide a healthy pre-rollout baseline.
+            baseline_samples=0
+            echo "::notice::planned maintenance: customer-path availability gate is inconclusive"
+          else
+            proxy_ready=0
+            for _ in $(seq 1 20); do
+              if curl --fail --silent --show-error --proxy "$probe_proxy" \
+                --connect-timeout 1 --max-time 3 \
+                'https://api.gregale.dev/v1/status?rollout_probe=proxy-preflight' \
+                >/dev/null; then
+                proxy_ready=1
+                break
+              fi
+              kill -0 "$probe_proxy_pid" 2>/dev/null || break
+              sleep 0.25
+            done
+            (( proxy_ready == 1 )) || {
+              echo "::error::control-plane rollout probe proxy did not become ready" >&2
+              exit 1
+            }
+          fi
+          ROLLOUT_BASELINE_SAMPLE_COUNT="$baseline_samples" \
+            ROLLOUT_PROBE_PROXY="$probe_proxy" scripts/ci/observe_rollout_availability.sh \
             "https://api.gregale.dev/v1/status" -- \
             ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
             root@${{ env.CP_HOST }} \
-            "${release_dir}/bin/deployctl bundle-check ${release_dir} &&
+            "${release_dir}/bin/deployctl bundle-check-installed ${release_dir} &&
              if test ! -s /opt/faas/releases/sbom-baseline.json; then
                current_release=\$(readlink -f /opt/faas/current 2>/dev/null || true);
                if test -n \"\$current_release\" && test -s \"\$current_release/release.sbom.json\"; then
@@ -883,20 +911,56 @@ jobs:
         run: |
           set -euo pipefail
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
-            root@${{ env.CP_HOST }} 'set -euo pipefail
-            if ! systemctl is-enabled --quiet faas-s3-gatewayd.service; then
-              echo "faas-s3-gatewayd is not enabled; optional object storage remains unchanged"
+            root@${{ env.CP_HOST }} "bash -s -- '${RELEASE_ID}'" <<'REMOTE'
+          set -euo pipefail
+          release_id="$1"
+          registry=/etc/faas/object-storage.json
+          apid_dropin=/etc/systemd/system/faas-apid.service.d/99-faas-object-storage.conf
+          source_unit="/opt/faas/releases/${release_id}/optional-systemd/faas-s3-gatewayd.service"
+          installed_unit=/etc/systemd/system/faas-s3-gatewayd.service
+
+          # The Ansible role creates both markers only for an explicitly
+          # enabled provider. A merely disabled unit is not enough evidence to
+          # turn storage on during an unrelated platform release.
+          if [[ ! -s "$registry" || ! -s "$apid_dropin" ]]; then
+            echo "faas-s3-gatewayd is not configured; optional object storage remains unchanged"
+            exit 0
+          fi
+          test -f "$source_unit"
+
+          # deployctl releases before this fix treated the optional daemon as
+          # opposite-role residue, replacing its unit with /dev/null. Recover
+          # that exact state but refuse to overwrite any unexpected symlink or
+          # non-regular operator-owned path.
+          if [[ -L "$installed_unit" ]]; then
+            [[ "$(readlink "$installed_unit")" == /dev/null ]] || {
+              echo "unexpected faas-s3-gatewayd unit symlink" >&2
+              exit 1
+            }
+            rm -f -- "$installed_unit"
+          elif [[ -e "$installed_unit" && ! -f "$installed_unit" ]]; then
+            echo "faas-s3-gatewayd unit path is not a regular file" >&2
+            exit 1
+          fi
+          staged_unit="${installed_unit}.new-${release_id}"
+          trap 'rm -f -- "$staged_unit"' EXIT
+          install -o root -g root -m 0644 "$source_unit" "$staged_unit"
+          mv -Tf "$staged_unit" "$installed_unit"
+          trap - EXIT
+
+          systemctl daemon-reload
+          systemctl unmask faas-s3-gatewayd.service
+          systemctl enable faas-s3-gatewayd.service
+          systemctl restart faas-s3-gatewayd.service
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --max-time 2 http://127.0.0.1:9096/readyz >/dev/null; then
               exit 0
             fi
-            systemctl restart faas-s3-gatewayd.service
-            for attempt in $(seq 1 30); do
-              if curl --fail --silent --max-time 2 http://127.0.0.1:9096/readyz >/dev/null; then
-                exit 0
-              fi
-              sleep 2
-            done
-            journalctl -u faas-s3-gatewayd.service -n 100 --no-pager >&2
-            exit 1'
+            sleep 2
+          done
+          journalctl -u faas-s3-gatewayd.service -n 100 --no-pager >&2
+          exit 1
+          REMOTE
 
       - name: Accept activated release SBOM baseline
         run: |
