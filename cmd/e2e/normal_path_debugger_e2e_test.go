@@ -14,6 +14,7 @@ package e2e_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"os"
@@ -36,6 +37,7 @@ func newNormalPathDebuggerFixture(t *testing.T, slug string) *normalPathFixture 
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(telemetryDir) })
 	telemetrySocket := filepath.Join(telemetryDir, "request-telemetry.sock")
+	spansWriterSocket := filepath.Join(telemetryDir, "otel-spans-writer.sock")
 	artifactDir, err := os.MkdirTemp("", "faas-e2e-debugger-artifacts-*")
 	if err != nil {
 		t.Fatalf("create debugger artifact dir: %v", err)
@@ -47,8 +49,11 @@ func newNormalPathDebuggerFixture(t *testing.T, slug string) *normalPathFixture 
 	}
 	f := newNormalPathFixtureWithPlanAndEnv(t, slug, api.PlanPro,
 		"FAAS_APP_ERRORS_ENABLED=false",
+		"FAAS_OTEL_SPANS_WRITER_ENABLED=true",
 		"FAAS_REQUEST_TELEMETRY_ENABLED=true",
 		"FAAS_APID_REQUEST_TELEMETRY_SOCKET="+telemetrySocket,
+		"FAAS_APID_OTEL_SPANS_WRITER_SOCKET="+spansWriterSocket,
+		"FAAS_OTEL_FLUSH_INTERVAL=50ms",
 		"FAAS_STORAGE_BACKEND=local",
 		"FAAS_STORAGE_ROOT="+artifactDir,
 	)
@@ -75,21 +80,27 @@ func TestE2E_NormalPath_DebuggerTelemetryAnalyticsAndReplay(t *testing.T) {
 	waitForNormalPathDebuggerResponse(t, f, "normal-path:debugger-source\n", 10*time.Second)
 
 	const secret = "customer-secret-must-not-cross-debugger"
+	const traceID = "4bf92f3577b34da6a3ce929d0e0e4736"
+	const traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 	_, body, statusCode := doReqHeaders(t, f.h, f.host, http.MethodGet,
 		"/debugger/telemetry", nil, map[string]string{
 			"Authorization":     "Bearer " + f.key,
 			"X-Customer-Secret": secret,
+			"Traceparent":       traceparent,
 		})
 	if statusCode != http.StatusOK || string(body) != "normal-path:debugger-source\n" {
 		t.Fatalf("debugger source request: status=%d body=%q", statusCode, body)
 	}
 
-	request := waitForNormalPathDebuggerRequest(t, f, sourceDeployment.ID, 20*time.Second)
+	request := waitForNormalPathDebuggerRequest(t, f, sourceDeployment.ID, traceID, 20*time.Second)
 	if request.Status != http.StatusOK || request.Method != http.MethodGet {
 		t.Fatalf("debugger request = %+v, want GET/200", request)
 	}
 	if request.InstanceID != sourceInstance.ID {
 		t.Fatalf("debugger request instance_id=%q, want source %q", request.InstanceID, sourceInstance.ID)
+	}
+	if request.TraceID == nil || *request.TraceID != traceID {
+		t.Fatalf("debugger request trace_id=%v, want propagated W3C trace %s", request.TraceID, traceID)
 	}
 
 	body, statusCode = doReq(t, f.h, f.key, http.MethodGet,
@@ -149,18 +160,57 @@ func TestE2E_NormalPath_DebuggerTelemetryAnalyticsAndReplay(t *testing.T) {
 		t.Fatalf("debugger export leaked customer header value %q", secret)
 	}
 
+	// Exercise a platform-owned dependency span on the same W3C trace as the
+	// persisted app request. The service-mesh call emits the span; gatewayd's
+	// retained-span accumulator flushes it over the spans-writer socket, and
+	// apid correlates it back to this request row by trace ID and account.
+	dependencyApp := createServiceApp(t, f, "analyticsdependency", nil)
+	_, dependencyInstance := createNormalPathLiveDeployment(t, f, dependencyApp.ID, "dependency-v1")
+	f.vmmd.SetVersion(dependencyInstance.ID, "dependency-v1")
+	warmStatus, _, warmBody := pollServiceCall(t, f.h, f.app.ID, "analyticsdependency", "/health", http.StatusOK, 15*time.Second)
+	if warmStatus != http.StatusOK {
+		t.Fatalf("warm dependency service call: status=%d body=%s", warmStatus, warmBody)
+	}
+	dependencyStatus, _, dependencyBody := serviceCall(t, f.h, f.app.ID, "analyticsdependency", "/health",
+		http.Header{"Traceparent": []string{traceparent}})
+	if dependencyStatus != http.StatusOK {
+		t.Fatalf("correlated dependency service call: status=%d body=%s", dependencyStatus, dependencyBody)
+	}
+
 	// The same gateway-recorded row that powers the debugger must feed the
 	// route-centric analytics API after crossing the telemetry socket and
-	// Postgres. This catches regressions that helper-only aggregation tests
-	// cannot see (for example, a missing route query or plan gate).
-	body, statusCode = doReq(t, f.h, f.key, http.MethodGet,
-		"/v1/apps/normal-debugger/analytics?since=24h", nil)
-	if statusCode != http.StatusOK {
-		t.Fatalf("request analytics: status=%d body=%s", statusCode, body)
-	}
+	// Postgres. Poll until the asynchronous retained-span writer has attached
+	// the classified dependency evidence to the request row.
 	var analytics api.RequestAnalyticsResponse
-	if err := json.Unmarshal(body, &analytics); err != nil {
-		t.Fatalf("decode request analytics: %v body=%s", err, body)
+	dependencyFound := false
+	analyticsDeadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(analyticsDeadline) {
+		body, statusCode = doReq(t, f.h, f.key, http.MethodGet,
+			"/v1/apps/normal-debugger/analytics?since=24h", nil)
+		if statusCode != http.StatusOK {
+			t.Fatalf("request analytics: status=%d body=%s", statusCode, body)
+		}
+		if err := json.Unmarshal(body, &analytics); err != nil {
+			t.Fatalf("decode request analytics: %v body=%s", err, body)
+		}
+		for _, route := range analytics.Routes {
+			if route.Route != request.Route || route.Method != request.Method {
+				continue
+			}
+			for _, dependency := range route.Dependencies {
+				if dependency.Type == "managed_binding" && dependency.Kind == "service_proxy" && dependency.Name == "service.analyticsdependency" && dependency.Samples >= 1 {
+					dependencyFound = true
+					break
+				}
+			}
+		}
+		if dependencyFound {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !dependencyFound {
+		t.Fatalf("route analytics did not receive the correlated service dependency span: %+v", analytics.Routes)
 	}
 	if analytics.Requests < 1 {
 		t.Fatalf("request analytics = %+v, want at least one persisted request", analytics)
@@ -311,20 +361,25 @@ func TestE2E_NormalPath_DebuggerTelemetryAnalyticsAndReplay(t *testing.T) {
 	}
 
 	mirrorRequests := 0
+	wantReplayPath := strings.TrimPrefix(request.Route, request.Method+" ")
+	var observedBridgeRequests []string
 	for _, capture := range f.vmmd.Requests() {
 		if capture.Init.Instance != sourceInstance.ID {
-			mirrorRequests++
-			wantReplayPath := "/" + strings.TrimPrefix(request.Route, "/")
-			if capture.Init.Method != request.Method || capture.Init.RequestUri != wantReplayPath {
-				t.Fatalf("debugger replay bridge request = method %q uri %q, want %q %q", capture.Init.Method, capture.Init.RequestUri, request.Method, wantReplayPath)
-			}
-			if len(capture.Body) != 0 {
-				t.Fatalf("debugger replay forwarded body=%q, want empty metadata-only body", capture.Body)
-			}
+			observedBridgeRequests = append(observedBridgeRequests,
+				fmt.Sprintf("%s %s instance=%s", capture.Init.Method, capture.Init.RequestUri, capture.Init.Instance))
+		}
+		// VMMD also records health and setup traffic; count only the replay's
+		// cross-instance request with the expected method and route.
+		if capture.Init.Instance == sourceInstance.ID || capture.Init.Method != request.Method || capture.Init.RequestUri != wantReplayPath {
+			continue
+		}
+		mirrorRequests++
+		if len(capture.Body) != 0 {
+			t.Fatalf("debugger replay forwarded body=%q, want empty metadata-only body", capture.Body)
 		}
 	}
 	if mirrorRequests != 1 {
-		t.Fatalf("debugger replay mirror forwards=%d, want exactly one after idempotent retry", mirrorRequests)
+		t.Fatalf("debugger replay mirror forwards=%d, want exactly one after idempotent retry; cross-instance VMMD requests=%v", mirrorRequests, observedBridgeRequests)
 	}
 
 	body, statusCode = doReq(t, f.h, f.key, http.MethodGet,
@@ -341,7 +396,7 @@ func TestE2E_NormalPath_DebuggerTelemetryAnalyticsAndReplay(t *testing.T) {
 	}
 }
 
-func waitForNormalPathDebuggerRequest(t *testing.T, f *normalPathFixture, deploymentID string, timeout time.Duration) api.DebugTelemetryRequestItem {
+func waitForNormalPathDebuggerRequest(t *testing.T, f *normalPathFixture, deploymentID, expectedTraceID string, timeout time.Duration) api.DebugTelemetryRequestItem {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	var last api.DebugTelemetryListResponse
@@ -355,7 +410,7 @@ func waitForNormalPathDebuggerRequest(t *testing.T, f *normalPathFixture, deploy
 			t.Fatalf("decode polled debugger requests: %v body=%s", err, body)
 		}
 		for _, request := range last.Requests {
-			if request.DeploymentID == deploymentID {
+			if request.DeploymentID == deploymentID && request.TraceID != nil && *request.TraceID == expectedTraceID {
 				return request
 			}
 		}
