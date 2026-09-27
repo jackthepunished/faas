@@ -14011,6 +14011,11 @@ paths:
         required: true
         description: Source environment whose live releases are compared with the target.
         schema: { type: string, pattern: '^[a-z0-9](?:[a-z0-9-]{0,31}[a-z0-9])?$' }
+      - name: sync_config
+        in: query
+        required: false
+        description: Opt in to copying the source's non-secret configuration atomically with the target release graph.
+        schema: { type: boolean, default: false }
     get:
       tags: [projects]
       operationId: getProjectEnvironmentPromotionPreview
@@ -14020,7 +14025,10 @@ paths:
         response includes non-secret configuration changes, live deployment
         identities, target protection state, and an opaque promotion token
         bound to those identities. It does not create deployments or audit
-        mutations.
+        mutations. Configuration remains target-scoped by default;
+        `sync_config=true` opts into applying the source's non-secret
+        configuration snapshot with the release graph, and is blocked unless
+        the target already has an active release graph for atomic cutover.
       responses:
         '200':
           description: Promotion preview and immutable promotion identity.
@@ -14060,7 +14068,8 @@ paths:
         issued for that exact promotion. After cutover, every target artifact
         is verified against its source release and target environment. A
         failed verification automatically rolls back the promotion. Target
-        configuration and secrets are never copied from the source environment.
+        configuration remains target-scoped unless the token was created with
+        `sync_config=true`; secrets are never copied from the source environment.
       requestBody:
         required: true
         content:
@@ -28255,12 +28264,13 @@ components:
     # ─── Domains ──────────────────────────────────────────────────────────
 
     CustomDomainResponse:
-      description: "A custom domain binding: domain string, target app, verification status, and TLS provisioning state. Issue #961 / Mega-A PR-3 adds `default`, `cert_not_after`, and `cert_sans` for the `gregale domains set-default | verify | show` surface."
+      description: "A custom domain binding: domain string, target app, optional project environment, verification status, and TLS provisioning state. Issue #961 / Mega-A PR-3 adds `default`, `cert_not_after`, and `cert_sans` for the `gregale domains set-default | verify | show` surface."
       type: object
       required: [domain, app_id, verified]
       properties:
         domain: { type: string , example: "app.example.com"}
         app_id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+        environment: { type: string, description: "Project environment that owns the route; omitted for legacy application-wide domains." }
         challenge_token: { type: [string, "null"] }
         verified: { type: boolean }
         verified_at: { type: [string, "null"], format: date-time }
@@ -28274,12 +28284,13 @@ components:
         dns_last_checked_at: { type: [string, "null"], format: date-time, description: "Timestamp of the most recent DNS verification/doctor probe." }
 
     CreateCustomDomainRequest:
-      description: "Bind a custom domain to an app."
+      description: "Bind a custom domain to an app, optionally routing it to one project environment."
       type: object
       required: [domain, app_id]
       properties:
         domain: { type: string , example: "app.example.com"}
         app_id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
+        environment: { type: string, pattern: '^[a-z0-9]([a-z0-9-]{0,31}[a-z0-9])?$', description: "Optional project environment slug. When set, traffic follows only that environment's active release graph." }
 
     DomainDoctorReport:
       description: "Per-domain doctor report (ADR-120). Carries 5 Render-style checks (dns_record, points_to_gregale, tls_certificate, caa_permits, ipv6_conflict) plus the durable row's app_id and observed_at. `stale:true` means the cached observation row was older than FAAS_DOMAIN_DOCTOR_TTL_SECONDS (default 300) when the handler ran a synchronous re-probe."
@@ -29463,10 +29474,18 @@ components:
           type: array
           items: { type: string }
 
+    ProjectEnvironmentDomainResponse:
+      description: Custom hostname routed to one workload in this project environment.
+      type: object
+      required: [domain, verified]
+      properties:
+        domain: { type: string }
+        verified: { type: boolean }
+
     ProjectEnvironmentStateWorkloadResponse:
       description: Effective configuration and live release state for one workload.
       type: object
-      required: [workload_slug, workload_name, release, variables, secrets, bindings, routes, policies]
+      required: [workload_slug, workload_name, release, variables, secrets, bindings, domains, routes, policies]
       properties:
         app_id: { type: string, format: uuid }
         workload_slug: { type: string }
@@ -29481,6 +29500,9 @@ components:
         bindings:
           type: array
           items: { $ref: '#/components/schemas/ProjectEnvironmentBindingResponse' }
+        domains:
+          type: array
+          items: { $ref: '#/components/schemas/ProjectEnvironmentDomainResponse' }
         routes: { $ref: '#/components/schemas/ProjectEnvironmentRoutePolicyResponse' }
         policies: { $ref: '#/components/schemas/ProjectEnvironmentEdgePolicyResponse' }
 
@@ -29632,10 +29654,23 @@ components:
         before: { $ref: '#/components/schemas/ProjectEnvironmentBindingResponse' }
         after: { $ref: '#/components/schemas/ProjectEnvironmentBindingResponse' }
 
-    ProjectEnvironmentWorkloadDiffResponse:
-      description: Release, variable, secret, and binding changes for one workload.
+    ProjectEnvironmentDomainDiffResponse:
+      description: Environment-owned hostname changes for one workload.
       type: object
-      required: [workload_slug, workload_name, release, variables, secrets, bindings, routes, policies]
+      required: [kind, before, after]
+      properties:
+        kind: { type: string, enum: [unchanged, changed] }
+        before:
+          type: array
+          items: { $ref: '#/components/schemas/ProjectEnvironmentDomainResponse' }
+        after:
+          type: array
+          items: { $ref: '#/components/schemas/ProjectEnvironmentDomainResponse' }
+
+    ProjectEnvironmentWorkloadDiffResponse:
+      description: Release, variable, secret, binding, and domain changes for one workload.
+      type: object
+      required: [workload_slug, workload_name, release, variables, secrets, bindings, domains, routes, policies]
       properties:
         workload_slug: { type: string }
         workload_name: { type: string }
@@ -29649,6 +29684,7 @@ components:
         bindings:
           type: array
           items: { $ref: '#/components/schemas/ProjectEnvironmentBindingChangeResponse' }
+        domains: { $ref: '#/components/schemas/ProjectEnvironmentDomainDiffResponse' }
         routes: { $ref: '#/components/schemas/ProjectEnvironmentRoutePolicyDiffResponse' }
         policies: { $ref: '#/components/schemas/ProjectEnvironmentEdgePolicyDiffResponse' }
 
@@ -29769,6 +29805,9 @@ components:
         project_slug: { type: string }
         from_environment: { type: string }
         to_environment: { type: string }
+        sync_config:
+          type: boolean
+          description: Whether this exact promotion will copy the source's non-secret configuration to the target.
         to_environment_protected: { type: boolean }
         approval_required: { type: boolean }
         can_promote: { type: boolean }
@@ -29884,6 +29923,9 @@ components:
         project_slug: { type: string }
         from_environment: { type: string }
         to_environment: { type: string }
+        sync_config:
+          type: boolean
+          description: Whether this promotion copied the source's non-secret configuration.
         promotion_hash: { type: string, pattern: '^[a-f0-9]{64}$' }
         release_graph: { $ref: '#/components/schemas/ProjectEnvironmentPromotionReleaseGraphResponse' }
         workloads:
@@ -29934,6 +29976,9 @@ components:
         project_slug: { type: string }
         from_environment: { type: string }
         to_environment: { type: string }
+        sync_config:
+          type: boolean
+          description: Config sync was enabled for this promotion.
         promotion_hash: { type: string, pattern: '^[a-f0-9]{64}$' }
         status:
           type: string
@@ -29968,6 +30013,9 @@ components:
         project_slug: { type: string }
         from_environment: { type: string }
         to_environment: { type: string }
+        sync_config:
+          type: boolean
+          description: Whether the operation copied non-secret source config to its target.
         promotion_hash: { type: string, pattern: '^[a-f0-9]{64}$' }
         status: { type: string, enum: [running, succeeded, failed] }
         error: { type: string }
