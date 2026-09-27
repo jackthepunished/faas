@@ -298,6 +298,8 @@ from .claim_api_consumer_usage_statement_request import ClaimAPIConsumerUsageSta
 from .clear_obsolete_deployments_body import ClearObsoleteDeploymentsBody
 from .clear_obsolete_report import ClearObsoleteReport
 from .complete_object_multipart_upload_request import CompleteObjectMultipartUploadRequest
+from .complete_workflow_callback_response import CompleteWorkflowCallbackResponse
+from .complete_workflow_callback_response_status import CompleteWorkflowCallbackResponseStatus
 from .consume_invoice_response import ConsumeInvoiceResponse
 from .consumed_credit_row import ConsumedCreditRow
 from .consumer_key_list_response import ConsumerKeyListResponse
@@ -424,6 +426,7 @@ from .create_trigger_request_broker_poison_strategy_type_3_type_1 import (
     CreateTriggerRequestBrokerPoisonStrategyType3Type1,
 )
 from .create_trigger_request_config import CreateTriggerRequestConfig
+from .create_workflow_callback_webhook_binding_request import CreateWorkflowCallbackWebhookBindingRequest
 from .cron_response import CronResponse
 from .cron_response_kind import CronResponseKind
 from .cron_response_suspended_reason import CronResponseSuspendedReason
@@ -852,8 +855,10 @@ from .list_secrets_for_account_response import ListSecretsForAccountResponse
 from .list_tenant_surfaces_response import ListTenantSurfacesResponse
 from .list_trigger_dead_letter_response import ListTriggerDeadLetterResponse
 from .list_trigger_records_response import ListTriggerRecordsResponse
+from .list_workflow_callbacks_response import ListWorkflowCallbacksResponse
 from .list_workflow_runs_response import ListWorkflowRunsResponse
 from .list_workflow_runs_status import ListWorkflowRunsStatus
+from .list_workflow_step_attempts_response import ListWorkflowStepAttemptsResponse
 from .list_workflow_steps_response import ListWorkflowStepsResponse
 from .log_excerpt import LogExcerpt
 from .log_excerpt_level import LogExcerptLevel
@@ -1643,11 +1648,18 @@ from .wake_timeline_json_row_trigger_class import WakeTimelineJSONRowTriggerClas
 from .wake_timeline_response import WakeTimelineResponse
 from .worker_scaling import WorkerScaling
 from .worker_scaling_metric import WorkerScalingMetric
+from .workflow_callback_response import WorkflowCallbackResponse
+from .workflow_callback_webhook_binding_response import WorkflowCallbackWebhookBindingResponse
+from .workflow_callback_webhook_receipt_response import WorkflowCallbackWebhookReceiptResponse
+from .workflow_callback_webhook_receipt_response_status import WorkflowCallbackWebhookReceiptResponseStatus
+from .workflow_condition_spec import WorkflowConditionSpec
 from .workflow_retry_spec import WorkflowRetrySpec
 from .workflow_retry_spec_backoff import WorkflowRetrySpecBackoff
 from .workflow_run_response import WorkflowRunResponse
 from .workflow_run_response_status import WorkflowRunResponseStatus
 from .workflow_spec import WorkflowSpec
+from .workflow_step_attempt_response import WorkflowStepAttemptResponse
+from .workflow_step_attempt_response_status import WorkflowStepAttemptResponseStatus
 from .workflow_step_response import WorkflowStepResponse
 from .workflow_step_response_status import WorkflowStepResponseStatus
 from .workflow_step_spec import WorkflowStepSpec
@@ -1957,6 +1969,8 @@ __all__ = (
     "ClearObsoleteDeploymentsBody",
     "ClearObsoleteReport",
     "CompleteObjectMultipartUploadRequest",
+    "CompleteWorkflowCallbackResponse",
+    "CompleteWorkflowCallbackResponseStatus",
     "ConsumedCreditRow",
     "ConsumeInvoiceResponse",
     "ConsumerKeyListResponse",
@@ -2075,6 +2089,7 @@ __all__ = (
     "CreateTriggerRequestBrokerPoisonStrategyType2Type1",
     "CreateTriggerRequestBrokerPoisonStrategyType3Type1",
     "CreateTriggerRequestConfig",
+    "CreateWorkflowCallbackWebhookBindingRequest",
     "CronResponse",
     "CronResponseKind",
     "CronResponseSuspendedReason",
@@ -2503,8 +2518,10 @@ __all__ = (
     "ListTenantSurfacesResponse",
     "ListTriggerDeadLetterResponse",
     "ListTriggerRecordsResponse",
+    "ListWorkflowCallbacksResponse",
     "ListWorkflowRunsResponse",
     "ListWorkflowRunsStatus",
+    "ListWorkflowStepAttemptsResponse",
     "ListWorkflowStepsResponse",
     "LogExcerpt",
     "LogExcerptLevel",
@@ -3248,11 +3265,18 @@ __all__ = (
     "WakeTimelineResponse",
     "WorkerScaling",
     "WorkerScalingMetric",
+    "WorkflowCallbackResponse",
+    "WorkflowCallbackWebhookBindingResponse",
+    "WorkflowCallbackWebhookReceiptResponse",
+    "WorkflowCallbackWebhookReceiptResponseStatus",
+    "WorkflowConditionSpec",
     "WorkflowRetrySpec",
     "WorkflowRetrySpecBackoff",
     "WorkflowRunResponse",
     "WorkflowRunResponseStatus",
     "WorkflowSpec",
+    "WorkflowStepAttemptResponse",
+    "WorkflowStepAttemptResponseStatus",
     "WorkflowStepResponse",
     "WorkflowStepResponseStatus",
     "WorkflowStepSpec",
