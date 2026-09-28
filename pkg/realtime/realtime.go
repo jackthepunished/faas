@@ -293,6 +293,11 @@ type callbackAuthSnapshot struct {
 	token string
 }
 
+type channelKey struct {
+	endpointID string
+	channel    string
+}
+
 type endpointState struct {
 	config atomic.Pointer[Endpoint]
 	gate   sync.Mutex
@@ -315,8 +320,11 @@ type Manager struct {
 
 	endpoints   sync.Map // map[string]*endpointState
 	endpointsMu sync.Mutex
+	// mu protects the connection and subscriber indexes. Subscription changes also take
+	// connection.mu after mu so Snapshot sees the same channel membership.
 	mu          sync.RWMutex
 	conns       map[string]*connection
+	subscribers map[channelKey]map[string]struct{}
 	reserved    atomic.Int64
 	closed      atomic.Bool
 
@@ -345,11 +353,12 @@ func NewManager(cfg Config, hooks Hooks) *Manager {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Manager{
-		cfg:    cfg,
-		hooks:  hooks,
-		ctx:    ctx,
-		cancel: cancel,
-		conns:  make(map[string]*connection),
+		cfg:         cfg,
+		hooks:       hooks,
+		ctx:         ctx,
+		cancel:      cancel,
+		conns:       make(map[string]*connection),
+		subscribers: make(map[channelKey]map[string]struct{}),
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  4096,
 			WriteBufferSize: 4096,
@@ -869,6 +878,16 @@ func (m *Manager) removeConnection(ctx context.Context, c *connection) {
 	c.state.gate.Lock()
 	m.mu.Lock()
 	if current, ok := m.conns[c.info.ID]; ok && current == c {
+		c.mu.Lock()
+		for channel := range c.channels {
+			key := channelKey{endpointID: c.info.EndpointID, channel: channel}
+			members := m.subscribers[key]
+			delete(members, c.info.ID)
+			if len(members) == 0 {
+				delete(m.subscribers, key)
+			}
+		}
+		c.mu.Unlock()
 		delete(m.conns, c.info.ID)
 	}
 	callbackAuthToken := c.currentCallbackAuthToken()
@@ -996,7 +1015,9 @@ func (m *Manager) Subscribe(connectionID, channel string) error {
 	if !validChannel(channel) {
 		return ErrInvalidChannel
 	}
-	c, ok := m.connection(connectionID)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, ok := m.conns[connectionID]
 	if !ok {
 		return ErrConnectionNotFound
 	}
@@ -1006,7 +1027,16 @@ func (m *Manager) Subscribe(connectionID, channel string) error {
 	default:
 	}
 	c.mu.Lock()
-	c.channels[channel] = struct{}{}
+	if _, subscribed := c.channels[channel]; !subscribed {
+		c.channels[channel] = struct{}{}
+		key := channelKey{endpointID: c.info.EndpointID, channel: channel}
+		members := m.subscribers[key]
+		if members == nil {
+			members = make(map[string]struct{})
+			m.subscribers[key] = members
+		}
+		members[connectionID] = struct{}{}
+	}
 	c.mu.Unlock()
 	return nil
 }
@@ -1016,7 +1046,9 @@ func (m *Manager) Unsubscribe(connectionID, channel string) error {
 	if !validChannel(channel) {
 		return ErrInvalidChannel
 	}
-	c, ok := m.connection(connectionID)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, ok := m.conns[connectionID]
 	if !ok {
 		return ErrConnectionNotFound
 	}
@@ -1026,7 +1058,15 @@ func (m *Manager) Unsubscribe(connectionID, channel string) error {
 	default:
 	}
 	c.mu.Lock()
-	delete(c.channels, channel)
+	if _, subscribed := c.channels[channel]; subscribed {
+		delete(c.channels, channel)
+		key := channelKey{endpointID: c.info.EndpointID, channel: channel}
+		members := m.subscribers[key]
+		delete(members, connectionID)
+		if len(members) == 0 {
+			delete(m.subscribers, key)
+		}
+	}
 	c.mu.Unlock()
 	return nil
 }
@@ -1045,17 +1085,10 @@ func (m *Manager) Publish(ctx context.Context, endpointID, channel string, msg M
 	state := value.(*endpointState)
 	maxMessageBytes := state.config.Load().MaxMessageBytes
 	m.mu.RLock()
-	connections := make([]string, 0, len(m.conns))
-	for id, c := range m.conns {
-		if c.state != state {
-			continue
-		}
-		c.mu.RLock()
-		_, subscribed := c.channels[channel]
-		c.mu.RUnlock()
-		if subscribed {
-			connections = append(connections, id)
-		}
+	members := m.subscribers[channelKey{endpointID: endpointID, channel: channel}]
+	connections := make([]string, 0, len(members))
+	for id := range members {
+		connections = append(connections, id)
 	}
 	m.mu.RUnlock()
 	if int64(len(msg.Data)) > maxMessageBytes {
