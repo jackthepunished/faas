@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
@@ -18,6 +19,7 @@ import (
 )
 
 const managedRealtimeOwnerLeaseTTL = 30 * time.Second
+const maxConcurrentRealtimePublishes = 8
 
 var errManagedRealtimeOwnerUnavailable = errors.New("realtime: owner node unavailable")
 
@@ -301,16 +303,53 @@ func (o *leasedRealtimeOwner) PublishWithStatus(ctx context.Context, endpointID,
 	if err != nil {
 		return result, fmt.Errorf("%w: list active nodes: %w", errManagedRealtimeOwnerUnavailable, err)
 	}
+	// Keep one result per node so aggregation and error selection stay in
+	// fleet order even when node requests finish in a different order.
+	type publishResult struct {
+		attempted bool
+		count     int
+		err       error
+	}
+	results := make([]publishResult, len(nodes))
+	jobs := make(chan int)
+	var workers sync.WaitGroup
+	for range min(len(nodes), maxConcurrentRealtimePublishes) {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for i := range jobs {
+				results[i].attempted = true
+				if err := ctx.Err(); err != nil {
+					results[i].err = err
+					continue
+				}
+				op, err := o.nodeOperator(nodes[i])
+				if err != nil {
+					results[i].err = err
+					continue
+				}
+				results[i].count, results[i].err = op.Publish(ctx, endpointID, channel, message)
+			}
+		}()
+	}
+dispatch:
+	for i := range nodes {
+		select {
+		case <-ctx.Done():
+			break dispatch
+		case jobs <- i:
+		}
+	}
+	close(jobs)
+	workers.Wait()
+
 	var lastErr error
-	for _, node := range nodes {
-		op, err := o.nodeOperator(node)
-		if err != nil {
-			lastErr = err
+	for _, outcome := range results {
+		if !outcome.attempted {
 			result.NodesUnavailable++
 			continue
 		}
-		count, err := op.Publish(ctx, endpointID, channel, message)
-		if err != nil {
+		if err := outcome.err; err != nil {
 			var managementErr *realtime.ManagementError
 			if errors.As(err, &managementErr) && managementErr.StatusCode == http.StatusNotFound {
 				// An activated node can lag registration. Callers still need
@@ -323,11 +362,14 @@ func (o *leasedRealtimeOwner) PublishWithStatus(ctx context.Context, endpointID,
 			continue
 		}
 		result.NodesQueried++
-		result.Queued += count
+		result.Queued += outcome.count
 	}
 	result.Partial = result.NodesUnavailable > 0
 	if result.NodesQueried > 0 {
 		return result, nil
+	}
+	if err := ctx.Err(); err != nil {
+		lastErr = err
 	}
 	if lastErr == nil {
 		lastErr = errors.New("no active realtime nodes accepted publish")
