@@ -2795,18 +2795,21 @@ gregale secrets set --app my-api DATABASE_URL="$DATABASE_URL" --restart
 
 Remove a sealed secret
 
-`gregale secrets unset <KEY> --app <slug> [--scope <SCOPE>]`
+`gregale secrets unset <KEY> --app <slug> [--scope <SCOPE>] [--wait-for-ack] [--timeout <DURATION>]`
 
 | Flag | Meaning | |
 |---|---|---|
 | `--app <slug>` | app slug | required |
 | `--scope <SCOPE>` | env scope to delete from (defaults to linked project environment) |  |
+| `--wait-for-ack` | wait until every active authorized runtime confirms it removed the secret |  |
+| `--timeout <DURATION>` | maximum time to wait for runtime acknowledgements |  |
 
 Examples:
 
 ```sh
 gregale secrets unset --app my-api OLD_API_KEY
 gregale secrets unset --app my-api OLD_API_KEY --scope staging
+gregale secrets unset --app my-api OLD_API_KEY --wait-for-ack
 ```
 
 ### secrets list-all

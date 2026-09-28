@@ -41,6 +41,7 @@ WHERE credit.id = inserted.credit_id AND credit.account_id = sqlc.arg(account_id
 SELECT s.scope,
        s.key,
        i.id::text AS instance_id,
+       ''::text AS workload_name,
        i.state AS runtime_state,
        CASE
          WHEN d.secret_reload_signal IS NULL THEN 'unknown'
@@ -61,21 +62,126 @@ SELECT s.scope,
   JOIN app_secrets s ON s.app_id = i.app_id AND s.scope = d.scope
   LEFT JOIN app_secret_runtime_reload_observations o
     ON o.app_id = s.app_id AND o.scope = s.scope AND o.key = s.key AND o.instance_id = i.id
+   AND o.workload_name = ''
  WHERE s.account_id = sqlc.arg(account_id)::uuid
    AND i.app_id = sqlc.arg(app_id)::uuid
    AND (sqlc.arg(scope)::text = '' OR s.scope = sqlc.arg(scope)::text)
+   AND (sqlc.arg(key)::text = '' OR s.key = sqlc.arg(key)::text)
    AND i.state IN ('waking','cold_booting','running','draining','snapshotting','migrating','warm')
-   AND (
-       coalesce(d.override_env_secrets, '{}'::jsonb) = '{}'::jsonb
-       OR d.override_env_secrets ? s.key
-       OR EXISTS (
-           SELECT 1
-             FROM jsonb_array_elements(coalesce(d.sidecars, '[]'::jsonb)) AS sidecar(value)
-             CROSS JOIN LATERAL jsonb_each_text(coalesce(sidecar.value->'env_secrets', '{}'::jsonb)) AS secret_ref(env_key, ref)
-            WHERE secret_ref.ref = 'secret:' || s.key
-       )
+   AND ((coalesce(d.override_env_secrets, '{}'::jsonb) = '{}'::jsonb
+         AND jsonb_array_length(coalesce(d.sidecars, '[]'::jsonb)) = 0)
+        OR d.override_env_secrets ? s.key)
+UNION ALL
+SELECT s.scope,
+       s.key,
+       i.id::text AS instance_id,
+       sidecar.value->>'name' AS workload_name,
+       i.state AS runtime_state,
+       CASE
+         WHEN reload.signal IS NULL THEN 'unknown'
+         WHEN reload.signal = '' THEN 'disabled'
+         ELSE 'enabled'
+       END AS reload_support,
+       o.secret_version,
+       o.projection,
+       o.signal,
+       o.observed_at,
+       o.error_code,
+       o.application_ack_version,
+       o.application_ack_status,
+       o.application_ack_at,
+       o.application_ack_error_code
+  FROM instances i
+  JOIN deployments d ON d.id = i.deployment_id AND d.app_id = i.app_id
+  JOIN app_secrets s ON s.app_id = i.app_id AND s.scope = d.scope
+ CROSS JOIN LATERAL jsonb_array_elements(coalesce(d.sidecars, '[]'::jsonb)) AS sidecar(value)
+  LEFT JOIN deployment_sidecar_secret_reload_signals reload
+    ON reload.deployment_id = d.id AND reload.sidecar_name = sidecar.value->>'name'
+  LEFT JOIN app_secret_runtime_reload_observations o
+    ON o.app_id = s.app_id AND o.scope = s.scope AND o.key = s.key AND o.instance_id = i.id
+   AND o.workload_name = sidecar.value->>'name'
+ WHERE s.account_id = sqlc.arg(account_id)::uuid
+   AND i.app_id = sqlc.arg(app_id)::uuid
+   AND (sqlc.arg(scope)::text = '' OR s.scope = sqlc.arg(scope)::text)
+   AND (sqlc.arg(key)::text = '' OR s.key = sqlc.arg(key)::text)
+   AND i.state IN ('waking','cold_booting','running','draining','snapshotting','migrating','warm')
+   AND sidecar.value->>'type' = 'sidecar'
+   AND coalesce(sidecar.value->'env_secrets', '{}'::jsonb) ? s.key
+ORDER BY scope ASC, key ASC, instance_id ASC, workload_name ASC;
+
+-- name: CreateAppSecretRevocation :one
+INSERT INTO app_secret_revocations (id, account_id, app_id, scope, key, created_at)
+VALUES (sqlc.arg(id)::uuid, sqlc.arg(account_id)::uuid, sqlc.arg(app_id)::uuid,
+        sqlc.arg(scope)::text, sqlc.arg(key)::text, sqlc.arg(created_at)::timestamptz)
+RETURNING id::text, account_id::text, app_id::text, scope, key, created_at;
+
+-- name: GetCustomerAppSecretForDeletion :one
+SELECT EXISTS (
+           SELECT 1 FROM app_secrets
+            WHERE account_id = sqlc.arg(account_id)::uuid
+              AND app_id = sqlc.arg(app_id)::uuid
+              AND scope = sqlc.arg(scope)::text
+              AND key = sqlc.arg(key)::text
+       ) AS present,
+       EXISTS (
+           SELECT 1 FROM app_secrets
+            WHERE account_id = sqlc.arg(account_id)::uuid
+              AND app_id = sqlc.arg(app_id)::uuid
+              AND scope = sqlc.arg(scope)::text
+              AND key = sqlc.arg(key)::text
+              AND (managed_postgres_binding_id IS NOT NULL OR managed_object_storage_credential_id IS NOT NULL)
+       ) AS managed;
+
+-- name: CreateAppSecretRevocationTarget :exec
+INSERT INTO app_secret_revocation_targets
+    (revocation_id, instance_id, workload_name, runtime_state, reload_support)
+VALUES (sqlc.arg(revocation_id)::uuid, sqlc.arg(instance_id)::uuid,
+        sqlc.arg(workload_name)::text, sqlc.arg(runtime_state)::text,
+        sqlc.arg(reload_support)::text);
+
+-- name: GetAppSecretRevocation :one
+SELECT id::text, account_id::text, app_id::text, scope, key, created_at
+  FROM app_secret_revocations
+ WHERE account_id = sqlc.arg(account_id)::uuid
+   AND app_id = sqlc.arg(app_id)::uuid
+   AND id = sqlc.arg(id)::uuid;
+
+-- name: ListAppSecretRevocationTargets :many
+SELECT instance_id::text, workload_name, runtime_state, reload_support,
+       status, coalesce(ack_revision, ''), ack_at, coalesce(error_code, '')
+  FROM app_secret_revocation_targets
+ WHERE revocation_id = sqlc.arg(revocation_id)::uuid
+ ORDER BY instance_id, workload_name;
+
+-- name: RecordAppSecretRevocationAck :execrows
+UPDATE app_secret_revocation_targets t
+   SET status = sqlc.arg(status)::text,
+       ack_revision = sqlc.arg(ack_revision)::text,
+       ack_at = sqlc.arg(ack_at)::timestamptz,
+       error_code = nullif(sqlc.arg(error_code)::text, '')
+  FROM app_secret_revocations r
+ WHERE t.revocation_id = r.id
+   AND r.account_id = sqlc.arg(account_id)::uuid
+   AND r.app_id = sqlc.arg(app_id)::uuid
+   AND t.instance_id = sqlc.arg(instance_id)::uuid
+   AND t.workload_name = sqlc.arg(workload_name)::text
+   AND r.created_at <= sqlc.arg(ack_at)::timestamptz
+   AND EXISTS (SELECT 1 FROM instances i WHERE i.id = t.instance_id AND i.app_id = r.app_id)
+   AND NOT EXISTS (
+       SELECT 1 FROM app_secrets s
+        WHERE s.account_id = r.account_id AND s.app_id = r.app_id
+          AND s.scope = r.scope AND s.key = r.key
    )
-ORDER BY s.scope ASC, s.key ASC, i.id ASC;
+   AND t.status <> 'applied';
+
+-- name: DeleteCustomerAppSecret :execrows
+DELETE FROM app_secrets
+ WHERE account_id = sqlc.arg(account_id)::uuid
+   AND app_id = sqlc.arg(app_id)::uuid
+   AND scope = sqlc.arg(scope)::text
+   AND key = sqlc.arg(key)::text
+   AND managed_postgres_binding_id IS NULL
+   AND managed_object_storage_credential_id IS NULL;
 
 -- name: SetDeploymentSecretReloadSignal :execrows
 -- imaged persists the validated image opt-in on each newly built deployment;

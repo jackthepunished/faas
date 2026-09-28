@@ -464,11 +464,33 @@ type AppSecret struct {
 	ManagedObjectStorageCredentialID pgtype.UUID
 }
 
+type AppSecretRevocation struct {
+	ID        pgtype.UUID
+	AccountID pgtype.UUID
+	AppID     pgtype.UUID
+	Scope     string
+	Key       string
+	CreatedAt pgtype.Timestamptz
+}
+
+type AppSecretRevocationTarget struct {
+	RevocationID  pgtype.UUID
+	InstanceID    pgtype.UUID
+	WorkloadName  string
+	RuntimeState  string
+	ReloadSupport string
+	Status        string
+	AckRevision   pgtype.Text
+	AckAt         pgtype.Timestamptz
+	ErrorCode     pgtype.Text
+}
+
 type AppSecretRuntimeReloadObservation struct {
 	AppID                   pgtype.UUID
 	Scope                   string
 	Key                     string
 	InstanceID              pgtype.UUID
+	WorkloadName            string
 	SecretVersion           int64
 	Projection              string
 	Signal                  string
@@ -1010,6 +1032,12 @@ type DeploymentSidecarLayer struct {
 	ContentDigest string
 	CreatedAt     pgtype.Timestamptz
 	UpdatedAt     pgtype.Timestamptz
+}
+
+type DeploymentSidecarSecretReloadSignal struct {
+	DeploymentID pgtype.UUID
+	SidecarName  string
+	Signal       string
 }
 
 type DomainDoctorObservation struct {

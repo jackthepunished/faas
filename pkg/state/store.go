@@ -3095,6 +3095,10 @@ type Store interface {
 	// updated_at so a re-imaged rebuild's new key replaces the
 	// prior build's key without orphaned-key drift.
 	SetDeploymentSidecarLayer(ctx context.Context, layer DeploymentSidecarLayer) (DeploymentSidecarLayer, error)
+	// SetDeploymentSidecarSecretReloadSignal persists the immutable OCI opt-in
+	// discovered while building the named sidecar image. Empty explicitly means
+	// that sidecar does not support in-process secret reload.
+	SetDeploymentSidecarSecretReloadSignal(ctx context.Context, deploymentID, sidecarName, signal string) error
 	// ListDeploymentSidecarLayers returns the deployment's full
 	// sidecar set, ordered by sidecar_name ASC for deterministic
 	// iteration. Returns an empty slice when the deployment has
@@ -5593,6 +5597,12 @@ type Store interface {
 	// CodeSecretNotFound (not a 404) because the URL resource
 	// IS the secret name, by design.
 	DeleteAppSecretInScope(ctx context.Context, accountID, appID, scope, key string) error
+	// DeleteAppSecretInScopeWithRevocation atomically removes the secret and
+	// snapshots active authorized runtime targets into a durable revocation.
+	DeleteAppSecretInScopeWithRevocation(ctx context.Context, accountID, appID, scope, key string) (AppSecretRevocation, error)
+	// GetAppSecretRevocation reads one value-free deletion record and its
+	// acknowledgement targets for the owning account/app.
+	GetAppSecretRevocation(ctx context.Context, accountID, appID, revocationID string) (AppSecretRevocation, error)
 	// ListAppSecretsInScope is the scope-aware sibling of
 	// ListAppSecrets (ADR-092 PR-A). Used by schedd's
 	// pkg/sched/engine.go::loadSealedEnvFor wake-time reader

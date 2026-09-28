@@ -984,6 +984,79 @@ func (q *Queries) CreateApp(ctx context.Context, db DBTX, arg CreateAppParams) (
 	return i, err
 }
 
+const createAppSecretRevocation = `-- name: CreateAppSecretRevocation :one
+INSERT INTO app_secret_revocations (id, account_id, app_id, scope, key, created_at)
+VALUES ($1::uuid, $2::uuid, $3::uuid,
+        $4::text, $5::text, $6::timestamptz)
+RETURNING id::text, account_id::text, app_id::text, scope, key, created_at
+`
+
+type CreateAppSecretRevocationParams struct {
+	ID        pgtype.UUID
+	AccountID pgtype.UUID
+	AppID     pgtype.UUID
+	Scope     string
+	Key       string
+	CreatedAt pgtype.Timestamptz
+}
+
+type CreateAppSecretRevocationRow struct {
+	ID        string
+	AccountID string
+	AppID     string
+	Scope     string
+	Key       string
+	CreatedAt pgtype.Timestamptz
+}
+
+func (q *Queries) CreateAppSecretRevocation(ctx context.Context, db DBTX, arg CreateAppSecretRevocationParams) (CreateAppSecretRevocationRow, error) {
+	row := db.QueryRow(ctx, createAppSecretRevocation,
+		arg.ID,
+		arg.AccountID,
+		arg.AppID,
+		arg.Scope,
+		arg.Key,
+		arg.CreatedAt,
+	)
+	var i CreateAppSecretRevocationRow
+	err := row.Scan(
+		&i.ID,
+		&i.AccountID,
+		&i.AppID,
+		&i.Scope,
+		&i.Key,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const createAppSecretRevocationTarget = `-- name: CreateAppSecretRevocationTarget :exec
+INSERT INTO app_secret_revocation_targets
+    (revocation_id, instance_id, workload_name, runtime_state, reload_support)
+VALUES ($1::uuid, $2::uuid,
+        $3::text, $4::text,
+        $5::text)
+`
+
+type CreateAppSecretRevocationTargetParams struct {
+	RevocationID  pgtype.UUID
+	InstanceID    pgtype.UUID
+	WorkloadName  string
+	RuntimeState  string
+	ReloadSupport string
+}
+
+func (q *Queries) CreateAppSecretRevocationTarget(ctx context.Context, db DBTX, arg CreateAppSecretRevocationTargetParams) error {
+	_, err := db.Exec(ctx, createAppSecretRevocationTarget,
+		arg.RevocationID,
+		arg.InstanceID,
+		arg.WorkloadName,
+		arg.RuntimeState,
+		arg.ReloadSupport,
+	)
+	return err
+}
+
 const createBuild = `-- name: CreateBuild :one
 insert into builds (id, deployment_id, kind, source_bytes, status, log_path)
 values (gen_random_uuid(), $1, $2, $3, 'queued', $4)
@@ -1729,6 +1802,36 @@ delete from custom_domains where domain = $1
 func (q *Queries) DeleteCustomDomain(ctx context.Context, db DBTX, domain interface{}) error {
 	_, err := db.Exec(ctx, deleteCustomDomain, domain)
 	return err
+}
+
+const deleteCustomerAppSecret = `-- name: DeleteCustomerAppSecret :execrows
+DELETE FROM app_secrets
+ WHERE account_id = $1::uuid
+   AND app_id = $2::uuid
+   AND scope = $3::text
+   AND key = $4::text
+   AND managed_postgres_binding_id IS NULL
+   AND managed_object_storage_credential_id IS NULL
+`
+
+type DeleteCustomerAppSecretParams struct {
+	AccountID pgtype.UUID
+	AppID     pgtype.UUID
+	Scope     string
+	Key       string
+}
+
+func (q *Queries) DeleteCustomerAppSecret(ctx context.Context, db DBTX, arg DeleteCustomerAppSecretParams) (int64, error) {
+	result, err := db.Exec(ctx, deleteCustomerAppSecret,
+		arg.AccountID,
+		arg.AppID,
+		arg.Scope,
+		arg.Key,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const deleteDataUpstreamByID = `-- name: DeleteDataUpstreamByID :exec
@@ -3518,6 +3621,85 @@ func (q *Queries) GetAppErrorSample(ctx context.Context, db DBTX, arg GetAppErro
 		&i.DeploymentCreatedAt,
 		&i.ImageDigest,
 	)
+	return i, err
+}
+
+const getAppSecretRevocation = `-- name: GetAppSecretRevocation :one
+SELECT id::text, account_id::text, app_id::text, scope, key, created_at
+  FROM app_secret_revocations
+ WHERE account_id = $1::uuid
+   AND app_id = $2::uuid
+   AND id = $3::uuid
+`
+
+type GetAppSecretRevocationParams struct {
+	AccountID pgtype.UUID
+	AppID     pgtype.UUID
+	ID        pgtype.UUID
+}
+
+type GetAppSecretRevocationRow struct {
+	ID        string
+	AccountID string
+	AppID     string
+	Scope     string
+	Key       string
+	CreatedAt pgtype.Timestamptz
+}
+
+func (q *Queries) GetAppSecretRevocation(ctx context.Context, db DBTX, arg GetAppSecretRevocationParams) (GetAppSecretRevocationRow, error) {
+	row := db.QueryRow(ctx, getAppSecretRevocation, arg.AccountID, arg.AppID, arg.ID)
+	var i GetAppSecretRevocationRow
+	err := row.Scan(
+		&i.ID,
+		&i.AccountID,
+		&i.AppID,
+		&i.Scope,
+		&i.Key,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getCustomerAppSecretForDeletion = `-- name: GetCustomerAppSecretForDeletion :one
+SELECT EXISTS (
+           SELECT 1 FROM app_secrets
+            WHERE account_id = $1::uuid
+              AND app_id = $2::uuid
+              AND scope = $3::text
+              AND key = $4::text
+       ) AS present,
+       EXISTS (
+           SELECT 1 FROM app_secrets
+            WHERE account_id = $1::uuid
+              AND app_id = $2::uuid
+              AND scope = $3::text
+              AND key = $4::text
+              AND (managed_postgres_binding_id IS NOT NULL OR managed_object_storage_credential_id IS NOT NULL)
+       ) AS managed
+`
+
+type GetCustomerAppSecretForDeletionParams struct {
+	AccountID pgtype.UUID
+	AppID     pgtype.UUID
+	Scope     string
+	Key       string
+}
+
+type GetCustomerAppSecretForDeletionRow struct {
+	Present bool
+	Managed bool
+}
+
+func (q *Queries) GetCustomerAppSecretForDeletion(ctx context.Context, db DBTX, arg GetCustomerAppSecretForDeletionParams) (GetCustomerAppSecretForDeletionRow, error) {
+	row := db.QueryRow(ctx, getCustomerAppSecretForDeletion,
+		arg.AccountID,
+		arg.AppID,
+		arg.Scope,
+		arg.Key,
+	)
+	var i GetCustomerAppSecretForDeletionRow
+	err := row.Scan(&i.Present, &i.Managed)
 	return i, err
 }
 
@@ -5356,10 +5538,59 @@ func (q *Queries) ListAppErrorRequests(ctx context.Context, db DBTX, arg ListApp
 	return items, nil
 }
 
+const listAppSecretRevocationTargets = `-- name: ListAppSecretRevocationTargets :many
+SELECT instance_id::text, workload_name, runtime_state, reload_support,
+       status, coalesce(ack_revision, ''), ack_at, coalesce(error_code, '')
+  FROM app_secret_revocation_targets
+ WHERE revocation_id = $1::uuid
+ ORDER BY instance_id, workload_name
+`
+
+type ListAppSecretRevocationTargetsRow struct {
+	InstanceID    string
+	WorkloadName  string
+	RuntimeState  string
+	ReloadSupport string
+	Status        string
+	AckRevision   string
+	AckAt         pgtype.Timestamptz
+	ErrorCode     string
+}
+
+func (q *Queries) ListAppSecretRevocationTargets(ctx context.Context, db DBTX, revocationID pgtype.UUID) ([]ListAppSecretRevocationTargetsRow, error) {
+	rows, err := db.Query(ctx, listAppSecretRevocationTargets, revocationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListAppSecretRevocationTargetsRow{}
+	for rows.Next() {
+		var i ListAppSecretRevocationTargetsRow
+		if err := rows.Scan(
+			&i.InstanceID,
+			&i.WorkloadName,
+			&i.RuntimeState,
+			&i.ReloadSupport,
+			&i.Status,
+			&i.AckRevision,
+			&i.AckAt,
+			&i.ErrorCode,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listAppSecretRuntimeReloadTargets = `-- name: ListAppSecretRuntimeReloadTargets :many
 SELECT s.scope,
        s.key,
        i.id::text AS instance_id,
+       ''::text AS workload_name,
        i.state AS runtime_state,
        CASE
          WHEN d.secret_reload_signal IS NULL THEN 'unknown'
@@ -5380,33 +5611,66 @@ SELECT s.scope,
   JOIN app_secrets s ON s.app_id = i.app_id AND s.scope = d.scope
   LEFT JOIN app_secret_runtime_reload_observations o
     ON o.app_id = s.app_id AND o.scope = s.scope AND o.key = s.key AND o.instance_id = i.id
+   AND o.workload_name = ''
  WHERE s.account_id = $1::uuid
    AND i.app_id = $2::uuid
    AND ($3::text = '' OR s.scope = $3::text)
+   AND ($4::text = '' OR s.key = $4::text)
    AND i.state IN ('waking','cold_booting','running','draining','snapshotting','migrating','warm')
-   AND (
-       coalesce(d.override_env_secrets, '{}'::jsonb) = '{}'::jsonb
-       OR d.override_env_secrets ? s.key
-       OR EXISTS (
-           SELECT 1
-             FROM jsonb_array_elements(coalesce(d.sidecars, '[]'::jsonb)) AS sidecar(value)
-             CROSS JOIN LATERAL jsonb_each_text(coalesce(sidecar.value->'env_secrets', '{}'::jsonb)) AS secret_ref(env_key, ref)
-            WHERE secret_ref.ref = 'secret:' || s.key
-       )
-   )
-ORDER BY s.scope ASC, s.key ASC, i.id ASC
+   AND ((coalesce(d.override_env_secrets, '{}'::jsonb) = '{}'::jsonb
+         AND jsonb_array_length(coalesce(d.sidecars, '[]'::jsonb)) = 0)
+        OR d.override_env_secrets ? s.key)
+UNION ALL
+SELECT s.scope,
+       s.key,
+       i.id::text AS instance_id,
+       sidecar.value->>'name' AS workload_name,
+       i.state AS runtime_state,
+       CASE
+         WHEN reload.signal IS NULL THEN 'unknown'
+         WHEN reload.signal = '' THEN 'disabled'
+         ELSE 'enabled'
+       END AS reload_support,
+       o.secret_version,
+       o.projection,
+       o.signal,
+       o.observed_at,
+       o.error_code,
+       o.application_ack_version,
+       o.application_ack_status,
+       o.application_ack_at,
+       o.application_ack_error_code
+  FROM instances i
+  JOIN deployments d ON d.id = i.deployment_id AND d.app_id = i.app_id
+  JOIN app_secrets s ON s.app_id = i.app_id AND s.scope = d.scope
+ CROSS JOIN LATERAL jsonb_array_elements(coalesce(d.sidecars, '[]'::jsonb)) AS sidecar(value)
+  LEFT JOIN deployment_sidecar_secret_reload_signals reload
+    ON reload.deployment_id = d.id AND reload.sidecar_name = sidecar.value->>'name'
+  LEFT JOIN app_secret_runtime_reload_observations o
+    ON o.app_id = s.app_id AND o.scope = s.scope AND o.key = s.key AND o.instance_id = i.id
+   AND o.workload_name = sidecar.value->>'name'
+ WHERE s.account_id = $1::uuid
+   AND i.app_id = $2::uuid
+   AND ($3::text = '' OR s.scope = $3::text)
+   AND ($4::text = '' OR s.key = $4::text)
+   AND i.state IN ('waking','cold_booting','running','draining','snapshotting','migrating','warm')
+   AND sidecar.value->>'type' = 'sidecar'
+   AND coalesce(sidecar.value->'env_secrets', '{}'::jsonb) ? s.key
+ORDER BY scope ASC, key ASC, instance_id ASC, workload_name ASC
 `
 
 type ListAppSecretRuntimeReloadTargetsParams struct {
 	AccountID pgtype.UUID
 	AppID     pgtype.UUID
 	Scope     string
+	Key       string
 }
 
 type ListAppSecretRuntimeReloadTargetsRow struct {
 	Scope                   string
 	Key                     string
 	InstanceID              string
+	WorkloadName            string
 	RuntimeState            string
 	ReloadSupport           string
 	SecretVersion           pgtype.Int8
@@ -5425,7 +5689,12 @@ type ListAppSecretRuntimeReloadTargetsRow struct {
 // a target with nullable outcome fields rather than disappearing from the
 // denominator.
 func (q *Queries) ListAppSecretRuntimeReloadTargets(ctx context.Context, db DBTX, arg ListAppSecretRuntimeReloadTargetsParams) ([]ListAppSecretRuntimeReloadTargetsRow, error) {
-	rows, err := db.Query(ctx, listAppSecretRuntimeReloadTargets, arg.AccountID, arg.AppID, arg.Scope)
+	rows, err := db.Query(ctx, listAppSecretRuntimeReloadTargets,
+		arg.AccountID,
+		arg.AppID,
+		arg.Scope,
+		arg.Key,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -5437,6 +5706,7 @@ func (q *Queries) ListAppSecretRuntimeReloadTargets(ctx context.Context, db DBTX
 			&i.Scope,
 			&i.Key,
 			&i.InstanceID,
+			&i.WorkloadName,
 			&i.RuntimeState,
 			&i.ReloadSupport,
 			&i.SecretVersion,
@@ -11382,6 +11652,56 @@ func (q *Queries) ReapStaleUploadPartFiles(ctx context.Context, db DBTX) ([]Reap
 		return nil, err
 	}
 	return items, nil
+}
+
+const recordAppSecretRevocationAck = `-- name: RecordAppSecretRevocationAck :execrows
+UPDATE app_secret_revocation_targets t
+   SET status = $1::text,
+       ack_revision = $2::text,
+       ack_at = $3::timestamptz,
+       error_code = nullif($4::text, '')
+  FROM app_secret_revocations r
+ WHERE t.revocation_id = r.id
+   AND r.account_id = $5::uuid
+   AND r.app_id = $6::uuid
+   AND t.instance_id = $7::uuid
+   AND t.workload_name = $8::text
+   AND r.created_at <= $3::timestamptz
+   AND EXISTS (SELECT 1 FROM instances i WHERE i.id = t.instance_id AND i.app_id = r.app_id)
+   AND NOT EXISTS (
+       SELECT 1 FROM app_secrets s
+        WHERE s.account_id = r.account_id AND s.app_id = r.app_id
+          AND s.scope = r.scope AND s.key = r.key
+   )
+   AND t.status <> 'applied'
+`
+
+type RecordAppSecretRevocationAckParams struct {
+	Status       string
+	AckRevision  string
+	AckAt        pgtype.Timestamptz
+	ErrorCode    string
+	AccountID    pgtype.UUID
+	AppID        pgtype.UUID
+	InstanceID   pgtype.UUID
+	WorkloadName string
+}
+
+func (q *Queries) RecordAppSecretRevocationAck(ctx context.Context, db DBTX, arg RecordAppSecretRevocationAckParams) (int64, error) {
+	result, err := db.Exec(ctx, recordAppSecretRevocationAck,
+		arg.Status,
+		arg.AckRevision,
+		arg.AckAt,
+		arg.ErrorCode,
+		arg.AccountID,
+		arg.AppID,
+		arg.InstanceID,
+		arg.WorkloadName,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const recordMailSuppression = `-- name: RecordMailSuppression :one

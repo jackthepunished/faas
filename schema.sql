@@ -2657,6 +2657,21 @@ CREATE TABLE public.deployments (
 
 
 --
+-- Name: deployment_sidecar_secret_reload_signals; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.deployment_sidecar_secret_reload_signals (
+    deployment_id uuid NOT NULL,
+    sidecar_name text NOT NULL,
+    signal text NOT NULL,
+    CONSTRAINT deployment_sidecar_secret_reload_signals_pkey PRIMARY KEY (deployment_id, sidecar_name),
+    CONSTRAINT deployment_sidecar_secret_reload_signals_deployment_id_fkey FOREIGN KEY (deployment_id) REFERENCES public.deployments(id) ON DELETE CASCADE,
+    CONSTRAINT deployment_sidecar_secret_reload_name_chk CHECK ((sidecar_name ~ '^[a-z0-9][a-z0-9-]{0,62}$'::text)),
+    CONSTRAINT deployment_sidecar_secret_reload_signal_chk CHECK ((signal = ANY (ARRAY[''::text, 'SIGHUP'::text, 'SIGUSR1'::text, 'SIGUSR2'::text])))
+);
+
+
+--
 -- Name: domain_doctor_observations; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -3061,6 +3076,7 @@ CREATE TABLE public.app_secret_runtime_reload_observations (
     scope text NOT NULL,
     key text NOT NULL,
     instance_id uuid NOT NULL,
+    workload_name text DEFAULT ''::text NOT NULL,
     secret_version bigint NOT NULL,
     projection text NOT NULL,
     signal text NOT NULL,
@@ -3070,9 +3086,10 @@ CREATE TABLE public.app_secret_runtime_reload_observations (
     application_ack_status text,
     application_ack_at timestamp with time zone,
     application_ack_error_code text,
-    CONSTRAINT app_secret_runtime_reload_observations_pkey PRIMARY KEY (app_id, scope, key, instance_id),
+    CONSTRAINT app_secret_runtime_reload_observations_pkey PRIMARY KEY (app_id, scope, key, instance_id, workload_name),
     CONSTRAINT app_secret_runtime_reload_observation_secret_fkey FOREIGN KEY (app_id, scope, key) REFERENCES public.app_secrets(app_id, scope, key) ON DELETE CASCADE,
     CONSTRAINT app_secret_runtime_reload_observation_instance_fkey FOREIGN KEY (instance_id) REFERENCES public.instances(id) ON DELETE CASCADE,
+    CONSTRAINT app_secret_runtime_reload_observation_workload_name_chk CHECK (((workload_name = ''::text) OR (workload_name ~ '^[a-z0-9][a-z0-9-]{0,62}$'::text))),
     CONSTRAINT app_secret_runtime_reload_observation_version_chk CHECK ((secret_version >= 1)),
     CONSTRAINT app_secret_runtime_reload_observation_projection_chk CHECK ((projection = ANY (ARRAY['updated'::text, 'unchanged'::text, 'failed'::text]))),
     CONSTRAINT app_secret_runtime_reload_observation_signal_chk CHECK ((signal = ANY (ARRAY['sent'::text, 'queued'::text, 'failed'::text, 'not_attempted'::text]))),
@@ -3084,6 +3101,52 @@ CREATE TABLE public.app_secret_runtime_reload_observations (
             (application_ack_status = 'applied'::text AND application_ack_error_code IS NULL)
             OR (application_ack_status = 'failed'::text AND application_ack_error_code = 'application_reload_failed'::text)
         ))
+    )
+);
+
+
+--
+-- Name: app_secret_revocations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.app_secret_revocations (
+    id uuid NOT NULL,
+    account_id uuid NOT NULL,
+    app_id uuid NOT NULL,
+    scope text NOT NULL,
+    key text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT app_secret_revocations_pkey PRIMARY KEY (id),
+    CONSTRAINT app_secret_revocations_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE,
+    CONSTRAINT app_secret_revocations_app_id_fkey FOREIGN KEY (app_id) REFERENCES public.apps(id) ON DELETE CASCADE,
+    CONSTRAINT app_secret_revocations_scope_shape CHECK ((scope ~ '^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$'::text)),
+    CONSTRAINT app_secret_revocations_key_shape CHECK (((key ~ '^[A-Z][A-Z0-9_]*$'::text) AND (length(key) <= 128)))
+);
+
+
+--
+-- Name: app_secret_revocation_targets; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.app_secret_revocation_targets (
+    revocation_id uuid NOT NULL,
+    instance_id uuid NOT NULL,
+    workload_name text DEFAULT ''::text NOT NULL,
+    runtime_state text NOT NULL,
+    reload_support text NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    ack_revision text,
+    ack_at timestamp with time zone,
+    error_code text,
+    CONSTRAINT app_secret_revocation_targets_pkey PRIMARY KEY (revocation_id, instance_id, workload_name),
+    CONSTRAINT app_secret_revocation_targets_revocation_id_fkey FOREIGN KEY (revocation_id) REFERENCES public.app_secret_revocations(id) ON DELETE CASCADE,
+    CONSTRAINT app_secret_revocation_targets_workload_name_chk CHECK (((workload_name = ''::text) OR (workload_name ~ '^[a-z0-9][a-z0-9-]{0,62}$'::text))),
+    CONSTRAINT app_secret_revocation_targets_reload_support_chk CHECK ((reload_support = ANY (ARRAY['enabled'::text, 'disabled'::text, 'unknown'::text]))),
+    CONSTRAINT app_secret_revocation_targets_status_chk CHECK ((status = ANY (ARRAY['pending'::text, 'applied'::text, 'failed'::text]))),
+    CONSTRAINT app_secret_revocation_targets_ack_shape_chk CHECK (
+        (status = 'pending'::text AND ack_revision IS NULL AND ack_at IS NULL AND error_code IS NULL)
+        OR (status = 'applied'::text AND ack_revision IS NOT NULL AND ack_revision ~ '^[0-9a-f]{64}$'::text AND ack_at IS NOT NULL AND error_code IS NULL)
+        OR (status = 'failed'::text AND ack_revision IS NOT NULL AND ack_revision ~ '^[0-9a-f]{64}$'::text AND ack_at IS NOT NULL AND error_code = 'application_reload_failed'::text)
     )
 );
 
@@ -6097,6 +6160,12 @@ CREATE INDEX app_registry_credentials_account_idx ON public.app_registry_credent
 --
 
 CREATE INDEX app_secrets_account_app_scope_idx ON public.app_secrets USING btree (account_id, app_id, scope);
+
+--
+-- Name: app_secret_revocations_app_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX app_secret_revocations_app_idx ON public.app_secret_revocations USING btree (account_id, app_id, created_at DESC);
 
 
 --

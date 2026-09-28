@@ -6120,28 +6120,30 @@ const (
 // signal outcome for an exact set of secret versions. It is deliberately not
 // an application acknowledgement: the process may still fail to apply them.
 type AppSecretRuntimeReloadResult struct {
-	AccountID   string
-	AppID       string
-	InstanceID  string
-	Revision    string
-	Projection  SecretReloadProjectionStatus
-	Signal      SecretReloadSignalStatus
-	ErrorCode   string
-	AttemptedAt time.Time
-	Candidates  []AppSecretDeliveryCandidate
+	AccountID    string
+	AppID        string
+	InstanceID   string
+	WorkloadName string
+	Revision     string
+	Projection   SecretReloadProjectionStatus
+	Signal       SecretReloadSignalStatus
+	ErrorCode    string
+	AttemptedAt  time.Time
+	Candidates   []AppSecretDeliveryCandidate
 }
 
 // AppSecretRuntimeReloadAckResult records an application-owned outcome for
 // the current secret revision. It attests only what the application reports.
 type AppSecretRuntimeReloadAckResult struct {
-	AccountID   string
-	AppID       string
-	InstanceID  string
-	Revision    string
-	Status      SecretApplicationReloadAckStatus
-	ErrorCode   string
-	AttemptedAt time.Time
-	Candidates  []AppSecretDeliveryCandidate
+	AccountID    string
+	AppID        string
+	InstanceID   string
+	WorkloadName string
+	Revision     string
+	Status       SecretApplicationReloadAckStatus
+	ErrorCode    string
+	AttemptedAt  time.Time
+	Candidates   []AppSecretDeliveryCandidate
 }
 
 // AppSecretRuntimeReloadObservation is the latest guest-init projection and
@@ -6152,6 +6154,7 @@ type AppSecretRuntimeReloadObservation struct {
 	Scope                   string
 	Key                     string
 	InstanceID              string
+	WorkloadName            string
 	Version                 int64
 	Projection              SecretReloadProjectionStatus
 	Signal                  SecretReloadSignalStatus
@@ -6172,6 +6175,7 @@ type AppSecretRuntimeReloadTarget struct {
 	Scope                   string
 	Key                     string
 	InstanceID              string
+	WorkloadName            string
 	RuntimeState            string
 	ReloadSupport           string
 	Reported                bool
@@ -6184,6 +6188,58 @@ type AppSecretRuntimeReloadTarget struct {
 	ApplicationAck          SecretApplicationReloadAckStatus
 	ApplicationAckAt        *time.Time
 	ApplicationAckErrorCode string
+}
+
+// AppSecretRevocation is a durable, value-free record of one secret deletion
+// and the active authorized workloads that were expected to remove it.
+type AppSecretRevocation struct {
+	ID        string
+	AccountID string
+	AppID     string
+	Scope     string
+	Key       string
+	CreatedAt time.Time
+	Targets   []AppSecretRevocationTarget
+}
+
+// AppSecretRevocationTarget snapshots one authorized runtime at deletion
+// time. InstanceID intentionally has no lifetime FK: acknowledgement evidence
+// must survive deletion of the secret row and later instance cleanup.
+type AppSecretRevocationTarget struct {
+	InstanceID    string
+	WorkloadName  string
+	RuntimeState  string
+	ReloadSupport string
+	Status        string
+	AckRevision   string
+	AckAt         *time.Time
+	ErrorCode     string
+}
+
+// Progress summarizes a revocation without treating missing or failed
+// acknowledgements as success. An empty target roster is complete because no
+// active authorized runtime existed when the deletion committed.
+func (r AppSecretRevocation) Progress() (status string, acknowledged, pending int) {
+	blocked, failed := false, false
+	for _, target := range r.Targets {
+		if target.Status == "applied" {
+			acknowledged++
+			continue
+		}
+		pending++
+		blocked = blocked || target.ReloadSupport != "enabled"
+		failed = failed || target.Status == "failed"
+	}
+	if pending == 0 {
+		return "complete", acknowledged, 0
+	}
+	if blocked {
+		return "blocked", acknowledged, pending
+	}
+	if failed {
+		return "failed", acknowledged, pending
+	}
+	return "pending", acknowledged, pending
 }
 
 // AccountAppSecret is the per-row shape returned by
