@@ -54,6 +54,7 @@ its baseline line in the same change (the gate fails on a stale entry).
 
 | ADR | Title | Status | Source |
 |---|---|---|---|
+| 301 | [Owner-controlled delegated platform-tenant credential policy](301-platform-tenant-credential-policy.md) | accepted | Explicit downstream key-scope allowlist and active-key ceiling per linked consumer; self-service remains off by default |
 | 300 | [Tenant-scoped self-service hostname onboarding](300-platform-tenant-self-service-hostnames.md) | accepted | Narrow hostnames:manage credential; existing linked surfaces, delegated DNS suffixes, and DNS proof only |
 | 316 | [Source-ref branch freshness before promotion](316-source-ref-branch-freshness-before-promotion.md) | accepted | Preserve branch intent and recheck GitHub's current head immediately before promotion |
 | 315 | [Actions-owned mapped environment deployments](315-actions-mapped-environment-deployments.md) | accepted | Generated Actions workflows route configured branches into their registered project environments |
