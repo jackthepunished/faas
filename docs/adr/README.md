@@ -54,6 +54,7 @@ its baseline line in the same change (the gate fails on a stale entry).
 
 | ADR | Title | Status | Source |
 |---|---|---|---|
+| 334 | [Owner-controlled downstream customer provisioning](334-platform-tenant-consumer-provisioning-policy.md) | accepted | Default-off customer creation policy and per-tenant active-customer ceiling, separate from the tenant-bound manage scope |
 | 333 | [Backoff-aware realtime callback replay monitoring](333-realtime-callback-backoff-aware-replay-monitoring.md) | accepted | Ready/delayed callback heads and delivery-attempt metrics distinguish intentional backoff from stalled replay |
 | 332 | [Realtime callback replay scheduling index](332-realtime-callback-replay-index.md) | accepted | Ordered per-connection queues and ready/delayed heaps for scalable durable callback replay |
 | 331 | [Realtime callback retry backoff](331-realtime-callback-retry-backoff.md) | accepted | Persisted jittered exponential retry schedule and bounded `Retry-After` handling for durable callbacks |
