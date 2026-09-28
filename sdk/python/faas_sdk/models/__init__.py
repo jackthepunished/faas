@@ -1075,6 +1075,7 @@ from .plan_detection_warning import PlanDetectionWarning
 from .plan_detection_warning_detector import PlanDetectionWarningDetector
 from .plan_detection_warning_outcome import PlanDetectionWarningOutcome
 from .plan_managed import PlanManaged
+from .plan_platform_tenant_reconciliation_request import PlanPlatformTenantReconciliationRequest
 from .plan_response import PlanResponse
 from .plan_response_scan_source import PlanResponseScanSource
 from .plan_workload import PlanWorkload
@@ -1114,6 +1115,10 @@ from .platform_tenant_list_response import PlatformTenantListResponse
 from .platform_tenant_rate_card_list_response import PlatformTenantRateCardListResponse
 from .platform_tenant_rate_card_response import PlatformTenantRateCardResponse
 from .platform_tenant_rate_card_response_unit import PlatformTenantRateCardResponseUnit
+from .platform_tenant_reconciliation_plan_change import PlatformTenantReconciliationPlanChange
+from .platform_tenant_reconciliation_plan_change_action import PlatformTenantReconciliationPlanChangeAction
+from .platform_tenant_reconciliation_plan_change_resource_type import PlatformTenantReconciliationPlanChangeResourceType
+from .platform_tenant_reconciliation_plan_response import PlatformTenantReconciliationPlanResponse
 from .platform_tenant_request_budget_response import PlatformTenantRequestBudgetResponse
 from .platform_tenant_response import PlatformTenantResponse
 from .platform_tenant_response_status import PlatformTenantResponseStatus
@@ -2836,6 +2841,7 @@ __all__ = (
     "PlanDetectionWarningDetector",
     "PlanDetectionWarningOutcome",
     "PlanManaged",
+    "PlanPlatformTenantReconciliationRequest",
     "PlanResponse",
     "PlanResponseScanSource",
     "PlanWorkload",
@@ -2871,6 +2877,10 @@ __all__ = (
     "PlatformTenantRateCardListResponse",
     "PlatformTenantRateCardResponse",
     "PlatformTenantRateCardResponseUnit",
+    "PlatformTenantReconciliationPlanChange",
+    "PlatformTenantReconciliationPlanChangeAction",
+    "PlatformTenantReconciliationPlanChangeResourceType",
+    "PlatformTenantReconciliationPlanResponse",
     "PlatformTenantRequestBudgetResponse",
     "PlatformTenantResponse",
     "PlatformTenantResponseStatus",
