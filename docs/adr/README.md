@@ -55,6 +55,14 @@ its baseline line in the same change (the gate fails on a stale entry).
 | ADR | Title | Status | Source |
 |---|---|---|---|
 | 300 | [Tenant-scoped self-service hostname onboarding](300-platform-tenant-self-service-hostnames.md) | accepted | Narrow hostnames:manage credential; existing linked surfaces, delegated DNS suffixes, and DNS proof only |
+| 316 | [Source-ref branch freshness before promotion](316-source-ref-branch-freshness-before-promotion.md) | accepted | Preserve branch intent and recheck GitHub's current head immediately before promotion |
+| 315 | [Actions-owned mapped environment deployments](315-actions-mapped-environment-deployments.md) | accepted | Generated Actions workflows route configured branches into their registered project environments |
+| 314 | [Actions-owned release-tag deployments](314-actions-release-tag-deployments.md) | accepted | Deploy only newly created SemVer release tags from the immutable event SHA |
+| 313 | [GitHub push head recheck before reconciliation](313-github-push-head-recheck.md) | accepted | Recheck branch freshness after fetch and scan, immediately before reconciling a push |
+| 312 | [PR preview freshness](312-pr-preview-freshness.md) | accepted | Verify current PR state and head before preview mutation and fence older preview promotions |
+| 311 | [GitHub push freshness and promotion fence](311-github-push-freshness-and-promotion-fence.md) | accepted | Verify remote branch heads before webhook dispatch and fence older GitHub revisions at promotion |
+| 310 | [Git-driven deployment ownership and preview quotas](310-git-driven-deployment-ownership-and-preview-quotas.md) | accepted | One production push owner, terminal Action checks, and a bounded separate PR-preview allowance |
+| 300 | [Tenant-scoped self-service hostname onboarding](300-platform-tenant-self-service-hostnames.md) | accepted | Narrow hostnames:manage credential; existing linked surfaces, delegated DNS suffixes, and DNS proof only |
 | 299 | [Owner-controlled platform-tenant hostname delegation](299-platform-tenant-hostname-delegation.md) | accepted | Deny-by-default DNS suffix allowlist and tenant-wide hostname cap for downstream self-service |
 | 298 | [Tenant-scoped surface deployment outcome webhooks](298-platform-tenant-deployment-webhooks.md) | accepted | Transactional live/failed deployment outcomes for explicitly linked surfaces; safe revision metadata without source details or raw errors |
 | 297 | [Shared outbound provider cooldown](297-shared-outbound-provider-cooldown.md) | proposed | Postgres-shared cooldown honors provider Retry-After across outbound gateway replicas |

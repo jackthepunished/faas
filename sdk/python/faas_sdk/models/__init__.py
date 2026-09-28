@@ -741,10 +741,13 @@ from .git_hub_check_activity_status import GitHubCheckActivityStatus
 from .git_hub_deployment_policy import GitHubDeploymentPolicy
 from .git_hub_deployment_policy_patch import GitHubDeploymentPolicyPatch
 from .git_hub_deployment_policy_patch_preview_service_policy import GitHubDeploymentPolicyPatchPreviewServicePolicy
+from .git_hub_deployment_policy_patch_production_trigger import GitHubDeploymentPolicyPatchProductionTrigger
 from .git_hub_deployment_policy_preview_service_policy import GitHubDeploymentPolicyPreviewServicePolicy
+from .git_hub_deployment_policy_production_trigger import GitHubDeploymentPolicyProductionTrigger
 from .git_hub_install_activity import GitHubInstallActivity
 from .git_hub_install_mutation_request import GitHubInstallMutationRequest
 from .git_hub_install_status import GitHubInstallStatus
+from .git_hub_install_status_deploy_branches import GitHubInstallStatusDeployBranches
 from .git_hub_install_status_health import GitHubInstallStatusHealth
 from .git_hub_install_status_state import GitHubInstallStatusState
 from .git_hub_install_status_sync_result import GitHubInstallStatusSyncResult
@@ -2461,10 +2464,13 @@ __all__ = (
     "GitHubDeploymentPolicy",
     "GitHubDeploymentPolicyPatch",
     "GitHubDeploymentPolicyPatchPreviewServicePolicy",
+    "GitHubDeploymentPolicyPatchProductionTrigger",
     "GitHubDeploymentPolicyPreviewServicePolicy",
+    "GitHubDeploymentPolicyProductionTrigger",
     "GitHubInstallActivity",
     "GitHubInstallMutationRequest",
     "GitHubInstallStatus",
+    "GitHubInstallStatusDeployBranches",
     "GitHubInstallStatusHealth",
     "GitHubInstallStatusState",
     "GitHubInstallStatusSyncResult",
