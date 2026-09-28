@@ -394,3 +394,34 @@ func TestLeasedRealtimeOwnerPublishReportsPartialFleet(t *testing.T) {
 		t.Fatalf("partial publish = (%+v, %v)", result, err)
 	}
 }
+
+func TestLeasedRealtimeOwnerPublishWithNoKnownSubscribersReturnsEmptyStatus(t *testing.T) {
+	ctx := context.Background()
+	store := state.NewMemStore()
+	activeNodes, err := store.ActiveComputeNodes(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(activeNodes) == 0 {
+		t.Fatal("NewMemStore should provide at least one active local node")
+	}
+	local := &fakeRealtimeNode{}
+	owner := newLeasedRealtimeOwner(store, store, "", nil, nil)
+	owner.channelRoutingEnabled = true
+	owner.channelRoutes = store
+	for _, node := range activeNodes {
+		owner.setChannelRoutesReady(node.ID, true)
+	}
+	owner.clientFor = func(state.ComputeNode) (realtimeNodeOperator, error) { return local, nil }
+
+	result, err := owner.PublishWithStatus(ctx, "endpoint", "updates", realtime.Message{})
+	if err != nil {
+		t.Fatalf("PublishWithStatus: %v", err)
+	}
+	if result.Queued != 0 || result.NodesQueried != 0 || result.NodesUnavailable != 0 || result.Partial {
+		t.Fatalf("empty publish status = %+v, want all zero values", result)
+	}
+	if local.pubs != 0 {
+		t.Fatalf("published to %d nodes, want no publish for an empty subscriber set", local.pubs)
+	}
+}
