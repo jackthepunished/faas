@@ -63,6 +63,17 @@ func TestAccountReleaseWebhooks_CRUDAndScope(t *testing.T) {
 	if got := e.do(t, http.MethodGet, accountReleaseWebhooksPath+"/"+appHook.ID, nil, nil); got.Code != http.StatusNotFound {
 		t.Fatalf("app subscription exposed on account route: %d %s", got.Code, got.Body)
 	}
+	healthRec := e.do(t, http.MethodGet, accountReleaseWebhooksPath+"/"+created.ID+"/health", nil, nil)
+	if healthRec.Code != http.StatusOK {
+		t.Fatalf("account health status %d: %s", healthRec.Code, healthRec.Body)
+	}
+	var health api.AppWebhookDeliveryHealthResponse
+	if err := json.Unmarshal(healthRec.Body.Bytes(), &health); err != nil || health.WebhookID != created.ID || health.PendingCount != 0 {
+		t.Fatalf("account health = %+v, err=%v", health, err)
+	}
+	if got := e.do(t, http.MethodGet, accountReleaseWebhooksPath+"/"+appHook.ID+"/health", nil, nil); got.Code != http.StatusNotFound {
+		t.Fatalf("app health exposed on account route: %d %s", got.Code, got.Body)
+	}
 	if got := e.do(t, http.MethodGet, accountReleaseWebhooksPath+"/"+created.ID, nil, nil); got.Code != http.StatusOK {
 		t.Fatalf("get status %d: %s", got.Code, got.Body)
 	}
@@ -106,6 +117,20 @@ func TestAccountReleaseWebhooks_CRUDAndScope(t *testing.T) {
 	retry := e.do(t, http.MethodPost, accountReleaseWebhooksPath+"/"+created.ID+"/deliveries/"+delivery.ID+"/retry", nil, nil)
 	if retry.Code != http.StatusOK || !strings.Contains(retry.Body.String(), "pending") {
 		t.Fatalf("retry status %d: %s", retry.Code, retry.Body)
+	}
+	claimed, err := e.store.ClaimDueAppWebhookDeliveries(t.Context(), 1, time.Now().Add(time.Second))
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim replayed release delivery = %+v, err=%v", claimed, err)
+	}
+	if err := e.store.MarkAppWebhookDeliverySucceeded(t.Context(), delivery.ID, 204, claimed[0].Attempt, claimed[0].NextAttemptAt, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	attempts := e.do(t, http.MethodGet, accountReleaseWebhooksPath+"/"+created.ID+"/deliveries/"+delivery.ID+"/attempts", nil, nil)
+	if attempts.Code != http.StatusOK || !strings.Contains(attempts.Body.String(), `"replay_generation":1`) || !strings.Contains(attempts.Body.String(), `"response_code":204`) {
+		t.Fatalf("release attempts status %d: %s", attempts.Code, attempts.Body)
+	}
+	if other := e.do(t, http.MethodGet, accountReleaseWebhooksPath+"/"+appHook.ID+"/deliveries/"+delivery.ID+"/attempts", nil, nil); other.Code != http.StatusNotFound {
+		t.Errorf("app webhook on release attempt path = %d: %s", other.Code, other.Body)
 	}
 	if got := e.do(t, http.MethodDelete, accountReleaseWebhooksPath+"/"+created.ID, nil, nil); got.Code != http.StatusNoContent {
 		t.Fatalf("delete status %d: %s", got.Code, got.Body)

@@ -514,18 +514,20 @@ type AppTrustedSigner struct {
 }
 
 type AppWebhook struct {
-	ID             pgtype.UUID
-	AppID          pgtype.UUID
-	AccountID      pgtype.UUID
-	TargetUrl      string
-	SecretSealed   []byte
-	EventFilter    []string
-	RetryPolicy    string
-	Enabled        bool
-	CreatedAt      pgtype.Timestamptz
-	UpdatedAt      pgtype.Timestamptz
-	DeliveryFormat string
-	Scope          string
+	ID                              pgtype.UUID
+	AppID                           pgtype.UUID
+	AccountID                       pgtype.UUID
+	TargetUrl                       string
+	SecretSealed                    []byte
+	EventFilter                     []string
+	RetryPolicy                     string
+	Enabled                         bool
+	CreatedAt                       pgtype.Timestamptz
+	UpdatedAt                       pgtype.Timestamptz
+	DeliveryFormat                  string
+	Scope                           string
+	ReceiverCooldownUntil           pgtype.Timestamptz
+	ReceiverRecoveryProbeDeliveryID pgtype.UUID
 }
 
 type AppWebhookDelivery struct {
@@ -536,6 +538,7 @@ type AppWebhookDelivery struct {
 	Event            string
 	Payload          []byte
 	Attempt          int32
+	ReplayGeneration int32
 	Status           string
 	LastError        pgtype.Text
 	LastResponseCode pgtype.Int4
@@ -543,6 +546,19 @@ type AppWebhookDelivery struct {
 	DeliveredAt      pgtype.Timestamptz
 	CreatedAt        pgtype.Timestamptz
 	UpdatedAt        pgtype.Timestamptz
+}
+
+type AppWebhookDeliveryAttempt struct {
+	ID               pgtype.UUID
+	DeliveryID       pgtype.UUID
+	ReplayGeneration int32
+	AttemptNumber    int32
+	Outcome          string
+	ResponseCode     int32
+	Error            string
+	StartedAt        pgtype.Timestamptz
+	FinishedAt       pgtype.Timestamptz
+	NextAttemptAt    pgtype.Timestamptz
 }
 
 type AuditLog struct {

@@ -1476,6 +1476,29 @@ CREATE TABLE public.app_trusted_signers (
 
 
 --
+-- Name: app_webhook_delivery_attempts; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.app_webhook_delivery_attempts (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    delivery_id uuid NOT NULL,
+    replay_generation integer NOT NULL,
+    attempt_number integer NOT NULL,
+    outcome text NOT NULL,
+    response_code integer DEFAULT 0 NOT NULL,
+    error text DEFAULT ''::text NOT NULL,
+    started_at timestamp with time zone NOT NULL,
+    finished_at timestamp with time zone NOT NULL,
+    next_attempt_at timestamp with time zone,
+    CONSTRAINT app_webhook_delivery_attempts_attempt_number_check CHECK (((attempt_number >= 1) AND (attempt_number <= 8))),
+    CONSTRAINT app_webhook_delivery_attempts_outcome_check CHECK ((outcome = ANY (ARRAY['succeeded'::text, 'retrying'::text, 'dead'::text]))),
+    CONSTRAINT app_webhook_delivery_attempts_replay_generation_check CHECK ((replay_generation >= 0)),
+    CONSTRAINT app_webhook_delivery_attempts_response_code_check CHECK (((response_code >= 0) AND (response_code <= 999))),
+    CONSTRAINT app_webhook_delivery_attempts_time_chk CHECK ((finished_at >= started_at))
+);
+
+
+--
 -- Name: app_webhook_deliveries; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1487,6 +1510,7 @@ CREATE TABLE public.app_webhook_deliveries (
     event text NOT NULL,
     payload jsonb NOT NULL,
     attempt integer DEFAULT 0 NOT NULL,
+    replay_generation integer DEFAULT 0 NOT NULL,
     status text DEFAULT 'pending'::text NOT NULL,
     last_error text,
     last_response_code integer,
@@ -1496,6 +1520,7 @@ CREATE TABLE public.app_webhook_deliveries (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT app_webhook_deliveries_attempt_chk CHECK (((attempt >= 0) AND (attempt <= 8))),
     CONSTRAINT app_webhook_deliveries_event_chk CHECK (((char_length(event) >= 1) AND (char_length(event) <= 256))),
+    CONSTRAINT app_webhook_deliveries_replay_generation_check CHECK ((replay_generation >= 0)),
     CONSTRAINT app_webhook_deliveries_status_chk CHECK ((status = ANY (ARRAY['pending'::text, 'in_flight'::text, 'succeeded'::text, 'failed'::text, 'dead'::text])))
 );
 
@@ -1517,6 +1542,8 @@ CREATE TABLE public.app_webhooks (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     delivery_format text DEFAULT 'json'::text NOT NULL,
     scope text DEFAULT 'app'::text NOT NULL,
+    receiver_cooldown_until timestamp with time zone,
+    receiver_recovery_probe_delivery_id uuid,
     CONSTRAINT app_webhooks_delivery_format_chk CHECK ((delivery_format = ANY (ARRAY['json'::text, 'cloudevents'::text]))),
     CONSTRAINT app_webhooks_retry_policy_chk CHECK ((retry_policy = ANY (ARRAY['default'::text, 'aggressive'::text, 'none'::text]))),
     CONSTRAINT app_webhooks_scope_chk CHECK ((((scope = 'app'::text) AND (app_id IS NOT NULL)) OR ((scope = 'account'::text) AND (app_id IS NULL) AND (cardinality(event_filter) >= 1) AND (cardinality(event_filter) <= 4) AND (array_position(event_filter, NULL::text) IS NULL) AND (event_filter <@ ARRAY['deployment.live'::text, 'deployment.failed'::text, 'rollout.completed'::text, 'rollout.aborted'::text])))),
@@ -4962,6 +4989,22 @@ ALTER TABLE ONLY public.app_trusted_signers
 
 
 --
+-- Name: app_webhook_delivery_attempts app_webhook_delivery_attempts_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.app_webhook_delivery_attempts
+    ADD CONSTRAINT app_webhook_delivery_attempts_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: app_webhook_delivery_attempts app_webhook_delivery_attempts_unique; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.app_webhook_delivery_attempts
+    ADD CONSTRAINT app_webhook_delivery_attempts_unique UNIQUE (delivery_id, replay_generation, attempt_number);
+
+
+--
 -- Name: app_webhook_deliveries app_webhook_deliveries_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -6230,10 +6273,29 @@ CREATE INDEX app_webhook_deliveries_account_created_idx ON public.app_webhook_de
 
 
 --
+-- Name: app_webhook_deliveries_due_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX app_webhook_deliveries_due_idx ON public.app_webhook_deliveries USING btree (next_attempt_at) WHERE (status = ANY (ARRAY['pending'::text, 'in_flight'::text]));
+
+
+--
 -- Name: app_webhook_deliveries_pending_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX app_webhook_deliveries_pending_idx ON public.app_webhook_deliveries USING btree (account_id, next_attempt_at) WHERE (status = ANY (ARRAY['pending'::text, 'in_flight'::text]));
+
+
+-- Name: app_webhook_deliveries_retention_idx; Type: INDEX; Schema: public; Owner: -
+
+CREATE INDEX app_webhook_deliveries_retention_idx ON public.app_webhook_deliveries USING btree (updated_at, id) WHERE (status = ANY (ARRAY['succeeded'::text, 'dead'::text]));
+
+
+--
+-- Name: app_webhook_deliveries_webhook_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX app_webhook_deliveries_webhook_idx ON public.app_webhook_deliveries USING btree (webhook_id);
 
 
 --
@@ -8736,6 +8798,14 @@ ALTER TABLE ONLY public.app_secrets
 
 ALTER TABLE ONLY public.app_trusted_signers
     ADD CONSTRAINT app_trusted_signers_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: app_webhook_delivery_attempts app_webhook_delivery_attempts_delivery_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.app_webhook_delivery_attempts
+    ADD CONSTRAINT app_webhook_delivery_attempts_delivery_id_fkey FOREIGN KEY (delivery_id) REFERENCES public.app_webhook_deliveries(id) ON DELETE CASCADE;
 
 
 --

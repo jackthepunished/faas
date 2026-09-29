@@ -6061,37 +6061,39 @@ type Store interface {
 
 	// ClaimDueAppWebhookDeliveries is the dispatcher's tick entry.
 	// In a single transaction it:
-	//   1. Locks up to `limit` rows whose status IN
+	//   1. Locks eligible subscriptions, then counts unexpired in-flight
+	//      leases in a fresh snapshot. At most four leases may be active
+	//      per subscription across all scheduler instances.
+	//   2. Locks up to `limit` rows whose status IN
 	//      ('pending','in_flight') AND next_attempt_at <= `now`,
-	//      ORDER BY account_id, next_attempt_at (per-account round-
-	//      robin emerges from the ORDER BY).
-	//   2. Transitions status='pending' → 'in_flight' for the locked
-	//      rows. 'in_flight' rows that were already past
-	//      next_attempt_at (orphaned by a dispatcher restart) are
-	//      re-claimed and re-tried — see MarkAppWebhookDeliveryFailed
-	//      for the crash-recovery reasoning.
-	//   3. Returns the locked rows for the caller to process.
+	//      excluding subscriptions with an active receiver cooldown and
+	//      interleaving due rows across subscriptions and accounts.
+	//   3. Transitions the rows to 'in_flight' and sets
+	//      next_attempt_at to the claim deadline. Only expired
+	//      in_flight claims can be reclaimed after a crash.
+	//   4. Returns the locked rows for the caller to process.
 	// The transaction commits before the dispatcher starts the HTTP
 	// work; status='in_flight' is the post-commit visible state.
 	ClaimDueAppWebhookDeliveries(ctx context.Context, limit int, now time.Time) ([]AppWebhookDelivery, error)
 	// MarkAppWebhookDeliverySucceeded stamps status='succeeded',
 	// delivered_at=deliveredAt, last_response_code=responseCode,
-	// attempt=currentAttempt+1 (the successful attempt count). The
-	// dispatcher calls this on a 2xx response.
-	MarkAppWebhookDeliverySucceeded(ctx context.Context, id string, responseCode int, currentAttempt int, deliveredAt time.Time) error
-	// MarkAppWebhookDeliveryFailed stamps status='failed',
+	// attempt=currentAttempt+1 (the successful attempt count). A write
+	// only succeeds for the matching in-flight claim deadline.
+	MarkAppWebhookDeliverySucceeded(ctx context.Context, id string, responseCode int, currentAttempt int, claimUntil, deliveredAt time.Time, meta ...AppWebhookAttemptMetadata) error
+	// MarkAppWebhookDeliveryFailed stamps status='pending',
 	// next_attempt_at=nextAttemptAt, attempt=currentAttempt+1,
 	// last_error=errMsg, last_response_code=responseCode. The
 	// dispatcher calls this on a retryable error (5xx/408/429/
-	// network) when the next attempt is within the budget.
-	MarkAppWebhookDeliveryFailed(ctx context.Context, id string, responseCode int, currentAttempt int, errMsg string, nextAttemptAt time.Time) error
+	// network) when the next attempt is within the budget. A cooldown
+	// deadline in metadata is applied to the subscription atomically.
+	MarkAppWebhookDeliveryFailed(ctx context.Context, id string, responseCode int, currentAttempt int, claimUntil time.Time, errMsg string, nextAttemptAt time.Time, meta ...AppWebhookAttemptMetadata) error
 	// MarkAppWebhookDeliveryDead stamps status='dead' with the
 	// supplied errMsg. The dispatcher calls this on:
 	//   - attempt >= 7 (budget exhausted)
 	//   - terminal 4xx (non-408/429)
 	// Once dead, the row stays dead until the customer POSTs
 	// /deliveries/{id}/retry.
-	MarkAppWebhookDeliveryDead(ctx context.Context, id string, currentAttempt int, errMsg string) error
+	MarkAppWebhookDeliveryDead(ctx context.Context, id string, currentAttempt int, claimUntil time.Time, errMsg string, meta ...AppWebhookAttemptMetadata) error
 	// ResetAppWebhookDeliveryFromDead is the customer-facing
 	// "retry a dead delivery" path. Stamps status='pending',
 	// next_attempt_at=now, attempt=0 (full budget re-armed). Used
@@ -6115,6 +6117,23 @@ type Store interface {
 	// /deliveries/{id}/retry) and the dispatcher-side audit
 	// emission that needs to read the row's account_id + app_id.
 	AppWebhookDeliveryByID(ctx context.Context, id string) (AppWebhookDelivery, error)
+	// ListAppWebhookDeliveryAttempts returns a bounded, newest-first history.
+	// The delivery, webhook, and account IDs are all enforced in the store query.
+	ListAppWebhookDeliveryAttempts(ctx context.Context, deliveryID, webhookID, accountID string, pageSize int, pageToken string) ([]AppWebhookDeliveryAttempt, string, error)
+	// AppWebhookDeliveryHealth returns receiver recovery state, claimable queue
+	// age, counts, and 24-hour terminal outcomes for one account-owned webhook.
+	AppWebhookDeliveryHealth(ctx context.Context, webhookID, accountID string, now time.Time) (AppWebhookDeliveryHealth, error)
+	// OldestOverdueAppWebhookDeliveryAt backs the fleet claimable queue-age signal.
+	OldestOverdueAppWebhookDeliveryAt(ctx context.Context, now time.Time) (*time.Time, error)
+	// AppWebhookFleetQueueHealth reports both claimable and subscription-held
+	// due work in one snapshot for the fleet health poll.
+	AppWebhookFleetQueueHealth(ctx context.Context, now time.Time) (AppWebhookFleetQueueHealth, error)
+	// PruneAppWebhookDeliveries deletes at most limit terminal deliveries last
+	// updated before cutoff. Attempt history follows via cascade.
+	PruneAppWebhookDeliveries(ctx context.Context, cutoff time.Time, limit int) (int64, error)
+	// AppWebhookDeliveryStorageBytes measures the delivery and attempt tables,
+	// including indexes and TOAST storage (zero for MemStore).
+	AppWebhookDeliveryStorageBytes(ctx context.Context) (int64, error)
 
 	// --- ADR-096 customer-facing automatic error grouping ---
 	//

@@ -743,9 +743,9 @@ ADR-075 / issue #475 / migration 00138.
   plaintext is destroyed at function exit and never crosses the
   wire after the create round-trip — the response carries only
   `webhook_secret_sealed_masked: "***"`.
-- **API** — 8 endpoints under `/v1/apps/{slug}/webhooks[/...]`:
+- **API** — endpoints under `/v1/apps/{slug}/webhooks[/...]`:
   list, create, get, update, delete, rotate-secret,
-  list-deliveries, retry-delivery. Plan-tier gate (`WebhookPerApp
+  list-deliveries, attempt-history, delivery-health, retry-delivery. Plan-tier gate (`WebhookPerApp
   == 0` → 402 `plan_webhooks_not_allowed`); quota gate
   (per-app / per-account → 422 `plan_webhook_quota`). Closed enum
   drift on `retry_policy` and `event_filter` surfaces as 400
@@ -753,11 +753,16 @@ ADR-075 / issue #475 / migration 00138.
 - **Event vocabulary (issue #2444)** — new subscriptions expose only the
   producer-backed events `app.parked`, `app.woken`, and
   `usage_statement.finalized`. The delivery ledger retains its historical
-  closed set so old delivery rows remain readable across upgrades. Producers call
-  `pkg/webhook.Emit` after their source mutation commits; it stores the raw
-  JSON payload in one durable row per enabled matching subscription, so the
-  existing retry endpoint can replay every event. OpenAPI carries a payload
-  schema for each B5 event and for the finalized usage statement payload.
+  closed set so old delivery rows remain readable across upgrades. App park
+  records a durable transition with the status update and emits only after
+  instance drain, with schedd recovery if apid exits before completion
+  (ADR-342). Usage statement finalization writes its event and matching
+  subscription snapshot in the same transaction, then relays to one durable
+  delivery row per subscription (ADR-344). Parked-to-active wake transitions
+  are recorded with the app status change and schedd recovers `app.woken` after
+  readiness (ADR-343). The existing retry endpoint can replay every event.
+  OpenAPI carries a payload schema for each B5 event and for the finalized usage
+  statement payload.
 - **CLI** — `gregale webhooks <list|add|update|rm|deliveries|retry>`
   (mirrors `gregale crons`). Closed-set drift on `--retry-policy`
   surfaces locally before the round-trip (same posture as
@@ -769,6 +774,11 @@ ADR-075 / issue #475 / migration 00138.
   `app.webhook_deleted`, `app.webhook_secret_rotated`,
   `app.webhook_delivery_retried`, plus the dispatcher-emitted
   `webhook.delivered` / `webhook.failed` / `webhook.dead`.
+- **Delivery health** — scoped webhook health APIs and the dashboard show
+  queue counts, oldest overdue age, and 24-hour terminal success rate.
+  Schedd exports separate fleet claimable-age and receiver-held due-count/age
+  signals, plus dead-delivery and poll-success metrics, with alert rules and an
+  operator runbook.
 
 ADR-076 / issue #476 / migrations 00140 + 00141.
 

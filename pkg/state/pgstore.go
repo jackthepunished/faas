@@ -3867,6 +3867,8 @@ func updateApp(ctx context.Context, queryer appUpdateQueryRower, id string, p Up
 		   idle_timeout_s  = case when $3 then $4 else idle_timeout_s end,
 		   max_concurrency = coalesce($5, max_concurrency),
 		   status          = coalesce($6, status),
+		   park_transition_id = case when $6 is not null and $6 <> 'evicted_cold' then null else park_transition_id end,
+		   wake_transition_id = case when $6::text is not null and $6::text <> 'active' then null else wake_transition_id end,
 		   manifest        = case when $7 then $8::jsonb else manifest end,
 		   min_instances   = case
 		                        when $27 then $28
@@ -4149,7 +4151,11 @@ func updateApp(ctx context.Context, queryer appUpdateQueryRower, id string, p Up
 // server and integration test path.
 func (s *PgStore) CompareAndSetAppStatus(ctx context.Context, id string, from, to AppStatus) (bool, error) {
 	tag, err := s.pool.Exec(ctx,
-		`update apps set status = $3 where id = $1 and status = $2`,
+		`update apps
+		    set status = $3,
+		        park_transition_id = case when $3 <> 'evicted_cold' then null else park_transition_id end,
+		        wake_transition_id = case when $3 <> 'active' then null else wake_transition_id end
+		  where id = $1 and status = $2`,
 		id, string(from), string(to),
 	)
 	if err != nil {
@@ -30219,6 +30225,7 @@ func replayDeadLetterEventTx(ctx context.Context, tx pgx.Tx, accountID, appID st
 		tag, err = tx.Exec(ctx, `
 			update app_webhook_deliveries
 			   set status = 'pending', attempt = 0, last_error = '',
+			       replay_generation = replay_generation + 1,
 			       last_response_code = null, next_attempt_at = now(), updated_at = now()
 			 where id = $1 and account_id = $2 and app_id = $3 and status = 'dead'`,
 			ev.SourceID, accountID, appID)

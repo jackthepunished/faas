@@ -3320,9 +3320,8 @@ func (e *AlertRuleQuotaError) Error() string {
 //
 // AppWebhook is an app-, account-, or platform-tenant subscription;
 // AppWebhookDelivery is the persistent ledger row drained by cmd/schedd's
-// pkg/webhook.Dispatcher. The wire format, signing scheme, and
-// per-account fairness algorithm live on the dispatcher side; the
-// Store only owns the durable shape.
+// pkg/webhook.Dispatcher. The dispatcher owns the wire format and signing;
+// the Store's claim methods provide per-account fairness.
 //
 // Why a parallel outbound surface (not alert_deliveries):
 //   - alert_deliveries is alert-shaped (rule_id, observed_value,
@@ -3413,7 +3412,7 @@ func ValidAppWebhookEvent(event AppWebhookEvent) bool {
 // reads this column at claim time and computes next_attempt_at
 // against the matching schedule.
 //
-//   - default:    30s, 2m, 10m, 1h, 6h (5 retries → 7 attempts max)
+//   - default:    30s, 2m, 10m, 20m, 1h, 6h (6 retries → 7 attempts max)
 //   - aggressive: half of each default step
 //   - none:       no retries — first 5xx/408/429 lands the row in
 //     status='dead' immediately
@@ -3587,11 +3586,29 @@ type TCPListener struct {
 	UpdatedAt    time.Time
 }
 
+// AppWebhookClaimLease is the recovery deadline assigned to each claimed row.
+const AppWebhookClaimLease = 30 * time.Second
+
+// AppWebhookMaxInFlightPerSubscription bounds concurrent receiver requests
+// across all scheduler instances. Only unexpired in-flight leases count.
+const AppWebhookMaxInFlightPerSubscription = 4
+
+// AppWebhookRecoveryRetryDelay spaces probes after a transient failure that
+// did not include a usable receiver Retry-After deadline.
+const AppWebhookRecoveryRetryDelay = 30 * time.Second
+
+// appWebhookFairnessPeriodSeconds matches the dispatcher's default five-second
+// tick. Advancing the account rotation by one batch per tick spreads the extra
+// slots when the batch size is not divisible by the active account count.
+const appWebhookFairnessPeriodSeconds int64 = 5
+
 // AppWebhookDelivery is one (event × target) ledger row. The
 // dispatcher mutates the row in place on every attempt until
-// status='succeeded' or status='dead'. Payload is the wire body the
-// customer receives; the dispatcher signs with HMAC-SHA256 over
+// status='succeeded' or status='dead'. Payload is the event data
+// included in the wire body; the dispatcher signs with HMAC-SHA256 over
 // "<unix>.<delivery_id>.<body>" using the unsealed secret.
+// While in flight, NextAttemptAt is the claim deadline and also fences a
+// completion from an older claim after the delivery has been reclaimed.
 type AppWebhookDelivery struct {
 	ID               string
 	WebhookID        string
@@ -3607,6 +3624,73 @@ type AppWebhookDelivery struct {
 	DeliveredAt      *time.Time // nil until status=succeeded
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
+}
+
+// AppWebhookAttemptMetadata records the wall-clock interval of a dispatch.
+// ResponseCode is used for terminal outcomes, whose older Mark method had no
+// response-code parameter. Zero timestamps are filled by the store for callers
+// that use the original Mark methods.
+type AppWebhookAttemptMetadata struct {
+	StartedAt    time.Time
+	FinishedAt   time.Time
+	ResponseCode int
+	// ReceiverCooldownUntil is the parsed, capped Retry-After deadline on
+	// a 429/503. Stores apply it only with a successful fenced completion.
+	ReceiverCooldownUntil *time.Time
+	// ReceiverCooldownTargetURL fences a response from an old target URL
+	// after the subscription has been retargeted.
+	ReceiverCooldownTargetURL string
+}
+
+// AppWebhookDeliveryAttempt is one immutable outcome in a delivery's history.
+// ReplayGeneration separates budgets when a dead delivery is manually retried.
+// No request body, response body, headers, or signing secret is retained.
+type AppWebhookDeliveryAttempt struct {
+	ID               string
+	DeliveryID       string
+	ReplayGeneration int
+	AttemptNumber    int
+	Outcome          string // succeeded | retrying | dead
+	ResponseCode     int    // 0 when no HTTP response arrived
+	Error            string
+	StartedAt        time.Time
+	FinishedAt       time.Time
+	NextAttemptAt    *time.Time
+}
+
+// AppWebhookReceiverState describes the subscription's claim gate at the
+// health snapshot. A probe is active only while its delivery lease is live.
+type AppWebhookReceiverState string
+
+const (
+	AppWebhookReceiverReady         AppWebhookReceiverState = "ready"
+	AppWebhookReceiverCoolingDown   AppWebhookReceiverState = "cooling_down"
+	AppWebhookReceiverAwaitingProbe AppWebhookReceiverState = "awaiting_probe"
+	AppWebhookReceiverProbing       AppWebhookReceiverState = "probing"
+)
+
+// AppWebhookDeliveryHealth is a scoped snapshot of one webhook's queue.
+// Recent terminal counts use a rolling 24-hour window ending at the query time.
+// OldestOverdueAt includes only work the subscription has claim capacity for.
+type AppWebhookDeliveryHealth struct {
+	WebhookID             string
+	ReceiverState         AppWebhookReceiverState
+	ReceiverCooldownUntil *time.Time
+	PendingCount          int64
+	InFlightCount         int64
+	DeadCount             int64
+	OldestOverdueAt       *time.Time
+	RecentSucceededCount  int64
+	RecentDeadCount       int64
+}
+
+// AppWebhookFleetQueueHealth separates due deliveries with claim capacity from
+// those held by a receiver cooldown or a full subscription claim slot.
+// All values are fleet-wide and contain no customer identifiers.
+type AppWebhookFleetQueueHealth struct {
+	OldestClaimableAt *time.Time
+	OldestHeldAt      *time.Time
+	HeldDueCount      int64
 }
 
 // AppWebhookQuotaError is returned by CreateAppWebhookIfUnderQuota

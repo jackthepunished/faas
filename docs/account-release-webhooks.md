@@ -41,6 +41,9 @@ receiver match an event, each gets an independent delivery ID and retry state.
 
 ## Verify each delivery
 
+The Go, Node.js, and Python SDKs provide receiver-side signature verification
+helpers and examples in [Verify outbound Gregale webhooks](webhook-receiver-verification.md).
+
 Read the raw request body, `X-Faas-Webhook-Timestamp`, and
 `X-Faas-Delivery-Id`. Compute HMAC-SHA256 with the stored secret over the
 exact bytes `<unix_timestamp>.<delivery_id>.<raw_body>`, then compare its hex
@@ -48,6 +51,8 @@ digest in constant time with the hex part of
 `X-Faas-Webhook-Signature: sha256=<hex>`. Reject timestamps outside your
 replay window and deduplicate by delivery ID. Do not parse and re-serialize
 the body before checking the signature.
+The timestamp header is the time of this HTTP attempt; the event time in the
+body can be older when Gregale retries a delivery.
 
 ## Operate and recover
 
@@ -66,6 +71,9 @@ its `app_id`, event, attempt count, status, and last response/error details.
 Only `dead` deliveries can be manually retried. The normal dispatcher uses
 the same retry and dead-letter policy as app webhooks. Rotate the receiver's
 secret in your receiver and Gregale together; the rotate response is masked.
+Succeeded and dead deliveries, including attempt history, are retained for
+90 days after their last update; pending and in-flight deliveries remain until
+they finish. Replay a dead delivery before its retention window expires.
 Deleting a receiver removes its delivery history, so export anything you need
 for audit before deletion.
 

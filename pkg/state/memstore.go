@@ -348,6 +348,10 @@ type MemStore struct {
 	// query is a single goroutine today.
 	appWebhooks                     map[string]AppWebhook
 	appWebhookDeliveries            map[string]AppWebhookDelivery
+	appWebhookDeliveryAttempts      map[string][]AppWebhookDeliveryAttempt
+	appWebhookReplayGenerations     map[string]int
+	appWebhookReceiverCooldowns     map[string]time.Time
+	appWebhookRecoveryProbes        map[string]string
 	inboundWebhookEndpoints         map[string]InboundWebhookEndpoint
 	workflowCallbackWebhookBindings map[string]WorkflowCallbackWebhookBinding
 	queueBindings                   map[string]QueueBinding
@@ -624,6 +628,11 @@ type MemStore struct {
 	// apiConsumerUsageStatements is keyed by statement ID. statement keys
 	// enforce one immutable snapshot per (app, consumer, period).
 	apiConsumerUsageStatements map[string]APIConsumerUsageStatement
+	appWebhookEventOutbox      map[string]appWebhookOutboxEvent
+	appParkTransitionByApp     map[string]string
+	appParkTransitions         map[string]memAppParkTransition
+	appWakeTransitionByApp     map[string]string
+	appWakeTransitions         map[string]memAppWakeTransition
 	// apiConsumerUsageStatementHandoffs is keyed by statement ID. A statement
 	// can be handed off at most once, while the implementation also rejects
 	// reuse of an external invoice reference within an account.
@@ -1074,6 +1083,10 @@ func NewMemStore() *MemStore {
 		alertDeliveries:                 map[string]AlertDelivery{},
 		appWebhooks:                     map[string]AppWebhook{},
 		appWebhookDeliveries:            map[string]AppWebhookDelivery{},
+		appWebhookDeliveryAttempts:      map[string][]AppWebhookDeliveryAttempt{},
+		appWebhookReplayGenerations:     map[string]int{},
+		appWebhookReceiverCooldowns:     map[string]time.Time{},
+		appWebhookRecoveryProbes:        map[string]string{},
 		inboundWebhookEndpoints:         map[string]InboundWebhookEndpoint{},
 		workflowCallbackWebhookBindings: map[string]WorkflowCallbackWebhookBinding{},
 		queueBindings:                   map[string]QueueBinding{},
@@ -1173,6 +1186,11 @@ func NewMemStore() *MemStore {
 		apiConsumerRateCards:              map[string]APIConsumerRateCard{},
 		platformTenantRateCards:           map[string]PlatformTenantRateCard{},
 		apiConsumerUsageStatements:        map[string]APIConsumerUsageStatement{},
+		appWebhookEventOutbox:             map[string]appWebhookOutboxEvent{},
+		appParkTransitionByApp:            map[string]string{},
+		appParkTransitions:                map[string]memAppParkTransition{},
+		appWakeTransitionByApp:            map[string]string{},
+		appWakeTransitions:                map[string]memAppWakeTransition{},
 		apiConsumerUsageStatementHandoffs: map[string]APIConsumerUsageStatementHandoff{},
 		platformTenantStatements:          map[string]PlatformTenantStatement{},
 		platformTenantStatementHandoffs:   map[string]PlatformTenantStatementHandoff{},
@@ -5527,6 +5545,12 @@ func (m *MemStore) updateAppWithActivity(_ context.Context, id string, p UpdateA
 	}
 	if p.Status != nil {
 		a.Status = *p.Status
+		if *p.Status != AppEvictedCold {
+			m.clearCurrentAppParkTransitionLocked(id)
+		}
+		if *p.Status != AppActive {
+			m.clearCurrentAppWakeTransitionLocked(id)
+		}
 	}
 	if p.Manifest != nil {
 		a.Manifest = *p.Manifest
@@ -5850,6 +5874,12 @@ func (m *MemStore) CompareAndSetAppStatus(_ context.Context, id string, from, to
 		return false, nil
 	}
 	a.Status = to
+	if to != AppEvictedCold {
+		m.clearCurrentAppParkTransitionLocked(id)
+	}
+	if to != AppActive {
+		m.clearCurrentAppWakeTransitionLocked(id)
+	}
 	m.apps[id] = a
 	return true, nil
 }
@@ -24846,6 +24876,10 @@ func (m *MemStore) replayDeadLetterEventLocked(accountID, appID, eventID string)
 		delivery.NextAttemptAt = now
 		delivery.UpdatedAt = now
 		m.appWebhookDeliveries[event.SourceID] = delivery
+		if m.appWebhookReplayGenerations == nil {
+			m.appWebhookReplayGenerations = make(map[string]int)
+		}
+		m.appWebhookReplayGenerations[event.SourceID]++
 	case "job_run":
 		return m.replayAccountJobDeadLetterLocked(accountID, *event)
 	case "workflow_run":
