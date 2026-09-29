@@ -1,6 +1,6 @@
 # Application scenario tests
 
-`gregale test` deploys source into expiring developer sessions and runs
+By default, `gregale test` deploys source into expiring developer sessions and runs
 declarative HTTP checks or repository-owned assertion commands through its
 public Gregale URL. Each lifecycle
 profile gets a distinct run and, when requested, isolated managed PostgreSQL
@@ -123,8 +123,8 @@ has a 30-second timeout within the scenario timeout.
 
 An asynchronous request may capture an invocation ID under the name used by
 `wait_for.invocations[].trigger_key`. The existing object, delivery, and queue
-wait conditions then run before `checks`. Native request steps run only with
-the `real-vm` engine; a local `--engine simulated` run still needs its own
+wait conditions then run before `checks`. Native request steps run with
+`real-vm` or `local`. A `--engine simulated` run still needs its own
 `simulation` command.
 
 To create a small starting manifest from an OpenAPI document:
@@ -139,6 +139,433 @@ parameters and a declared 2xx response. It adds status and JSON content-type
 checks where applicable, skips other operations, and never overwrites an
 existing manifest. Review the generated requests, then add authentication,
 fixtures, ownership, idempotency, and business assertions explicitly.
+
+## Local HTTP tests and case data
+
+Start your application with its normal local development command, then run the
+same native requests and checks against it:
+
+```sh
+gregale test --scenario api-smoke --engine local --base-url http://localhost:3000
+gregale test --scenario customer-export --engine local --base-url http://localhost:3000 \
+  --data cases.json --repeat 2 --report results.json --junit results.xml
+```
+
+The `local` engine sends real HTTP requests to a local app. It can start the app
+from the manifest, or use an already running app with `--base-url`.
+It requires no platform login and provisions no Gregale resources. `--base-url`
+must be an HTTP origin on `localhost` or a loopback IP address, with no path,
+credentials, query, or fragment. Redirects are not followed. Execution order is
+`setup`, `trigger`, `requests`, `checks`, assertion `command`, then `cleanup`.
+Cleanup runs after failures and interruption. The scenario's `source` directory
+is the working directory for commands; it need not contain a deployable app.
+
+Local runs do not deploy `services`, create PostgreSQL databases or buckets,
+apply `secrets` or consumer authentication policy, or create consumers. Configure
+your local app and its dependencies beforehand, or use `setup` and `cleanup`
+commands. For a step with `as: customer-a`, provide the existing local test key
+in `GREGALE_TEST_CONSUMER_CUSTOMER_A_KEY`; an optional
+`GREGALE_TEST_CONSUMER_CUSTOMER_A_ID` is also passed to commands. Missing keys
+fail before setup. These keys remain owned by your local fixtures.
+
+Platform `wait_for` conditions are rejected by the local engine. Use `real-vm`
+for queue, invocation, delivery, object, and lifecycle evidence. `--profile`,
+`--preflight`, and `--max-workload-minutes` apply only to real-VM tests. Reports
+label local runs with `engine: local` and `profile: local` and contain no VM wake
+evidence. A local HTTP test and a simulated test do not establish that an app
+behaves correctly after being parked and restored.
+
+### Start and stop the app with the test
+
+Declare the foreground app command in `local` to run everything with one command:
+
+```yaml
+version: 1
+scenarios:
+  api-smoke:
+    project: my-api
+    source: .
+    local:
+      command: [node, server.js]
+      readiness:
+        path: /health
+        status: 200
+        timeout: 30s
+      shutdown_timeout: 5s
+    checks:
+      - name: health
+        method: GET
+        path: /health
+        expect: {status: 200}
+```
+
+```sh
+gregale test --scenario api-smoke --engine local
+gregale test --scenario api-smoke --engine local --load --vus 5 --duration 30s \
+  --progress --report results.json --junit results.xml
+```
+
+Gregale chooses an available loopback port. The app and fixture commands receive
+`HOST`, `PORT`, `GREGALE_TEST_HOST`, `GREGALE_TEST_PORT`, and `GREGALE_TEST_URL`,
+along with the usual run identity and case data. Inherited `HOST` and `PORT` are
+replaced for this run. Configure your app to bind these values; for example,
+Node's HTTP server can use `server.listen(Number(process.env.PORT), process.env.HOST)`.
+Commands run in `source` and do not implicitly use a shell. An executable can also
+take `${local.host}`, `${local.port}`, or `${local.url}` in its argument list:
+
+```yaml
+local:
+  command: [python3, -m, http.server, '${local.port}', --bind, '${local.host}']
+```
+
+When `local.command` is declared, `--base-url http://localhost:3000` selects port
+3000 for the managed app. An occupied port fails before startup; Gregale does not
+attach to or stop the existing server. `localhost` resolves to `127.0.0.1` in this
+mode. The port reservation is released immediately before launching the command,
+so the app must bind it itself. Without `local.command`, `--base-url` continues to
+target an app you started separately.
+
+Execution is `startup` and readiness, `setup`, `trigger`, `requests`, `checks`,
+assertion `command`, `cleanup`, then `shutdown`. With `--load`, the concurrent
+journeys replace the individual requests and checks. Each data row and repeat
+starts a fresh app process. Cleanup can still call the app after failed checks,
+Ctrl-C, or SIGTERM. An app that exits before shutdown fails the run, even with exit
+code zero. The command must stay in the foreground; it must not detach or daemonize.
+
+Readiness sends unauthenticated GET requests every 100 ms without redirects or
+proxies. Defaults are `/`, status `200`, and `30s`; timeout is limited to `1s..5m`
+and also respects the overall scenario timeout. The path cannot contain a query,
+fragment, or template. Setup does not run until readiness succeeds. Put any setup
+needed to start the server in the app command itself.
+
+Shutdown sends SIGTERM to the app's process group, waits up to
+`shutdown_timeout` (`1s..30s`, default `5s`), and uses SIGKILL for remaining
+processes when necessary. Forced shutdown is recorded and does not by itself
+fail the test. JSON and JUnit include `local_app` readiness and shutdown evidence
+and the `startup` and `shutdown` phases. App output is held in a bounded 64 KiB
+tail and printed to stderr only after a failed run; it is omitted from reports
+and JSON stdout. Managed startup is supported on Unix platforms, including Linux
+and macOS. The `local` block is used only by `--engine local`.
+
+### Run the same scenario for JSON or CSV rows
+
+`--data` currently applies to the local engine. A JSON data file is an array of
+objects with the same fields in every row:
+
+```json
+[
+  {"format": "csv", "limit": 10, "include_archived": false},
+  {"format": "json", "limit": 25, "include_archived": true}
+]
+```
+
+Reference these fields in paths, queries, headers, JSON bodies, or expectations:
+
+```yaml
+requests:
+  - name: submit
+    method: POST
+    path: /exports
+    json:
+      format: '${data.format}'
+      limit: '${data.limit}'
+      include_archived: '${data.include_archived}'
+      run: '${run.id}'
+    expect: {status: 202}
+    capture: {export_id: '/id'}
+checks:
+  - name: read
+    method: GET
+    path: /exports/${steps.submit.export_id}?format=${data.format}
+    expect:
+      status: 200
+      json: {'/format': '${data.format}', '/limit': '${data.limit}'}
+```
+
+An exact `${data.limit}` or `${data.include_archived}` JSON value preserves the
+number or boolean type. `${data.limit.string}` forces a string even for a
+numeric input. Embedded references such as `limit-${data.limit}`
+produce text. CSV uses a header row and treats every value as a string:
+
+```csv
+format,label
+csv,small-export
+json,large-export
+```
+
+Data files are limited to 1 MiB, 1–100 rows, and 1–32 fields. Field names begin
+with a lowercase letter and contain lowercase letters, digits, and underscores
+(at most 64 characters). JSON fields accept strings, numbers, and booleans;
+nested values and null are rejected. Unknown `${data.*}` references fail
+manifest validation for the selected scenario. Add `--scenario NAME` when other
+scenarios need a different data file. Validate before sending requests with:
+
+```sh
+gregale test --validate --engine local --data cases.json
+```
+
+Each row runs the whole scenario with a fresh run ID and capture map. Cases run
+in file order; `--repeat N` repeats all rows N times. All rows use the same
+running local app, so use run IDs or fixture cleanup to avoid shared state.
+An assertion failure is reported for its row; remaining rows continue, and the
+command exits unsuccessfully if any row fails. Interruption stops new rows.
+Commands receive `GREGALE_TEST_CASE` (`row-1`, `row-2`, etc.) and
+`GREGALE_TEST_DATA_JSON`, plus the local URL, run ID, engine, profile, and scenario
+name. Without a data file, there is one unnamed case with empty `{}` data.
+The CLI strips its `FAAS_TOKEN` account credential from command environments.
+Command output goes to stderr under `--json`.
+
+JSON and JUnit reports identify the row and attempt, including request evidence
+and cleanup failures. They omit data values and captures. JUnit names such as
+`customer-export/local/row-1#2` distinguish the second run of the first row.
+
+## Native local load tests
+
+Run the same HTTP workflow under concurrent load without installing a separate
+test tool:
+
+```sh
+gregale test --scenario api-smoke --engine local --base-url http://localhost:3000 \
+  --load --vus 5 --iterations 100 --report load.json --junit load.xml
+gregale test --scenario api-smoke --engine local --base-url http://localhost:3000 \
+  --load --vus 5 --duration 30s
+```
+
+Each user runs a journey consisting of `requests` followed by `checks`, in order,
+then immediately starts the next journey. Users share the total iteration budget;
+`--iterations 100 --vus 5` runs 100 journeys in total. This is a closed concurrency
+model: throughput depends on the app's response speed. It does not promise a
+fixed arrival rate. Captures start empty for every journey. `${run.id}` becomes
+`<run-ID>-<iteration-number>` so requests can create distinct resources. Cleanup
+commands receive the parent `GREGALE_TEST_RUN_ID` and can remove resources by
+that prefix.
+
+Keep defaults and CI thresholds in the scenario:
+
+```yaml
+load:
+  vus: 5
+  iterations: 100
+  thresholds:
+    p95: 250ms
+    error_rate: 0.01
+    steps:
+      submit: {p95: 200ms, error_rate: 0}
+      read: {p95: 100ms}
+```
+
+`thresholds.steps` keys must name declared HTTP requests or checks. Step budgets
+add to the aggregate limits; they do not replace them. Only explicitly supplied
+step limits apply. A step with a budget and no samples fails, including a check
+skipped because an earlier request failed. This prevents an aggregate percentile
+or an allowed error rate from hiding a problem in a critical step. JSON reports
+include evaluated budgets under each step, terminal summaries identify them by
+step name, and failed budgets fail the JUnit case and command.
+
+This optional block configures `--load`; it does not enable load for a normal
+test. Replace `iterations` with `duration: 30s` to choose a timed run. CLI flags
+override the manifest; selecting `--duration` clears its iteration setting and
+stages, and selecting `--iterations` clears its duration and stages. Without
+configuration, `--load`
+uses one user and 100 journeys. `--vus`, `--iterations`, and `--duration` require
+`--load`. Validate the configuration without contacting the app:
+
+```sh
+gregale test --validate --scenario api-smoke --engine local --load
+```
+
+`setup` and `trigger` run once before load. The assertion `command` runs once
+after successful load and thresholds. `cleanup` runs once after each run,
+including a failure or interruption. With `--data`, every row gets a separate
+load run and fixture lifecycle; rows run sequentially. `--repeat` repeats those
+runs. Commands receive `GREGALE_TEST_LOAD=1`, `GREGALE_TEST_LOAD_MODE`,
+`GREGALE_TEST_LOAD_VUS`, `GREGALE_TEST_LOAD_ITERATIONS`, and
+`GREGALE_TEST_LOAD_DURATION`. After load, assertions and cleanup can also inspect
+aggregate evidence in `GREGALE_TEST_LOAD_JSON`.
+
+### Ramp traffic, pace users, and follow progress
+
+Declare a stage schedule instead of `iterations` or `duration`:
+
+```yaml
+load:
+  vus: 1
+  pacing: 100ms
+  stages:
+    - {duration: 10s, target: 5}
+    - {duration: 20s, target: 5}
+    - {duration: 10s, target: 20}
+    - {duration: 20s, target: 20}
+    - {duration: 10s, target: 0}
+  thresholds:
+    error_rate: 0.01
+    steps:
+      submit: {p95: 200ms, error_rate: 0}
+      read: {p95: 100ms}
+```
+
+`vus` is the initial user count. Each stage interpolates linearly from the
+previous target to its target, rounded to the nearest whole user. Repeating a
+target holds that concurrency. A target of zero stops starting journeys for the
+affected users; it can also hold an idle period. During a ramp down, running
+users finish their entire current journey before becoming inactive. Active
+journeys can temporarily exceed the new target while they finish. After the
+schedule ends, in-flight journeys get the same 30-second drain allowance as a
+timed run.
+
+Schedules may contain up to 20 stages, each at least 1 second, with a combined
+duration of at most 5 minutes and targets from 0 to 50 users. The scenario timeout
+and HTTP-step budget still apply. Reports label the mode and stop reason as
+`stages`, record initial/max/peak users, and include each stage's duration, start
+and target user counts, and journeys started in that stage. Journeys are assigned
+to the stage in which they start, even if they finish in a later stage.
+
+`pacing` pauses each user after a journey finishes before starting its next one,
+including after a failed journey. It applies to all load modes and defaults to
+zero. It adds no pause after the final journey and does not count toward HTTP
+step latency. The allowed range is 0 seconds to 1 minute; `--pacing 0s` disables
+manifest pacing. This remains a concurrency model, not a fixed arrival-rate
+promise.
+
+```sh
+gregale test --scenario customer-export --engine local --base-url http://localhost:3000 \
+  --load --progress --report load.json --junit load.xml
+```
+
+`--progress` prints a snapshot once per second to stderr: elapsed time, current
+stage or draining state, target and active users, completed/started journeys,
+HTTP steps, and failures. It also works with `--json`; stdout remains a single
+JSON result. `--pacing` and `--progress` require `--load`. Commands additionally
+receive `GREGALE_TEST_LOAD_MAX_VUS` and `GREGALE_TEST_LOAD_PACING`.
+
+A failed request or assertion ends that journey; other journeys continue.
+`error_rate` is failed HTTP steps divided by all attempted HTTP steps, as a
+fraction from 0 to 1. An expected 403 passes. The default error threshold is zero;
+there is no default latency threshold. Configured limits are inclusive. Crossing
+either threshold fails the receipt and exits with status 1. No samples, canceled
+runs, time limits, incomplete runs caused by the request budget, and failed
+cleanup also fail, regardless of the error tolerance.
+
+The terminal summary shows throughput, p95 latency, failure counts, thresholds,
+and the first error for up to ten failed steps. The JSON `load` object reports
+started, completed, failed, and interrupted journeys, peak concurrency,
+HTTP-step throughput, response status counts, error rate, and
+min/mean/p50/p95/p99/max latency. Each step gets its own metrics and up to five
+distinct error examples. Status `0` means no HTTP response
+was received. Latency is client-observed step time, including template expansion,
+request encoding, the full bounded response read, and assertions. Percentiles
+use the nearest-rank method; they describe these client timings, not isolated
+server processing time. Throughput uses the entire load phase, including draining
+in-flight work. Receipts contain aggregate evidence rather than one entry per
+journey. JUnit names contain `/local/load/` to distinguish load cases; response
+bodies, request headers, data values, and captures are not added to reports.
+
+Load currently requires `--engine local` and an already running HTTP app on
+loopback. It uses native Go HTTP requests, with no k6 or Postman runtime download.
+Limits are 50 users, 10,000 journeys for an iteration run, 5 minutes of scheduling,
+and 100,000 HTTP-step attempts per case/run. Iteration configurations that could
+exceed the HTTP-step budget are rejected before execution. Timed runs fail if
+they exhaust it. Timed runs stop starting journeys at the requested duration and
+allow up to 30 additional seconds for in-flight work; iteration runs have a
+5-minute execution deadline. The scenario timeout covers setup, trigger, load,
+and assertions and can shorten these limits. Each request has a 30-second
+timeout, responses are capped at 1 MiB, redirects are not followed, and connections
+are reused. Cleanup has its own 45-second deadline.
+
+## Import a Postman collection
+
+Create a native scenario from a local [Postman Collection v2.1 JSON
+export](https://schema.postman.com/json/collection/v2.1.0/docs/index.html):
+
+```sh
+gregale test import --from collection.json --project export-api
+```
+
+The command creates `gregale-test.yaml` with an `api-collection` scenario. Use
+`--source`, `--scenario`, and `--output` to change those defaults. Import is local
+and never sends collection requests, downloads a runner, or requires a platform
+login. The new manifest has private file permissions and cannot overwrite an
+existing file.
+
+This is a request scaffold. Review its expected statuses and add native
+`expect.json`, `capture`, `checks`, or assertion commands for business behavior.
+A request with one distinct saved response status uses that code. Requests with
+no saved status default to `200`; `--status CODE` changes the fallback. Multiple
+distinct saved codes require an explicit `--status CODE`. Saved examples supply
+draft expectations; they do not establish what the original test asserted.
+
+### Supported conversion
+
+- Requests keep their order through nested folders; duplicate names get unique
+  native step names.
+- Enabled structured headers and query parameters are copied. Disabled entries
+  are omitted, repeated query parameters are preserved, and literal structured
+  query values are URL encoded.
+- Raw JSON bodies are converted to native `json` bodies. Quoted `{{count}}`
+  references become `${data.count.string}` to keep their string type; unquoted
+  references become `${data.count}` and use the case input's JSON type. Literal
+  numbers are preserved or the import fails with a request for a case input.
+- `noauth` and bearer authentication follow collection, folder, and request
+  inheritance. A bearer token must be a complete named variable such as
+  `{{token}}`. Literal bearer tokens and literal `Authorization`, `Cookie`, and
+  `X-Api-Key` credentials are rejected.
+- URL strings and structured URL objects are supported. Declared `:id` path
+  parameters become case inputs.
+
+All requests must share one origin. The original host is removed so execution
+targets the local app or isolated Gregale app. A leading origin variable such
+as `{{baseUrl}}` is removed too. If its exported value includes a path prefix
+such as `https://api.example/v1`, `/v1` is retained in the native paths. An
+undefined origin variable is assumed to represent an origin with no path prefix.
+Review that prefix if an environment supplied a different URL. A collection that
+calls multiple external services must be split into separate scenarios.
+
+Other `{{variable}}` references become runtime `${data.field}` inputs.
+Camel case names are converted to lowercase with underscores, so `customerId`
+becomes `customer_id`. Import prints the required variable-to-field mappings;
+colliding names are rejected. Exported values for these inputs are omitted.
+Supply fresh test values in the existing JSON/CSV case file:
+
+```json
+[{"customer_id": "customer-a", "count": 10, "token": "local-test-token"}]
+```
+
+```sh
+gregale test --validate --scenario api-collection --engine local --data cases.json
+gregale test --scenario api-collection --engine local \
+  --base-url http://localhost:3000 --data cases.json --junit results.xml
+```
+
+The importer does not read Postman environment files or reproduce variable
+default values and scope changes. Supply those values as case inputs or explicit
+native fixtures. Imported scenarios that use `${data.*}` currently run with the
+local engine; real-VM case data is not supported yet.
+
+### Scripts and unsupported features
+
+An enabled collection, folder, or request script stops import by default.
+To deliberately generate only the requests:
+
+```sh
+gregale test import --from collection.json --project export-api --requests-only
+```
+
+The import summary reports how many scripts were omitted. Port their assertions,
+response captures, setup, and execution order changes into native steps before
+using the scenario as a replacement for the collection's tests. Scripts are
+never executed, even with `--requests-only`. That option does not allow other
+unsupported request features.
+
+Form data, files, binary and GraphQL bodies, variables in JSON object keys,
+dynamic and vault variables, authentication types other than bearer/noauth,
+custom proxies and certificates, and protocol profile options are rejected.
+Native requests do not reproduce Postman's cookie jar or automatic redirects.
+Collections are limited to 5 MiB, 100 requests, 16 folder levels, and 32 required
+case fields. Import errors leave no partial manifest. `gregale --json test import`
+returns request counts, fallback status counts, omitted script counts, and input
+field mappings without copying variable values or script contents.
+
+## Real-VM lifecycle tests
 
 Run all three profiles, or select one:
 
@@ -182,7 +609,7 @@ acceptance workflow uploads both the JSON and JUnit reports even on failure.
 It receives `GREGALE_TEST_ENGINE=simulated`,
 `GREGALE_TEST_PROFILE=simulated`, and `GREGALE_TEST_SCENARIO`. The report omits
 VM wake evidence and labels its engine `simulated`. VM lifecycle profiles only
-apply to `real-vm`, and passing `--profile` with `--engine simulated` is an
+apply to `real-vm`, and passing `--profile` with `--engine local` or `simulated` is an
 error. A simulation can test application logic quickly, while the real-VM runs
 prove the platform lifecycle path.
 Keep application behavior assertions in a shared module when both engines can
