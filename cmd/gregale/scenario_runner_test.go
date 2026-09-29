@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -173,14 +174,14 @@ func TestProvisionTestConsumersReturnsShortLivedCredentialsAndPartialCleanupIDs(
 }
 
 func TestExpandTestSecretValue(t *testing.T) {
-	got, err := expandTestSecretValue("${service.notifications.url}/deliver?run=${run.id}&bucket=${bucket.exports.name}",
+	got, err := expandTestSecretValue("${service.notifications.url}/deliver?run=${run.id}&bucket=${bucket.exports.name}&secret=${run.secret}",
 		map[string]string{"notifications": "https://sink.example"}, map[string]string{"notifications": "sink-app"},
-		map[string]testBucketRef{"exports": {Name: "exports-123"}}, "run-123")
-	if err != nil || got != "https://sink.example/deliver?run=run-123&bucket=exports-123" {
+		map[string]testBucketRef{"exports": {Name: "exports-123"}}, "run-123", "secret-456")
+	if err != nil || got != "https://sink.example/deliver?run=run-123&bucket=exports-123&secret=secret-456" {
 		t.Fatalf("expanded = (%q, %v)", got, err)
 	}
 	for _, value := range []string{"${service.unknown.url}", "${bucket.unknown.name}", "${run.id", "${service.notifications.secret}"} {
-		if _, err := expandTestSecretValue(value, map[string]string{"notifications": "https://sink.example"}, nil, nil, "run-123"); err == nil {
+		if _, err := expandTestSecretValue(value, map[string]string{"notifications": "https://sink.example"}, nil, nil, "run-123", "secret-456"); err == nil {
 			t.Errorf("reference %q was accepted", value)
 		}
 	}
@@ -444,7 +445,7 @@ func TestSimulatedScenarioRunsWithoutPlatformAndOmitsWakeEvidence(t *testing.T) 
 	if err := os.WriteFile(manifest, []byte(contents), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if code := cmdTest([]string{"--scenario", "local-test", "--engine", "simulated", "--manifest", manifest, "--report", report}); code != 0 {
+	if code := cmdTest([]string{"--scenario", "local-test", "--engine", "simulated", "--repeat", "2", "--manifest", manifest, "--report", report}); code != 0 {
 		t.Fatalf("simulated test exit = %d, want 0", code)
 	}
 	body, err := os.ReadFile(report)
@@ -454,8 +455,15 @@ func TestSimulatedScenarioRunsWithoutPlatformAndOmitsWakeEvidence(t *testing.T) 
 	if !strings.Contains(string(body), `"engine": "simulated"`) || strings.Contains(string(body), `"evidence"`) || strings.Contains(string(body), `"app_slug"`) {
 		t.Fatalf("simulated report mislabels platform evidence: %s", body)
 	}
+	var attempts []testRunReceipt
+	if err := json.Unmarshal(body, &attempts); err != nil || len(attempts) != 2 || attempts[0].Attempt != 1 || attempts[1].Attempt != 2 {
+		t.Fatalf("repeat report = (%+v, %v)", attempts, err)
+	}
 	if code := cmdTest([]string{"--scenario", "local-test", "--engine", "simulated", "--profile", "cold", "--manifest", manifest}); code == 0 {
 		t.Fatal("simulated run accepted a VM lifecycle profile")
+	}
+	if code := cmdTest([]string{"--scenario", "local-test", "--profile", "restored", "--max-workload-minutes", "1", "--manifest", manifest}); code == 0 {
+		t.Fatal("real VM run exceeded the workload-minute guard without stopping")
 	}
 }
 

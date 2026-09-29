@@ -7,10 +7,11 @@ const send = (response, status, body) => {
   response.end(JSON.stringify(body));
 };
 
-export function createWorker({ store, notificationURL, runID, request = fetch } = {}) {
+export function createWorker({ store, notificationURL, runID, workerToken = process.env.WORKER_TEST_TOKEN, request = fetch, failFirstProcess = false } = {}) {
   return http.createServer(async (incoming, outgoing) => {
     const path = new URL(incoming.url, "http://localhost").pathname;
     if (incoming.method === "GET" && path === "/") return send(outgoing, 200, { ready: true });
+    if (!workerToken || incoming.headers["x-worker-test-token"] !== workerToken) return send(outgoing, 401, { error: "unauthorized_worker_request" });
     const owner = incoming.headers["x-owner-digest"];
     if (typeof owner !== "string" || !/^[a-f0-9]{64}$/.test(owner)) return send(outgoing, 401, { error: "unauthorized" });
     try {
@@ -22,6 +23,13 @@ export function createWorker({ store, notificationURL, runID, request = fetch } 
           return send(outgoing, 400, { error: "invalid_export" });
         }
         const id = createHash("sha256").update(`${owner}:${body.idempotency_key}`).digest("hex").slice(0, 32);
+        if (failFirstProcess) {
+          const faultKey = `faults/${runID}/${id}.json`;
+          if (!(await store.get(faultKey))) {
+            await store.put(faultKey, { failed_once: true });
+            return send(outgoing, 503, { id, error: "planned_retry" });
+          }
+        }
         const key = `reports/${runID}/${id}.json`;
         const existing = await store.get(key);
         if (existing) return send(outgoing, 200, { id, created: false });
@@ -80,6 +88,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
       }));
     },
   };
-  createWorker({ store, notificationURL: process.env.NOTIFICATION_URL, runID: process.env.TEST_RUN_ID })
+  createWorker({ store, notificationURL: process.env.NOTIFICATION_URL, runID: process.env.TEST_RUN_ID,
+    workerToken: process.env.WORKER_TEST_TOKEN,
+    failFirstProcess: process.env.FAIL_FIRST_PROCESS === "1" })
     .listen(Number(process.env.PORT ?? "8080"), "0.0.0.0");
 }

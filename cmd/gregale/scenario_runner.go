@@ -54,11 +54,25 @@ type testScenario struct {
 }
 
 type testService struct {
-	Source    string            `yaml:"source"`
-	Fixture   string            `yaml:"fixture"`
-	FailFirst int               `yaml:"fail_first"`
-	Postgres  bool              `yaml:"postgres"`
-	Secrets   map[string]string `yaml:"secrets"`
+	Source      string            `yaml:"source"`
+	Fixture     string            `yaml:"fixture"`
+	FailFirst   int               `yaml:"fail_first"`
+	Postgres    bool              `yaml:"postgres"`
+	Secrets     map[string]string `yaml:"secrets"`
+	AsyncRoutes []testAsyncRoute  `yaml:"async_routes"`
+}
+
+type testAsyncRoute struct {
+	Path        string           `yaml:"path"`
+	Methods     []string         `yaml:"methods"`
+	RetryPolicy *testRetryPolicy `yaml:"retry_policy"`
+}
+
+type testRetryPolicy struct {
+	MaxAttempts   int     `yaml:"max_attempts"`
+	BaseSeconds   float64 `yaml:"base_seconds"`
+	MaxSeconds    float64 `yaml:"max_seconds"`
+	JitterSeconds float64 `yaml:"jitter_seconds"`
 }
 
 type testConsumer struct {
@@ -67,9 +81,23 @@ type testConsumer struct {
 }
 
 type testWaitFor struct {
-	QueueIdle  bool                 `yaml:"queue_idle"`
-	Objects    []testObjectOutput   `yaml:"objects"`
-	Deliveries []testDeliveryOutput `yaml:"deliveries"`
+	QueueIdle   bool                   `yaml:"queue_idle"`
+	Invocations []testInvocationOutput `yaml:"invocations"`
+	Objects     []testObjectOutput     `yaml:"objects"`
+	Deliveries  []testDeliveryOutput   `yaml:"deliveries"`
+}
+
+type testInvocationOutput struct {
+	Service     string `yaml:"service"`
+	TriggerKey  string `yaml:"trigger_key"`
+	MinAttempts int    `yaml:"min_attempts"`
+}
+
+type testInvocationEvidence struct {
+	Service  string `json:"service"`
+	ID       string `json:"id"`
+	State    string `json:"state"`
+	Attempts int    `json:"attempts"`
 }
 
 type testDeliveryOutput struct {
@@ -112,6 +140,7 @@ type testBucketRef struct {
 }
 
 var testBucketPrefixPattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,47}$`)
+var testTriggerKeyPattern = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 
 type testWakeEvidence struct {
 	Header   string `json:"header,omitempty"`
@@ -136,10 +165,16 @@ type testRunReceipt struct {
 	Scenario     string                             `json:"scenario"`
 	Profile      string                             `json:"profile"`
 	Engine       string                             `json:"engine"`
+	Attempt      int                                `json:"attempt"`
+	StartedAt    time.Time                          `json:"started_at"`
+	FinishedAt   time.Time                          `json:"finished_at"`
+	DurationMS   int64                              `json:"duration_ms"`
+	Phases       []testPhaseEvidence                `json:"phases,omitempty"`
 	RunID        string                             `json:"run_id,omitempty"`
 	AppSlug      string                             `json:"app_slug,omitempty"`
 	DeploymentID string                             `json:"deployment_id,omitempty"`
 	Services     map[string]string                  `json:"services,omitempty"`
+	AsyncRoutes  map[string][]string                `json:"async_routes,omitempty"`
 	ServiceWake  map[string]testServiceWakeEvidence `json:"service_wake,omitempty"`
 	ServiceHot   map[string]testServiceHotEvidence  `json:"service_hot,omitempty"`
 	Status       string                             `json:"status"`
@@ -148,25 +183,41 @@ type testRunReceipt struct {
 	Buckets      []string                           `json:"buckets,omitempty"`
 	Evidence     *testWakeEvidence                  `json:"evidence,omitempty"`
 	Outputs      []testOutputEvidence               `json:"outputs,omitempty"`
+	Invocations  []testInvocationEvidence           `json:"invocations,omitempty"`
 	Deliveries   []testDeliveryEvidence             `json:"deliveries,omitempty"`
 	QueueIdle    bool                               `json:"queue_idle,omitempty"`
+	Diagnostics  map[string]testWorkloadDiagnostics `json:"diagnostics,omitempty"`
 }
 
 func cmdTest(args []string) int {
 	fs := newFlagSet("test", flag.ContinueOnError)
 	scenarioName := fs.String("scenario", "", "scenario name from the manifest")
+	validateOnly := fs.Bool("validate", false, "validate scenario sources without platform access")
+	preflightOnly := fs.Bool("preflight", false, "check account capacity before provisioning")
 	engine := fs.String("engine", "real-vm", "real-vm or simulated")
 	profile := fs.String("profile", "all", "warm, cold, restored, or all")
+	repeat := fs.Int("repeat", 1, "independent runs per selected profile (1..20)")
+	maxWorkloadMinutes := fs.Int("max-workload-minutes", 0, "maximum estimated VM workload-minutes for this command (0 disables guard)")
 	manifestPath := fs.String("manifest", "gregale-test.yaml", "scenario manifest path")
 	reportPath := fs.String("report", "", "write a JSON report to this path")
+	junitPath := fs.String("junit", "", "write a JUnit XML report to this path")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
 	if rejectUnexpectedFlagArgs(fs) || fs.NArg() != 0 {
-		PrintUsage(osStderr, "usage: gregale test --scenario NAME [--engine real-vm|simulated] [--profile warm|cold|restored|all] [--manifest PATH] [--report PATH]", "test")
+		PrintUsage(osStderr, "usage: gregale test [--validate|--preflight] [--scenario NAME] [--engine real-vm|simulated] [--profile warm|cold|restored|all] [--repeat N] [--max-workload-minutes N] [--manifest PATH] [--report PATH] [--junit PATH]", "test")
 		return 1
 	}
-	if *scenarioName == "" {
+	if *repeat < 1 || *repeat > 20 {
+		return printErr("Invalid repeat count", errors.New("--repeat must be between 1 and 20"))
+	}
+	if *maxWorkloadMinutes < 0 {
+		return printErr("Invalid workload-minute limit", errors.New("--max-workload-minutes must be zero or greater"))
+	}
+	if (*validateOnly && *preflightOnly) || ((*validateOnly || *preflightOnly) && (*reportPath != "" || *junitPath != "")) {
+		return printErr("Invalid test options", errors.New("validation and preflight do not run scenarios or write reports"))
+	}
+	if *scenarioName == "" && !*validateOnly {
 		return printErr("Scenario required", errors.New("pass --scenario NAME"))
 	}
 	var profiles []string
@@ -190,12 +241,37 @@ func cmdTest(args []string) int {
 	if err != nil {
 		return printErr("Invalid scenario manifest", err)
 	}
+	if *validateOnly {
+		return validateTestManifest(scenarios, sourceDir, *scenarioName)
+	}
+	if *preflightOnly {
+		if *engine != "real-vm" {
+			return printErr("Invalid preflight", errors.New("--preflight applies only to real-vm tests"))
+		}
+		if _, err := collectTestValidation(scenarios, sourceDir, *scenarioName); err != nil {
+			return printErr("Invalid scenario source", err)
+		}
+		client, err := authedClient()
+		if err != nil {
+			return printErr("Not logged in", err)
+		}
+		return runTestPreflight(context.Background(), client, *scenarioName, scenarios[*scenarioName], profiles, *repeat)
+	}
 	scenario, ok := scenarios[*scenarioName]
 	if !ok {
 		return printErr("Unknown scenario", fmt.Errorf("%q is not declared in %s", *scenarioName, *manifestPath))
 	}
+	if *engine == "real-vm" && *maxWorkloadMinutes > 0 {
+		estimate := estimateTestWorkloadMinutes(scenario, len(profiles)*(*repeat))
+		if estimate > *maxWorkloadMinutes {
+			return printErr("Test resource guard exceeded", fmt.Errorf("up to %d workload-minutes exceed --max-workload-minutes %d; select fewer profiles or attempts, or raise the limit", estimate, *maxWorkloadMinutes))
+		}
+	}
 	var client *Client
 	if *engine == "real-vm" {
+		if _, err := collectTestValidation(scenarios, sourceDir, *scenarioName); err != nil {
+			return printErr("Invalid scenario source", err)
+		}
 		client, err = authedClient()
 		if err != nil {
 			return printErr("Not logged in", err)
@@ -205,42 +281,57 @@ func cmdTest(args []string) int {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
-	results := make([]testRunReceipt, 0, len(profiles)+1)
+	results := make([]testRunReceipt, 0, (len(profiles)+1)*(*repeat))
 	failed := false
-	if *engine == "simulated" {
-		receipt := runSimulatedTest(ctx, *scenarioName, scenario, sourceDir)
-		results = append(results, receipt)
-		failed = receipt.Status != "passed"
-		if !jsonOutput {
-			_, _ = fmt.Fprintf(osStdout, "%s: %s (simulated)\n", receipt.Scenario, receipt.Status)
-			if receipt.Error != "" {
-				_, _ = fmt.Fprintln(osStderr, receipt.Error)
-			}
-		}
-	}
-	for _, selected := range profiles {
+runLoop:
+	for attempt := 1; attempt <= *repeat; attempt++ {
 		if ctx.Err() != nil {
 			failed = true
 			break
 		}
-		receipt := runTestProfile(ctx, client, *scenarioName, scenario, sourceDir, selected)
-		results = append(results, receipt)
-		if receipt.Status != "passed" {
-			failed = true
-		}
-		if !jsonOutput {
-			_, _ = fmt.Fprintf(osStdout, "%s: %s (%s, app %s)\n", receipt.Scenario, receipt.Status, receipt.Profile, receipt.AppSlug)
-			if receipt.Error != "" {
-				_, _ = fmt.Fprintln(osStderr, receipt.Error)
+		if *engine == "simulated" {
+			receipt := runSimulatedTest(ctx, *scenarioName, scenario, sourceDir)
+			receipt.Attempt = attempt
+			results = append(results, receipt)
+			failed = failed || receipt.Status != "passed"
+			if !jsonOutput {
+				_, _ = fmt.Fprintf(osStdout, "%s: %s (simulated, attempt %d/%d)\n", receipt.Scenario, receipt.Status, attempt, *repeat)
+				if receipt.Error != "" {
+					_, _ = fmt.Fprintln(osStderr, receipt.Error)
+				}
 			}
-			if receipt.CleanupError != "" {
-				_, _ = fmt.Fprintln(osStderr, receipt.CleanupError)
+			continue
+		}
+		for _, selected := range profiles {
+			if ctx.Err() != nil {
+				failed = true
+				break runLoop
+			}
+			receipt := runTestProfile(ctx, client, *scenarioName, scenario, sourceDir, selected)
+			receipt.Attempt = attempt
+			results = append(results, receipt)
+			if receipt.Status != "passed" {
+				failed = true
+			}
+			if !jsonOutput {
+				_, _ = fmt.Fprintf(osStdout, "%s: %s (%s, attempt %d/%d, app %s)\n", receipt.Scenario, receipt.Status, receipt.Profile, attempt, *repeat, receipt.AppSlug)
+				if receipt.Error != "" {
+					_, _ = fmt.Fprintln(osStderr, receipt.Error)
+				}
+				if receipt.CleanupError != "" {
+					_, _ = fmt.Fprintln(osStderr, receipt.CleanupError)
+				}
 			}
 		}
 	}
 	if *reportPath != "" {
 		if err := writeTestReport(*reportPath, results); err != nil {
 			return printErr("Could not save test report", err)
+		}
+	}
+	if *junitPath != "" {
+		if err := writeTestJUnit(*junitPath, results); err != nil {
+			return printErr("Could not save JUnit report", err)
 		}
 	}
 	if jsonOutput {
@@ -322,12 +413,43 @@ func readTestManifest(path string) (map[string]testScenario, string, error) {
 					return nil, "", fmt.Errorf("scenario %q service %q sets reserved fixture secret", name, service)
 				}
 			}
+			if spec.Fixture != "" && len(spec.AsyncRoutes) > 0 {
+				return nil, "", fmt.Errorf("scenario %q service %q cannot add async routes to a built-in fixture", name, service)
+			}
+			seenRoutes := map[string]bool{}
+			for _, route := range spec.AsyncRoutes {
+				if !strings.HasPrefix(route.Path, "/") || len(route.Path) > 2048 || len(route.Methods) == 0 || len(route.Methods) > 4 {
+					return nil, "", fmt.Errorf("scenario %q service %q has an invalid async route", name, service)
+				}
+				for _, method := range route.Methods {
+					if method != http.MethodPost && method != http.MethodPut && method != http.MethodPatch && method != http.MethodDelete {
+						return nil, "", fmt.Errorf("scenario %q service %q async route has unsupported method %q", name, service, method)
+					}
+					key := method + " " + route.Path
+					if seenRoutes[key] {
+						return nil, "", fmt.Errorf("scenario %q service %q has duplicate async route %s", name, service, key)
+					}
+					seenRoutes[key] = true
+				}
+				if route.RetryPolicy != nil {
+					if problem := route.RetryPolicy.dto().Validate(); problem != nil {
+						return nil, "", fmt.Errorf("scenario %q service %q async route retry policy: %s", name, service, problem.Detail)
+					}
+				}
+			}
 		}
 		if len(scenario.Trigger) > 0 && scenario.Trigger[0] == "" {
 			return nil, "", fmt.Errorf("scenario %q has an empty trigger command", name)
 		}
-		if (scenario.WaitFor.QueueIdle || len(scenario.WaitFor.Objects) > 0 || len(scenario.WaitFor.Deliveries) > 0) && len(scenario.Trigger) == 0 {
+		if (scenario.WaitFor.QueueIdle || len(scenario.WaitFor.Invocations) > 0 || len(scenario.WaitFor.Objects) > 0 || len(scenario.WaitFor.Deliveries) > 0) && len(scenario.Trigger) == 0 {
 			return nil, "", fmt.Errorf("scenario %q needs trigger when wait_for is set", name)
+		}
+		seenTriggerKeys := map[string]bool{}
+		for _, invocation := range scenario.WaitFor.Invocations {
+			if _, ok := scenario.Services[invocation.Service]; !ok || !testTriggerKeyPattern.MatchString(invocation.TriggerKey) || seenTriggerKeys[invocation.TriggerKey] || invocation.MinAttempts < 0 {
+				return nil, "", fmt.Errorf("scenario %q has an invalid invocation wait condition", name)
+			}
+			seenTriggerKeys[invocation.TriggerKey] = true
 		}
 		for _, delivery := range scenario.WaitFor.Deliveries {
 			service, ok := scenario.Services[delivery.Service]
@@ -419,14 +541,14 @@ func validateTestSecrets(workload string, secrets map[string]string, scenario te
 		if api.ValidateSecretKey(key) != nil {
 			return fmt.Errorf("workload %q has invalid secret key %q", workload, key)
 		}
-		if _, err := expandTestSecretValue(value, serviceURLs, serviceSlugs, buckets, "0123456789abcdef0123456789abcdef"); err != nil {
+		if _, err := expandTestSecretValue(value, serviceURLs, serviceSlugs, buckets, "0123456789abcdef0123456789abcdef", "example-run-secret"); err != nil {
 			return fmt.Errorf("workload %q secret %q: %w", workload, key, err)
 		}
 	}
 	return nil
 }
 
-func expandTestSecretValue(value string, serviceURLs, serviceSlugs map[string]string, buckets map[string]testBucketRef, runID string) (string, error) {
+func expandTestSecretValue(value string, serviceURLs, serviceSlugs map[string]string, buckets map[string]testBucketRef, runID, runSecret string) (string, error) {
 	var expansionErr error
 	expanded := testSecretReferencePattern.ReplaceAllStringFunc(value, func(match string) string {
 		if expansionErr != nil {
@@ -438,6 +560,8 @@ func expandTestSecretValue(value string, serviceURLs, serviceSlugs map[string]st
 		switch {
 		case len(parts) == 2 && parts[0] == "run" && parts[1] == "id":
 			replacement, ok = runID, true
+		case len(parts) == 2 && parts[0] == "run" && parts[1] == "secret":
+			replacement, ok = runSecret, true
 		case len(parts) == 3 && parts[0] == "service" && parts[2] == "url":
 			replacement, ok = serviceURLs[parts[1]]
 		case len(parts) == 3 && parts[0] == "service" && parts[2] == "slug":
@@ -522,8 +646,14 @@ func provisionTestConsumers(ctx context.Context, client testConsumerClient, appS
 	return env, ids, nil
 }
 
-func runSimulatedTest(parent context.Context, name string, scenario testScenario, manifestDir string) testRunReceipt {
-	receipt := testRunReceipt{Scenario: name, Profile: "simulated", Engine: "simulated", Status: "failed"}
+func runSimulatedTest(parent context.Context, name string, scenario testScenario, manifestDir string) (receipt testRunReceipt) {
+	receipt = testRunReceipt{Scenario: name, Profile: "simulated", Engine: "simulated", Status: "failed", StartedAt: time.Now().UTC()}
+	phases := newTestPhaseRecorder("simulation")
+	defer func() {
+		receipt.Phases = phases.finish(receipt.Status)
+		receipt.FinishedAt = time.Now().UTC()
+		receipt.DurationMS = receipt.FinishedAt.Sub(receipt.StartedAt).Milliseconds()
+	}()
 	if len(scenario.Simulation) == 0 || scenario.Simulation[0] == "" {
 		receipt.Error = "scenario has no simulation command"
 		return receipt
@@ -553,13 +683,32 @@ func runSimulatedTest(parent context.Context, name string, scenario testScenario
 }
 
 func runTestProfile(parent context.Context, client *Client, name string, scenario testScenario, manifestDir, profile string) (receipt testRunReceipt) {
-	receipt = testRunReceipt{Scenario: name, Profile: profile, Engine: "real-vm", Status: "failed", Evidence: &testWakeEvidence{}}
+	receipt = testRunReceipt{Scenario: name, Profile: profile, Engine: "real-vm", Status: "failed", Evidence: &testWakeEvidence{}, StartedAt: time.Now().UTC()}
+	phases := newTestPhaseRecorder("provision")
+	advancePhase := func(name string) {
+		status := "passed"
+		if receipt.Error != "" {
+			status = "failed"
+		}
+		phases.advance(name, status)
+	}
+	defer func() {
+		receipt.Phases = phases.finish(receipt.Status)
+		receipt.FinishedAt = time.Now().UTC()
+		receipt.DurationMS = receipt.FinishedAt.Sub(receipt.StartedAt).Milliseconds()
+	}()
 	random := make([]byte, 16)
 	if _, err := rand.Read(random); err != nil {
 		receipt.Error = fmt.Sprintf("create test run identity: %v", err)
 		return
 	}
 	receipt.RunID = hex.EncodeToString(random)
+	runSecretBytes := make([]byte, 32)
+	if _, err := rand.Read(runSecretBytes); err != nil {
+		receipt.Error = fmt.Sprintf("create test run secret: %v", err)
+		return
+	}
+	runSecret := hex.EncodeToString(runSecretBytes)
 	timeout := 15 * time.Minute
 	if scenario.Timeout != "" {
 		timeout, _ = time.ParseDuration(scenario.Timeout)
@@ -608,6 +757,18 @@ func runTestProfile(parent context.Context, client *Client, name string, scenari
 				receipt.addCleanupError(fmt.Sprintf("release test service namespace: %v", err))
 			}
 		}
+	}()
+	defer func() {
+		if receipt.Error == "" && receipt.CleanupError == "" {
+			return
+		}
+		diagnosticCtx, diagnosticCancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+		defer diagnosticCancel()
+		slugs := make(map[string]string, len(workloads))
+		for _, workload := range workloads {
+			slugs[workload.name] = workload.session.App.Slug
+		}
+		receipt.Diagnostics = collectTestDiagnostics(diagnosticCtx, client, slugs)
 	}()
 	serviceNames := make([]string, 0, len(scenario.Services))
 	for name := range scenario.Services {
@@ -719,6 +880,7 @@ func runTestProfile(parent context.Context, client *Client, name string, scenari
 	}
 	serviceURLs := make(map[string]string, len(workloads))
 	serviceSlugs := make(map[string]string, len(workloads))
+	serviceAppIDs := make(map[string]string, len(workloads))
 	for _, workload := range workloads {
 		appURL := canonicalAppURL(workload.session.App)
 		parsed, parseErr := url.Parse(appURL)
@@ -728,6 +890,7 @@ func runTestProfile(parent context.Context, client *Client, name string, scenari
 		}
 		serviceURLs[workload.name] = appURL
 		serviceSlugs[workload.name] = workload.session.App.Slug
+		serviceAppIDs[workload.name] = workload.session.App.ID
 	}
 	for _, workload := range workloads {
 		secrets := scenario.Secrets
@@ -750,7 +913,7 @@ func runTestProfile(parent context.Context, client *Client, name string, scenari
 		}
 		sort.Strings(keys)
 		for _, key := range keys {
-			value, err := expandTestSecretValue(secrets[key], serviceURLs, serviceSlugs, bucketByName, receipt.RunID)
+			value, err := expandTestSecretValue(secrets[key], serviceURLs, serviceSlugs, bucketByName, receipt.RunID, runSecret)
 			if err != nil {
 				receipt.Error = fmt.Sprintf("resolve secret %s for %s: %v", key, workload.name, err)
 				return
@@ -769,6 +932,7 @@ func runTestProfile(parent context.Context, client *Client, name string, scenari
 	}
 	// The nested deploy command has its own progress output. Keep --json's
 	// stdout as one machine-readable test receipt.
+	advancePhase("deploy")
 	previousStdout := osStdout
 	if jsonOutput {
 		osStdout = osStderr
@@ -793,6 +957,22 @@ func runTestProfile(parent context.Context, client *Client, name string, scenari
 		}
 	}
 	osStdout = previousStdout
+	advancePhase("async_routes")
+	for _, workload := range workloads[1:] {
+		routes := scenario.Services[workload.name].AsyncRoutes
+		if len(routes) == 0 {
+			continue
+		}
+		created, err := createTestAsyncRoutes(ctx, client, workload.session.App.Slug, canonicalAppURL(workload.session.App), routes)
+		if err != nil {
+			receipt.Error = fmt.Sprintf("configure async routes for %s: %v", workload.name, err)
+			return
+		}
+		if receipt.AsyncRoutes == nil {
+			receipt.AsyncRoutes = make(map[string][]string)
+		}
+		receipt.AsyncRoutes[workload.name] = created
+	}
 	target, err := url.Parse(canonicalAppURL(session.App))
 	if err != nil || target.Scheme == "" || target.Host == "" {
 		receipt.Error = "test environment returned an invalid app URL"
@@ -826,6 +1006,7 @@ func runTestProfile(parent context.Context, client *Client, name string, scenari
 			}
 		}
 	}()
+	advancePhase("prepare_profile")
 	for _, command := range scenario.Setup {
 		if err := runTestCommand(ctx, sourceDir, env, command); err != nil {
 			receipt.Error = fmt.Sprintf("fixture setup: %v", err)
@@ -876,11 +1057,42 @@ func runTestProfile(parent context.Context, client *Client, name string, scenari
 		}
 	}
 	recorder.reset()
+	advancePhase("trigger")
 	if len(scenario.Trigger) > 0 {
+		triggerOutputPath := ""
+		if len(scenario.WaitFor.Invocations) > 0 {
+			output, err := os.CreateTemp("", "gregale-test-trigger-*.json")
+			if err != nil {
+				receipt.Error = fmt.Sprintf("create trigger output: %v", err)
+				return
+			}
+			triggerOutputPath = output.Name()
+			_ = output.Close()
+			defer func() { _ = os.Remove(triggerOutputPath) }()
+			env = append(env, "GREGALE_TEST_TRIGGER_OUTPUT="+triggerOutputPath)
+		}
 		if err := runTestCommand(ctx, sourceDir, env, scenario.Trigger); err != nil {
 			receipt.Error = fmt.Sprintf("application trigger command: %v", err)
 			receipt.captureWakeEvidence(recorder)
 			return
+		}
+		advancePhase("completion")
+		if triggerOutputPath != "" {
+			triggerValues, err := readTestTriggerOutput(triggerOutputPath)
+			if err != nil {
+				receipt.Error = fmt.Sprintf("read application trigger output: %v", err)
+				receipt.captureWakeEvidence(recorder)
+				return
+			}
+			for _, condition := range scenario.WaitFor.Invocations {
+				evidence, err := waitForTestInvocation(ctx, client, condition, serviceAppIDs[condition.Service], triggerValues[condition.TriggerKey])
+				receipt.Invocations = append(receipt.Invocations, evidence)
+				if err != nil {
+					receipt.Error = fmt.Sprintf("wait for invocation from %s: %v", condition.Service, err)
+					receipt.captureWakeEvidence(recorder)
+					return
+				}
+			}
 		}
 		slugs := make([]string, 0, len(workloads))
 		for _, workload := range workloads {
@@ -907,10 +1119,12 @@ func runTestProfile(parent context.Context, client *Client, name string, scenari
 			}
 		}
 	}
+	advancePhase("assertions")
 	if err := runTestCommand(ctx, sourceDir, env, scenario.Command); err != nil {
 		receipt.Error = fmt.Sprintf("application assertion command: %v", err)
 	}
 	receipt.captureWakeEvidence(recorder)
+	advancePhase("lifecycle_evidence")
 	if err := verifyTestProfile(ctx, client, session.App.Slug, profile, receipt.Evidence); err != nil {
 		if receipt.Error != "" {
 			receipt.Error += "; "
@@ -950,6 +1164,7 @@ func runTestProfile(parent context.Context, client *Client, name string, scenari
 	if receipt.Error == "" {
 		receipt.Status = "passed"
 	}
+	advancePhase("cleanup")
 	return
 }
 
