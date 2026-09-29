@@ -3729,6 +3729,9 @@ func (m *MemStore) ApplyProjectReconcile(
 				tombstone.WorkloadClass = app.WorkloadClass
 				tombstone.StartCommand = app.StartCommand
 				tombstone.Manifest = mergeProjectManagedManifest(tombstone.Manifest, app.Manifest)
+				if mutation.SetPlatformTenantRequired {
+					tombstone.PlatformTenantRequired = app.PlatformTenantRequired
+				}
 				tombstone.Status = AppActive
 				tombstone.DeletedAt = nil
 				tombstone.DeleteGraceUntil = nil
@@ -3767,6 +3770,9 @@ func (m *MemStore) ApplyProjectReconcile(
 			app.WorkloadClass = mutation.App.WorkloadClass
 			app.StartCommand = mutation.App.StartCommand
 			app.Manifest = mutation.App.Manifest
+			if mutation.SetPlatformTenantRequired {
+				app.PlatformTenantRequired = mutation.App.PlatformTenantRequired
+			}
 			m.apps[app.ID] = app
 			out.Changed = append(out.Changed, app)
 		case "remove":
@@ -5823,6 +5829,9 @@ func (m *MemStore) updateAppWithActivity(_ context.Context, id string, p UpdateA
 	}
 	if p.SetConsumerAuthMode && p.ConsumerAuthMode != nil {
 		a.ConsumerAuthMode = ConsumerAuthMode(*p.ConsumerAuthMode)
+	}
+	if p.SetPlatformTenantRequired {
+		a.PlatformTenantRequired = boolOrFalse(p.PlatformTenantRequired)
 	}
 	if p.SetVisibility && p.Visibility != nil {
 		a.Visibility = api.NormalizeAppVisibility(*p.Visibility)
@@ -12196,6 +12205,9 @@ func (m *MemStore) EnqueueInvocation(_ context.Context, inv Invocation) (Invocat
 	if _, ok := m.apps[inv.AppID]; !ok {
 		return Invocation{}, fmt.Errorf("state: invocation for unknown app %q", inv.AppID)
 	}
+	if err := m.platformTenantInvocationAllowedLocked(inv); err != nil {
+		return Invocation{}, err
+	}
 	if inv.ID == "" {
 		inv.ID = newID()
 	}
@@ -12345,6 +12357,9 @@ func (m *MemStore) ClaimInvocation(_ context.Context, id, instanceID string, lea
 	}
 	if inv.WorkPolicyName != "" {
 		return Invocation{}, ErrConflict
+	}
+	if err := m.platformTenantInvocationAllowedLocked(inv); err != nil {
+		return Invocation{}, ErrNotFound
 	}
 	now := time.Now()
 	exp := now.Add(time.Duration(leaseSeconds) * time.Second)
@@ -24552,6 +24567,9 @@ func (m *MemStore) ClaimInvocationWithCap(_ context.Context, id, instanceID stri
 	defer m.mu.Unlock()
 	inv, ok := m.invocations[id]
 	if !ok {
+		return Invocation{}, ErrNotFound
+	}
+	if err := m.platformTenantInvocationAllowedLocked(inv); err != nil {
 		return Invocation{}, ErrNotFound
 	}
 	row, ok := m.accountAsyncQuota[inv.AccountID]
