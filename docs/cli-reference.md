@@ -788,7 +788,7 @@ gregale github bind my-api --repo acme/my-api --branch main
 
 Bind GitHub, configure previews, and write an Actions workflow
 
-`gregale github setup <slug> [--repo <OWNER/NAME>] [--production-branch <BRANCH>] [--deploy-branches <MAPPINGS>] [--pinned-sha <SHA>] [--pin-action] [--workflow <PATH>] [--preview] [--no-preview] [--preview-ttl-hours <HOURS>] [--preview-service-policy <POLICY>] [--root-dir <DIR>] [--ignore <PATHS>] [--rollout <MODE>] [--dry-run] [--force]`
+`gregale github setup <slug> [--repo <OWNER/NAME>] [--production-branch <BRANCH>] [--deploy-branches <MAPPINGS>] [--pinned-sha <SHA>] [--pin-action] [--enable-action-updates] [--workflow <PATH>] [--preview] [--no-preview] [--preview-ttl-hours <HOURS>] [--preview-service-policy <POLICY>] [--root-dir <DIR>] [--ignore <PATHS>] [--rollout <MODE>] [--dry-run] [--force]`
 
 | Flag | Meaning | |
 |---|---|---|
@@ -797,6 +797,7 @@ Bind GitHub, configure previews, and write an Actions workflow
 | `--deploy-branches <MAPPINGS>` | comma-separated branch=environment mappings (default or registered environment) |  |
 | `--pinned-sha <SHA>` | pin the generated deploy Action to this full 40-character commit SHA (default: moving v0 tag) |  |
 | `--pin-action` | resolve the current v0 deploy Action tag to its commit SHA |  |
+| `--enable-action-updates` | add a weekly GitHub Actions Dependabot updater |  |
 | `--workflow <PATH>` | workflow path relative to repository root |  |
 | `--preview` | enable pull-request previews |  |
 | `--no-preview` | disable pull-request previews |  |
@@ -805,7 +806,7 @@ Bind GitHub, configure previews, and write an Actions workflow
 | `--root-dir <DIR>` | repository-relative source root for the root workload |  |
 | `--ignore <PATHS>` | comma-separated ignored change paths |  |
 | `--rollout <MODE>` | production rollout mode: standard\|safe (safe requires Pro/Scale) | one of `standard` · `safe` |
-| `--dry-run` | show the workflow without writing or changing remote state |  |
+| `--dry-run` | show generated files without writing or changing remote state |  |
 | `--force` | overwrite an existing workflow file |  |
 
 Examples:
