@@ -32,6 +32,17 @@ const (
 // below are at or below this value. See ADR-257.
 const MaxOutboundRequestsPerDay int64 = 100_000_000
 
+// Operator-only managed realtime resume preview safety bounds. These are not
+// plan entitlements or a billing allowance; product limits are decided before
+// the preview is promoted.
+const (
+	RealtimeResumeSubscriptionsPerNode       = 256
+	RealtimeResumeSubscriptionsPerConnection = 8
+	RealtimeResumeClientFrameMaxBytes        = 4096
+	RealtimeResumeServerFrameMaxBytes        = 8 << 10
+	RealtimeResumeBearerTokenMaxBytes        = 3072
+)
+
 // Operator-configurable object-storage preview safeguards, not plan allowances
 // or billable storage entitlements. Metering/pricing need a separate decision.
 const (
