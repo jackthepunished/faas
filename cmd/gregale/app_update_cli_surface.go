@@ -37,6 +37,7 @@ var updateAppRequestCLISurfaces = map[string]updateAppCLISurface{
 	"request_rate_limit_burst":        {KnownGap: "no customer CLI setter; API-only today"},
 	"retry_policy":                    {Path: "gregale.yaml retry_policy"},
 	"service_replicas":                {Path: "gregale.yaml lifecycle.service_replicas"},
+	"before_checkpoint":               {Path: "gregale.yaml lifecycle.before_checkpoint"},
 	"worker_replicas":                 {Path: "gregale workers scale"},
 	"ports":                           {KnownGap: "no existing-app CLI setter; API-only today"},
 	"favicon":                         {KnownGap: "no customer CLI setter; API-only today"},
