@@ -21,7 +21,57 @@ import (
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/jobresult"
 )
+
+// recordJobTaskAttemptLocked keeps the same first-terminal-result semantics
+// as the PostgreSQL journal trigger. The caller holds m.mu.
+func (m *MemStore) recordJobTaskAttemptLocked(task JobTask) {
+	if task.FinishedAt == nil || task.Attempt < 1 {
+		return
+	}
+	switch task.Status {
+	case "succeeded", "failed", "timeout", "cancelled", "oom":
+	default:
+		return
+	}
+	if m.jobTaskAttempts[task.RunID] == nil {
+		m.jobTaskAttempts[task.RunID] = make(map[int]map[int]JobTaskAttempt)
+	}
+	if m.jobTaskAttempts[task.RunID][task.TaskIndex] == nil {
+		m.jobTaskAttempts[task.RunID][task.TaskIndex] = make(map[int]JobTaskAttempt)
+	}
+	if _, exists := m.jobTaskAttempts[task.RunID][task.TaskIndex][task.Attempt]; exists {
+		return
+	}
+	m.jobTaskAttempts[task.RunID][task.TaskIndex][task.Attempt] = JobTaskAttempt{
+		RunID: task.RunID, TaskIndex: task.TaskIndex, Attempt: task.Attempt,
+		InputID: task.InputID, InputRef: task.InputRef, Status: task.Status,
+		InstanceID: task.InstanceID, ErrorClass: task.ErrorClass,
+		ErrorMessage: task.ErrorMessage, ExitCode: task.ExitCode,
+		StartedAt: task.StartedAt, FinishedAt: *task.FinishedAt,
+		LogContent: task.LogContent, LogTruncated: task.LogTruncated,
+		OutputManifest: append(json.RawMessage(nil), task.OutputManifest...),
+	}
+}
+
+func (m *MemStore) JobTaskAttemptList(_ context.Context, runID string, taskIndex, limit, offset int) ([]JobTaskAttempt, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var attempts []JobTaskAttempt
+	for _, attempt := range m.jobTaskAttempts[runID][taskIndex] {
+		attempts = append(attempts, attempt)
+	}
+	sort.Slice(attempts, func(i, j int) bool { return attempts[i].Attempt < attempts[j].Attempt })
+	if offset >= len(attempts) || limit <= 0 || offset < 0 {
+		return nil, nil
+	}
+	attempts = attempts[offset:]
+	if limit < len(attempts) {
+		attempts = attempts[:limit]
+	}
+	return attempts, nil
+}
 
 // --- jobs (template) ------------------------------------------------
 
@@ -432,6 +482,9 @@ func (m *MemStore) JobSetImageMaterialization(_ context.Context, id, sourceRef, 
 	}
 	j.UpdatedAt = time.Now().UTC()
 	m.jobs[id] = j
+	if status == "ready" {
+		m.bindJobRunImageLocked(j)
+	}
 	if status == "failed" {
 		m.settleJobImageFailureLocked(id, failure)
 	}
@@ -468,7 +521,19 @@ func (m *MemStore) JobPublishImageMaterialization(_ context.Context, id, sourceR
 	j.UpdatedAt = now
 	delete(m.jobMaterializationClaims, id)
 	m.jobs[id] = j
+	m.bindJobRunImageLocked(j)
 	return j, nil
+}
+
+func (m *MemStore) bindJobRunImageLocked(job Job) {
+	for id, run := range m.jobRuns {
+		if run.JobID != job.ID || run.ImageRefSnapshot != job.ImageRef || run.ImageStorageKeySnapshot != "" {
+			continue
+		}
+		run.ImageResolvedDigestSnapshot = job.ImageResolvedDigest
+		run.ImageStorageKeySnapshot = job.ImageStorageKey
+		m.jobRuns[id] = run
+	}
 }
 
 // JobRecordImageMaterializationFailure mirrors the durable retry transition.
@@ -533,6 +598,7 @@ func (m *MemStore) settleJobImageFailureLocked(jobID, reason string) {
 			task.ErrorMessage = &reason
 			task.FinishedAt = &now
 			task.NextAttemptAt = nil
+			m.recordJobTaskAttemptLocked(task)
 			tasks[index] = task
 			changed = true
 		}
@@ -632,6 +698,22 @@ func (m *MemStore) jobConcurrentByAccountLocked(accountID string) int {
 	return count
 }
 
+func runHasPermanentFailure(run JobRun, tasks map[int]JobTask, job Job) bool {
+	if run.FailurePolicy != "fail_fast" {
+		return false
+	}
+	retryMax := job.RetryMax
+	if run.RetryMax != nil {
+		retryMax = *run.RetryMax
+	}
+	for _, task := range tasks {
+		if (task.Status == "failed" || task.Status == "timeout" || task.Status == "oom") && task.Attempt > retryMax {
+			return true
+		}
+	}
+	return false
+}
+
 // --- job_runs --------------------------------------------------------
 
 // JobRunCreate inserts a job_runs row + fans out `tasks` rows in
@@ -640,7 +722,7 @@ func (m *MemStore) jobConcurrentByAccountLocked(accountID string) int {
 //
 // Returns the run row + the fanned-out task slice (task_index 0..N-1,
 // all status='queued').
-func (m *MemStore) JobRunCreate(_ context.Context, jobID, accountID, triggerKind string, parallelism, retryMaxOverride, taskTimeoutOverride *int, envOverrides json.RawMessage, tasks int) (JobRun, []JobTask, error) {
+func (m *MemStore) JobRunCreate(_ context.Context, jobID, accountID, triggerKind string, parallelism, retryMaxOverride, taskTimeoutOverride *int, envOverrides json.RawMessage, tasks int, options ...JobRunOptions) (JobRun, []JobTask, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	job, ok := m.jobs[jobID]
@@ -654,18 +736,83 @@ func (m *MemStore) JobRunCreate(_ context.Context, jobID, accountID, triggerKind
 		envOverrides = json.RawMessage("{}")
 	}
 	now := time.Now().UTC()
+	var inputs []JobInput
+	if len(options) > 0 {
+		inputs = options[0].Inputs
+	}
+	if len(inputs) > 0 && len(inputs) != tasks {
+		return JobRun{}, nil, fmt.Errorf("state: input count %d must equal tasks %d", len(inputs), tasks)
+	}
+	manifestVersion, inputDigest := jobInputDigest(inputs)
+	inputManifestURI, inputManifestSHA256 := "", ""
+	if len(options) > 0 {
+		inputManifestURI, inputManifestSHA256 = options[0].InputManifestURI, options[0].InputManifestSHA256
+	}
+	executionClass := "standard"
+	failurePolicy := "continue"
+	var eligibleAt, latestStartAt *time.Time
+	if len(options) > 0 {
+		if options[0].ExecutionClass != "" {
+			executionClass = options[0].ExecutionClass
+		}
+		if options[0].FailurePolicy != "" {
+			failurePolicy = options[0].FailurePolicy
+		}
+		eligibleAt, latestStartAt = options[0].EligibleAt, options[0].LatestStartAt
+	}
+	if (executionClass == "standard" && (eligibleAt != nil || latestStartAt != nil)) ||
+		(executionClass == "flexible" && (eligibleAt == nil || latestStartAt == nil || !latestStartAt.After(*eligibleAt))) ||
+		(executionClass != "standard" && executionClass != "flexible") {
+		return JobRun{}, nil, fmt.Errorf("state: invalid job execution window")
+	}
+	if failurePolicy != "continue" && failurePolicy != "fail_fast" {
+		return JobRun{}, nil, fmt.Errorf("state: invalid job failure policy")
+	}
+	if eligibleAt != nil {
+		value := eligibleAt.UTC()
+		eligibleAt = &value
+	}
+	if latestStartAt != nil {
+		value := latestStartAt.UTC()
+		latestStartAt = &value
+	}
+	command := append([]string{}, job.Command...)
+	if len(options) > 0 && options[0].CommandArgs != nil {
+		command = append(append([]string{}, job.Command[:min(1, len(job.Command))]...), (*options[0].CommandArgs)...)
+	}
+	retryMax := derefInt(retryMaxOverride, job.RetryMax)
+	timeout := derefInt(taskTimeoutOverride, job.TaskTimeoutS)
+	effectiveEnv, err := jobEffectiveEnv(job.EnvOverrides, envOverrides)
+	if err != nil {
+		return JobRun{}, nil, err
+	}
+	ramMB := job.RAMMB
 	run := JobRun{
-		ID:              newUUIDString(),
-		JobID:           jobID,
-		AccountID:       accountID,
-		TriggerKind:     triggerKind,
-		EnvOverrides:    envOverrides,
-		Tasks:           tasks,
-		Parallelism:     derefInt(parallelism, job.MaxParallelism),
-		RetryMax:        retryMaxOverride,
-		TaskTimeoutS:    taskTimeoutOverride,
-		AggregateStatus: "queued",
-		CreatedAt:       now,
+		ID:                          newUUIDString(),
+		JobID:                       jobID,
+		AccountID:                   accountID,
+		TriggerKind:                 triggerKind,
+		EnvOverrides:                envOverrides,
+		Tasks:                       tasks,
+		InputManifestVersion:        manifestVersion,
+		InputDigest:                 inputDigest,
+		InputManifestURI:            inputManifestURI,
+		InputManifestSHA256:         inputManifestSHA256,
+		Parallelism:                 derefInt(parallelism, job.MaxParallelism),
+		ExecutionClass:              executionClass,
+		FailurePolicy:               failurePolicy,
+		EligibleAt:                  eligibleAt,
+		LatestStartAt:               latestStartAt,
+		RetryMax:                    &retryMax,
+		TaskTimeoutS:                &timeout,
+		Command:                     command,
+		ImageRefSnapshot:            job.ImageRef,
+		ImageResolvedDigestSnapshot: job.ImageResolvedDigest,
+		ImageStorageKeySnapshot:     job.ImageStorageKey,
+		RAMMBSnapshot:               &ramMB,
+		EffectiveEnvSnapshot:        effectiveEnv,
+		AggregateStatus:             "queued",
+		CreatedAt:                   now,
 	}
 	m.jobRuns[run.ID] = run
 
@@ -680,11 +827,97 @@ func (m *MemStore) JobRunCreate(_ context.Context, jobID, accountID, triggerKind
 			Attempt:   1,
 			CreatedAt: now,
 		}
+		if len(inputs) > 0 {
+			t.InputID = inputs[i].ID
+			t.InputRef = inputs[i].Ref
+		}
 		fanned = append(fanned, t)
 		taskMap[i] = t
 	}
 	m.jobTasks[run.ID] = taskMap
 
+	return run, fanned, nil
+}
+
+func (m *MemStore) JobRunReplayFailed(_ context.Context, sourceRunID, accountID string) (JobRun, []JobTask, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	source, ok := m.jobRuns[sourceRunID]
+	if !ok || source.AccountID != accountID {
+		return JobRun{}, nil, ErrNotFound
+	}
+	if source.FinishedAt == nil {
+		return JobRun{}, nil, ErrConflict
+	}
+	job, ok := m.jobs[source.JobID]
+	if !ok || job.Status != "active" {
+		return JobRun{}, nil, ErrNotFound
+	}
+	if job.ImageMaterializationStatus != "ready" || job.ImageStorageKey == "" ||
+		source.ImageRefSnapshot == "" || source.ImageResolvedDigestSnapshot == "" ||
+		source.ImageRefSnapshot != job.ImageRef ||
+		source.ImageResolvedDigestSnapshot != job.ImageResolvedDigest {
+		return JobRun{}, nil, ErrConflict
+	}
+	var failed []JobTask
+	for _, task := range m.jobTasks[sourceRunID] {
+		switch task.Status {
+		case "failed", "timeout", "oom", "cancelled":
+			failed = append(failed, task)
+		case "queued", "claimed":
+			return JobRun{}, nil, ErrConflict
+		}
+	}
+	if len(failed) == 0 {
+		return JobRun{}, nil, ErrConflict
+	}
+	sort.Slice(failed, func(i, j int) bool { return failed[i].TaskIndex < failed[j].TaskIndex })
+	now := time.Now().UTC()
+	linked := sourceRunID
+	run := JobRun{
+		ID: newUUIDString(), JobID: source.JobID, AccountID: accountID,
+		TriggerKind: "manual", EnvOverrides: append(json.RawMessage(nil), source.EnvOverrides...),
+		Tasks: len(failed), Parallelism: source.Parallelism,
+		ExecutionClass: "standard", FailurePolicy: source.FailurePolicy,
+		RetryMax: source.RetryMax, TaskTimeoutS: source.TaskTimeoutS,
+		Command:          append([]string(nil), source.Command...),
+		ImageRefSnapshot: job.ImageRef, ImageResolvedDigestSnapshot: job.ImageResolvedDigest,
+		ImageStorageKeySnapshot: job.ImageStorageKey, RAMMBSnapshot: source.RAMMBSnapshot,
+		EffectiveEnvSnapshot: append(json.RawMessage(nil), source.EffectiveEnvSnapshot...),
+		SourceRunID:          &linked, AggregateStatus: "queued", CreatedAt: now,
+	}
+	if run.Command == nil {
+		run.Command = append([]string{}, job.Command...)
+	}
+	if run.RAMMBSnapshot == nil {
+		value := job.RAMMB
+		run.RAMMBSnapshot = &value
+	}
+	if len(run.EffectiveEnvSnapshot) == 0 {
+		var err error
+		run.EffectiveEnvSnapshot, err = jobEffectiveEnv(job.EnvOverrides, run.EnvOverrides)
+		if err != nil {
+			return JobRun{}, nil, err
+		}
+	}
+	inputs := make([]JobInput, len(failed))
+	for i, task := range failed {
+		inputs[i] = JobInput{ID: task.InputID, Ref: task.InputRef}
+	}
+	if source.InputManifestVersion > 0 {
+		run.InputManifestVersion, run.InputDigest = jobInputDigest(inputs)
+	}
+	fanned := make([]JobTask, 0, len(failed))
+	tasks := make(map[int]JobTask, len(failed))
+	for i, task := range failed {
+		origin := task.TaskIndex
+		created := JobTask{RunID: run.ID, TaskIndex: i, SourceTaskIndex: &origin,
+			InputID: task.InputID, InputRef: task.InputRef, Status: "queued", Attempt: 1, CreatedAt: now}
+		fanned = append(fanned, created)
+		tasks[i] = created
+	}
+	m.jobRuns[run.ID] = run
+	m.jobTasks[run.ID] = tasks
 	return run, fanned, nil
 }
 
@@ -711,16 +944,31 @@ func (m *MemStore) JobRunCreateScheduled(_ context.Context, jobID, schedule, tim
 	if len(envOverrides) == 0 {
 		envOverrides = json.RawMessage("{}")
 	}
+	effectiveEnv, err := jobEffectiveEnv(job.EnvOverrides, envOverrides)
+	if err != nil {
+		return JobRun{}, false, err
+	}
+	ramMB := job.RAMMB
 	run := JobRun{
-		ID:              newUUIDString(),
-		JobID:           jobID,
-		AccountID:       job.AccountID,
-		TriggerKind:     "scheduled",
-		EnvOverrides:    envOverrides,
-		Tasks:           1,
-		Parallelism:     job.MaxParallelism,
-		AggregateStatus: "queued",
-		CreatedAt:       firedAt,
+		ID:                          newUUIDString(),
+		JobID:                       jobID,
+		AccountID:                   job.AccountID,
+		TriggerKind:                 "scheduled",
+		EnvOverrides:                envOverrides,
+		Tasks:                       1,
+		Parallelism:                 job.MaxParallelism,
+		ExecutionClass:              "standard",
+		FailurePolicy:               "continue",
+		RetryMax:                    &job.RetryMax,
+		TaskTimeoutS:                &job.TaskTimeoutS,
+		Command:                     append([]string{}, job.Command...),
+		ImageRefSnapshot:            job.ImageRef,
+		ImageResolvedDigestSnapshot: job.ImageResolvedDigest,
+		ImageStorageKeySnapshot:     job.ImageStorageKey,
+		RAMMBSnapshot:               &ramMB,
+		EffectiveEnvSnapshot:        effectiveEnv,
+		AggregateStatus:             "queued",
+		CreatedAt:                   firedAt,
 	}
 	m.jobRuns[run.ID] = run
 	task := JobTask{RunID: run.ID, TaskIndex: 0, Status: "queued", Attempt: 1, CreatedAt: firedAt}
@@ -882,6 +1130,21 @@ func (m *MemStore) JobRunRecompute(_ context.Context, runID string) (JobRun, err
 		// No tasks — degenerate case (shouldn't happen post-create).
 		return run, nil
 	}
+	if job, ok := m.jobs[run.JobID]; ok && runHasPermanentFailure(run, tasks, job) {
+		for index, task := range tasks {
+			if task.Status != "queued" {
+				continue
+			}
+			task.Status = "cancelled"
+			class, message := "cancelled", "fail_fast after permanent task failure"
+			task.ErrorClass, task.ErrorMessage = &class, &message
+			finished := time.Now().UTC()
+			task.FinishedAt = &finished
+			m.recordJobTaskAttemptLocked(task)
+			tasks[index] = task
+		}
+		m.jobTasks[runID] = tasks
+	}
 	run = recomputeJobRun(run, tasks, time.Now().UTC())
 	m.jobRuns[runID] = run
 	return run, nil
@@ -912,6 +1175,7 @@ func (m *MemStore) JobRunCancel(_ context.Context, runID string) (JobRun, error)
 			if t.FinishedAt == nil {
 				t.FinishedAt = &now
 			}
+			m.recordJobTaskAttemptLocked(t)
 			tasks[i] = t
 		}
 	}
@@ -984,7 +1248,13 @@ func (m *MemStore) JobTaskClaimBatch(_ context.Context, limit int) ([]JobTask, e
 			if !runOK || !jobOK || job.ImageMaterializationStatus != "ready" || job.ImageStorageKey == "" {
 				continue
 			}
+			if runHasPermanentFailure(run, tasks, job) {
+				continue
+			}
 			if t.Status != "queued" {
+				continue
+			}
+			if run.ExecutionClass == "flexible" && (run.EligibleAt == nil || run.LatestStartAt == nil || now.Before(*run.EligibleAt) || !now.Before(*run.LatestStartAt)) {
 				continue
 			}
 			// Backoff gate: skip tasks whose next_attempt_at is in the future.
@@ -995,6 +1265,11 @@ func (m *MemStore) JobTaskClaimBatch(_ context.Context, limit int) ([]JobTask, e
 		}
 	}
 	sort.Slice(matched, func(i, k int) bool {
+		left := m.jobRuns[matched[i].RunID]
+		right := m.jobRuns[matched[k].RunID]
+		if left.ExecutionClass != right.ExecutionClass {
+			return left.ExecutionClass == "standard"
+		}
 		if matched[i].CreatedAt.Equal(matched[k].CreatedAt) {
 			return matched[i].TaskIndex < matched[k].TaskIndex
 		}
@@ -1004,6 +1279,45 @@ func (m *MemStore) JobTaskClaimBatch(_ context.Context, limit int) ([]JobTask, e
 		matched = matched[:limit]
 	}
 	return matched, nil
+}
+
+func (m *MemStore) JobTaskExpireUnstarted(_ context.Context, now time.Time) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var runIDs []string
+	expired := 0
+	for runID, tasks := range m.jobTasks {
+		if expired >= 1000 {
+			break
+		}
+		run, ok := m.jobRuns[runID]
+		if !ok || run.ExecutionClass != "flexible" || run.LatestStartAt == nil || now.Before(*run.LatestStartAt) {
+			continue
+		}
+		changed := false
+		for index, task := range tasks {
+			if expired >= 1000 {
+				break
+			}
+			if task.Status != "queued" {
+				continue
+			}
+			task.Status = "cancelled"
+			class, message := "cancelled", "flexible start window expired before admission"
+			task.ErrorClass, task.ErrorMessage = &class, &message
+			finished := now.UTC()
+			task.FinishedAt = &finished
+			m.recordJobTaskAttemptLocked(task)
+			tasks[index] = task
+			expired++
+			changed = true
+		}
+		if changed {
+			m.jobTasks[runID] = tasks
+			runIDs = append(runIDs, runID)
+		}
+	}
+	return runIDs, nil
 }
 
 // JobTaskMarkClaimed transitions a single task from queued to
@@ -1051,12 +1365,19 @@ func (m *MemStore) CreateAndClaimJobInstance(_ context.Context, instanceID, jobI
 	if !ok || run.JobID != jobID || run.AccountID != job.AccountID {
 		return Instance{}, ErrNotFound
 	}
+	now := time.Now().UTC()
+	if run.ExecutionClass == "flexible" && (run.EligibleAt == nil || run.LatestStartAt == nil || now.Before(*run.EligibleAt) || !now.Before(*run.LatestStartAt)) {
+		return Instance{}, ErrNotFound
+	}
 	tasks, ok := m.jobTasks[runID]
 	if !ok {
 		return Instance{}, ErrNotFound
 	}
 	task, ok := tasks[taskIndex]
 	if !ok || task.Status != "queued" {
+		return Instance{}, ErrNotFound
+	}
+	if runHasPermanentFailure(run, tasks, job) {
 		return Instance{}, ErrNotFound
 	}
 	plan := api.PlanHobby // Narrow tests may seed a job without an account row.
@@ -1083,7 +1404,6 @@ func (m *MemStore) CreateAndClaimJobInstance(_ context.Context, instanceID, jobI
 	if _, exists := m.instances[instanceID]; exists {
 		return Instance{}, ErrConflict
 	}
-	now := time.Now().UTC()
 	ins := Instance{ID: instanceID, State: instanceState, RAMMB: ramMB, NodeID: computeNodeID,
 		StartedAt: now, Mode: string(InstanceModeJob), Kind: "job_task", JobID: jobID,
 		JobRunID: runID, JobTaskIndex: taskIndex}
@@ -1113,20 +1433,32 @@ func (m *MemStore) CreateAndClaimJobInstance(_ context.Context, instanceID, jobI
 // Returns ErrNotFound when (run_id, task_index) does not resolve OR
 // when the task is already terminal.
 func (m *MemStore) JobTaskMarkTerminal(_ context.Context, runID string, taskIndex int, status string, exitCode int, errorClass, errorMessage string, finishedAt time.Time) error {
-	return m.jobTaskMarkTerminal(runID, taskIndex, "", "", false, status, exitCode, errorClass, errorMessage, "", false, false, finishedAt)
+	return m.jobTaskMarkTerminal(runID, taskIndex, "", "", false, status, exitCode, errorClass, errorMessage, "", false, false, finishedAt, nil)
 }
 
 // JobTaskMarkTerminalWithLogs is the in-memory mirror of the PostgreSQL
 // atomic terminal transition and log persistence operation.
 func (m *MemStore) JobTaskMarkTerminalWithLogs(_ context.Context, runID string, taskIndex int, status string, exitCode int, errorClass, errorMessage, logContent string, logTruncated bool, finishedAt time.Time) error {
-	return m.jobTaskMarkTerminal(runID, taskIndex, "", "", false, status, exitCode, errorClass, errorMessage, logContent, logTruncated, true, finishedAt)
+	return m.jobTaskMarkTerminal(runID, taskIndex, "", "", false, status, exitCode, errorClass, errorMessage, logContent, logTruncated, true, finishedAt, nil)
 }
 
-func (m *MemStore) JobTaskCompleteClaimedWithLogs(_ context.Context, runID string, taskIndex int, instanceID, leaseToken, status string, exitCode int, errorClass, errorMessage, logContent string, logTruncated bool, finishedAt time.Time) error {
-	return m.jobTaskMarkTerminal(runID, taskIndex, instanceID, leaseToken, true, status, exitCode, errorClass, errorMessage, logContent, logTruncated, true, finishedAt)
+func (m *MemStore) JobTaskCompleteClaimedWithLogs(_ context.Context, runID string, taskIndex int, instanceID, leaseToken, status string, exitCode int, errorClass, errorMessage, logContent string, logTruncated bool, finishedAt time.Time, outputManifest ...json.RawMessage) error {
+	var output json.RawMessage
+	if len(outputManifest) > 0 {
+		output = outputManifest[0]
+	}
+	return m.jobTaskMarkTerminal(runID, taskIndex, instanceID, leaseToken, true, status, exitCode, errorClass, errorMessage, logContent, logTruncated, true, finishedAt, output)
 }
 
-func (m *MemStore) jobTaskMarkTerminal(runID string, taskIndex int, expectedInstanceID, expectedLeaseToken string, requireClaim bool, status string, exitCode int, errorClass, errorMessage, logContent string, logTruncated, persistLogs bool, finishedAt time.Time) error {
+func (m *MemStore) jobTaskMarkTerminal(runID string, taskIndex int, expectedInstanceID, expectedLeaseToken string, requireClaim bool, status string, exitCode int, errorClass, errorMessage, logContent string, logTruncated, persistLogs bool, finishedAt time.Time, outputManifest json.RawMessage) error {
+	if len(outputManifest) > 0 {
+		if status != "succeeded" {
+			return fmt.Errorf("state: output manifest requires successful task")
+		}
+		if _, err := jobresult.Validate(outputManifest); err != nil {
+			return fmt.Errorf("state: invalid output manifest: %w", err)
+		}
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	tasks, ok := m.jobTasks[runID]
@@ -1157,10 +1489,12 @@ func (m *MemStore) jobTaskMarkTerminal(runID string, taskIndex int, expectedInst
 		t.LogContent = logContent
 		t.LogTruncated = logTruncated
 	}
+	t.OutputManifest = append(json.RawMessage(nil), outputManifest...)
 	fin := finishedAt.UTC()
 	t.FinishedAt = &fin
 	t.LeaseToken = nil
 	t.LeaseExpiresAt = nil
+	m.recordJobTaskAttemptLocked(t)
 	tasks[taskIndex] = t
 	m.jobTasks[runID] = tasks
 	return nil
@@ -1183,6 +1517,13 @@ func (m *MemStore) JobTaskRetry(_ context.Context, runID string, taskIndex int, 
 	if t.Status != "failed" && t.Status != "timeout" && t.Status != "oom" && t.Status != "cancelled" {
 		return ErrConflict
 	}
+	if run, ok := m.jobRuns[runID]; ok && run.ImageStorageKeySnapshot != "" {
+		job := m.jobs[run.JobID]
+		if job.ImageMaterializationStatus != "ready" || job.ImageStorageKey != run.ImageStorageKeySnapshot {
+			return ErrConflict
+		}
+	}
+	m.recordJobTaskAttemptLocked(t)
 	t.Status = "queued"
 	t.Attempt++
 	t.InstanceID = nil
@@ -1195,6 +1536,7 @@ func (m *MemStore) JobTaskRetry(_ context.Context, runID string, taskIndex int, 
 	t.ExitCode = nil
 	t.LogContent = ""
 	t.LogTruncated = false
+	t.OutputManifest = nil
 	t.LeaseToken = nil
 	t.LeaseExpiresAt = nil
 	t.LastLeaseNode = nil
@@ -1223,6 +1565,13 @@ func (m *MemStore) JobTaskFailBoot(_ context.Context, runID string, taskIndex in
 	t.LeaseExpiresAt = nil
 	t.LastLeaseNode = nil
 	if t.Attempt <= retryMax {
+		failed := t
+		failed.Status = "failed"
+		code := 1
+		failed.ExitCode = &code
+		finished := time.Now().UTC()
+		failed.FinishedAt = &finished
+		m.recordJobTaskAttemptLocked(failed)
 		t.Status = "queued"
 		t.Attempt++
 		t.InstanceID = nil
@@ -1240,6 +1589,7 @@ func (m *MemStore) JobTaskFailBoot(_ context.Context, runID string, taskIndex in
 	finished := time.Now().UTC()
 	t.FinishedAt = &finished
 	t.NextAttemptAt = nil
+	m.recordJobTaskAttemptLocked(t)
 	tasks[taskIndex] = t
 	return false, nil
 }
@@ -1320,6 +1670,7 @@ func (m *MemStore) JobTaskCancel(_ context.Context, runID string, taskIndex int)
 		now := time.Now().UTC()
 		t.FinishedAt = &now
 	}
+	m.recordJobTaskAttemptLocked(t)
 	tasks[taskIndex] = t
 	m.jobTasks[runID] = tasks
 	return nil
@@ -1375,6 +1726,15 @@ func (m *MemStore) JobTaskReapClaimed(_ context.Context, runID string, taskIndex
 	task.LeaseExpiresAt = nil
 	task.LastLeaseNode = nil
 	if retry {
+		timedOut := task
+		timedOut.Status = "timeout"
+		code := 124
+		class := "infra"
+		message := "reaper reclaimed stale lease"
+		finished := time.Now().UTC()
+		timedOut.ExitCode, timedOut.ErrorClass, timedOut.ErrorMessage = &code, &class, &message
+		timedOut.FinishedAt = &finished
+		m.recordJobTaskAttemptLocked(timedOut)
 		task.Status = "queued"
 		task.Attempt++
 		task.InstanceID = nil
@@ -1398,6 +1758,7 @@ func (m *MemStore) JobTaskReapClaimed(_ context.Context, runID string, taskIndex
 		task.ExitCode = &code
 		task.ErrorClass = &class
 		task.ErrorMessage = &message
+		m.recordJobTaskAttemptLocked(task)
 	}
 	tasks[taskIndex] = task
 	run := m.jobRuns[runID]

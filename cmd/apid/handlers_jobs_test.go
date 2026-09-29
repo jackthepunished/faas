@@ -423,6 +423,108 @@ func TestCreateJobRun_HappyPath(t *testing.T) {
 	}
 }
 
+func TestCreateJobRunArgumentOverride(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	seedJob(t, e, "argument-run-job", "ghcr.io/example/worker:v1")
+	arguments := []string{"--dataset", "one"}
+	rec := e.do(t, "POST", "/v1/jobs/argument-run-job/runs", api.CreateJobRunRequest{
+		Tasks: 1, Arguments: &arguments,
+	}, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST run with arguments = %d: %s", rec.Code, rec.Body.String())
+	}
+	var run api.JobRunResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &run); err != nil {
+		t.Fatal(err)
+	}
+	if len(run.Command) != 3 || run.Command[0] != "/bin/sh" || run.Command[1] != "--dataset" || run.Command[2] != "one" {
+		t.Fatalf("captured command = %v", run.Command)
+	}
+	if run.RetryMax != 3 || run.TaskTimeoutSec != 300 {
+		t.Fatalf("captured policy = retry %d timeout %d", run.RetryMax, run.TaskTimeoutSec)
+	}
+}
+
+func TestCreateJobRunRejectsPlatformEnvironmentOverride(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	seedJob(t, e, "env-run-job", "ghcr.io/example/worker:v1")
+	for _, env := range []map[string]string{
+		{"GREGALE_TASK_INDEX": "999"},
+		{"BAD-KEY": "value"},
+		{"INPUT": "bad\x00value"},
+	} {
+		rec := e.do(t, "POST", "/v1/jobs/env-run-job/runs", api.CreateJobRunRequest{
+			Tasks: 1, EnvOverrides: env,
+		}, nil)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("run with env %v = %d, want 400: %s", env, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestCreateJobRunDeclaredInputs(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	seedJob(t, e, "input-run-job", "ghcr.io/example/worker:v1")
+	inputs := []api.JobRunInput{{ID: "a", Ref: "s3://data/a"}, {ID: "b", Ref: "s3://data/b"}}
+	rec := e.do(t, "POST", "/v1/jobs/input-run-job/runs", api.CreateJobRunRequest{Inputs: inputs}, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST input run = %d: %s", rec.Code, rec.Body.String())
+	}
+	var run api.JobRunResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &run); err != nil {
+		t.Fatal(err)
+	}
+	if run.Tasks != 2 {
+		t.Fatalf("run tasks = %d, want 2", run.Tasks)
+	}
+	if run.InputManifestVersion != 1 || !strings.HasPrefix(run.InputDigest, "sha256:") {
+		t.Fatalf("manifest fingerprint = version %d digest %q", run.InputManifestVersion, run.InputDigest)
+	}
+	rec = e.do(t, "GET", "/v1/jobs/input-run-job/runs/"+run.ID+"/tasks", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET tasks = %d: %s", rec.Code, rec.Body.String())
+	}
+	var tasks api.ListJobTasksResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &tasks); err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks.Tasks) != 2 || tasks.Tasks[0].InputID != "a" || tasks.Tasks[0].InputRef != "s3://data/a" || tasks.Tasks[1].InputID != "b" {
+		t.Fatalf("task inputs = %+v", tasks.Tasks)
+	}
+	rec = e.do(t, "POST", "/v1/jobs/input-run-job/runs", api.CreateJobRunRequest{
+		Inputs: []api.JobRunInput{{ID: "a", Ref: "one"}, {ID: "a", Ref: "two"}},
+	}, nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("duplicate input IDs = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCreateFlexibleJobRunWindow(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	seedJob(t, e, "flexible-run-job", "ghcr.io/example/worker:v1")
+	eligible := time.Now().UTC().Add(2 * time.Minute)
+	latest := eligible.Add(time.Hour)
+	rec := e.do(t, "POST", "/v1/jobs/flexible-run-job/runs", api.CreateJobRunRequest{
+		Tasks: 2, ExecutionClass: "flexible", FailurePolicy: "fail_fast", EligibleAt: &eligible, LatestStartAt: &latest,
+	}, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST flexible run = %d: %s", rec.Code, rec.Body.String())
+	}
+	var run api.JobRunResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &run); err != nil {
+		t.Fatal(err)
+	}
+	if run.ExecutionClass != "flexible" || run.FailurePolicy != "fail_fast" || run.EligibleAt == "" || run.LatestStartAt == "" {
+		t.Fatalf("flexible window = %+v", run)
+	}
+	rec = e.do(t, "POST", "/v1/jobs/flexible-run-job/runs", api.CreateJobRunRequest{
+		Tasks: 1, ExecutionClass: "standard", LatestStartAt: &latest,
+	}, nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("standard run with window = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestCreateJobRunAllowsBatchLargerThanLiveConcurrency(t *testing.T) {
 	e := setup(t, api.PlanScale)
 	seedJob(t, e, "large-batch-job", "ghcr.io/example/worker:v1")
@@ -574,6 +676,68 @@ func TestRetryJobTask_RequeuesFailedTask(t *testing.T) {
 	}
 	if resp.NextAttemptAt == "" || resp.RetriedAt == "" {
 		t.Fatalf("retry timestamps missing: %+v", resp)
+	}
+}
+
+func TestJobTaskAttemptsAndLinkedReplayAPI(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	name := seedJob(t, e, "replay-input-job", "ghcr.io/example/worker:v1")
+	job, err := e.store.JobGetByName(context.Background(), e.acct.ID, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.store.JobSetImageMaterialization(context.Background(), job.ID, job.ImageRef,
+		"ready", "sha256:"+strings.Repeat("a", 64), "jobs/replay-input.ext4", ""); err != nil {
+		t.Fatal(err)
+	}
+	rec := e.do(t, "POST", "/v1/jobs/"+name+"/runs", api.CreateJobRunRequest{
+		Inputs: []api.JobRunInput{{ID: "first", Ref: "data/first"}, {ID: "second", Ref: "data/second"}},
+	}, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create run = %d: %s", rec.Code, rec.Body.String())
+	}
+	var run api.JobRunResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &run); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.store.JobTaskMarkTerminal(context.Background(), run.ID, 0, "failed", 1, "failed", "bad input", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.store.JobTaskMarkTerminal(context.Background(), run.ID, 1, "succeeded", 0, "", "", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.store.JobRunRecompute(context.Background(), run.ID); err != nil {
+		t.Fatal(err)
+	}
+	rec = e.do(t, "GET", "/v1/jobs/"+name+"/runs/"+run.ID+"/tasks/0/attempts", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("attempts = %d: %s", rec.Code, rec.Body.String())
+	}
+	var attempts api.ListJobTaskAttemptsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if len(attempts.Attempts) != 1 || attempts.Attempts[0].InputID != "first" || attempts.Attempts[0].ErrorMessage != "bad input" {
+		t.Fatalf("attempts = %+v", attempts)
+	}
+	rec = e.do(t, "POST", "/v1/jobs/"+name+"/runs/"+run.ID+"/replay-failed", nil, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("replay = %d: %s", rec.Code, rec.Body.String())
+	}
+	var replay api.JobRunResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &replay); err != nil {
+		t.Fatal(err)
+	}
+	if replay.SourceRunID != run.ID || replay.Tasks != 1 {
+		t.Fatalf("replay = %+v", replay)
+	}
+	rec = e.do(t, "GET", "/v1/jobs/"+name+"/runs/"+replay.ID+"/tasks", nil, nil)
+	var tasks api.ListJobTasksResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &tasks); err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks.Tasks) != 1 || tasks.Tasks[0].SourceTaskIndex == nil || *tasks.Tasks[0].SourceTaskIndex != 0 {
+		t.Fatalf("replay tasks = %+v", tasks)
 	}
 }
 

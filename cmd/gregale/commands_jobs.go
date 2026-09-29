@@ -14,8 +14,8 @@
 //                             [--ram N] [--timeout S] [--parallelism N]
 //                             [--retries N] [--pause|--resume]       UpdateJob
 //   gregale jobs rm    <name>                                                  DeleteJob
-//   gregale jobs run   <name> --tasks N [--parallelism N]
-//                             [--retries N] [--timeout S] [--env ...]   CreateJobRun
+//   gregale jobs run   <name> (--tasks N | --input ID=REF ...)
+//                             [--parallelism N] [--arg VALUE ...]       CreateJobRun
 //   gregale jobs runs  <name>                                                  ListJobRuns
 //   gregale jobs cancel <name> <run-id>                                  CancelJobRun
 //   gregale jobs tasks <name> <run-id>                                  ListJobRunTasks
@@ -62,7 +62,7 @@ var jobRunIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[
 func cmdJobs(args []string) int {
 	parent, _ := lookupCliCommand("jobs")
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: gregale jobs <list|add|info|update|rm|run|runs|cancel|tasks|retry|logs|registry> [args]", "jobs")
+		PrintUsage(os.Stderr, "usage: gregale jobs <list|add|info|update|rm|run|runs|cancel|tasks|attempts|retry|replay-failed|artifact-url|logs|registry> [args]", "jobs")
 		return 1
 	}
 	switch args[0] {
@@ -84,8 +84,14 @@ func cmdJobs(args []string) int {
 		return cmdJobsCancel(args[1:])
 	case "tasks":
 		return cmdJobsTasks(args[1:])
+	case "attempts":
+		return cmdJobsAttempts(args[1:])
 	case "retry":
 		return cmdJobsRetry(args[1:])
+	case "replay-failed":
+		return cmdJobsReplayFailed(args[1:])
+	case "artifact-url":
+		return cmdJobsArtifactURL(args[1:])
 	case "logs":
 		return cmdJobsLogs(args[1:])
 	case "registry":
@@ -395,16 +401,24 @@ func cmdJobsRm(args []string) int {
 // Pro=1000, Scale=5000.
 func cmdJobsRun(args []string) int {
 	if len(args) == 0 {
-		PrintUsage(os.Stderr, "usage: gregale jobs run <name> --tasks N [--parallelism N] [--retries N] [--timeout S] [--env K=V ...]", "jobs")
+		PrintUsage(os.Stderr, "usage: gregale jobs run <name> (--tasks N | --input ID=REF ...) [--parallelism N] [--retries N] [--timeout S] [--env K=V ...] [--arg VALUE ...]", "jobs")
 		return 1
 	}
 	name := args[0]
 	fs := newFlagSet("jobs-run", flag.ContinueOnError)
-	tasks := fs.Int("tasks", 0, "number of tasks to fan out (required)")
+	tasks := fs.Int("tasks", 0, "number of tasks to fan out (or use --input)")
 	parallelism := fs.Int("parallelism", 0, "override job parallelism for this run")
 	retries := fs.Int("retries", 0, "override retry max for this run")
 	timeout := fs.Int("timeout", 0, "override task timeout (s) for this run")
 	env := registerJobsMultiFlag(fs, "env", "repeatable; e.g. --env K=V --env K2=V2")
+	arguments := registerJobsMultiFlag(fs, "arg", "repeatable command argument override")
+	inputFlags := registerJobsMultiFlag(fs, "input", "repeatable input binding: ID=REF")
+	manifestURI := fs.String("input-manifest-uri", "", "account-readable obj:// URI containing JSON input bindings")
+	manifestSHA256 := fs.String("input-manifest-sha256", "", "sha256:<64 hex> digest of exact manifest bytes")
+	flexible := fs.Bool("flexible", false, "use spare capacity within a start window")
+	failFast := fs.Bool("fail-fast", false, "cancel unstarted tasks after permanent failure")
+	eligibleAtFlag := fs.String("eligible-at", "", "earliest task start (RFC3339; flexible runs)")
+	latestStartAtFlag := fs.String("latest-start-at", "", "latest task start (RFC3339; required for flexible runs)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return 1
 	}
@@ -417,13 +431,53 @@ func cmdJobsRun(args []string) int {
 			retriesProvided = true
 		}
 	})
-	if *tasks <= 0 {
-		PrintUsage(os.Stderr, "usage: gregale jobs run <name> --tasks N (N > 0)", "jobs")
+	if (*manifestURI == "") != (*manifestSHA256 == "") || (*manifestURI != "" && (*tasks != 0 || len(*inputFlags) != 0)) {
+		PrintUsage(os.Stderr, "usage: --input-manifest-uri URI and --input-manifest-sha256 DIGEST must be paired and cannot be combined with --tasks or --input", "jobs")
+		return 1
+	}
+	if *tasks <= 0 && len(*inputFlags) == 0 && *manifestURI == "" {
+		PrintUsage(os.Stderr, "usage: gregale jobs run <name> --tasks N or --input ID=REF ... or --input-manifest-uri URI --input-manifest-sha256 DIGEST", "jobs")
 		return 1
 	}
 	req := api.CreateJobRunRequest{
-		Tasks:        *tasks,
-		EnvOverrides: parseEnvOverrides([]string(*env)),
+		Tasks:               *tasks,
+		EnvOverrides:        parseEnvOverrides([]string(*env)),
+		InputManifestURI:    *manifestURI,
+		InputManifestSHA256: *manifestSHA256,
+	}
+	for _, raw := range *inputFlags {
+		id, ref, ok := strings.Cut(raw, "=")
+		if !ok || id == "" || ref == "" {
+			PrintUsage(os.Stderr, "usage: --input ID=REF requires a nonempty ID and REF", "jobs")
+			return 1
+		}
+		req.Inputs = append(req.Inputs, api.JobRunInput{ID: id, Ref: ref})
+	}
+	if *flexible {
+		req.ExecutionClass = "flexible"
+	}
+	if *failFast {
+		req.FailurePolicy = "fail_fast"
+	}
+	if *eligibleAtFlag != "" {
+		parsed, err := time.Parse(time.RFC3339, *eligibleAtFlag)
+		if err != nil {
+			PrintUsage(os.Stderr, "--eligible-at must be RFC3339", "jobs")
+			return 1
+		}
+		req.EligibleAt = &parsed
+	}
+	if *latestStartAtFlag != "" {
+		parsed, err := time.Parse(time.RFC3339, *latestStartAtFlag)
+		if err != nil {
+			PrintUsage(os.Stderr, "--latest-start-at must be RFC3339", "jobs")
+			return 1
+		}
+		req.LatestStartAt = &parsed
+	}
+	if len(*arguments) > 0 {
+		args := append([]string(nil), (*arguments)...)
+		req.Arguments = &args
 	}
 	if *parallelism > 0 {
 		p := *parallelism
@@ -531,6 +585,87 @@ func cmdJobsTasks(args []string) int {
 		return jsonOut(writeNDJSON(out.Tasks))
 	}
 	renderJobTasksTable(osStdout, out.Tasks)
+	return 0
+}
+
+// cmdJobsAttempts returns retained terminal outcomes, including earlier
+// attempts whose task projection was subsequently retried.
+func cmdJobsAttempts(args []string) int {
+	if len(args) != 3 || !jobRunIDPattern.MatchString(args[1]) {
+		PrintUsage(os.Stderr, "usage: gregale jobs attempts <name> <run-id> <task-index>", "jobs")
+		return 1
+	}
+	taskIdx, err := strconv.Atoi(args[2])
+	if err != nil || taskIdx < 0 {
+		PrintUsage(os.Stderr, "usage: gregale jobs attempts <name> <run-id> <task-index>   (task-index >= 0)", "jobs")
+		return 1
+	}
+	client, err := authedClient()
+	if err != nil {
+		return printErr("Not logged in", err)
+	}
+	out, err := client.ListJobTaskAttempts(context.Background(), args[0], args[1], taskIdx)
+	if err != nil {
+		return printErr("Request failed", err)
+	}
+	if jsonOutput {
+		return jsonOut(writeJSONSingle(out))
+	}
+	for _, attempt := range out.Attempts {
+		if _, err := fmt.Fprintf(osStdout, "%d\t%s\t%s\t%s\n", attempt.Attempt, attempt.Status, attempt.InputID, attempt.ErrorMessage); err != nil {
+			return printErr("Output failed", err)
+		}
+	}
+	return 0
+}
+
+// cmdJobsReplayFailed creates a linked run containing unsuccessful inputs.
+func cmdJobsReplayFailed(args []string) int {
+	if len(args) != 2 || !jobRunIDPattern.MatchString(args[1]) {
+		PrintUsage(os.Stderr, "usage: gregale jobs replay-failed <name> <run-id>", "jobs")
+		return 1
+	}
+	client, err := authedClient()
+	if err != nil {
+		return printErr("Not logged in", err)
+	}
+	run, err := client.ReplayFailedJobRun(context.Background(), args[0], args[1])
+	if err != nil {
+		return printErr("Replay failed", err)
+	}
+	if jsonOutput {
+		return jsonOut(writeJSONSingle(run))
+	}
+	PrintOK(osStdout, "Run %s created from %s (%d tasks)", run.ID, args[1], run.Tasks)
+	return 0
+}
+
+// cmdJobsArtifactURL verifies a managed result and returns its short-lived
+// signed GET URL together with the expected size and SHA-256.
+func cmdJobsArtifactURL(args []string) int {
+	if len(args) != 4 || !jobRunIDPattern.MatchString(args[1]) || args[3] == "" {
+		PrintUsage(os.Stderr, "usage: gregale jobs artifact-url <name> <run-id> <task-index> <artifact-name>", "jobs")
+		return 1
+	}
+	taskIdx, err := strconv.Atoi(args[2])
+	if err != nil || taskIdx < 0 {
+		PrintUsage(os.Stderr, "usage: gregale jobs artifact-url <name> <run-id> <task-index> <artifact-name>   (task-index >= 0)", "jobs")
+		return 1
+	}
+	client, err := authedClient()
+	if err != nil {
+		return printErr("Not logged in", err)
+	}
+	out, err := client.DownloadJobArtifact(context.Background(), args[0], args[1], taskIdx, args[3])
+	if err != nil {
+		return printErr("Download request failed", err)
+	}
+	if jsonOutput {
+		return jsonOut(writeJSONSingle(out))
+	}
+	if _, err := fmt.Fprintf(osStdout, "%s\n%s  %d bytes\n", out.Download.URL, out.SHA256, out.SizeBytes); err != nil {
+		return printErr("Output failed", err)
+	}
 	return 0
 }
 

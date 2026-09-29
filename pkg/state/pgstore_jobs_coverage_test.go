@@ -21,6 +21,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -115,6 +116,15 @@ func TestPg_Jobs_RecurringScheduleRoundTripAndClaim(t *testing.T) {
 	if err != nil || updated.LastScheduledAt == nil || !updated.LastScheduledAt.Equal(firedAt) {
 		t.Fatalf("JobGetByID after schedule fire = %+v, err %v", updated, err)
 	}
+	if _, err := s.JobUpdateWithSchedule(ctx, job.ID, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil); !errors.Is(err, state.ErrConflict) {
+		t.Fatalf("update with queued scheduled run = %v, want conflict", err)
+	}
+	if err := s.JobTaskMarkTerminal(ctx, run.ID, 0, "succeeded", 0, "", "", time.Now()); err != nil {
+		t.Fatalf("settle scheduled task before editing job: %v", err)
+	}
+	if _, err := s.JobRunRecompute(ctx, run.ID); err != nil {
+		t.Fatalf("recompute scheduled run: %v", err)
+	}
 
 	newSchedule := "30 3 * * *"
 	newTimezone := "UTC"
@@ -200,8 +210,11 @@ func TestPg_Jobs_JobRunCreateInheritsOptionalDefaults(t *testing.T) {
 	if run.Parallelism != job.MaxParallelism {
 		t.Errorf("parallelism = %d, want inherited %d", run.Parallelism, job.MaxParallelism)
 	}
-	if run.RetryMax != nil || run.TaskTimeoutS != nil {
-		t.Errorf("durable overrides = retry:%v timeout:%v, want nil inheritance markers", run.RetryMax, run.TaskTimeoutS)
+	if run.RetryMax == nil || *run.RetryMax != job.RetryMax || run.TaskTimeoutS == nil || *run.TaskTimeoutS != job.TaskTimeoutS {
+		t.Errorf("durable policy = retry:%v timeout:%v, want captured job defaults", run.RetryMax, run.TaskTimeoutS)
+	}
+	if !slices.Equal(run.Command, job.Command) {
+		t.Errorf("durable command = %v, want %v", run.Command, job.Command)
 	}
 	if len(tasks) != 2 {
 		t.Errorf("fanned tasks = %d, want 2", len(tasks))
@@ -708,6 +721,11 @@ func TestPg_Jobs_JobTaskFailBootConsumesBudgetAndFencesOldClaim(t *testing.T) {
 	if err != nil || !retried {
 		t.Fatalf("first boot failure: retried=%v err=%v", retried, err)
 	}
+	attempts, err := s.JobTaskAttemptList(ctx, run.ID, tasks[0].TaskIndex, 10, 0)
+	if err != nil || len(attempts) != 1 || attempts[0].Attempt != 1 || attempts[0].Status != "failed" ||
+		attempts[0].InstanceID == nil || *attempts[0].InstanceID != firstID {
+		t.Fatalf("boot failure attempt journal = %+v, err %v", attempts, err)
+	}
 	task, err := s.JobTaskGet(ctx, run.ID, tasks[0].TaskIndex)
 	if err != nil || task.Status != "queued" || task.Attempt != 2 || task.InstanceID != nil || task.NextAttemptAt == nil || task.ErrorClass == nil || *task.ErrorClass != "infra" {
 		t.Fatalf("first boot failure task=%+v err=%v", task, err)
@@ -733,6 +751,10 @@ func TestPg_Jobs_JobTaskFailBootConsumesBudgetAndFencesOldClaim(t *testing.T) {
 	task, err = s.JobTaskGet(ctx, run.ID, tasks[0].TaskIndex)
 	if err != nil || task.Status != "failed" || task.Attempt != 2 || task.FinishedAt == nil || task.ErrorMessage == nil || *task.ErrorMessage != "artifact unavailable" {
 		t.Fatalf("terminal boot failure task=%+v err=%v", task, err)
+	}
+	attempts, err = s.JobTaskAttemptList(ctx, run.ID, tasks[0].TaskIndex, 10, 0)
+	if err != nil || len(attempts) != 2 || attempts[1].Attempt != 2 || attempts[1].Status != "failed" {
+		t.Fatalf("exhausted boot attempt journal = %+v, err %v", attempts, err)
 	}
 }
 
@@ -809,4 +831,98 @@ func TestPg_Jobs_ListJobInstances(t *testing.T) {
 		}
 	}
 	t.Fatalf("ListJobInstances did not return active job_task instance %s", id)
+}
+
+func TestPg_Jobs_DeclaredInputFanout(t *testing.T) {
+	s, _, ctx := pgJobsStoreWithPool(t)
+	job, _, _ := pgJobsSeed(t, s, ctx, "input-fanout")
+	inputs := []state.JobInput{{ID: "b", Ref: "obj://b"}, {ID: "a", Ref: "obj://a"}}
+	run, tasks, err := s.JobRunCreate(ctx, job.ID, job.AccountID, "manual", nil, nil, nil, nil, 2,
+		state.JobRunOptions{Inputs: inputs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 2 || tasks[0].TaskIndex != 0 || tasks[0].InputID != "b" || tasks[0].InputRef != "obj://b" ||
+		tasks[1].TaskIndex != 1 || tasks[1].InputID != "a" || tasks[1].InputRef != "obj://a" {
+		t.Fatalf("ordered task bindings = %+v", tasks)
+	}
+	listed, err := s.JobTaskList(ctx, run.ID, 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 2 || listed[0].InputID != "b" || listed[1].InputID != "a" {
+		t.Fatalf("persisted task bindings = %+v", listed)
+	}
+	noArgs := []string{}
+	argumentsRun, _, err := s.JobRunCreate(ctx, job.ID, job.AccountID, "manual", nil, nil, nil, nil, 1,
+		state.JobRunOptions{CommandArgs: &noArgs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(argumentsRun.Command, []string{"/bin/sh"}) {
+		t.Fatalf("empty argument override command = %v", argumentsRun.Command)
+	}
+}
+
+func TestPg_Jobs_ResultManifestFencedToClaim(t *testing.T) {
+	s, pool, ctx := pgJobsStoreWithPool(t)
+	job, run, tasks := pgJobsSeed(t, s, ctx, "result-manifest")
+	instanceID := pgJobsCreateJobTaskInstance(t, pool, ctx, job.AccountID, job.ID)
+	lease := uuid.NewString()
+	if err := s.JobTaskMarkClaimed(ctx, run.ID, tasks[0].TaskIndex, instanceID, lease,
+		time.Now().Add(time.Minute), resolveDefaultLocal(t, ctx, s)); err != nil {
+		t.Fatal(err)
+	}
+	manifest := json.RawMessage(`{"version":1,"artifacts":[{"name":"result","uri":"s3://bucket/output","size_bytes":7,"sha256":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}]}`)
+	if err := s.JobTaskCompleteClaimedWithLogs(ctx, run.ID, tasks[0].TaskIndex, instanceID, uuid.NewString(),
+		"succeeded", 0, "", "", "", false, time.Now(), manifest); !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("stale lease completion error = %v", err)
+	}
+	if err := s.JobTaskCompleteClaimedWithLogs(ctx, run.ID, tasks[0].TaskIndex, instanceID, lease,
+		"succeeded", 0, "", "", "", false, time.Now(), manifest); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.JobTaskGet(ctx, run.ID, tasks[0].TaskIndex)
+	if err != nil || got.Status != "succeeded" || len(got.OutputManifest) == 0 {
+		t.Fatalf("committed result = %+v, err = %v", got, err)
+	}
+}
+
+func TestPg_Jobs_FlexibleExpiryAndFailFast(t *testing.T) {
+	s, _, ctx := pgJobsStoreWithPool(t)
+	job, _, _ := pgJobsSeed(t, s, ctx, "window-policy")
+	eligible := time.Now().Add(-2 * time.Hour)
+	latest := time.Now().Add(-time.Hour)
+	run, _, err := s.JobRunCreate(ctx, job.ID, job.AccountID, "manual", nil, nil, nil, nil, 2,
+		state.JobRunOptions{ExecutionClass: "flexible", EligibleAt: &eligible, LatestStartAt: &latest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expired, err := s.JobTaskExpireUnstarted(ctx, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(expired, run.ID) {
+		t.Fatalf("expired run ids = %v, want %s", expired, run.ID)
+	}
+	listed, err := s.JobTaskList(ctx, run.ID, 10, 0)
+	if err != nil || len(listed) != 2 || listed[0].Status != "cancelled" || listed[1].Status != "cancelled" {
+		t.Fatalf("expired tasks = %+v, err = %v", listed, err)
+	}
+	zero := 0
+	fast, _, err := s.JobRunCreate(ctx, job.ID, job.AccountID, "manual", nil, &zero, nil, nil, 3,
+		state.JobRunOptions{FailurePolicy: "fail_fast"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.JobTaskMarkTerminal(ctx, fast.ID, 0, "failed", 1, "failed", "customer failure", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.JobRunRecompute(ctx, fast.ID); err != nil {
+		t.Fatal(err)
+	}
+	listed, err = s.JobTaskList(ctx, fast.ID, 10, 0)
+	if err != nil || len(listed) != 3 || listed[1].Status != "cancelled" || listed[2].Status != "cancelled" {
+		t.Fatalf("fail-fast tasks = %+v, err = %v", listed, err)
+	}
 }
