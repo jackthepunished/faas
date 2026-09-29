@@ -13,19 +13,15 @@ APIKeyByHash
 AbortMigratingInstance
 AbortServiceRollout
 AccountByEmail
-AccountByID
 AccountByKeyHash
-AccountByOIDCSubject
 AccountByProviderCustomerID
 AccountPasswordByAccountID
 AccountsByIDs
 ActiveComputeNodes
-AddOrgMember
 AlertPresetByName
 AlertRuleByAccountAppAndPresetName
 AlertRuleByID
 AppBySlug
-AppBySlugIncludingDeleted
 AppLogDrainByID
 AppLogDrainHealthByDrainID
 AppWebhookByID
@@ -43,7 +39,6 @@ ApplyProjectPlan
 ApplyRegressionAction
 AppsForProject
 AuthDefaultFlippedAt
-AuthenticateKey
 AuthenticateOIDCBearer
 AutoRollbackDeploymentsTx
 BeginServiceRolloutCutover
@@ -72,13 +67,8 @@ CompleteGdprRequest
 ComputeNodeByID
 ComputeNodeByName
 ConsumeCliAuthCode
-ConsumeEmailVerificationToken
-ConsumeLoginToken
-ConsumeMFADisableRequest
-ConsumeOrgInvitation
 ConsumeProjectEnvironmentApproval
 ConsumeRecoveryCode
-ConsumerKeyByAppAndPrefix
 CountAPIKeys
 CountActiveCronInvocations
 CountActiveOrgMembers
@@ -110,10 +100,7 @@ CountPendingOrgInvitations
 CountTenantHostnamesForSurface
 CountTenantSurfacesForAccount
 CountWakeBootStarted24h
-CreateAPIConsumer
-CreateAPIKey
 CreateAPIKeyWithExpiry
-CreateAPIKeyWithExpiryAndProvenance
 CreateAccountWithPersonalOrg
 CreateAlertRuleIfUnderQuota
 CreateAppLogDrain
@@ -122,7 +109,6 @@ CreateAppWebhookIfUnderQuota
 CreateBuildProvenance
 CreateBuildWithID
 CreateConsumerKey
-CreateConsumerKeyForConsumer
 CreateCorsPresetIfUnderQuota
 CreateCreditLedgerEntry
 CreateCronIfUnderQuotaWithOptions
@@ -131,13 +117,10 @@ CreateDeploymentScopeExclusion
 CreateEdgeRule
 CreateEdgeRuleIfUnderQuota
 CreateInstanceWithMode
-CreateOrg
 CreateOrgAPIKey
 CreateOrgAPIKeyWithProvenance
-CreateOrgInvitation
 CreateProjectEnvironmentApproval
 CreateQueueBinding
-CreateSession
 CreateSessionWithBinding
 CreateTenantHostnameIfUnderQuota
 CreateTenantSurfaceIfUnderQuota
@@ -146,7 +129,6 @@ CurrentMonthOverageCents
 DailyCostCents
 DecrementAccountAsyncInflight
 DecrementInstanceTailCount
-DeleteAPIKey
 DeleteAPIKeyReturning
 DeleteAccount
 DeleteAccountPassword
@@ -206,7 +188,6 @@ FailSourceDeployment
 FinalizeServiceRollout
 FindGdprRequestByRequestID
 FindMatchingEvent
-GetAPIConsumerByID
 GetAPIKey
 GetAccountEgressAllowlistExtra
 GetAccountKeyGraceWindow
@@ -267,9 +248,6 @@ InsertWorkflowEvent
 InstallationIDForRepo
 InstanceListByNodeForRecovery
 IsMailSuppressed
-IssueEmailVerificationToken
-IssueLoginToken
-IssueMFADisableRequest
 JobConcurrentByAccount
 JobCountByAccount
 JobGetByID
@@ -369,7 +347,6 @@ ListEdgeRulesForApp
 ListEgressCircuitCandidates
 ListEnabledAlertRules
 ListEnabledAppLogDrains
-ListEnabledCrons
 ListEnabledTriggers
 ListEventsBySidecar
 ListEventsByTraceID
@@ -419,7 +396,6 @@ ListRunningInstancesOnDeadNodes
 ListRuntimeConfigRevisions
 ListRuntimeConfigs
 ListServiceRolloutsInFlight
-ListSessions
 ListSnapshotDeploymentIDs
 ListSnapshotsForGC
 ListSnapshotsStaleOlderThan
@@ -441,8 +417,6 @@ LookupBootStartedForWakes
 LookupDeploymentScopeExclusions
 LookupRuntimeSnapshot
 MTDSpendEurCents
-MarkAPIKeyRevoked
-MarkAccountDeletionPending
 MarkAccountEmailVerified
 MarkAllSnapshotsStaleByAppProtocol
 MarkAllSnapshotsStaleByFCVersion
@@ -452,7 +426,6 @@ MarkBuildCancelled
 MarkComputeNodeInactive
 MarkDeploymentStageFailed
 MarkDomainVerified
-MarkDunningStep
 MarkFireNowRequestFailed
 MarkFireNowRequestSucceeded
 MarkMFAEnrolled
@@ -492,7 +465,6 @@ OrgByID
 OrgByPersonalAccount
 OrgBySlug
 OrgInvitationByTokenHash
-OrgMemberByAccount
 PaddleOverageDedupeSchema
 PerAccountRateLimitAggregate
 Ping
@@ -536,7 +508,6 @@ RecoverRollout
 RefreshCertExpiryStates
 RegistryCredentialQuotaCheck
 ReinviteMigratingInstance
-RemoveOrgMember
 RenameApp
 ReorderDeployment
 ReplaceProvisionedStaticEgressIPs
@@ -553,18 +524,13 @@ RequeueBuild
 ResetAppWebhookDeliveryFromDead
 ResolveStaleRegressionObservations
 ResolveStatusIncident
-RestoreAccount
 RetireRuntimeSnapshot
 RetryDeploymentFromStage
 RetryQueueDeadLetter
 RetryTriggerRecordByOperator
-RevokeAPIConsumer
-RevokeAllSessions
 RevokeConsumerKey
 RevokeOrgAPIKey
 RevokeOrgInvitation
-RevokeSession
-RotateAPIKey
 RotateOrgAPIKey
 RotateOrgAPIKeyWithProvenance
 RunningInstanceForApp
@@ -617,7 +583,6 @@ TriggerRecordIDByItemIdentifier
 UpdateAccountBillingInfo
 UpdateAccountPlan
 UpdateAccountProviderCustomerID
-UpdateAccountStatus
 UpdateAccountStripeSubscriptionItem
 UpdateAlertDeliveryStatus
 UpdateAlertRule
@@ -659,7 +624,6 @@ UpsertAppOpenAPIDocIfUnderQuota
 UpsertAppRegistryCredential
 UpsertAppSecret
 UpsertAppSecretWithKid
-UpsertAppSecretWithKidInScope
 UpsertAppTrustedSigner
 UpsertComputeNode
 UpsertComputeNodeFromOperator
@@ -667,12 +631,9 @@ UpsertDeploymentOpenAPIDoc
 UpsertDeploymentScanResult
 UpsertDeploymentSecretFindings
 UpsertDoctorObservation
-UpsertGitHubInstall
-UpsertGithubInstallBinding
 UpsertGithubWebhookSecret
 UpsertNodeKey
 UpsertOAuthLink
-UpsertOIDCTrustPolicy
 UpsertRegressionObservation
 UpsertRuntimeConfig
 UsageByAccount

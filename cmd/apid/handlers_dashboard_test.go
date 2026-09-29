@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -70,10 +71,7 @@ func newAuthedDashboardServerFull(t *testing.T) (http.Handler, *http.Cookie, *st
 	if err != nil {
 		t.Fatalf("session manager: %v", err)
 	}
-	cookie, err := mgr.Issue(acct.ID)
-	if err != nil {
-		t.Fatalf("issue session: %v", err)
-	}
+	cookie := issueDashboardTestCookie(t, store, mgr, acct.ID)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv := newServerWithDeps(store, log, "gregale.dev", noopNotifier{}, "", noopMailer{}, stubGithubdClient{}, mgr, nil, 15*60_000_000_000, "").
 		WithRollbackArtifactVerifier(stubRollbackArtifactVerifier{})
@@ -218,7 +216,7 @@ func TestDashboardHandler_AppsList(t *testing.T) {
 	// §8 contract: the empty-state CTA surfaces the deploy quickstart
 	// and the storage docs link. We don't pin "faas apps create" —
 	// that was the old §8 contradiction this PR fixes.
-	if !strings.Contains(body, "faas deploy --template=hello-node") {
+	if !strings.Contains(body, "gregale deploy --template=hello-node") {
 		t.Errorf("body missing deploy quickstart; got:\n%s", body)
 	}
 	if !strings.Contains(body, "https://gregale.dev/docs/storage") {
@@ -433,7 +431,7 @@ func TestDashboardHandler_Billing_PaidPlan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("session: %v", err)
 	}
-	cookie, err := mgr.Issue(acct.ID)
+	cookie, err := mintDashboardSession(t.Context(), store, mgr, acct.ID)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -484,7 +482,7 @@ func TestDashboardHandler_Billing_FreePlan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("session: %v", err)
 	}
-	cookie, err := mgr.Issue(acct.ID)
+	cookie, err := mintDashboardSession(t.Context(), store, mgr, acct.ID)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -536,7 +534,7 @@ func TestDashboardAccountDPA_RendersMarkdown(t *testing.T) {
 	if err != nil {
 		t.Fatalf("session: %v", err)
 	}
-	cookie, err := mgr.Issue(acct.ID)
+	cookie, err := mintDashboardSession(t.Context(), store, mgr, acct.ID)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
@@ -982,7 +980,7 @@ func TestDashboardBilling_RendersOverageCap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("session manager: %v", err)
 	}
-	sid, err := mgr.Issue(acct.ID)
+	sid, err := mintDashboardSession(t.Context(), store, mgr, acct.ID)
 	if err != nil {
 		t.Fatalf("issue session: %v", err)
 	}
@@ -1524,4 +1522,25 @@ func TestDashboardHostingReceipt_ProjectsReadinessEvidence(t *testing.T) {
 	if empty, err := dashboardHostingReceipt(json.RawMessage(`{}`)); err != nil || empty != nil {
 		t.Fatalf("empty receipt = (%v, %v), want (nil, nil)", empty, err)
 	}
+}
+
+// issueDashboardTestCookie mints a session-bound cookie the way login
+// does: a live sessions row plus an envelope carrying its sid. The
+// dashboard checks the row like /v1 does, so a sid-less Issue() cookie
+// is rejected.
+func issueDashboardTestCookie(t *testing.T, store state.Store, mgr *session.Manager, accountID string) string {
+	t.Helper()
+	cookie, err := mintDashboardSession(t.Context(), store, mgr, accountID)
+	if err != nil {
+		t.Fatalf("mint dashboard session: %v", err)
+	}
+	return cookie
+}
+
+func mintDashboardSession(ctx context.Context, store state.Store, mgr *session.Manager, accountID string) (string, error) {
+	sid := uuid.NewString()
+	if _, err := store.CreateSession(ctx, sid, accountID, "192.0.2.10", "dashboard-test"); err != nil {
+		return "", err
+	}
+	return mgr.IssueWithSessionAndBindingHash(sid, accountID, "", false)
 }

@@ -495,34 +495,42 @@ func (s *PgStore) AccountByOIDCSubject(ctx context.Context, issuerURL, subject s
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			repo, ok := githubActionsRepositoryFromSubject(issuerURL, subject)
-			if !ok {
-				return Account{}, ErrNotFound
-			}
-			// First secretless deploy: resolve exactly one account through an
-			// existing repo binding whose installation was proven by user OAuth.
-			var accountID string
-			bootstrapErr := s.pool.QueryRow(ctx, `
-				select min(a.github_install_account_id::text)
-				from apps a
-				join github_installations gi
-				  on gi.account_id = a.github_install_account_id
-				 and gi.installation_id = a.github_install_id
-				where lower(a.github_repo_full_name) = lower($1)
-				  and a.github_install_account_id = a.account_id
-				  and a.deleted_at is null
-				having count(distinct a.github_install_account_id) = 1`, repo).Scan(&accountID)
-			if errors.Is(bootstrapErr, pgx.ErrNoRows) {
-				return Account{}, ErrNotFound
-			}
-			if bootstrapErr != nil {
-				return Account{}, bootstrapErr
-			}
-			return s.AccountByID(ctx, accountID)
+			// Secretless deploy from a subject no policy pins yet.
+			return s.AccountByOIDCRepositoryBinding(ctx, issuerURL, subject)
 		}
 		return Account{}, err
 	}
 	return s.AccountByID(ctx, uuidFromPgtype(row.ID).String())
+}
+
+// AccountByOIDCRepositoryBinding resolves a GitHub Actions subject to the one
+// account whose app is bound to the subject's repository through an
+// installation proven by that account's user OAuth. ErrNotFound when the
+// issuer is not GitHub Actions, the repository is unbound, or more than one
+// account binds it.
+func (s *PgStore) AccountByOIDCRepositoryBinding(ctx context.Context, issuerURL, subject string) (Account, error) {
+	repo, ok := githubActionsRepositoryFromSubject(issuerURL, subject)
+	if !ok {
+		return Account{}, ErrNotFound
+	}
+	var accountID string
+	err := s.pool.QueryRow(ctx, `
+		select min(a.github_install_account_id::text)
+		from apps a
+		join github_installations gi
+		  on gi.account_id = a.github_install_account_id
+		 and gi.installation_id = a.github_install_id
+		where lower(a.github_repo_full_name) = lower($1)
+		  and a.github_install_account_id = a.account_id
+		  and a.deleted_at is null
+		having count(distinct a.github_install_account_id) = 1`, repo).Scan(&accountID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Account{}, ErrNotFound
+	}
+	if err != nil {
+		return Account{}, err
+	}
+	return s.AccountByID(ctx, accountID)
 }
 
 // UpsertOIDCTrustPolicy is the per-(account, issuer) insert-or-update
@@ -836,20 +844,71 @@ func (s *PgStore) UpdateAccountStatus(ctx context.Context, id string, status Acc
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	tag, err := tx.Exec(ctx, `update accounts set status = $2 where id = $1`, id, string(status))
+	tag, err := tx.Exec(ctx, `
+		update accounts
+		   set status = $2,
+		       past_due_at = case when $2 = 'past_due' then past_due_at else null end,
+		       deletion_requested_at = case when $2 = 'active' then null else deletion_requested_at end,
+		       suspended_reason = null
+		 where id = $1`, id, string(status))
 	if err != nil {
 		return err
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound
 	}
+	if err := syncPersonalOrgStatus(ctx, tx, id, status); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func syncPersonalOrgStatus(ctx context.Context, tx pgx.Tx, accountID string, status AccountStatus) error {
 	if _, err := tx.Exec(ctx, `
 		update orgs
 		   set status = $2, updated_at = now()
-		 where personal_org = true and personal_owner_account_id = $1`, id, string(status)); err != nil {
+		 where personal_org = true and personal_owner_account_id = $1`, accountID, string(status)); err != nil {
 		return fmt.Errorf("state: sync personal org status: %w", err)
 	}
-	return tx.Commit(ctx)
+	return nil
+}
+
+// SuspendAccountForFreeQuota applies the Free plan's monthly hard stop.
+// Only an active account is suspended, so a dunning or operator suspension
+// is never relabelled as a quota stop that the next month would lift.
+func (s *PgStore) SuspendAccountForFreeQuota(ctx context.Context, id string) (bool, error) {
+	return s.flipAccountForFreeQuota(ctx, id, `
+		update accounts
+		   set status = 'suspended', suspended_reason = 'free_quota', past_due_at = null
+		 where id = $1 and status = 'active'`, AccountSuspended)
+}
+
+// RestoreFreeQuotaSuspension lifts only a suspension that
+// SuspendAccountForFreeQuota applied.
+func (s *PgStore) RestoreFreeQuotaSuspension(ctx context.Context, id string) (bool, error) {
+	return s.flipAccountForFreeQuota(ctx, id, `
+		update accounts
+		   set status = 'active', suspended_reason = null
+		 where id = $1 and status = 'suspended' and suspended_reason = 'free_quota'`, AccountActive)
+}
+
+func (s *PgStore) flipAccountForFreeQuota(ctx context.Context, id, query string, to AccountStatus) (bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	tag, err := tx.Exec(ctx, query, id)
+	if err != nil {
+		return false, err
+	}
+	if tag.RowsAffected() == 0 {
+		return false, nil
+	}
+	if err := syncPersonalOrgStatus(ctx, tx, id, to); err != nil {
+		return false, err
+	}
+	return true, tx.Commit(ctx)
 }
 
 // UpdateAccountProviderCustomerID records the Stripe `cus_…` ID on the
@@ -2393,6 +2452,43 @@ func (s *PgStore) CreatePRPreviewAppsIfUnderQuota(ctx context.Context, apps []Ap
 	return created, nil
 }
 
+// checkAppQuotaTx is the deployed-app quota check. The caller holds the
+// account row lock. Production, developer, and PR preview apps each use
+// their own plan cap; keeping every count inside the account lock closes
+// the same TOCTOU window for each quota family.
+func checkAppQuotaTx(ctx context.Context, tx pgx.Tx, app App, limits api.Limits) error {
+	var observed int
+	developer := IsDeveloperApp(app)
+	preview := IsPRPreviewApp(app)
+	countQuery := `select count(*) from apps where account_id = $1 and status in ('active','evicted_cold') and preview_of_slug is null`
+	limit := limits.DeployedApps
+	kind := QuotaErrorKindApps
+	if developer {
+		countQuery = `select count(*) from apps where account_id = $1 and status in ('active','evicted_cold') and preview_of_slug is not null and coalesce(preview_pr_number, 0) = 0`
+		limit = limits.DeveloperApps
+		// Older internal callers construct a partial Limits value. Keep
+		// those callers safe while the plan table carries the real cap.
+		if limit <= 0 {
+			limit = limits.DeployedApps
+		}
+		kind = QuotaErrorKindDeveloperApps
+	} else if preview {
+		countQuery = `select count(*) from apps where account_id = $1 and status in ('active','evicted_cold') and preview_of_slug is not null and preview_pr_number > 0`
+		limit = limits.PreviewApps
+		if limit <= 0 {
+			limit = limits.DeployedApps
+		}
+		kind = QuotaErrorKindPreviewApps
+	}
+	if err := tx.QueryRow(ctx, countQuery, app.AccountID).Scan(&observed); err != nil {
+		return fmt.Errorf("state: count apps for account %s: %w", app.AccountID, err)
+	}
+	if observed >= limit {
+		return &QuotaError{Kind: kind, Limit: limit, Observed: observed}
+	}
+	return nil
+}
+
 func createAppIfUnderQuotaTx(ctx context.Context, tx pgx.Tx, app App, limits api.Limits) (App, error) {
 
 	// 1. Lock the parent accounts row. SELECT 1 + FOR UPDATE keeps the
@@ -2420,38 +2516,9 @@ func createAppIfUnderQuotaTx(ctx context.Context, tx pgx.Tx, app App, limits api
 		return App{}, ErrConflict
 	}
 
-	// 3. Authoritative count under the lock. Production, developer, and PR
-	//    preview apps each use their own plan cap.
-	//    Keeping both counts inside the account lock closes the same TOCTOU
-	//    window for either quota family.
-	var observed int
-	developer := IsDeveloperApp(app)
-	preview := IsPRPreviewApp(app)
-	countQuery := `select count(*) from apps where account_id = $1 and status in ('active','evicted_cold') and preview_of_slug is null`
-	limit := limits.DeployedApps
-	kind := QuotaErrorKindApps
-	if developer {
-		countQuery = `select count(*) from apps where account_id = $1 and status in ('active','evicted_cold') and preview_of_slug is not null and coalesce(preview_pr_number, 0) = 0`
-		limit = limits.DeveloperApps
-		// Older internal callers construct a partial Limits value. Keep
-		// those callers safe while the plan table carries the real cap.
-		if limit <= 0 {
-			limit = limits.DeployedApps
-		}
-		kind = QuotaErrorKindDeveloperApps
-	} else if preview {
-		countQuery = `select count(*) from apps where account_id = $1 and status in ('active','evicted_cold') and preview_of_slug is not null and preview_pr_number > 0`
-		limit = limits.PreviewApps
-		if limit <= 0 {
-			limit = limits.DeployedApps
-		}
-		kind = QuotaErrorKindPreviewApps
-	}
-	if err := tx.QueryRow(ctx, countQuery, app.AccountID).Scan(&observed); err != nil {
-		return App{}, fmt.Errorf("state: count apps for account %s: %w", app.AccountID, err)
-	}
-	if observed >= limit {
-		return App{}, &QuotaError{Kind: kind, Limit: limit, Observed: observed}
+	// 3. Authoritative count under the lock.
+	if err := checkAppQuotaTx(ctx, tx, app, limits); err != nil {
+		return App{}, err
 	}
 
 	// 4. Conditional insert. The slug unique index surfaces a concurrent collision
@@ -4337,8 +4404,10 @@ func (s *PgStore) ScheduleAppDeletion(ctx context.Context, id string, graceUntil
 	}
 	var a App
 	row := s.pool.QueryRow(ctx, `
-		with removed_crons as (
-			delete from crons where app_id = $1 returning id
+		with suspended_crons as (
+			-- Suspend, don't delete: restoring the app inside its grace
+			-- window brings its schedules back. The purge removes them.
+			update crons set suspended_reason = 'app_deleted' where app_id = $1 returning id
 		), cancelled_app_tasks as (
 			update app_tasks
 			   set status = case when status = 'queued' then 'cancelled' else status end,
@@ -4366,9 +4435,46 @@ func (s *PgStore) ScheduleAppDeletion(ctx context.Context, id string, graceUntil
 // RestoreApp reactivates an app only while its customer grace deadline is
 // still in the future. The conditional update makes restore vs. sweep a
 // single race-safe decision; an unsuccessful update is reported as conflict.
-func (s *PgStore) RestoreApp(ctx context.Context, id string) (App, error) {
+func (s *PgStore) RestoreApp(ctx context.Context, id string, limits api.Limits) (App, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return App{}, fmt.Errorf("state: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // no-op after Commit
+	a, err := restoreAppTx(ctx, tx, id, limits)
+	if err != nil {
+		return App{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return App{}, fmt.Errorf("state: commit restore app: %w", err)
+	}
+	return a, nil
+}
+
+// restoreAppTx is the restore body shared by RestoreApp and
+// RestoreAppWithActivity, so the two paths cannot drift apart.
+func restoreAppTx(ctx context.Context, tx pgx.Tx, id string, limits api.Limits) (App, error) {
+	var tomb App
+	if err := scanAppInto(&tomb, tx.QueryRow(ctx, `select `+appsSelectColumns+` from apps where id = $1`, id)); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return App{}, ErrConflict
+		}
+		return App{}, mapErr(err)
+	}
+	// A restored app counts against the deployed-app quota like a new
+	// one. Without the check, delete → create → restore gave any plan an
+	// unlimited number of live apps.
+	var locked int
+	if err := tx.QueryRow(ctx, `select 1 from accounts where id = $1 for update`, tomb.AccountID).Scan(&locked); err != nil {
+		return App{}, mapErr(err)
+	}
+	if tomb.Status == AppDeleted {
+		if err := checkAppQuotaTx(ctx, tx, tomb, limits); err != nil {
+			return App{}, err
+		}
+	}
 	var a App
-	row := s.pool.QueryRow(ctx, `
+	row := tx.QueryRow(ctx, `
 		update apps
 		   set status = 'active', deleted_at = null, delete_grace_until = null, purge_claimed_at = null
 		 where id = $1
@@ -4381,6 +4487,11 @@ func (s *PgStore) RestoreApp(ctx context.Context, id string) (App, error) {
 			return App{}, ErrConflict
 		}
 		return App{}, mapErr(err)
+	}
+	// The crons the deletion suspended come back; the scheduler re-suspends
+	// them (no_live_deployment) if the app has nothing live to run them on.
+	if _, err := tx.Exec(ctx, `update crons set suspended_reason = '' where app_id = $1 and suspended_reason = $2`, id, CronSuspendedAppDeleted); err != nil {
+		return App{}, fmt.Errorf("state: restore app crons: %w", err)
 	}
 	return a, nil
 }
@@ -8885,7 +8996,7 @@ func (s *PgStore) markDeploymentLive(ctx context.Context, id string, fenceGitDri
 	if _, err := tx.Exec(ctx, `
 		update crons
 		   set suspended_reason = ''
-		 where app_id = $1 and suspended_reason <> ''`, appID); err != nil {
+		 where app_id = $1 and suspended_reason = 'no_live_deployment'`, appID); err != nil {
 		return fmt.Errorf("state: reactivate deployment crons: %w", err)
 	}
 	if dep.Status == DeployLive || (dep.CanaryTotalSteps <= 0 && IsServiceRollout(dep)) {
@@ -12658,9 +12769,11 @@ func (s *PgStore) CreateCronIfUnderQuotaWithOptions(ctx context.Context, appID, 
 	return c, nil
 }
 
+// CronByID hides a soft-deleted app's crons (suspended app_deleted): they
+// did not exist for callers before deletion kept them for restore.
 func (s *PgStore) CronByID(ctx context.Context, id string) (Cron, error) {
 	row := s.pool.QueryRow(ctx,
-		`select id, app_id, schedule, path, enabled, suspended_reason, timezone, skip_if_running, last_fired_at, created_at, command, command_shell, command_timeout_seconds, command_max_output_bytes, retry_max, retry_backoff_seconds from crons where id = $1`, id)
+		`select id, app_id, schedule, path, enabled, suspended_reason, timezone, skip_if_running, last_fired_at, created_at, command, command_shell, command_timeout_seconds, command_max_output_bytes, retry_max, retry_backoff_seconds from crons where id = $1 and suspended_reason <> 'app_deleted'`, id)
 	c, err := scanCronRow(row)
 	if err != nil {
 		return Cron{}, mapErr(err)
@@ -12815,7 +12928,7 @@ func (s *PgStore) ReactivateCronsForApp(ctx context.Context, appID string) (int,
 	tag, err := s.pool.Exec(ctx, `
 		update crons
 		   set suspended_reason = ''
-		 where app_id = $1 and suspended_reason <> ''`, appID)
+		 where app_id = $1 and suspended_reason = 'no_live_deployment'`, appID)
 	if err != nil {
 		return 0, fmt.Errorf("state: reactivate crons for app: %w", err)
 	}
@@ -22194,6 +22307,16 @@ func (s *PgStore) ReserveIdempotent(ctx context.Context, accountID, key string, 
 	return res, nil
 }
 
+// ReleaseIdempotent drops an in-flight reservation without storing a
+// response, so the next request with the key runs instead of waiting out
+// abandonAfter. A completed response is never touched.
+func (s *PgStore) ReleaseIdempotent(ctx context.Context, accountID, key string) error {
+	_, err := s.pool.Exec(ctx,
+		`delete from idempotency_keys where account_id = $1 and key = $2 and response_status = 0`,
+		accountID, key)
+	return err
+}
+
 // --- secrets -----------------------------------------------------------------
 //
 // Customer secrets (spec §11/G2). Ciphertext only — apid seals server-side
@@ -26246,7 +26369,9 @@ func (s *PgStore) MarkAccountDeletionPending(ctx context.Context, id string) err
 
 // RestoreAccount flips status back to active and clears
 // deletion_requested_at iff the row is still inside the 30-day grace
-// window. Past grace → ErrConflict so the handler renders 409.
+// window. Past grace → ErrConflict so the handler renders 409. A deletion
+// the dunning timer scheduled (past_due_at set) is undone by paying, not
+// by this self-service restore.
 func (s *PgStore) RestoreAccount(ctx context.Context, id string) error {
 	tag, err := s.pool.Exec(ctx,
 		`update accounts
@@ -26254,6 +26379,7 @@ func (s *PgStore) RestoreAccount(ctx context.Context, id string) error {
 		       deletion_requested_at = null
 		 where id = $1
 		   and status = 'deleted_pending'
+		   and past_due_at is null
 		   and deletion_requested_at > now() - interval '30 days'`,
 		id)
 	if err != nil {
@@ -26593,7 +26719,9 @@ func (s *PgStore) MarkDunningStep(ctx context.Context, id string, from, to Accou
 	tag, err := s.pool.Exec(ctx,
 		`update accounts
 		    set status = $2,
-		        past_due_at = case when $2 = 'past_due' then coalesce(past_due_at, $3) else past_due_at end
+		        past_due_at = case when $2 = 'past_due' then coalesce(past_due_at, $3) else past_due_at end,
+		        deletion_requested_at = case when $2 = 'deleted_pending' then coalesce(deletion_requested_at, now()) else deletion_requested_at end,
+		        suspended_reason = null
 		  where id = $1 and status = $4`,
 		id, string(to), stamp, string(from))
 	if err != nil {
@@ -27566,9 +27694,19 @@ func (s *PgStore) ConsumeOrgInvitation(ctx context.Context, hash []byte, accepti
 		ib := *inv.InvitedByAccountID
 		inviter = &ib
 	}
+	// Removal keeps the (org_id, account_id) row with removed_at set, so a
+	// plain insert collided with it and a removed member could never
+	// rejoin ("already a member"). Reactivate the removed row instead;
+	// an active row still affects no rows and reads as already-member.
 	tag, err := tx.Exec(ctx, `
 		insert into org_memberships (org_id, account_id, role, invited_by_account_id)
 		values ($1, $2, $3, $4)
+		on conflict (org_id, account_id) do update
+		   set role = excluded.role,
+		       invited_by_account_id = excluded.invited_by_account_id,
+		       joined_at = now(),
+		       removed_at = null
+		 where org_memberships.removed_at is not null
 	`, inv.OrgID, accepting.ID, string(inv.Role), inviter)
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -27576,6 +27714,9 @@ func (s *PgStore) ConsumeOrgInvitation(ctx context.Context, hash []byte, accepti
 			return OrgMembership{}, OrgInvitation{}, ErrOrgAlreadyMember
 		}
 		return OrgMembership{}, OrgInvitation{}, fmt.Errorf("state: consume org invitation insert: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return OrgMembership{}, OrgInvitation{}, ErrOrgAlreadyMember
 	}
 	if tag.RowsAffected() != 1 {
 		return OrgMembership{}, OrgInvitation{}, fmt.Errorf("state: consume org invitation rows=%d", tag.RowsAffected())

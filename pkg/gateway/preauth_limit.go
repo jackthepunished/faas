@@ -5,7 +5,9 @@ import (
 	"context"
 	"errors"
 	"math"
+	"net"
 	"net/http"
+	"net/netip"
 	"path"
 	"strconv"
 	"strings"
@@ -272,7 +274,7 @@ func (h *Handler) applyPreAuthRateLimit(w http.ResponseWriter, r *http.Request, 
 		h.observe(r, rec.status, app.ID, string(app.Plan), false, Target{})
 		return true
 	}
-	source := ip.String()
+	source := preAuthSourceKey(ip)
 	shadow := preAuthShadowContext{appID: app.ID}
 	var matched *api.PreAuthRouteLimit
 	matchedIndex := -1
@@ -444,4 +446,25 @@ func (h *Handler) ForgetPreAuthRateLimits() int {
 		return 0
 	}
 	return h.preAuthLimiter.ForgetAll()
+}
+
+// preAuthSourceKey buckets IPv6 sources by /64. A subscriber is usually
+// delegated a whole /64, so keying on the full address let one client
+// rotate interface IDs for a fresh bucket per request (defeating the
+// per-source login protection) and fill the shared source table, pushing
+// every other app's new sources into its overflow bucket.
+func preAuthSourceKey(ip net.IP) string {
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return ip.String()
+	}
+	addr = addr.Unmap()
+	if addr.Is4() {
+		return addr.String()
+	}
+	prefix, err := addr.Prefix(64)
+	if err != nil {
+		return addr.String()
+	}
+	return prefix.String()
 }

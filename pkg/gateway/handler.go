@@ -2142,7 +2142,7 @@ func (h *Handler) emitAuthnAudit(r *http.Request, app App, subject *string, kind
 // returns false and ServeHTTP proceeds with the legacy
 // Backend.Lookup. Extracted from ServeHTTP to keep the
 // handler cap under 50 lines.
-func (h *Handler) matchAndSubstituteRoute(r *http.Request, app *App) bool {
+func (h *Handler) matchAndSubstituteRoute(r *http.Request, appHost string, app *App) bool {
 	if h.edgeRules == nil || h.resolveTargetApp == nil {
 		return false
 	}
@@ -2151,9 +2151,9 @@ func (h *Handler) matchAndSubstituteRoute(r *http.Request, app *App) bool {
 	if _, _, ok := EnvironmentIDsFromHost(wire.DeployWildcardSuffix, hostname(r.Host)); ok {
 		return false
 	}
-	rule := h.edgeRules.MatchRoute(r.Context(), hostname(r.Host), r.URL.Path, r.Method)
+	rule, blocked := h.routeRuleForHost(r, appHost)
 	if rule == nil {
-		if h.metrics != nil {
+		if h.metrics != nil && !blocked {
 			h.metrics.ObserveEdgeRuleMatch(rateLimitScopeRoute, "miss")
 		}
 		return false
@@ -2209,6 +2209,45 @@ func (h *Handler) matchAndSubstituteRoute(r *http.Request, app *App) bool {
 	}
 	*app = target
 	return true
+}
+
+// routeRuleForHost picks the kind=route rule for the inbound host. The
+// target check in matchAndSubstituteRoute only proves a rule points at its
+// own account's app; match_host is free-form, so a rule can also name a host
+// another account's app answers on (or "*"). Such a rule must neither route
+// that tenant's traffic nor, by winning the first-match pick, hide the
+// owner's own route rule, so the pick is repeated scoped to the host's
+// owner. A host no app claims (ADR-091's synthetic route host) keeps the
+// unscoped pick. blocked reports that a foreign rule was refused and no
+// owner rule replaced it; the refusal is already audited and counted.
+func (h *Handler) routeRuleForHost(r *http.Request, appHost string) (rule *EdgeRuleResolved, blocked bool) {
+	host := hostname(r.Host)
+	rule = h.edgeRules.MatchRoute(r.Context(), host, r.URL.Path, r.Method)
+	if rule == nil {
+		return nil, false
+	}
+	hostApp, found := h.backend.Lookup(r.Context(), appHost)
+	if !found || hostApp.AccountID == rule.AccountID {
+		return rule, false
+	}
+	if h.edgeRuleAudit != nil {
+		h.edgeRuleAudit.Emit(r.Context(), "edge_rule.route_blocked", &rule.AccountID, map[string]any{
+			"rule_id":         rule.ID,
+			"from_host":       r.Host,
+			"to_slug":         rule.TargetAppSlug,
+			"rule_account_id": rule.AccountID,
+			"reason":          "host_not_owned",
+		})
+	}
+	if h.metrics != nil {
+		h.metrics.ObserveEdgeRuleMatch(rateLimitScopeRoute, "blocked")
+		h.metrics.ObserveEdgeRuleApply(rateLimitScopeRoute, "success")
+	}
+	owned := h.edgeRules.MatchRoute(WithEdgeRuleOwner(r.Context(), hostApp.AccountID), host, r.URL.Path, r.Method)
+	if owned == nil || owned.AccountID != hostApp.AccountID {
+		return nil, true
+	}
+	return owned, false
 }
 
 // matchAndApplyRewrite (ADR-089 / issue #561 PR 4) consults the
@@ -5632,7 +5671,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		lookedApp App
 		ok        bool
 	)
-	if h.matchAndSubstituteRoute(r, &app) {
+	if h.matchAndSubstituteRoute(r, appHost, &app) {
 		goto haveApp
 	}
 	//nolint:contextcheck // request ctx is the canonical inbound ctx at the HTTP handler boundary.
@@ -5645,6 +5684,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	app = lookedApp
 haveApp:
+	// Edge-rule matching from here on ignores rules another account
+	// wrote (OwnedEdgeRules): match_host is free-form, so a foreign rule
+	// could otherwise shadow this app's own gates.
+	//nolint:contextcheck // same request context, extended with the owner.
+	r = r.WithContext(WithEdgeRuleOwner(r.Context(), app.AccountID))
 	if app.AccountStatus == "suspended" || app.AccountStatus == "deleted_pending" {
 		api.WriteProblem(w, api.ErrAccountSuspended())
 		h.observe(r, rec.status, app.ID, "", false, Target{})

@@ -174,6 +174,7 @@ type MemStore struct {
 	outboundCredentials       map[string][]byte
 	mu                        sync.Mutex
 	accounts                  map[string]Account
+	freeQuotaSuspended        map[string]bool
 	accountDeployRates        map[string]accountDeployRateRow
 	keys                      map[string]APIKey
 	keyByHash                 map[string]APIKey
@@ -994,6 +995,7 @@ func NewMemStore() *MemStore {
 		outboundAppBindings:       map[string]OutboundAppBinding{},
 		outboundCredentials:       map[string][]byte{},
 		accounts:                  map[string]Account{},
+		freeQuotaSuspended:        map[string]bool{},
 		accountDeployRates:        map[string]accountDeployRateRow{},
 		keys:                      map[string]APIKey{},
 		keyByHash:                 map[string]APIKey{},
@@ -1556,13 +1558,10 @@ func (m *MemStore) AccountByOIDCSubject(_ context.Context, issuerURL, subject st
 		if policy.IssuerURL != issuerURL {
 			continue
 		}
-		// Empty subject_pattern = accept any subject. Real
-		// pattern = regex match.
-		matched := policy.SubjectPattern == ""
-		if !matched {
-			matched = regexpMatch(policy.SubjectPattern, subject)
-		}
-		if !matched {
+		// An empty subject_pattern binds nothing (the legacy
+		// permissive first-use policies); only a real pattern that
+		// matches the subject resolves the account.
+		if policy.SubjectPattern == "" || !regexpMatch(policy.SubjectPattern, subject) {
 			continue
 		}
 		_, ok := m.accounts[policy.AccountID]
@@ -1572,27 +1571,7 @@ func (m *MemStore) AccountByOIDCSubject(_ context.Context, issuerURL, subject st
 		matches = append(matches, policy)
 	}
 	if len(matches) == 0 {
-		repo, ok := githubActionsRepositoryFromSubject(issuerURL, subject)
-		if !ok {
-			return Account{}, ErrNotFound
-		}
-		accountIDs := map[string]struct{}{}
-		for appID, binding := range m.githubBindings {
-			app, appOK := m.apps[appID]
-			_, accountOK := m.accounts[binding.AccountID]
-			installKey := binding.AccountID + "\x00" + strconv.FormatInt(binding.InstallID, 10)
-			_, installOK := m.githubInstalls[installKey]
-			if strings.EqualFold(binding.RepoFullName, repo) && appOK && accountOK && installOK &&
-				app.AccountID == binding.AccountID {
-				accountIDs[binding.AccountID] = struct{}{}
-			}
-		}
-		if len(accountIDs) != 1 {
-			return Account{}, ErrNotFound
-		}
-		for accountID := range accountIDs {
-			return m.accounts[accountID], nil
-		}
+		return m.accountByOIDCRepositoryBindingLocked(issuerURL, subject)
 	}
 	sort.Slice(matches, func(i, j int) bool {
 		iSpecific := matches[i].SubjectPattern != ""
@@ -1606,6 +1585,40 @@ func (m *MemStore) AccountByOIDCSubject(_ context.Context, issuerURL, subject st
 		return matches[i].AccountID < matches[j].AccountID
 	})
 	return m.accounts[matches[0].AccountID], nil
+}
+
+// AccountByOIDCRepositoryBinding mirrors the PgStore repository-binding
+// resolution: the one account whose app binds the GitHub Actions subject's
+// repository through an installation that account proved.
+func (m *MemStore) AccountByOIDCRepositoryBinding(_ context.Context, issuerURL, subject string) (Account, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.accountByOIDCRepositoryBindingLocked(issuerURL, subject)
+}
+
+func (m *MemStore) accountByOIDCRepositoryBindingLocked(issuerURL, subject string) (Account, error) {
+	repo, ok := githubActionsRepositoryFromSubject(issuerURL, subject)
+	if !ok {
+		return Account{}, ErrNotFound
+	}
+	accountIDs := map[string]struct{}{}
+	for appID, binding := range m.githubBindings {
+		app, appOK := m.apps[appID]
+		_, accountOK := m.accounts[binding.AccountID]
+		installKey := binding.AccountID + "\x00" + strconv.FormatInt(binding.InstallID, 10)
+		_, installOK := m.githubInstalls[installKey]
+		if strings.EqualFold(binding.RepoFullName, repo) && appOK && accountOK && installOK &&
+			app.AccountID == binding.AccountID && app.Status != AppDeleted {
+			accountIDs[binding.AccountID] = struct{}{}
+		}
+	}
+	if len(accountIDs) != 1 {
+		return Account{}, ErrNotFound
+	}
+	for accountID := range accountIDs {
+		return m.accounts[accountID], nil
+	}
+	return Account{}, ErrNotFound
 }
 
 // regexpMatch is a tiny inlined wrapper to keep the import surface
@@ -1785,7 +1798,19 @@ func (m *MemStore) UpdateAccountStatus(_ context.Context, id string, status Acco
 		return ErrNotFound
 	}
 	a.Status = status
+	if status != AccountPastDue {
+		a.PastDueAt = nil
+	}
+	if status == AccountActive {
+		a.DeletionRequestedAt = nil
+	}
+	delete(m.freeQuotaSuspended, id)
 	m.accounts[id] = a
+	m.syncPersonalOrgStatusLocked(id, status)
+	return nil
+}
+
+func (m *MemStore) syncPersonalOrgStatusLocked(id string, status AccountStatus) {
 	now := time.Now().UTC()
 	for orgID, org := range m.orgs {
 		if org.Personal && org.PersonalOwnerAccountID != nil && *org.PersonalOwnerAccountID == id {
@@ -1794,7 +1819,37 @@ func (m *MemStore) UpdateAccountStatus(_ context.Context, id string, status Acco
 			m.orgs[orgID] = org
 		}
 	}
-	return nil
+}
+
+// SuspendAccountForFreeQuota mirrors PgStore.SuspendAccountForFreeQuota.
+func (m *MemStore) SuspendAccountForFreeQuota(_ context.Context, id string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.accounts[id]
+	if !ok || a.Status != AccountActive {
+		return false, nil
+	}
+	a.Status = AccountSuspended
+	a.PastDueAt = nil
+	m.accounts[id] = a
+	m.freeQuotaSuspended[id] = true
+	m.syncPersonalOrgStatusLocked(id, AccountSuspended)
+	return true, nil
+}
+
+// RestoreFreeQuotaSuspension mirrors PgStore.RestoreFreeQuotaSuspension.
+func (m *MemStore) RestoreFreeQuotaSuspension(_ context.Context, id string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.accounts[id]
+	if !ok || a.Status != AccountSuspended || !m.freeQuotaSuspended[id] {
+		return false, nil
+	}
+	a.Status = AccountActive
+	m.accounts[id] = a
+	delete(m.freeQuotaSuspended, id)
+	m.syncPersonalOrgStatusLocked(id, AccountActive)
+	return true, nil
 }
 
 // --- MFA (IAM-2, issue #186) -------------------------------------------------
@@ -2198,6 +2253,9 @@ func (m *MemStore) CreateAPIKey(_ context.Context, accountID string, hash []byte
 	// pre-existing 5-arg path (the 17+ test/handler call sites
 	// that don't yet know about expiry). The pgstore path
 	// relies on the SQL DEFAULT 'active' for the same shape.
+	if err := requireAPIKeyScopes(scopes); err != nil {
+		return APIKey{}, err
+	}
 	k := APIKey{
 		ID:        newID(),
 		AccountID: accountID,
@@ -2225,6 +2283,9 @@ func (m *MemStore) CreateOrgAPIKeyWithProvenance(_ context.Context, orgID, accou
 	var orgIDField string
 	if orgID != "" {
 		orgIDField = orgID
+	}
+	if err := requireAPIKeyScopes(scopes); err != nil {
+		return APIKey{}, err
 	}
 	k := APIKey{
 		ID:          newID(),
@@ -2390,6 +2451,9 @@ func (m *MemStore) CreateAPIKeyWithExpiry(_ context.Context, accountID string, h
 	if _, dup := m.keyByHash[h]; dup {
 		return APIKey{}, fmt.Errorf("state: duplicate key hash")
 	}
+	if err := requireAPIKeyScopes(scopes); err != nil {
+		return APIKey{}, err
+	}
 	k := APIKey{
 		ID:        newID(),
 		AccountID: accountID,
@@ -2414,6 +2478,9 @@ func (m *MemStore) CreateAPIKeyWithExpiryAndProvenance(_ context.Context, accoun
 	h := hex.EncodeToString(hash)
 	if _, dup := m.keyByHash[h]; dup {
 		return APIKey{}, fmt.Errorf("state: duplicate key hash")
+	}
+	if err := requireAPIKeyScopes(scopes); err != nil {
+		return APIKey{}, err
 	}
 	k := APIKey{
 		ID:          newID(),
@@ -2600,6 +2667,9 @@ func (m *MemStore) CreateOrgAPIKey(_ context.Context, orgID, accountID string, h
 	h := hex.EncodeToString(hash)
 	if _, dup := m.keyByHash[h]; dup {
 		return APIKey{}, fmt.Errorf("state: duplicate key hash")
+	}
+	if err := requireAPIKeyScopes(scopes); err != nil {
+		return APIKey{}, err
 	}
 	k := APIKey{
 		ID:        newID(),
@@ -3896,19 +3966,9 @@ func (m *MemStore) CreatePRPreviewAppsIfUnderQuota(_ context.Context, apps []App
 	return created, nil
 }
 
-func (m *MemStore) createAppIfUnderQuotaLocked(app App, limits api.Limits) (App, error) {
-	if _, ok := m.accounts[app.AccountID]; !ok {
-		return App{}, ErrNotFound
-	}
-	// 1. Return the slug collision before quota. Deploy clients use this
-	// signal to fetch and continue with an app they previously reserved.
-	for _, a := range m.apps {
-		if a.Slug == app.Slug && a.Status != AppDeleted {
-			return App{}, ErrConflict
-		}
-	}
-	// 2. Authoritative count under the same lock. Mirrors the PgStore
-	//    predicates, including the separate developer-environment cap.
+// checkAppQuotaLocked mirrors PgStore's checkAppQuotaTx predicates,
+// including the separate developer-environment cap. Caller holds m.mu.
+func (m *MemStore) checkAppQuotaLocked(app App, limits api.Limits) error {
 	observed := 0
 	developer := IsDeveloperApp(app)
 	preview := IsPRPreviewApp(app)
@@ -3937,7 +3997,25 @@ func (m *MemStore) createAppIfUnderQuotaLocked(app App, limits api.Limits) (App,
 		kind = QuotaErrorKindPreviewApps
 	}
 	if observed >= limit {
-		return App{}, &QuotaError{Kind: kind, Limit: limit, Observed: observed}
+		return &QuotaError{Kind: kind, Limit: limit, Observed: observed}
+	}
+	return nil
+}
+
+func (m *MemStore) createAppIfUnderQuotaLocked(app App, limits api.Limits) (App, error) {
+	if _, ok := m.accounts[app.AccountID]; !ok {
+		return App{}, ErrNotFound
+	}
+	// 1. Return the slug collision before quota. Deploy clients use this
+	// signal to fetch and continue with an app they previously reserved.
+	for _, a := range m.apps {
+		if a.Slug == app.Slug && a.Status != AppDeleted {
+			return App{}, ErrConflict
+		}
+	}
+	// 2. Authoritative count under the same lock.
+	if err := m.checkAppQuotaLocked(app, limits); err != nil {
+		return App{}, err
 	}
 	// 3. Conditional insert. The lock keeps the collision check above and
 	// insert atomic for MemStore.
@@ -5966,9 +6044,15 @@ func (m *MemStore) ScheduleAppDeletion(_ context.Context, id string, graceUntil 
 	return a, err
 }
 
-func (m *MemStore) RestoreApp(_ context.Context, id string) (App, error) {
+func (m *MemStore) RestoreApp(_ context.Context, id string, limits api.Limits) (App, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.restoreAppLocked(id, limits)
+}
+
+// restoreAppLocked is the restore body shared by RestoreApp and
+// RestoreAppWithActivity. Caller holds m.mu.
+func (m *MemStore) restoreAppLocked(id string, limits api.Limits) (App, error) {
 	a, ok := m.apps[id]
 	if !ok {
 		return App{}, ErrNotFound
@@ -5976,11 +6060,20 @@ func (m *MemStore) RestoreApp(_ context.Context, id string) (App, error) {
 	if _, claimed := m.appDeletionClaims[id]; claimed || a.Status != AppDeleted || a.DeleteGraceUntil == nil || !a.DeleteGraceUntil.After(time.Now()) {
 		return App{}, ErrConflict
 	}
+	if err := m.checkAppQuotaLocked(a, limits); err != nil {
+		return App{}, err
+	}
 	a.Status = AppActive
 	a.DeletedAt = nil
 	a.DeleteGraceUntil = nil
 	m.apps[id] = a
 	delete(m.appDeletionClaims, id)
+	for cronID, cron := range m.crons {
+		if cron.AppID == id && cron.SuspendedReason == CronSuspendedAppDeleted {
+			cron.SuspendedReason = ""
+			m.crons[cronID] = cron
+		}
+	}
 	return a, nil
 }
 
@@ -11145,7 +11238,7 @@ func (m *MemStore) CronByID(_ context.Context, id string) (Cron, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	c, ok := m.crons[id]
-	if !ok {
+	if !ok || c.SuspendedReason == CronSuspendedAppDeleted {
 		return Cron{}, ErrNotFound
 	}
 	return c, nil
@@ -11647,7 +11740,7 @@ func (m *MemStore) ReactivateCronsForApp(_ context.Context, appID string) (int, 
 func (m *MemStore) reactivateCronsForAppLocked(appID string) int {
 	updated := 0
 	for id, cron := range m.crons {
-		if cron.AppID != appID || cron.SuspendedReason == "" {
+		if cron.AppID != appID || cron.SuspendedReason != CronSuspendedNoLiveDeployment {
 			continue
 		}
 		cron.SuspendedReason = ""
@@ -18008,6 +18101,17 @@ func (m *MemStore) ReserveIdempotent(_ context.Context, accountID, key string, a
 	return IdempotencyReservation{Status: e.status, Body: append([]byte(nil), e.body...)}, nil
 }
 
+// ReleaseIdempotent mirrors PgStore: drop an in-flight reservation only.
+func (m *MemStore) ReleaseIdempotent(_ context.Context, accountID, key string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	id := accountID + "\x00" + key
+	if e, ok := m.idem[id]; ok && e.status == 0 {
+		delete(m.idem, id)
+	}
+	return nil
+}
+
 func (m *MemStore) PutIdempotent(_ context.Context, accountID, key string, status int, body []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -22028,6 +22132,11 @@ func (m *MemStore) MarkAccountDeletionPending(_ context.Context, id string) erro
 	if a.Status == AccountDeletedPending && a.DeletionRequestedAt != nil {
 		return nil
 	}
+	// Mirrors PgStore's `status in ('active','deleted_pending')`: a
+	// past_due or suspended account is not re-armed into deletion.
+	if a.Status != AccountActive && a.Status != AccountDeletedPending {
+		return ErrNotFound
+	}
 	a.Status = AccountDeletedPending
 	now := time.Now().UTC()
 	if a.DeletionRequestedAt == nil {
@@ -22047,7 +22156,7 @@ func (m *MemStore) RestoreAccount(_ context.Context, id string) error {
 	if !ok {
 		return ErrNotFound
 	}
-	if a.Status != AccountDeletedPending || a.DeletionRequestedAt == nil {
+	if a.Status != AccountDeletedPending || a.DeletionRequestedAt == nil || a.PastDueAt != nil {
 		return ErrConflict
 	}
 	if time.Since(*a.DeletionRequestedAt) > DeletionGraceDuration() {
@@ -22269,6 +22378,11 @@ func (m *MemStore) MarkDunningStep(_ context.Context, id string, from, to Accoun
 		now := time.Now().UTC()
 		a.PastDueAt = &now
 	}
+	if to == AccountDeletedPending && a.DeletionRequestedAt == nil {
+		now := time.Now().UTC()
+		a.DeletionRequestedAt = &now
+	}
+	delete(m.freeQuotaSuspended, id)
 	m.accounts[id] = a
 	return nil
 }
@@ -23044,8 +23158,10 @@ func (m *MemStore) ConsumeOrgInvitation(_ context.Context, hash []byte, acceptin
 	}
 	// Insert membership; surface ErrOrgAlreadyMember if a parallel
 	// accept beat us.
+	// A removed member's row stays (removed_at stamped); accepting a new
+	// invitation reactivates it rather than colliding with it.
 	k := orgAccountKey{OrgID: inv.OrgID, AccountID: acceptingAccount.ID}
-	if _, exists := m.memberships[k]; exists {
+	if existing, exists := m.memberships[k]; exists && existing.RemovedAt == nil {
 		return OrgMembership{}, OrgInvitation{}, ErrOrgAlreadyMember
 	}
 	now := time.Now().UTC()
@@ -25358,4 +25474,14 @@ func (m *MemStore) SumOpenUploadSessionBytesByAccount(_ context.Context, account
 		}
 	}
 	return total, nil
+}
+
+// requireAPIKeyScopes mirrors api_keys.scopes NOT NULL + cardinality CHECK:
+// Postgres refuses a key without scopes, so MemStore must too, or a caller
+// passing nil works in tests and 500s in production.
+func requireAPIKeyScopes(scopes []string) error {
+	if len(scopes) == 0 {
+		return fmt.Errorf("%w: api key scopes must not be empty", ErrInvalidArgument)
+	}
+	return nil
 }

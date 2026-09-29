@@ -46,17 +46,12 @@ import (
 	"net/http"
 	"path"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
 )
-
-// pathMatch is the stdlib path.Match wrapper — aliased here so the
-// path-glob filter unit tests can stub it via build tags in the
-// future without changing the production call site. Today it is a
-// straight passthrough; the indirection documents the seam.
-var pathMatch = path.Match
 
 type edgeRuleRequestHeadersContextKey struct{}
 
@@ -1433,7 +1428,7 @@ func PickFirstJWTMatch(rules []EdgeRuleJWTResolved, path, method string, request
 			continue
 		}
 		if r.PathGlob != "" {
-			ok, _ := pathGlobMatch(r.PathGlob, path)
+			ok, _ := protectivePathMatch(r.PathGlob, path)
 			if !ok {
 				continue
 			}
@@ -1453,7 +1448,7 @@ func PickFirstIPMatch(rules []EdgeRuleIPResolved, path, method string, requestHe
 			continue
 		}
 		if r.PathGlob != "" {
-			ok, _ := pathGlobMatch(r.PathGlob, path)
+			ok, _ := protectivePathMatch(r.PathGlob, path)
 			if !ok {
 				continue
 			}
@@ -1504,7 +1499,7 @@ func PickFirstGeoMatch(rules []EdgeRuleGeoResolved, path, method string, request
 			continue
 		}
 		if r.PathGlob != "" {
-			ok, _ := pathGlobMatch(r.PathGlob, path)
+			ok, _ := protectivePathMatch(r.PathGlob, path)
 			if !ok {
 				continue
 			}
@@ -1543,13 +1538,28 @@ func pickFirstMatch(rules []EdgeRuleResolved, path, method string, requestHeader
 	return nil
 }
 
+// protectivePathMatch is pathGlobMatch for gates that deny (kind=jwt, ip,
+// geo): the rule applies when the raw path OR its dot-segment/duplicate-
+// slash normalized form matches. Frameworks that normalize before routing
+// would otherwise serve /public/../admin/x or //admin/x as /admin/x while
+// the gate compared the raw string and let it through unchecked. Matching
+// both forms only ever adds protection.
+func protectivePathMatch(glob, p string) (bool, error) {
+	ok, err := pathGlobMatch(glob, p)
+	if ok || err != nil {
+		return ok, err
+	}
+	cleaned := path.Clean("/" + strings.ReplaceAll(p, "\\", "/"))
+	if cleaned == p {
+		return false, nil
+	}
+	return pathGlobMatch(glob, cleaned)
+}
+
 // pathGlobMatch is a tiny adapter over stdlib path.Match that
 // honours the two sentinel patterns the gateway rules allow:
 // "" (any path) and "*" (any path). Stdlib path.Match treats
 // both as errors for the empty / star input, so we short-circuit.
 func pathGlobMatch(glob, p string) (bool, error) {
-	if glob == "" || glob == "*" {
-		return true, nil
-	}
-	return pathMatch(glob, p)
+	return api.MatchEdgeRulePath(glob, p)
 }

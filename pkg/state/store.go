@@ -27,6 +27,20 @@ func nullableTriggerSource(source string) pgtype.Text {
 // githubActionsRepositoryFromSubject extracts OWNER/REPO from GitHub's
 // `repo:OWNER/REPO:...` subject form. It is used only as a first-use bridge
 // from an already OAuth-verified repository binding to an OIDC trust policy.
+// OIDCRepositoryBindingResolver resolves a GitHub Actions OIDC subject to the
+// single account whose app binds the subject's repository through an
+// installation proven by that account's user OAuth. The exchange uses it to
+// admit every workflow of a bound repository (other branches, pull_request
+// runs, a second repository) without a pre-existing pinned policy.
+type OIDCRepositoryBindingResolver interface {
+	AccountByOIDCRepositoryBinding(ctx context.Context, issuerURL, subject string) (Account, error)
+}
+
+var (
+	_ OIDCRepositoryBindingResolver = (*PgStore)(nil)
+	_ OIDCRepositoryBindingResolver = (*MemStore)(nil)
+)
+
 func githubActionsRepositoryFromSubject(issuerURL, subject string) (string, bool) {
 	if strings.TrimRight(issuerURL, "/") != githubActionsOIDCIssuer || !strings.HasPrefix(subject, "repo:") {
 		return "", false
@@ -955,7 +969,19 @@ type Store interface {
 	AccountByEmail(ctx context.Context, email string) (Account, error)
 	AccountByKeyHash(ctx context.Context, hash []byte) (Account, error)
 	UpdateAccountPlan(ctx context.Context, id string, plan api.Plan) error
+	// UpdateAccountStatus is the status writer for transitions outside the
+	// dunning ladder (payment recovery, operator action). It takes the
+	// account out of the ladder: past_due_at and suspended_reason are
+	// cleared, so a later payment failure starts a fresh grace period and
+	// an operator suspension is never advanced to deletion by dunning.
 	UpdateAccountStatus(ctx context.Context, id string, status AccountStatus) error
+	// SuspendAccountForFreeQuota applies the Free plan's monthly hard stop
+	// to an active account; it reports whether the account transitioned.
+	SuspendAccountForFreeQuota(ctx context.Context, id string) (bool, error)
+	// RestoreFreeQuotaSuspension lifts a suspension applied by
+	// SuspendAccountForFreeQuota and nothing else; it reports whether the
+	// account transitioned back to active.
+	RestoreFreeQuotaSuspension(ctx context.Context, id string) (bool, error)
 
 	// MFA (issue #186 / IAM-2).
 	// ConsumeRecoveryCode atomically matches `presented` against the
@@ -1621,14 +1647,10 @@ type Store interface {
 	// rows affected. Idempotent (a repeat call with the same currentSid
 	// returns 0 once siblings are gone).
 	//
-	// exceptID MUST be a real sid — the method does NOT special-case
-	// the empty string. A caller that passes exceptID="" will revoke
-	// every active session for accountID, including the caller's own
-	// (because SQL `id <> ''` is true for every uuid). The handler
-	// always passes the validated sid read out of the request context
-	// (sessionFrom(r) at session_middleware.go); a future caller that
-	// doesn't have the sid should pass a placeholder and let the
-	// revocation proceed, NOT pass "" with intent-to-skip.
+	// exceptID MUST be a valid uuid — sessions.id is a uuid column, so
+	// "" is rejected by Postgres (invalid input syntax for type uuid)
+	// even though MemStore accepts it. To revoke every session, pass
+	// uuid.Nil (no real session has that id).
 	//
 	// TouchSessionLastSeen stamps last_seen_at = now(). Best-effort fire-
 	// and-forget on the apid cookie branch (5-minute debounce) — failures
@@ -2211,8 +2233,10 @@ type Store interface {
 	// transitions the app to deleted atomically. It is idempotent.
 	ScheduleAppDeletion(ctx context.Context, id string, graceUntil time.Time) (App, error)
 	// RestoreApp clears the tombstone iff the app is still inside its grace
-	// window. Expired or non-deleted rows return ErrConflict.
-	RestoreApp(ctx context.Context, id string) (App, error)
+	// window. Expired or non-deleted rows return ErrConflict. The restored
+	// app counts against the deployed-app quota under the account lock
+	// like a new one: *QuotaError when the account is at its limit.
+	RestoreApp(ctx context.Context, id string, limits api.Limits) (App, error)
 	// ListDeletedApps returns tombstones for the app grace sweeper.
 	ListDeletedApps(ctx context.Context) ([]App, error)
 	// ClaimAppDeletion atomically closes the restore window for an expired

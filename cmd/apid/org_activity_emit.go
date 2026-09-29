@@ -125,20 +125,20 @@ func (s *server) scheduleAppDeletionWithActivity(ctx context.Context, r *http.Re
 	return parked, err
 }
 
-func (s *server) restoreAppWithActivity(ctx context.Context, r *http.Request, acct state.Account, app state.App) (state.App, error) {
+func (s *server) restoreAppWithActivity(ctx context.Context, r *http.Request, acct state.Account, app state.App, limits api.Limits) (state.App, error) {
 	entry := newAppLifecycleActivity(r, acct, "app.restored", "app.restored", map[string]any{"phase": "restored"})
 	prepared, prepareErr := s.prepareAppActivity(ctx, r, acct, app, entry)
 	if prepareErr != nil && s.log != nil {
 		s.log.Warn("activity: prepare app restore", "app", app.ID, "err", prepareErr)
 	}
 	if mutationStore, ok := s.store.(state.OrgActivityAppLifecycleMutationStore); ok && prepareErr == nil {
-		restored, outboxID, err := mutationStore.RestoreAppWithActivity(ctx, app.ID, prepared)
+		restored, outboxID, err := mutationStore.RestoreAppWithActivity(ctx, app.ID, limits, prepared)
 		if err == nil && outboxID > 0 {
 			s.deliverOrgActivityOutbox(ctx, outboxID)
 		}
 		return restored, err
 	}
-	restored, err := s.store.RestoreApp(ctx, app.ID)
+	restored, err := s.store.RestoreApp(ctx, app.ID, limits)
 	if err == nil && prepareErr == nil {
 		s.recordAppActivity(ctx, r, acct, restored, prepared)
 	}

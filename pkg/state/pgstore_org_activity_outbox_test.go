@@ -470,7 +470,7 @@ func TestPgStoreAppLifecycleActivityAtomic(t *testing.T) {
 	restoredEntry.SourceType = "app.restored"
 	restoredEntry.SourceID = "restore-app-1"
 	restoredEntry.Data = []byte(`{"phase":"restored"}`)
-	restored, restoredID, err := s.RestoreAppWithActivity(ctx, app.ID, restoredEntry)
+	restored, restoredID, err := s.RestoreAppWithActivity(ctx, app.ID, api.MustLimitsFor(api.PlanScale), restoredEntry)
 	if err != nil || restored.Status != state.AppActive || restoredID == 0 {
 		t.Fatalf("transactional app restore = (%+v, %d, %v), want active with event", restored, restoredID, err)
 	}

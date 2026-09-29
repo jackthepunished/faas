@@ -94,6 +94,19 @@ type DPAView struct {
 	Markdown string
 }
 
+// MFAChallengeData is the /dashboard/mfa payload: the TOTP challenge an
+// mfa_pending session must pass before any other dashboard page. Enrolled
+// is false for an account an explicit policy requires to enroll; it has
+// no code to enter yet and is pointed at the CLI enrollment.
+type MFAChallengeData struct {
+	CSRFToken string
+	Failed    bool
+	Enrolled  bool
+	// Next is where a passed challenge continues (already validated as a
+	// same-origin dashboard or CLI-approval path).
+	Next string
+}
+
 // IndexData is the /dashboard/ overview payload.
 type IndexData struct {
 	DeployedAppCount   int

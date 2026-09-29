@@ -540,6 +540,11 @@ type Account struct {
 // Active reports whether the account may deploy (not suspended/deleted).
 func (a Account) Active() bool { return a.Status == AccountActive || a.Status == AccountPastDue }
 
+// MayDeploy reports whether the account may start new deployments. A
+// past_due account keeps serving during its grace period but cannot deploy
+// (spec §4.7), and a suspended or deleted_pending account cannot either.
+func (a Account) MayDeploy() bool { return a.Status == AccountActive }
+
 // EmailVerified reports whether the account has proved control of its email.
 func (a Account) EmailVerified() bool { return a.EmailVerifiedAt != nil }
 
@@ -2875,8 +2880,9 @@ type Cron struct {
 	RetryBackoffSeconds   int // base delay; later retries double it, capped at 24 hours
 	Enabled               bool
 	// SuspendedReason is set by the scheduler when customer intent remains
-	// enabled but the app has no live deployment. A later successful deploy
-	// clears it without re-enabling a cron the customer disabled explicitly.
+	// enabled but the app has no live deployment (a later successful deploy
+	// clears it without re-enabling a cron the customer disabled
+	// explicitly), or by app deletion until the app is restored.
 	SuspendedReason string
 	Timezone        string // IANA timezone; empty is normalized to UTC
 	SkipIfRunning   bool   // skip a scheduled fire while a prior cron run is active
@@ -2885,6 +2891,11 @@ type Cron struct {
 }
 
 const CronSuspendedNoLiveDeployment = "no_live_deployment"
+
+// CronSuspendedAppDeleted holds a soft-deleted app's crons until the app is
+// restored (reason cleared) or purged (crons deleted). A deploy going live
+// must not clear it: only no_live_deployment is the scheduler's to lift.
+const CronSuspendedAppDeleted = "app_deleted"
 
 // CronOptions controls the optional scheduling behavior persisted with a cron.
 // Timezone is an IANA location name; an empty value means UTC. SkipIfRunning

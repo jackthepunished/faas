@@ -2584,6 +2584,15 @@ func ErrAccountSuspended() *Problem {
 		WithDocs(docsBase + "/billing")
 }
 
+// ErrDeploysBlocked is returned when an account that may not deploy (spec
+// §4.7: past_due and later) starts a deployment. Its apps keep whatever
+// the dunning ladder allows; only new deploys are refused.
+func ErrDeploysBlocked() *Problem {
+	return NewProblem(http.StatusPaymentRequired, CodeBillingPastDue,
+		"Deploys blocked", "new deploys are blocked until the outstanding payment is resolved: "+dashboardBillingURL).
+		WithDocs(docsBase + "/billing")
+}
+
 // ErrExportRateLimited is returned by GET /v1/account/export when
 // the account has already served an export inside the 24h rate
 // window (issue #755 / PR-5.1). 429 + Retry-After: the wire carries
@@ -3180,6 +3189,22 @@ func ErrPlanCorsPresetQuotaReached(plan Plan, scope string, limit, observed int)
 		"CORS preset limit reached",
 		fmt.Sprintf("%s plan caps CORS presets at %d per %s; you have %d. Delete one to add another.",
 			plan, limit, scope, observed)).
+		WithLimit(int64(limit), int64(observed)).
+		WithDocs(docsBase + "/plans#cors-presets")
+}
+
+// CodeCorsPresetTooLarge is returned when a CORS preset lists more
+// origins or methods than the plan's CorsPresetMaxOrigins /
+// CorsPresetMaxAllowMethods allow.
+const CodeCorsPresetTooLarge = "cors_preset_too_large"
+
+// ErrCorsPresetTooLarge reports a preset whose list exceeds the plan cap.
+// The gateway walks allow_origins on every matching request, so the cap is
+// what keeps one tenant's preset from costing the shared edge.
+func ErrCorsPresetTooLarge(plan Plan, field string, limit, observed int) *Problem {
+	return NewProblem(http.StatusUnprocessableEntity, CodeCorsPresetTooLarge,
+		"CORS preset too large",
+		fmt.Sprintf("%s plan allows at most %d %s per CORS preset; this preset has %d.", plan, limit, field, observed)).
 		WithLimit(int64(limit), int64(observed)).
 		WithDocs(docsBase + "/plans#cors-presets")
 }

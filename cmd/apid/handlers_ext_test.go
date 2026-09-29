@@ -5861,3 +5861,65 @@ func TestUpdateApp_CORSDefaultEnabled_OptOutPath(t *testing.T) {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body)
 	}
 }
+
+// TestStripePaymentSucceeded_LiftsDunningSuspension — the suspension email
+// tells the customer that paying restores service, but payment_succeeded
+// only restored past_due accounts: a customer who paid stayed suspended and
+// dunning went on to schedule the account for deletion. An operator
+// suspension (no past_due_at) must stay in place.
+func TestStripePaymentSucceeded_LiftsDunningSuspension(t *testing.T) {
+	e, _ := stripeWebhookHarness(t, api.PlanHobby)
+	ctx := context.Background()
+	if err := e.store.MarkDunningStep(ctx, e.acct.ID, state.AccountActive, state.AccountPastDue); err != nil {
+		t.Fatalf("seed past_due: %v", err)
+	}
+	if err := e.store.MarkDunningStep(ctx, e.acct.ID, state.AccountPastDue, state.AccountSuspended); err != nil {
+		t.Fatalf("seed dunning suspension: %v", err)
+	}
+
+	rec := postStripeEvent(t, e.h, "invoice.payment_succeeded", "cus_test_123")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("webhook status = %d, want 200: %s", rec.Code, rec.Body)
+	}
+	got, _ := e.store.AccountByID(ctx, e.acct.ID)
+	if got.Status != state.AccountActive || got.PastDueAt != nil {
+		t.Fatalf("after paying: status = %s, past_due_at = %v; want active with the dunning anchor cleared", got.Status, got.PastDueAt)
+	}
+
+	// An operator suspension is not lifted by a payment.
+	if err := e.store.UpdateAccountStatus(ctx, e.acct.ID, state.AccountSuspended); err != nil {
+		t.Fatalf("operator suspend: %v", err)
+	}
+	rec = postStripeEvent(t, e.h, "invoice.payment_succeeded", "cus_test_123")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("webhook status = %d, want 200: %s", rec.Code, rec.Body)
+	}
+	if got, _ := e.store.AccountByID(ctx, e.acct.ID); got.Status != state.AccountSuspended {
+		t.Fatalf("operator suspension: status = %s, want suspended", got.Status)
+	}
+}
+
+// TestStripePaymentSucceeded_UndoesDunningDeletion — paying inside the
+// deletion grace window restores an account the dunning timer scheduled
+// for deletion, and clears the anchor the grace sweep would purge on.
+func TestStripePaymentSucceeded_UndoesDunningDeletion(t *testing.T) {
+	e, _ := stripeWebhookHarness(t, api.PlanHobby)
+	ctx := context.Background()
+	for _, step := range [][2]state.AccountStatus{
+		{state.AccountActive, state.AccountPastDue},
+		{state.AccountPastDue, state.AccountSuspended},
+		{state.AccountSuspended, state.AccountDeletedPending},
+	} {
+		if err := e.store.MarkDunningStep(ctx, e.acct.ID, step[0], step[1]); err != nil {
+			t.Fatalf("seed %s→%s: %v", step[0], step[1], err)
+		}
+	}
+	rec := postStripeEvent(t, e.h, "invoice.payment_succeeded", "cus_test_123")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("webhook status = %d, want 200: %s", rec.Code, rec.Body)
+	}
+	got, _ := e.store.AccountByID(ctx, e.acct.ID)
+	if got.Status != state.AccountActive || got.DeletionRequestedAt != nil {
+		t.Fatalf("after paying: status = %s, deletion_requested_at = %v; want active and unscheduled", got.Status, got.DeletionRequestedAt)
+	}
+}

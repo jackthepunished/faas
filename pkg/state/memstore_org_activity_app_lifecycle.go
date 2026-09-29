@@ -77,7 +77,8 @@ func (m *MemStore) scheduleAppDeletion(id string, graceUntil time.Time, entry *O
 	}
 	for cronID, cron := range m.crons {
 		if cron.AppID == id {
-			delete(m.crons, cronID)
+			cron.SuspendedReason = CronSuspendedAppDeleted
+			m.crons[cronID] = cron
 		}
 	}
 	for i := range m.snapshots {
@@ -93,24 +94,20 @@ func (m *MemStore) scheduleAppDeletion(id string, graceUntil time.Time, entry *O
 	return a, outboxID, nil
 }
 
-func (m *MemStore) RestoreAppWithActivity(_ context.Context, id string, entry OrgActivity) (App, int64, error) {
+func (m *MemStore) RestoreAppWithActivity(_ context.Context, id string, limits api.Limits, entry OrgActivity) (App, int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	a, ok := m.apps[id]
 	if !ok {
 		return App{}, 0, ErrNotFound
 	}
-	if _, claimed := m.appDeletionClaims[id]; claimed || a.Status != AppDeleted || a.DeleteGraceUntil == nil || !a.DeleteGraceUntil.After(time.Now()) {
-		return App{}, 0, ErrConflict
-	}
 	entry, err := bindOrgActivityToApp(entry, a)
 	if err != nil {
 		return App{}, 0, err
 	}
-	a.Status = AppActive
-	a.DeletedAt = nil
-	a.DeleteGraceUntil = nil
-	m.apps[id] = a
-	delete(m.appDeletionClaims, id)
-	return a, m.enqueueOrgActivityOutboxLocked(entry), nil
+	restored, err := m.restoreAppLocked(id, limits)
+	if err != nil {
+		return App{}, 0, err
+	}
+	return restored, m.enqueueOrgActivityOutboxLocked(entry), nil
 }

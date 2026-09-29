@@ -72,7 +72,7 @@ type OrgActivityAppLifecycleMutationStore interface {
 	OrgActivityOutboxStore
 	CreateAppIfUnderQuotaWithActivity(context.Context, App, api.Limits, OrgActivity) (App, int64, error)
 	ScheduleAppDeletionWithActivity(context.Context, string, time.Time, OrgActivity) (App, int64, error)
-	RestoreAppWithActivity(context.Context, string, OrgActivity) (App, int64, error)
+	RestoreAppWithActivity(context.Context, string, api.Limits, OrgActivity) (App, int64, error)
 }
 
 // OrgActivityAppConfigBuilder constructs the activity from the exact app row

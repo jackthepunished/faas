@@ -88,6 +88,24 @@ func Run(t *testing.T, open Open) {
 		{"billing_usage_delivery_is_provider_qualified", testBillingUsageDelivery},
 		{"paddle_overage_window_existence_is_durable", testPaddleOverageWindowExistence},
 		{"overage_cap_distinguishes_zero_from_unset", testOverageCap},
+		{"account_lifecycle_leaves_the_dunning_ladder", testAccountLifecycleLeavesTheDunningLadder},
+		{"dunning_deletion_is_scheduled_and_paid_back", testDunningDeletionIsScheduledAndPaidBack},
+		{"self_service_deletion_only_from_active", testSelfServiceDeletionOnlyFromActive},
+		{"app_restore_honours_quota", testAppRestoreHonoursQuota},
+		{"app_restore_keeps_crons", testAppRestoreKeepsCrons},
+		{"removed_member_can_rejoin", testRemovedMemberCanRejoin},
+		{"api_key_requires_scopes", testAPIKeyRequiresScopes},
+		{"login_token_single_use_and_expiry", testLoginTokenSingleUseAndExpiry},
+		{"email_verification_token_single_use_and_expiry", testEmailVerificationTokenSingleUseAndExpiry},
+		{"session_revocation_is_account_scoped", testSessionRevocationIsAccountScoped},
+		{"delete_api_key_is_account_scoped", testDeleteAPIKeyIsAccountScoped},
+		{"mfa_disable_request_single_use", testMFADisableRequestSingleUse},
+		{"deploy_token_authentication", testDeployTokenAuthentication},
+		{"api_key_rotation_grace", testAPIKeyRotationGrace},
+		{"consumer_key_lookup_is_app_scoped", testConsumerKeyLookupIsAppScoped},
+		{"app_secret_scope_and_class", testAppSecretScopeAndClass},
+		{"oidc_empty_subject_pattern_binds_nothing", testOIDCEmptySubjectPatternBindsNothing},
+		{"oidc_repository_binding_resolution", testOIDCRepositoryBindingResolution},
 		{"cron_quota_trips_at_the_per_app_limit", testCronQuota},
 		{"project_reconcile_preserves_multiple_crons", testProjectReconcileMultipleCrons},
 		{"project_binding_update_is_scoped", testProjectBindingUpdate},
@@ -924,7 +942,7 @@ func testAppDeletionClaim(t *testing.T, fx *Fixture) {
 			t.Fatalf("ClaimAppDeletion attempt %d: %v", attempt, err)
 		}
 	}
-	if _, err := fx.Store.RestoreApp(fx.Ctx, fx.App.ID); !errors.Is(err, state.ErrConflict) {
+	if _, err := fx.Store.RestoreApp(fx.Ctx, fx.App.ID, api.MustLimitsFor(api.PlanScale)); !errors.Is(err, state.ErrConflict) {
 		t.Fatalf("RestoreApp after purge claim = %v, want ErrConflict", err)
 	}
 	if err := fx.Store.DeleteAppPermanently(fx.Ctx, fx.App.ID); err != nil {

@@ -2,7 +2,6 @@ package state
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -59,8 +58,10 @@ func (s *PgStore) ScheduleAppDeletionWithActivity(ctx context.Context, id string
 	}
 	var app App
 	row := tx.QueryRow(ctx, `
-		with removed_crons as (
-			delete from crons where app_id = $1 returning id
+		with suspended_crons as (
+			-- Suspend, don't delete: restoring the app inside its grace
+			-- window brings its schedules back. The purge removes them.
+			update crons set suspended_reason = 'app_deleted' where app_id = $1 returning id
 		), cancelled_app_tasks as (
 			update app_tasks
 			   set status = case when status = 'queued' then 'cancelled' else status end,
@@ -102,26 +103,15 @@ func (s *PgStore) ScheduleAppDeletionWithActivity(ctx context.Context, id string
 // RestoreAppWithActivity commits the grace-window restore and the timeline
 // handoff together. A closed or claimed grace window retains RestoreApp's
 // existing conflict behavior.
-func (s *PgStore) RestoreAppWithActivity(ctx context.Context, id string, entry OrgActivity) (App, int64, error) {
+func (s *PgStore) RestoreAppWithActivity(ctx context.Context, id string, limits api.Limits, entry OrgActivity) (App, int64, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return App{}, 0, fmt.Errorf("state: begin app activity restore: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	var app App
-	row := tx.QueryRow(ctx, `
-		update apps
-		   set status = 'active', deleted_at = null, delete_grace_until = null, purge_claimed_at = null
-		 where id = $1
-		   and status = 'deleted'
-		   and delete_grace_until > now()
-		   and purge_claimed_at is null
-		 returning `+appsSelectColumns, id)
-	if err := scanAppInto(&app, row); err != nil {
-		if errors.Is(err, ErrNotFound) {
-			return App{}, 0, ErrConflict
-		}
-		return App{}, 0, mapErr(err)
+	app, err := restoreAppTx(ctx, tx, id, limits)
+	if err != nil {
+		return App{}, 0, err
 	}
 	entry, err = bindOrgActivityToApp(entry, app)
 	if err != nil {

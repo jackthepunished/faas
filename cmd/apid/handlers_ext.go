@@ -106,6 +106,22 @@ func (s *server) getApp(w http.ResponseWriter, r *http.Request, acct state.Accou
 //
 // Returns *api.Problem instead of error to mirror cmd/apid/handlers.go
 // buildApp, the established helper signature in this package.
+// validateIdleTimeout keeps idle_timeout_s inside what the reaper applies:
+// 0 means the plan default, otherwise [floor, plan default × 2] (spec
+// §4.3). The reaper clamped out-of-range values silently, so the API
+// stored and reported a timeout — -5, or 999999999 — that never took
+// effect.
+func validateIdleTimeout(v int, limits api.Limits) *api.Problem {
+	if v == 0 {
+		return nil
+	}
+	floor, ceiling := limits.IdleTimeoutBounds()
+	if v < floor || v > ceiling {
+		return api.ErrValidation(fmt.Sprintf("idle_timeout_s must be 0 (plan default) or %d..%d; got %d", floor, ceiling, v))
+	}
+	return nil
+}
+
 func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api.Limits, app state.App) *api.Problem {
 	if req.RetryPolicy != nil {
 		if _, problem := marshalAppRetryPolicy(req.RetryPolicy); problem != nil {
@@ -119,6 +135,11 @@ func validateUpdateApp(req *api.UpdateAppRequest, acct state.Account, limits api
 		}
 		if visibility == api.AppVisibilityInternal && !acct.Plan.InternalIngressAllowed() {
 			return api.ErrPlanInternalIngressNotAllowed(acct.Plan)
+		}
+	}
+	if req.IdleTimeoutS != nil {
+		if prob := validateIdleTimeout(*req.IdleTimeoutS, limits); prob != nil {
+			return prob
 		}
 	}
 	// The app-wide edge bucket is a tightening-only runtime policy. Zero
@@ -1853,8 +1874,14 @@ func (s *server) restoreApp(w http.ResponseWriter, r *http.Request, acct state.A
 		s.notFound(w, "no such app")
 		return
 	}
-	restored, err := s.restoreAppWithActivity(r.Context(), r, acct, app)
+	limits := api.MustLimitsFor(acct.Plan)
+	restored, err := s.restoreAppWithActivity(r.Context(), r, acct, app, limits)
 	if err != nil {
+		var qe *state.QuotaError
+		if errors.As(err, &qe) {
+			api.WriteProblem(w, api.ErrPlanLimitApps(limits, qe.Observed))
+			return
+		}
 		if errors.Is(err, state.ErrConflict) {
 			api.WriteProblem(w, api.NewProblem(http.StatusConflict,
 				api.CodeAppNotRestorable, "App not restorable",
@@ -4592,7 +4619,7 @@ func (s *server) changePlan(w http.ResponseWriter, r *http.Request, acct state.A
 		writeJSON(w, http.StatusAccepted, response)
 		return
 	}
-	if err := s.store.UpdateAccountPlan(r.Context(), acct.ID, plan); err != nil {
+	if err := s.setAccountPlan(r.Context(), acct, plan); err != nil {
 		api.WriteProblem(w, api.ErrCapacity("could not update plan"))
 		return
 	}
@@ -5167,7 +5194,7 @@ func (s *server) handleBillingEventWithOptions(ctx context.Context, ev billing.E
 			}
 		}
 		if plan := billingPlanFromProviderID(ev.PlanID); plan != "" {
-			if err := s.store.UpdateAccountPlan(ctx, acct.ID, plan); err != nil {
+			if err := s.setAccountPlan(ctx, acct, plan); err != nil {
 				return fmt.Errorf("store plan: %w", err)
 			}
 		}
@@ -5182,8 +5209,8 @@ func (s *server) handleBillingEventWithOptions(ctx context.Context, ev billing.E
 			return err
 		}
 	case billing.EventPaymentFailed:
-		// Apps keep serving; deploys blocked at the auth gate (handlers
-		// reading acct.Active() refuse writes). 7-day dunning timer
+		// Apps keep serving; deploys are blocked by admitAccountDeploy
+		// and the githubd bridge (Account.MayDeploy). 7-day dunning timer
 		// (M7 dunning state machine) lives in pkg/meter.Dunning.
 		//
 		// We route through MarkDunningStep(active → past_due) instead
@@ -5251,7 +5278,7 @@ func (s *server) handleBillingEventWithOptions(ctx context.Context, ev billing.E
 			}
 		}
 		if plan := billingPlanFromProviderID(ev.PlanID); plan != "" {
-			if err := s.store.UpdateAccountPlan(ctx, acct.ID, plan); err != nil {
+			if err := s.setAccountPlan(ctx, acct, plan); err != nil {
 				return fmt.Errorf("store payment plan: %w", err)
 			}
 		}
@@ -5261,12 +5288,24 @@ func (s *server) handleBillingEventWithOptions(ctx context.Context, ev billing.E
 		// customer is still over quota from a prior cycle) emits a
 		// fresh warning — otherwise the stamp from the previous day
 		// would suppress it (spec §4.7).
-		if acct.Status == state.AccountPastDue {
+		//
+		// A dunning suspension (suspended with past_due_at still set) is
+		// lifted too: the suspension email tells the customer that paying
+		// — `gregale billing retry` — restores service, but only past_due
+		// was restored, so a customer who paid stayed suspended and the
+		// dunning timer went on to schedule the account for deletion.
+		// Operator suspensions carry no past_due_at and stay in place.
+		// A dunning deletion (deleted_pending with past_due_at) is
+		// undone by paying within its grace window as well.
+		if acct.Status == state.AccountPastDue ||
+			(acct.Status == state.AccountSuspended && acct.PastDueAt != nil) ||
+			(acct.Status == state.AccountDeletedPending && acct.PastDueAt != nil) {
 			if err := s.store.UpdateAccountStatus(ctx, acct.ID, state.AccountActive); err != nil {
 				s.log.Warn("apid: payment_succeeded restore",
 					"account", acct.ID, "err", err)
 				return fmt.Errorf("restore account: %w", err)
 			} else {
+				s.notifyAccountLifecycle(ctx, acct.ID, "account_reactivated")
 				// Status just flipped back to active. Send the
 				// recovery email (spec §171 "All transitions emailed").
 				// payment_succeeded is naturally idempotent — the
@@ -5292,7 +5331,7 @@ func (s *server) handleBillingEventWithOptions(ctx context.Context, ev billing.E
 			}
 		}
 		if plan := billingPlanFromProviderID(ev.PlanID); plan != "" {
-			if err := s.store.UpdateAccountPlan(ctx, acct.ID, plan); err != nil {
+			if err := s.setAccountPlan(ctx, acct, plan); err != nil {
 				return fmt.Errorf("store updated plan: %w", err)
 			}
 		}
