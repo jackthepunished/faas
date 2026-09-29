@@ -27,6 +27,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/state"
 	pkgtrace "github.com/onebox-faas/faas/pkg/trace"
+	"github.com/onebox-faas/faas/pkg/workpolicy"
 )
 
 // --- decodeJSONLimit --------------------------------------------------------
@@ -149,7 +150,7 @@ func (s *server) invokeAppAsync(w http.ResponseWriter, r *http.Request, acct sta
 		ResultRetentionUntil:   retentionForRequest(req.RetentionSeconds, acct),
 		OnSuccessDestinationID: onSuccessDestination,
 		OnFailureDestinationID: onFailureDestination,
-	}, "enqueue async invoke")
+	}, "enqueue async invoke", req.Work)
 	if versionProblem != nil {
 		api.WriteProblem(w, versionProblem)
 		return
@@ -187,6 +188,10 @@ func (s *server) invokeApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	}
 	if problem := validateInvokeRequest(req); problem != nil {
 		api.WriteProblem(w, problem)
+		return
+	}
+	if req.Work != nil {
+		api.WriteProblem(w, api.ErrValidation("work applies only to asynchronous invocations"))
 		return
 	}
 	if req.Method == "" {
@@ -311,7 +316,8 @@ func (s *server) resolveInvocationDestinations(ctx context.Context, appID, accou
 
 // --- queues -----------------------------------------------------------------
 
-// queueSend enqueues a single FIFO row on the per-app queue. The
+// queueSend enqueues one row on the per-app queue. Unkeyed rows retain
+// legacy FIFO dispatch; keyed rows use the shared work-lane claim gate. The
 // per-app MaxQueueDepth cap is re-checked here (the apid gate; the
 // drain re-checks at dispatch tick).
 func (s *server) queueSend(w http.ResponseWriter, r *http.Request, acct state.Account) {
@@ -328,7 +334,7 @@ func (s *server) queueSend(w http.ResponseWriter, r *http.Request, acct state.Ac
 	if !decodeJSONLimit(w, r, &req, int64(limits.MaxSourceBytesPerInvocation)) {
 		return
 	}
-	inv, traceID, problem := s.enqueueAppMessage(r.Context(), r.Header, acct, app, req.Payload, req.QueueName, req.RetryPolicy)
+	inv, traceID, problem := s.enqueueAppMessage(r.Context(), r.Header, acct, app, req.Payload, req.QueueName, req.RetryPolicy, req.Work)
 	if problem != nil {
 		api.WriteProblem(w, problem)
 		return
@@ -384,7 +390,7 @@ func (s *server) sendAppMessage(w http.ResponseWriter, r *http.Request, acct sta
 		api.WriteProblem(w, api.ErrCapacity("encode application message"))
 		return
 	}
-	inv, traceID, problem := s.enqueueAppMessage(r.Context(), r.Header, acct, app, payload, req.QueueName, req.RetryPolicy)
+	inv, traceID, problem := s.enqueueAppMessage(r.Context(), r.Header, acct, app, payload, req.QueueName, req.RetryPolicy, req.Work)
 	if problem != nil {
 		api.WriteProblem(w, problem)
 		return
@@ -400,7 +406,7 @@ func (s *server) sendAppMessage(w http.ResponseWriter, r *http.Request, acct sta
 	})
 }
 
-func (s *server) enqueueAppMessage(ctx context.Context, requestHeaders http.Header, acct state.Account, app state.App, payload json.RawMessage, queueName string, retryPolicy *api.RetryPolicyDTO) (state.Invocation, string, *api.Problem) {
+func (s *server) enqueueAppMessage(ctx context.Context, requestHeaders http.Header, acct state.Account, app state.App, payload json.RawMessage, queueName string, retryPolicy *api.RetryPolicyDTO, work *api.InvokeWork) (state.Invocation, string, *api.Problem) {
 	limits := api.MustLimitsFor(acct.Plan)
 	if limits.MaxQueueDepth == 0 {
 		return state.Invocation{}, "", api.ErrPlanFeatureGated("queues", acct.Plan)
@@ -410,7 +416,13 @@ func (s *server) enqueueAppMessage(ctx context.Context, requestHeaders http.Head
 		return state.Invocation{}, "", api.ErrCapacity("count queue")
 	}
 	if n >= limits.MaxQueueDepth {
-		return state.Invocation{}, "", api.ErrPlanQueueDepth(limits.MaxQueueDepth, n)
+		replaceable, problem := s.replaceableQueueWorkCount(ctx, app, work)
+		if problem != nil {
+			return state.Invocation{}, "", problem
+		}
+		if n-replaceable >= limits.MaxQueueDepth {
+			return state.Invocation{}, "", api.ErrPlanQueueDepth(limits.MaxQueueDepth, n)
+		}
 	}
 	if problem := validateInvocationRetryPolicy(retryPolicy); problem != nil {
 		return state.Invocation{}, "", problem
@@ -418,6 +430,33 @@ func (s *server) enqueueAppMessage(ctx context.Context, requestHeaders http.Head
 	resolvedQueueName, problem := s.resolveQueueSendName(ctx, acct, app, queueName)
 	if problem != nil {
 		return state.Invocation{}, "", problem
+	}
+	if work != nil && resolvedQueueName != "" {
+		// A named keyed row is owned by the queue trigger poller. Require an
+		// enabled push consumer so it cannot be accepted into an arbitrary name
+		// that the generic invocation drain deliberately excludes.
+		bound := false
+		bindings, err := s.store.ListQueueBindingsForApp(ctx, acct.ID, app.ID)
+		if err != nil {
+			return state.Invocation{}, "", api.ErrCapacity("look up queue binding")
+		}
+		for _, binding := range bindings {
+			bound = bound || (binding.Enabled && binding.Mode == "push" && binding.QueueName == resolvedQueueName)
+		}
+		if !bound {
+			triggers, err := s.store.ListTriggersForApp(ctx, app.ID)
+			if err != nil {
+				return state.Invocation{}, "", api.ErrCapacity("look up queue consumer")
+			}
+			for _, trigger := range triggers {
+				bound = bound || (trigger.Enabled && trigger.Kind == string(api.TriggerKindQueue) &&
+					trigger.Source.Valid && trigger.Source.String == string(state.InvocationQueue) &&
+					trigger.Slug == resolvedQueueName)
+			}
+		}
+		if !bound {
+			return state.Invocation{}, "", api.ErrValidation("named keyed queue requires an enabled push consumer")
+		}
 	}
 	traceHeaders, err := pkgtrace.MergeHeaders(ctx, nil)
 	if err != nil {
@@ -432,13 +471,50 @@ func (s *server) enqueueAppMessage(ctx context.Context, requestHeaders http.Head
 		Headers:         traceHeaders,
 		DueAt:           time.Now().UTC(),
 		RetryPolicyJSON: effectiveInvocationRetryPolicy(app, retryPolicy, limits.MaxQueueAttempts),
-	}, "enqueue application message")
+	}, "enqueue application message", work)
 	if versionProblem != nil {
 		return state.Invocation{}, "", versionProblem
 	}
 	var traceHeaderValues map[string]string
 	_ = json.Unmarshal(traceHeaders, &traceHeaderValues)
 	return inv, traceHeaderValues[api.TraceIDHeader], nil
+}
+
+func (s *server) replaceableQueueWorkCount(ctx context.Context, app state.App, work *api.InvokeWork) (int, *api.Problem) {
+	if work == nil {
+		return 0, nil
+	}
+	policies, ok := s.store.(state.AppWorkPolicyStore)
+	if !ok {
+		return 0, api.ErrCapacity("work policy store unavailable")
+	}
+	record, err := policies.AppWorkPolicyByName(ctx, app.ID, work.Policy)
+	if errors.Is(err, state.ErrNotFound) {
+		return 0, api.ErrValidation("unknown work policy")
+	}
+	if err != nil {
+		return 0, api.ErrCapacity("lookup work policy")
+	}
+	if record.Policy.PendingUpdates != workpolicy.PendingKeepLatest {
+		return 0, nil
+	}
+	key, err := workpolicy.CanonicalScalar(work.Key)
+	if err != nil {
+		return 0, api.ErrValidation("work key must be a bounded string, number, or boolean")
+	}
+	digest, err := workpolicy.DigestKey(key)
+	if err != nil {
+		return 0, api.ErrValidation("invalid work key")
+	}
+	counter, ok := s.store.(state.PendingQueueWorkCounter)
+	if !ok {
+		return 0, api.ErrCapacity("queue work counter unavailable")
+	}
+	n, err := counter.PendingQueueWorkInLane(ctx, app.ID, record.Policy.Name, digest[:])
+	if err != nil {
+		return 0, api.ErrCapacity("count replaceable queue work")
+	}
+	return n, nil
 }
 
 // queueReceive long-polls on invocation_done scoped to this app; when
@@ -719,7 +795,7 @@ func (s *server) delayedTaskCreate(w http.ResponseWriter, r *http.Request, acct 
 		ResultRetentionUntil:   retentionForRequestAt(sched, req.RetentionSeconds, acct),
 		OnSuccessDestinationID: onSuccessDestination,
 		OnFailureDestinationID: onFailureDestination,
-	}, "enqueue delayed task")
+	}, "enqueue delayed task", req.Work)
 	if versionProblem != nil {
 		api.WriteProblem(w, versionProblem)
 		return

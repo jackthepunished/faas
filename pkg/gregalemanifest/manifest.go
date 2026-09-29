@@ -46,6 +46,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/events"
 	"github.com/onebox-faas/faas/pkg/hostingconfig"
 	"github.com/onebox-faas/faas/pkg/sched"
+	"github.com/onebox-faas/faas/pkg/workpolicy"
 )
 
 // TriggerKind is the closed vocabulary for `triggers[].kind`. PR-C
@@ -99,10 +100,45 @@ const (
 // persistence. Filter is a JSON object encoded as a string so the same matcher
 // contract is shared by YAML/TOML manifests and the event router.
 type EventTrigger struct {
-	App    string `yaml:"app,omitempty" toml:"app"`
-	Source string `yaml:"source" toml:"source"`
-	Type   string `yaml:"type" toml:"type"`
-	Filter string `yaml:"filter,omitempty" toml:"filter"`
+	App             string `yaml:"app,omitempty" toml:"app"`
+	Source          string `yaml:"source" toml:"source"`
+	Type            string `yaml:"type" toml:"type"`
+	Filter          string `yaml:"filter,omitempty" toml:"filter"`
+	WorkPolicy      string `yaml:"work_policy,omitempty" toml:"work_policy"`
+	WorkKey         string `yaml:"work_key,omitempty" toml:"work_key"`
+	WorkFairnessKey string `yaml:"work_fairness_key,omitempty" toml:"work_fairness_key"`
+	WorkAction      string `yaml:"work_action,omitempty" toml:"work_action"`
+}
+
+func (t EventTrigger) EffectiveWorkAction() string {
+	if t.WorkAction == "" {
+		return "invoke"
+	}
+	return t.WorkAction
+}
+
+// WorkPolicy declares one named app policy shared by async invocations and
+// event subscriptions. Durations use whole milliseconds on the wire.
+type WorkPolicy struct {
+	App                      string `yaml:"app,omitempty" toml:"app"`
+	Name                     string `yaml:"name" toml:"name"`
+	MaxRunningPerKey         int    `yaml:"max_running_per_key" toml:"max_running_per_key"`
+	MaxRunningPerFairnessKey int    `yaml:"max_running_per_fairness_key,omitempty" toml:"max_running_per_fairness_key"`
+	PendingUpdates           string `yaml:"pending_updates,omitempty" toml:"pending_updates"`
+	DebounceMS               int64  `yaml:"debounce_ms,omitempty" toml:"debounce_ms"`
+	ExpiresAfterMS           int64  `yaml:"expires_after_ms,omitempty" toml:"expires_after_ms"`
+}
+
+func (p WorkPolicy) ToPolicy() workpolicy.Policy {
+	pending := workpolicy.PendingUpdates(p.PendingUpdates)
+	if pending == "" {
+		pending = workpolicy.PendingAll
+	}
+	return workpolicy.Policy{Name: p.Name, MaxRunningPerKey: p.MaxRunningPerKey,
+		MaxRunningPerFairnessKey: p.MaxRunningPerFairnessKey,
+		PendingUpdates:           pending,
+		Debounce:                 time.Duration(p.DebounceMS) * time.Millisecond,
+		ExpiresAfter:             time.Duration(p.ExpiresAfterMS) * time.Millisecond}
 }
 
 // AsyncRoute declares an HTTP route that accepts a request into Gregale's
@@ -338,6 +374,30 @@ func (m *Manifest) companionSpecs() ([]CompanionSpec, error) {
 // Validate checks the event pattern and content filter without requiring an
 // account ID. Account ownership is assigned by the authenticated apply path.
 func (t EventTrigger) Validate(idx int) error {
+	if t.WorkAction != "" && t.WorkAction != "invoke" && t.WorkAction != "cancel_pending" {
+		return fmt.Errorf("triggers.event[%d].work_action must be invoke or cancel_pending", idx)
+	}
+	if t.WorkAction == "cancel_pending" && t.WorkPolicy == "" {
+		return fmt.Errorf("triggers.event[%d]: cancel_pending requires work_policy and work_key", idx)
+	}
+	if (t.WorkPolicy == "") != (t.WorkKey == "") {
+		return fmt.Errorf("triggers.event[%d]: work_policy and work_key must be set together", idx)
+	}
+	if t.WorkPolicy != "" {
+		if err := (workpolicy.Policy{Name: t.WorkPolicy, MaxRunningPerKey: 1}).Validate(); err != nil {
+			return fmt.Errorf("triggers.event[%d].work_policy: %w", idx, err)
+		}
+		if _, err := workpolicy.ParseSelector(t.WorkKey); err != nil {
+			return fmt.Errorf("triggers.event[%d].work_key: %w", idx, err)
+		}
+		if t.WorkFairnessKey != "" {
+			if _, err := workpolicy.ParseSelector(t.WorkFairnessKey); err != nil {
+				return fmt.Errorf("triggers.event[%d].work_fairness_key: %w", idx, err)
+			}
+		}
+	} else if t.WorkFairnessKey != "" {
+		return fmt.Errorf("triggers.event[%d]: work_fairness_key requires work_policy", idx)
+	}
 	if err := events.ValidatePattern(t.Source); err != nil {
 		return fmt.Errorf("triggers.event[%d].source: %w", idx, err)
 	}
@@ -393,9 +453,12 @@ func (t EventTrigger) AsSubscription(accountID string) (events.Subscription, err
 // from "explicit false" — the spec is "absent → true" (a trigger with
 // no `enabled:` line is enabled).
 type Trigger struct {
-	Kind TriggerKind `yaml:"kind"`
-	App  string      `yaml:"app"`
-	Slug string      `yaml:"slug,omitempty"`
+	Kind            TriggerKind `yaml:"kind"`
+	App             string      `yaml:"app"`
+	Slug            string      `yaml:"slug,omitempty"`
+	WorkPolicy      string      `yaml:"work_policy,omitempty"`
+	WorkKey         string      `yaml:"work_key,omitempty"`
+	WorkFairnessKey string      `yaml:"work_fairness_key,omitempty"`
 	// Schedule + Path are cron-only fields. They are required for
 	// kind=cron and ignored for every other kind (the broker pulls
 	// on its own cadence; the runner doesn't know how to map a
@@ -1112,6 +1175,7 @@ type Manifest struct {
 	// Triggers for backward compatibility; the separate slice keeps event
 	// subscriptions from changing that wire shape.
 	EventTriggers []EventTrigger `yaml:"event_triggers,omitempty"`
+	WorkPolicies  []WorkPolicy   `yaml:"work_policies,omitempty"`
 	// AsyncRoutes are manifest-owned async edge rules. A nil slice leaves
 	// existing managed routes unchanged; an explicit empty list clears them.
 	AsyncRoutes []AsyncRoute    `yaml:"async_routes,omitempty"`
@@ -1499,6 +1563,7 @@ func parseManifest(b []byte) (*Manifest, error) {
 type tomlManifest struct {
 	SchemaVersion int                   `toml:"schema_version"`
 	Triggers      tomlTriggers          `toml:"triggers"`
+	WorkPolicies  []WorkPolicy          `toml:"work_policies"`
 	Companions    []CompanionSpec       `toml:"companions"`
 	MainDependsOn []ExtensionDependency `toml:"main_depends_on"`
 	Extensions    []ExtensionSpec       `toml:"extensions"`
@@ -1524,6 +1589,7 @@ func parseTOMLManifest(b []byte) (*Manifest, error) {
 	return &Manifest{
 		SchemaVersion: raw.SchemaVersion,
 		EventTriggers: raw.Triggers.Event,
+		WorkPolicies:  raw.WorkPolicies,
 		Companions:    raw.Companions,
 		MainDependsOn: raw.MainDependsOn,
 		Extensions:    raw.Extensions,
@@ -1583,6 +1649,24 @@ func (m *Manifest) ValidateForPlan(plan api.Plan) error {
 		if err := validateAppRetryPolicy(m.RetryPolicy); err != nil {
 			return err
 		}
+	}
+	seenWorkPolicies := make(map[string]struct{}, len(m.WorkPolicies))
+	for i, declaration := range m.WorkPolicies {
+		if declaration.App != "" && !isDNSSafeSlug(declaration.App) {
+			return fmt.Errorf("work_policies[%d].app %q must match [a-z0-9-]+", i, declaration.App)
+		}
+		if declaration.DebounceMS < 0 || declaration.DebounceMS > int64(workpolicy.MaxDebounce/time.Millisecond) ||
+			declaration.ExpiresAfterMS < 0 || declaration.ExpiresAfterMS > int64(workpolicy.MaxExpiresAfter/time.Millisecond) {
+			return fmt.Errorf("work_policies[%d]: duration out of range", i)
+		}
+		if err := declaration.ToPolicy().Validate(); err != nil {
+			return fmt.Errorf("work_policies[%d]: %w", i, err)
+		}
+		key := declaration.App + "\x00" + declaration.Name
+		if _, duplicate := seenWorkPolicies[key]; duplicate {
+			return fmt.Errorf("work_policies[%d]: duplicate (app, name)", i)
+		}
+		seenWorkPolicies[key] = struct{}{}
 	}
 	seenAsyncRoutes := make(map[string]struct{}, len(m.AsyncRoutes))
 	seenAsyncMatches := make(map[string]struct{}, len(m.AsyncRoutes))
@@ -1700,6 +1784,25 @@ func (m *Manifest) ValidateForPlan(plan api.Plan) error {
 		// typed Config map.
 		if err := t.validateKindConfig(i); err != nil {
 			return err
+		}
+		if (t.WorkPolicy == "") != (t.WorkKey == "") || (t.WorkPolicy == "" && t.WorkFairnessKey != "") {
+			return fmt.Errorf("trigger[%d]: work_policy and work_key must be set together; work_fairness_key requires them", i)
+		}
+		if t.WorkPolicy != "" {
+			if t.Kind == TriggerKindCron || t.Kind == TriggerKindQueue {
+				return fmt.Errorf("trigger[%d]: work policies require an external broker trigger", i)
+			}
+			if err := (workpolicy.Policy{Name: t.WorkPolicy, MaxRunningPerKey: 1}).Validate(); err != nil {
+				return fmt.Errorf("trigger[%d].work_policy: %w", i, err)
+			}
+			if _, err := workpolicy.ParseSelector(t.WorkKey); err != nil {
+				return fmt.Errorf("trigger[%d].work_key: %w", i, err)
+			}
+			if t.WorkFairnessKey != "" {
+				if _, err := workpolicy.ParseSelector(t.WorkFairnessKey); err != nil {
+					return fmt.Errorf("trigger[%d].work_fairness_key: %w", i, err)
+				}
+			}
 		}
 		// FilterCriteria (ADR-118) applies to every kind except
 		// cron — cron doesn't poll, so a record filter is a

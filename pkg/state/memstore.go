@@ -499,7 +499,11 @@ type MemStore struct {
 	// ... for update skip locked` semantics by serialising every access
 	// through m.mu (MemStore is inherently single-process); per-row
 	// lease_expires_at is in-memory instead of SQL NOW().
-	invocations map[string]Invocation
+	invocations         map[string]Invocation
+	workPolicies        map[string]AppWorkPolicy
+	eventWorkBindings   map[string]EventWorkBinding
+	triggerWorkBindings map[string]TriggerWorkBinding
+	workCancellations   map[string]WorkCancellation
 	// executions and executionPayloads mirror the ADR-171 durable intent
 	// split. Customer reads only touch executions; a payload is exposed solely
 	// by ClaimExecution after the in-memory lease CAS succeeds.
@@ -1164,6 +1168,10 @@ func NewMemStore() *MemStore {
 		tenantSurfaces:          map[string]TenantSurface{},
 		tenantHostnames:         map[string]TenantHostname{},
 		invocations:             map[string]Invocation{},
+		workPolicies:            map[string]AppWorkPolicy{},
+		eventWorkBindings:       map[string]EventWorkBinding{},
+		triggerWorkBindings:     map[string]TriggerWorkBinding{},
+		workCancellations:       map[string]WorkCancellation{},
 		executions:              map[string]Execution{},
 		executionPayloads:       map[string]executionPayload{},
 		executionUsageLedger:    map[string]executionUsageLedgerRow{},
@@ -11919,6 +11927,7 @@ func (m *MemStore) UpdateTrigger(_ context.Context, id string, enabled *bool, co
 func (m *MemStore) DeleteTrigger(_ context.Context, id, _ string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	delete(m.triggerWorkBindings, id)
 	delete(m.triggers, id)
 	return nil
 }
@@ -11958,14 +11967,44 @@ func (m *MemStore) ListEnabledTriggers(_ context.Context) ([]sqlc.Trigger, error
 func (m *MemStore) ClaimTriggerRecords(_ context.Context, triggerID string, limit int32) ([]sqlc.TriggerRecord, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	var out []sqlc.TriggerRecord
-	for _, r := range m.records {
-		if r.TriggerID.String() == triggerID && r.State == "pending" && len(out) < int(limit) {
-			r.State = "claimed"
-			out = append(out, r)
-		}
+	return m.claimTriggerRecordsLocked(triggerID, int(limit), nil), nil
+}
+
+func (m *MemStore) ClaimTriggerRecordsByItems(_ context.Context, triggerID string, items []string) ([]sqlc.TriggerRecord, error) {
+	if len(items) == 0 {
+		return nil, nil
 	}
-	return out, nil
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	allowed := make(map[string]bool, len(items))
+	for _, item := range items {
+		allowed[item] = true
+	}
+	return m.claimTriggerRecordsLocked(triggerID, len(allowed), allowed), nil
+}
+
+func (m *MemStore) claimTriggerRecordsLocked(triggerID string, limit int, allowed map[string]bool) []sqlc.TriggerRecord {
+	var out []sqlc.TriggerRecord
+	now := time.Now().UTC()
+	for id, r := range m.records {
+		if len(out) >= limit {
+			break
+		}
+		if r.TriggerID.String() != triggerID || (allowed != nil && !allowed[r.ItemIdentifier]) {
+			continue
+		}
+		due := (r.State == "pending" || r.State == "retry") && (!r.NextFireAt.Valid || !r.NextFireAt.Time.After(now))
+		expired := r.State == "claimed" && r.ClaimExpiresAt.Valid && !r.ClaimExpiresAt.Time.After(now)
+		if !due && !expired {
+			continue
+		}
+		r.State = "claimed"
+		r.ClaimGeneration++
+		r.ClaimExpiresAt = pgtypeFromTime(now.Add(10 * time.Minute))
+		m.records[id] = r
+		out = append(out, r)
+	}
+	return out
 }
 
 // InsertTriggerRecord mirrors PgStore.InsertTriggerRecord for the
@@ -12149,6 +12188,9 @@ func (m *MemStore) DropTriggerRecordByOperator(_ context.Context, id string) err
 //   shape matches PgStore.
 
 func (m *MemStore) EnqueueInvocation(_ context.Context, inv Invocation) (Invocation, error) {
+	if inv.WorkPolicyName != "" {
+		return Invocation{}, fmt.Errorf("state: use EnqueueKeyedInvocation for policy work")
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.apps[inv.AppID]; !ok {
@@ -12246,17 +12288,37 @@ func (m *MemStore) dueInvocationsLocked(now time.Time) []Invocation {
 		if inv.DueAt.After(now) {
 			continue
 		}
-		ownedByTrigger := false
-		for _, trigger := range m.triggers {
-			if trigger.Enabled && trigger.Kind == "queue" && trigger.Source.Valid &&
-				trigger.AppID.String() == canonicalMemUUID(inv.AppID) &&
-				trigger.Source.String == string(inv.Source) {
-				ownedByTrigger = true
-				break
+		if inv.WorkPolicyName != "" {
+			blocked := false
+			for _, older := range m.invocations {
+				if older.AppID == inv.AppID && older.WorkPolicyName == inv.WorkPolicyName &&
+					bytes.Equal(older.WorkKeyDigest, inv.WorkKeyDigest) &&
+					older.WorkSequence < inv.WorkSequence &&
+					(older.State == InvocationPending || older.State == InvocationDispatching) {
+					blocked = true
+					break
+				}
+			}
+			if blocked {
+				continue
+			}
+			if m.fairnessClaimAllowedLocked(inv, now) != nil {
+				continue
 			}
 		}
-		if ownedByTrigger {
-			continue
+		if inv.WorkPolicyName == "" {
+			ownedByTrigger := false
+			for _, trigger := range m.triggers {
+				if trigger.Enabled && trigger.Kind == "queue" && trigger.Source.Valid &&
+					trigger.AppID.String() == canonicalMemUUID(inv.AppID) &&
+					trigger.Source.String == string(inv.Source) {
+					ownedByTrigger = true
+					break
+				}
+			}
+			if ownedByTrigger {
+				continue
+			}
 		}
 		out = append(out, inv)
 	}
@@ -12280,6 +12342,9 @@ func (m *MemStore) ClaimInvocation(_ context.Context, id, instanceID string, lea
 	}
 	if inv.State != InvocationPending {
 		return Invocation{}, ErrNotFound
+	}
+	if inv.WorkPolicyName != "" {
+		return Invocation{}, ErrConflict
 	}
 	now := time.Now()
 	exp := now.Add(time.Duration(leaseSeconds) * time.Second)
@@ -12333,10 +12398,25 @@ func (m *MemStore) RequeueExpiredInvocations(_ context.Context, now time.Time, l
 // ErrNotFound so the drain doesn't double-complete a row that PG
 // already flipped.
 func (m *MemStore) CompleteInvocation(_ context.Context, id string, result json.RawMessage) error {
+	return m.completeInvocation(id, 0, result)
+}
+
+func (m *MemStore) CompleteKeyedInvocation(_ context.Context, id string, attempt int, result json.RawMessage) error {
+	if attempt <= 0 {
+		return ErrNotFound
+	}
+	return m.completeInvocation(id, attempt, result)
+}
+
+func (m *MemStore) completeInvocation(id string, attempt int, result json.RawMessage) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	inv, ok := m.invocations[id]
 	if !ok || inv.State != InvocationDispatching {
+		return ErrNotFound
+	}
+	if (inv.WorkPolicyName == "" && attempt != 0) ||
+		(inv.WorkPolicyName != "" && inv.Attempts != attempt) {
 		return ErrNotFound
 	}
 	quotaReserved := inv.QuotaReserved
@@ -12420,9 +12500,18 @@ func (m *MemStore) FailInvocation(_ context.Context, id string, lastError string
 	if inv.State != InvocationPending && inv.State != InvocationDispatching {
 		return ErrNotFound
 	}
+	failOpts := ApplyFailOptions(opts)
+	if inv.WorkPolicyName != "" {
+		if inv.State == InvocationPending && failOpts.ClaimAttempt != 0 {
+			return ErrNotFound
+		}
+		if inv.State == InvocationDispatching &&
+			(failOpts.ClaimAttempt <= 0 || inv.Attempts != failOpts.ClaimAttempt) {
+			return ErrNotFound
+		}
+	}
 	quotaReserved := inv.QuotaReserved
 	inv.QuotaReserved = false
-	failOpts := ApplyFailOptions(opts)
 	inv.LastError = lastError
 	if retryAfter > 0 {
 		// Transient. Either re-queue (budget == 0 or attempts not yet
@@ -12521,6 +12610,9 @@ func (m *MemStore) CancelInvocation(_ context.Context, id string) error {
 	}
 	if inv.State == InvocationCompleted || inv.State == InvocationFailed || inv.State == InvocationCancelled || inv.State == InvocationDeadLetter {
 		return nil
+	}
+	if inv.WorkPolicyName != "" && inv.State == InvocationDispatching {
+		return ErrConflict
 	}
 	quotaReserved := inv.QuotaReserved
 	inv.State = InvocationCancelled
@@ -24474,6 +24566,12 @@ func (m *MemStore) ClaimInvocationWithCap(_ context.Context, id, instanceID stri
 		return Invocation{}, ErrNotFound
 	}
 	now := time.Now()
+	if err := m.keyedClaimAllowedLocked(inv, now); err != nil {
+		return Invocation{}, err
+	}
+	if err := m.fairnessClaimAllowedLocked(inv, now); err != nil {
+		return Invocation{}, err
+	}
 	leaseExpires := now.Add(time.Duration(leaseSeconds) * time.Second)
 	inv.State = InvocationDispatching
 	inv.QuotaReserved = true

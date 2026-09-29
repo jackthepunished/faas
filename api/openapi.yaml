@@ -13963,6 +13963,53 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
 
+  /v1/triggers/{id}/work-binding:
+    parameters:
+      - $ref: '#/components/parameters/Id32'
+    get:
+      tags: [triggers]
+      operationId: getTriggerWorkBinding
+      summary: Get the broker trigger's application work-policy binding.
+      responses:
+        '200':
+          description: The configured broker work binding.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TriggerWorkBinding' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [triggers]
+      operationId: putTriggerWorkBinding
+      summary: Set the broker trigger's application work-policy binding.
+      description: |
+        An initial binding requires a disabled external trigger with no
+        existing record receipts. Resume the trigger after binding it.
+        Updating an existing binding is allowed while the trigger is enabled;
+        records already admitted keep their captured policy and key.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TriggerWorkBinding' }
+      responses:
+        '200':
+          description: The updated broker work binding.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TriggerWorkBinding' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/TriggerInvalid' }
+    delete:
+      tags: [triggers]
+      operationId: deleteTriggerWorkBinding
+      summary: Remove the broker trigger's application work-policy binding.
+      responses:
+        '204': { description: The broker work binding was removed. }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /v1/triggers/{id}/pause:
     parameters:
       - $ref: '#/components/parameters/Id32'
@@ -17924,6 +17971,85 @@ paths:
         '403': { $ref: '#/components/responses/PlanFeatureGated' }
         '413': { $ref: '#/components/responses/PlanSourceBytes' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /v1/apps/{slug}/work-policies:
+    get:
+      tags: [invocations]
+      operationId: listAppWorkPolicies
+      summary: List named work policies for an app.
+      parameters:
+        - $ref: '#/components/parameters/Slug'
+      responses:
+        '200':
+          description: App work policies.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkPolicyListResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/apps/{slug}/work-policies/{name}:
+    parameters:
+      - $ref: '#/components/parameters/Slug'
+      - in: path
+        name: name
+        required: true
+        description: Named app work policy.
+        schema: { type: string, pattern: '^[a-z][a-z0-9-]{0,62}$' }
+    put:
+      tags: [invocations]
+      operationId: upsertAppWorkPolicy
+      summary: Create or update a named app work policy.
+      description: Policy changes affect new work only. Existing invocations retain their admission settings and policy revision.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpsertWorkPolicyRequest' }
+      responses:
+        '200':
+          description: Saved policy.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkPolicyResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [invocations]
+      operationId: deleteAppWorkPolicy
+      summary: Delete a policy after removing event subscription bindings.
+      responses:
+        '204': { description: Policy deleted. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/apps/{slug}/work-policies/{name}/cancel-pending:
+    post:
+      tags: [invocations]
+      operationId: cancelPendingAppWork
+      summary: Cancel pending work for one policy and application key.
+      description: Running work continues. A repeated Idempotency-Key returns the original receipt and does not cancel newer work.
+      parameters:
+        - $ref: '#/components/parameters/Slug'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - in: path
+          name: name
+          required: true
+          description: Policy whose pending lane is being cancelled.
+          schema: { type: string, pattern: '^[a-z][a-z0-9-]{0,62}$' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CancelPendingWorkRequest' }
+      responses:
+        '200':
+          description: Durable cancellation receipt.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CancelPendingWorkResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
 
   /v1/apps/{slug}/queues/send:
     post:
@@ -29475,6 +29601,9 @@ components:
         data: { description: Any valid JSON value delivered inside the CloudEvents envelope. }
         queue_name: { type: string, pattern: '^[a-z][a-z0-9-]{0,62}$' }
         retry_policy: { $ref: '#/components/schemas/RetryPolicyDTO' }
+        work:
+          allOf: [{ $ref: '#/components/schemas/InvokeWork' }]
+          description: "Optional application-keyed policy for an unnamed queue without an active queue consumer."
 
     SendAppMessageResponse:
       description: Durable receipt for a queued app-to-app message.
@@ -29507,6 +29636,10 @@ components:
           type: object
           additionalProperties: true
           description: Normalized JSON filter evaluated by the event matcher.
+        work_policy: { type: string, description: "Named app policy for keyed event deliveries, when configured." }
+        work_key: { type: string, description: "Dot selector into the CloudEvents envelope for the work key." }
+        work_fairness_key: { type: string, description: "Optional dot selector for an application fairness group; defaults to work_key." }
+        work_action: { type: string, enum: [invoke, cancel_pending], description: "Action taken on a matching event." }
         enabled: { type: boolean }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
@@ -29537,7 +29670,7 @@ components:
         event_source: { type: string }
         event_type: { type: string }
         subscription_id: { type: string, format: uuid }
-        state: { type: string, enum: [pending, dispatching, completed, failed, cancelled, dead_letter] }
+        state: { type: string, enum: [pending, dispatching, completed, failed, cancelled, dead_letter, superseded, expired] }
         attempts: { type: integer, minimum: 0 }
         last_error: { type: string }
         created_at: { type: string, format: date-time }
@@ -31434,6 +31567,15 @@ components:
           description: "Source discriminator for kind=queue rows."
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
+
+    TriggerWorkBinding:
+      description: "An external broker trigger's binding to a named app work policy."
+      type: object
+      required: [policy_name, key]
+      properties:
+        policy_name: { type: string, description: "Named policy in the trigger's app." }
+        key: { type: string, description: "Scalar dot path into the broker message JSON payload." }
+        fairness_key: { type: string, description: "Optional scalar dot path for the fairness group." }
 
     CreateTriggerRequest:
       description: |
@@ -38932,6 +39074,9 @@ components:
         last_error: { type: [string, "null"] }
         ack_url: { type: [string, "null"], description: "Optional ack URL for queueReceive consumers; populated on queue-sourced rows." }
         attempts: { type: integer, description: "Number of dispatch attempts so far; 0 on the first try." }
+        work_policy_name: { type: string, description: "Named policy under which this invocation was admitted." }
+        work_policy_revision: { type: integer, minimum: 1, description: "Policy revision captured at admission." }
+        work_expires_at: { type: [string, "null"], format: date-time, description: "Pending work expiry; running work is never expired by this policy." }
         lease_expires_at: { type: [string, "null"], format: date-time, description: "When the in-flight dispatch lease expires; null when no lease is held." }
         received_at: { type: [string, "null"], format: date-time, description: "When the drain first claimed the row; null until claimed." }
         # ADR-134 PR-B: per-row async fields. All three are
@@ -38998,9 +39143,78 @@ components:
         destinations:
           anyOf: [{ $ref: '#/components/schemas/InvocationDestinations' }, { type: "null" }]
           description: "EPIC #1278. Optional terminal callbacks."
+        work:
+          allOf:
+            - $ref: '#/components/schemas/InvokeWork'
+          description: "Async invocation only. Assigns a named policy and application key."
+
+    InvokeWork:
+      description: Named policy and typed application key for one durable invocation.
+      type: object
+      additionalProperties: false
+      required: [policy, key]
+      properties:
+        policy: { type: string, pattern: '^[a-z][a-z0-9-]{0,62}$' }
+        key: { description: "A bounded JSON string, number, or boolean. Equal typed values share one work lane." }
+        fairness_key: { description: "Optional scalar shared by multiple work keys, such as a tenant ID. Defaults to key when the policy has a fairness cap." }
+
+    UpsertWorkPolicyRequest:
+      description: App work policy settings; durations use whole milliseconds.
+      type: object
+      additionalProperties: false
+      required: [max_running_per_key]
+      properties:
+        max_running_per_key: { type: integer, enum: [1] }
+        max_running_per_fairness_key: { type: integer, minimum: 0, maximum: 1000, default: 0 }
+        pending_updates: { type: string, enum: [all, keep_latest], default: all }
+        debounce_ms: { type: integer, minimum: 0, maximum: 86400000, default: 0 }
+        expires_after_ms: { type: integer, minimum: 0, maximum: 2592000000, default: 0 }
+
+    WorkPolicyResponse:
+      description: Saved app policy and revision used for subsequent work admissions.
+      type: object
+      additionalProperties: false
+      required: [name, revision, max_running_per_key, max_running_per_fairness_key, pending_updates, debounce_ms, expires_after_ms, created_at, updated_at]
+      properties:
+        name: { type: string }
+        revision: { type: integer, minimum: 1 }
+        max_running_per_key: { type: integer, enum: [1] }
+        max_running_per_fairness_key: { type: integer, minimum: 0, maximum: 1000 }
+        pending_updates: { type: string, enum: [all, keep_latest] }
+        debounce_ms: { type: integer }
+        expires_after_ms: { type: integer }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    WorkPolicyListResponse:
+      description: All named work policies for one app.
+      type: object
+      additionalProperties: false
+      required: [policies]
+      properties:
+        policies:
+          type: array
+          items: { $ref: '#/components/schemas/WorkPolicyResponse' }
+
+    CancelPendingWorkRequest:
+      description: Typed application key identifying pending work in one policy lane.
+      type: object
+      additionalProperties: false
+      required: [key]
+      properties:
+        key: { description: "A bounded JSON string, number, or boolean." }
+
+    CancelPendingWorkResponse:
+      description: Durable receipt for a cancel-pending operation.
+      type: object
+      additionalProperties: false
+      required: [id, cancelled_count]
+      properties:
+        id: { type: string, format: uuid }
+        cancelled_count: { type: integer, minimum: 0 }
 
     QueueSendRequest:
-      description: "Body for POST /v1/apps/{slug}/queues/send. Cap-checked against MaxQueueDepth."
+      description: "Body for POST /v1/apps/{slug}/queues/send. Cap-checked against MaxQueueDepth. Unkeyed messages retain legacy FIFO dispatch; keyed messages use per-key ordering."
       type: object
       properties:
         payload: { type: object, additionalProperties: true }
@@ -39009,6 +39223,9 @@ components:
           allOf:
             - $ref: '#/components/schemas/RetryPolicyDTO'
           description: Optional per-message retry curve override.
+        work:
+          allOf: [{ $ref: '#/components/schemas/InvokeWork' }]
+          description: "Optional policy for an unnamed queue send when the app has no active queue consumer."
 
     QueueWorkloadProfileRequest:
       description: |
@@ -39141,6 +39358,7 @@ components:
       required: [scheduled_at]
       properties:
         payload: { type: object, additionalProperties: true }
+        work: { $ref: '#/components/schemas/InvokeWork' }
         scheduled_at: { type: string, format: date-time }
         headers: { type: object, additionalProperties: true }
         method: { type: string, default: POST }
@@ -39155,6 +39373,7 @@ components:
       required: [delay_seconds]
       properties:
         payload: { type: object, additionalProperties: true }
+        work: { $ref: '#/components/schemas/InvokeWork' }
         delay_seconds: { type: integer, format: int64, minimum: 1, maximum: 31536000 }
         headers: { type: object, additionalProperties: true }
         method: { type: string, default: POST }

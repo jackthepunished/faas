@@ -72,6 +72,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -91,6 +92,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/state/sqlc"
 	"github.com/onebox-faas/faas/pkg/triggerconfig"
 	"github.com/onebox-faas/faas/pkg/wire"
+	"github.com/onebox-faas/faas/pkg/workpolicy"
 )
 
 const gatewayDispatchResponseMaxBytes = 1 << 20
@@ -174,6 +176,42 @@ type storeLike interface {
 	// seq, SQS receipt handle, Redis entry-id, queue invocation_id)
 	// to the trigger_records.id UUID the dead_letter FK expects.
 	TriggerRecordIDByItemIdentifier(ctx context.Context, triggerID, itemIdentifier string) (string, error)
+}
+
+func completeTriggerClaim(ctx context.Context, store storeLike, record sqlc.TriggerRecord) error {
+	if record.ClaimGeneration > 0 {
+		finisher, ok := store.(state.TriggerClaimFinisher)
+		if !ok {
+			return fmt.Errorf("trigger claim finisher unavailable")
+		}
+		return finisher.CompleteClaimedTriggerRecord(ctx, record.ID.String(), record.ClaimGeneration)
+	}
+	return store.MarkTriggerRecordSucceeded(ctx, record.ID.String())
+}
+
+func retryTriggerClaim(ctx context.Context, store storeLike, record sqlc.TriggerRecord, reason string, nextFireAt time.Time) error {
+	if record.ClaimGeneration > 0 {
+		finisher, ok := store.(state.TriggerClaimFinisher)
+		if !ok {
+			return fmt.Errorf("trigger claim finisher unavailable")
+		}
+		return finisher.RetryClaimedTriggerRecord(ctx, record.ID.String(), record.ClaimGeneration, reason, nextFireAt)
+	}
+	return store.MarkTriggerRecordRetry(ctx, record.ID.String(), reason, nextFireAt)
+}
+
+func routeTriggerClaimToDLQ(ctx context.Context, store storeLike, record sqlc.TriggerRecord, triggerID, reason string, detail []byte) error {
+	if record.ClaimGeneration > 0 {
+		finisher, ok := store.(state.TriggerClaimFinisher)
+		if !ok {
+			return fmt.Errorf("trigger claim finisher unavailable")
+		}
+		return finisher.RouteClaimedTriggerDeadLetter(ctx, record.ID.String(), record.ClaimGeneration, triggerID, reason, detail)
+	}
+	if err := store.InsertTriggerDeadLetter(ctx, record.ID.String(), triggerID, reason, "drop", detail); err != nil {
+		return err
+	}
+	return store.MarkTriggerRecordDeadLetter(ctx, record.ID.String(), string(detail))
 }
 
 type triggerConsumerHealthWriter interface {
@@ -449,9 +487,80 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 		}
 	}
 
+	// A broker policy uses the message's durable identity in trigger_records,
+	// while the poller still Ack/Nacks the current delivery handle. Resolve the
+	// binding once for this batch; each admitted row snapshots the live policy.
+	var workBinding *state.TriggerWorkBinding
+	var workPolicy state.AppWorkPolicy
+	var workKeySelector, fairnessSelector workpolicy.Selector
+	var keyedRecords state.KeyedTriggerRecordStore
+	var workPoisoner state.TriggerWorkPoisoner
+	if bindings, ok := store.(state.TriggerWorkBindingStore); ok {
+		workBinding, err = bindings.TriggerWorkBindingByID(ctx, t.ID.String())
+		if err != nil {
+			_ = poller.Nack(ctx, t, batchItemIDs(batch), triggerReasonBrokerError)
+			return fmt.Errorf("dispatch trigger work binding: %w", err)
+		}
+	}
+	if workBinding != nil {
+		policies, policyOK := store.(state.AppWorkPolicyStore)
+		var recordOK bool
+		keyedRecords, recordOK = store.(state.KeyedTriggerRecordStore)
+		var poisonOK bool
+		workPoisoner, poisonOK = store.(state.TriggerWorkPoisoner)
+		if !policyOK || !recordOK || !poisonOK {
+			_ = poller.Nack(ctx, t, batchItemIDs(batch), triggerReasonBrokerError)
+			return fmt.Errorf("dispatch trigger work policy store unavailable")
+		}
+		workPolicy, err = policies.AppWorkPolicyByName(ctx, t.AppID.String(), workBinding.PolicyName)
+		if err != nil {
+			_ = poller.Nack(ctx, t, batchItemIDs(batch), triggerReasonBrokerError)
+			return fmt.Errorf("dispatch trigger work policy: %w", err)
+		}
+		workKeySelector, err = workpolicy.ParseSelector(workBinding.KeySelector)
+		if err != nil {
+			_ = poller.Nack(ctx, t, batchItemIDs(batch), triggerReasonBrokerError)
+			return fmt.Errorf("dispatch trigger work key selector: %w", err)
+		}
+		if workBinding.FairnessSelector != "" {
+			fairnessSelector, err = workpolicy.ParseSelector(workBinding.FairnessSelector)
+			if err != nil {
+				_ = poller.Nack(ctx, t, batchItemIDs(batch), triggerReasonBrokerError)
+				return fmt.Errorf("dispatch trigger fairness selector: %w", err)
+			}
+		}
+		handles := make(map[string][]string, len(batch))
+		stable := make([]SourceRecord, 0, len(batch))
+		for _, rec := range batch {
+			if rec.StableIdentifier == "" {
+				// A delivery tag or receipt handle alone cannot identify a
+				// redelivery. Give the malformed record a durable DLQ receipt.
+				_, _, poisonErr := workPoisoner.RejectInvalidTriggerWorkRecord(ctx, t.ID.String(),
+					rec.ItemIdentifier, rec.Payload, marshalJSON(rec.Headers), marshalJSON(rec.Metadata),
+					"work policy requires stable broker message identity")
+				if poisonErr != nil {
+					l.log.Warn("sched trigger tick: invalid broker identity", "trigger_id", t.ID.String(), "err", poisonErr)
+					_ = poller.Nack(ctx, t, []string{rec.ItemIdentifier}, triggerReasonBrokerError)
+					continue
+				}
+				_ = poller.Nack(ctx, t, []string{rec.ItemIdentifier}, triggerReasonPoisonRecord)
+				continue
+			}
+			handles[rec.StableIdentifier] = append(handles[rec.StableIdentifier], rec.ItemIdentifier)
+			rec.ItemIdentifier = rec.StableIdentifier
+			stable = append(stable, rec)
+		}
+		batch = stable
+		poller = &workIdentityPoller{triggerSource: poller, handles: handles}
+		if len(batch) == 0 {
+			return nil
+		}
+	}
+
 	// 4. Persist polled records before applying terminal policy. This ordering
 	// gives rate-limit and poison paths a durable record to transition and link
 	// to the DLQ. ON CONFLICT makes a re-poll reuse the same record.
+	admitted := make([]SourceRecord, 0, len(batch))
 	for _, rec := range batch {
 		payload := rec.Payload
 		if payload == nil {
@@ -459,12 +568,69 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 		}
 		headers := marshalJSON(rec.Headers)
 		metadata := marshalJSON(rec.Metadata)
-		if _, err := store.InsertTriggerRecord(ctx, t.ID.String(), rec.ItemIdentifier, payload, headers, metadata); err != nil {
+		var insertErr error
+		if workBinding == nil {
+			_, insertErr = store.InsertTriggerRecord(ctx, t.ID.String(), rec.ItemIdentifier, payload, headers, metadata)
+		} else {
+			var existingID string
+			existingID, insertErr = store.TriggerRecordIDByItemIdentifier(ctx, t.ID.String(), rec.ItemIdentifier)
+			if insertErr == nil && existingID == "" {
+				key, keyErr := workKeySelector.Resolve(payload)
+				var fairness []string
+				if keyErr == nil && workBinding.FairnessSelector != "" {
+					var fairnessKey string
+					fairnessKey, keyErr = fairnessSelector.Resolve(payload)
+					if keyErr == nil {
+						fairness = append(fairness, fairnessKey)
+					}
+				}
+				if keyErr != nil {
+					var priorState string
+					_, priorState, insertErr = workPoisoner.RejectInvalidTriggerWorkRecord(ctx,
+						t.ID.String(), rec.ItemIdentifier, payload, headers, metadata, keyErr.Error())
+					if insertErr != nil {
+						l.log.Warn("sched trigger tick: reject invalid work key", "trigger_id", t.ID.String(), "err", insertErr)
+						_ = poller.Nack(ctx, t, []string{rec.ItemIdentifier}, triggerReasonBrokerError)
+						continue
+					}
+					if priorState == "dead_letter" {
+						_ = poller.Nack(ctx, t, []string{rec.ItemIdentifier}, triggerReasonPoisonRecord)
+						continue
+					}
+					// Another scheduler admitted this message before the
+					// selector changed. Dispatch its original receipt.
+					admitted = append(admitted, rec)
+					continue
+				}
+				_, insertErr = keyedRecords.InsertKeyedTriggerRecord(ctx, t.ID.String(),
+					rec.ItemIdentifier, payload, headers, metadata, workPolicy, key, fairness...)
+			}
+		}
+		if insertErr != nil {
 			l.log.Warn("sched trigger tick: insert record",
 				"trigger_id", t.ID.String(),
 				"item_identifier", rec.ItemIdentifier,
-				"err", err)
+				"err", insertErr)
+			_ = poller.Nack(ctx, t, []string{rec.ItemIdentifier}, triggerReasonBrokerError)
+			continue
 		}
+		admitted = append(admitted, rec)
+	}
+	batch = admitted
+	if len(batch) == 0 {
+		return nil
+	}
+	// A prior dispatch may have committed its terminal receipt and then lost
+	// the broker Ack. A redelivery must acknowledge that receipt without
+	// invoking the app again. This also handles policy-terminal broker work
+	// once those records are admitted into the shared work ledger.
+	var terminalErr error
+	batch, terminalErr = ackTerminalTriggerRedeliveries(ctx, store, poller, t, batch)
+	if terminalErr != nil {
+		return terminalErr
+	}
+	if len(batch) == 0 {
+		return nil
 	}
 
 	// 5. Rate-limit gate. Deny → dead_letter(reason='rate_limited').
@@ -499,7 +665,13 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 	}
 
 	// 6. Claim trigger_records rows.
-	claimed, claimErr := store.ClaimTriggerRecords(ctx, t.ID.String(), int32(len(batch)))
+	var claimed []sqlc.TriggerRecord
+	var claimErr error
+	if batchClaimer, ok := store.(state.TriggerBatchClaimer); ok {
+		claimed, claimErr = batchClaimer.ClaimTriggerRecordsByItems(ctx, t.ID.String(), batchItemIDs(batch))
+	} else {
+		claimed, claimErr = store.ClaimTriggerRecords(ctx, t.ID.String(), int32(len(batch)))
+	}
 	if claimErr != nil {
 		l.log.Warn("sched trigger tick: claim",
 			"trigger_id", t.ID.String(),
@@ -575,8 +747,18 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 		}
 		if len(exhaustedItems) > 0 {
 			items := claimedItemIDs(exhaustedItems)
-			l.deadLetterAllForApp(ctx, t.AppID.String(), t.AccountID.String(), t.ID.String(), items, triggerReasonMaxAttempts, postErr.Error(), store)
-			_ = poller.Nack(ctx, t, items, triggerReasonMaxAttempts)
+			if _, isQueue := poller.(*queuePoller); isQueue {
+				if err := poller.Nack(ctx, t, items, triggerReasonMaxAttempts); err != nil {
+					l.log.Warn("sched trigger tick: finalize exhausted queue batch", "trigger_id", t.ID.String(), "err", err)
+				} else {
+					l.deadLetterAllWithMark(ctx, t.AppID.String(), t.AccountID.String(), t.ID.String(), items, triggerReasonMaxAttempts, postErr.Error(), store, false)
+				}
+			} else {
+				finalized := l.deadLetterAllForApp(ctx, t.AppID.String(), t.AccountID.String(), t.ID.String(), items, triggerReasonMaxAttempts, postErr.Error(), store, exhaustedItems...)
+				if len(finalized) > 0 {
+					_ = poller.Nack(ctx, t, finalized, triggerReasonMaxAttempts)
+				}
+			}
 		}
 		return nil
 	}
@@ -589,10 +771,6 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 		l.log.Warn("sched trigger tick: response parse",
 			"trigger_id", t.ID.String(),
 			"err", err)
-		ids := make([]string, 0, len(claimed))
-		for _, c := range claimed {
-			ids = append(ids, c.ID.String())
-		}
 		l.observeESMRecordOutcome(t.Kind, wire.ESMRecordOutcomeDeadLetter, len(claimed))
 		l.observeESMRecordProcessingBatch(t.Kind, claimed)
 		// Audit finding #6 (paired with the post-error path
@@ -608,8 +786,10 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 			}
 			l.deadLetterAllWithMark(ctx, t.AppID.String(), t.AccountID.String(), t.ID.String(), items, triggerReasonPoisonRecord, "gateway response malformed", store, false)
 		} else {
-			l.deadLetterAllForApp(ctx, t.AppID.String(), t.AccountID.String(), t.ID.String(), ids, triggerReasonPoisonRecord, "gateway response malformed", store)
-			_ = poller.Nack(ctx, t, items, triggerReasonPoisonRecord)
+			finalized := l.deadLetterAllForApp(ctx, t.AppID.String(), t.AccountID.String(), t.ID.String(), items, triggerReasonPoisonRecord, "gateway response malformed", store, claimed...)
+			if len(finalized) > 0 {
+				_ = poller.Nack(ctx, t, finalized, triggerReasonPoisonRecord)
+			}
 		}
 		return nil
 	}
@@ -617,6 +797,10 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 	statusByID := make(map[string]triggerDispatchResult, len(resp.Results))
 	for _, r := range resp.Results {
 		statusByID[r.ItemIdentifier] = r
+	}
+	claimedByID := make(map[string]sqlc.TriggerRecord, len(claimed))
+	for _, record := range claimed {
+		claimedByID[record.ID.String()] = record
 	}
 
 	succeedIDs := []string{}
@@ -693,12 +877,15 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 				return nil
 			}
 		}
-		for _, id := range succeedIDs {
+		brokerAckItems := make([]string, 0, len(succeedIDs))
+		for i, id := range succeedIDs {
 			if !isQueuePoller {
-				if err := store.MarkTriggerRecordSucceeded(ctx, id); err != nil {
+				if err := completeTriggerClaim(ctx, store, claimedByID[id]); err != nil {
 					l.log.Warn("sched trigger tick: mark succeeded",
 						"id", id, "err", err)
+					continue
 				}
+				brokerAckItems = append(brokerAckItems, succeedItems[i])
 			}
 			// Audit: trigger.fired per succeeded record,
 			// dual-emitted as esm.source.created for
@@ -723,8 +910,8 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 				t.ID.String(), t.AppID.String(), t.Kind,
 			)
 		}
-		if !isQueuePoller {
-			if err := poller.Ack(ctx, t, succeedItems); err != nil {
+		if !isQueuePoller && len(brokerAckItems) > 0 {
+			if err := poller.Ack(ctx, t, brokerAckItems); err != nil {
 				l.log.Warn("sched trigger tick: poller ack",
 					"trigger_id", t.ID.String(), "err", err)
 			}
@@ -735,16 +922,19 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 			attribute.String("gregale.trigger.kind", t.Kind),
 			attribute.Int("gregale.trigger.records", len(retryIDs)))
 		defer retrySpan.End()
+		brokerNackItems := make([]string, 0, len(retryIDs))
 		for i, id := range retryIDs {
 			attempts := retryAttempts[i]
 			// Review finding #9: exponential backoff + ±20%
 			// jitter replaces the prior hardcoded 2s.
 			backoff := l.computeTriggerRetryBackoff(ctx, t, attempts)
 			nextFireAt := time.Now().Add(backoff)
-			if err := store.MarkTriggerRecordRetry(ctx, id, "", nextFireAt); err != nil {
+			if err := retryTriggerClaim(ctx, store, claimedByID[id], "", nextFireAt); err != nil {
 				l.log.Warn("sched trigger tick: mark retry",
 					"id", id, "err", err)
+				continue
 			}
+			brokerNackItems = append(brokerNackItems, retryItems[i])
 			// Audit: trigger.retry, dual-emitted as
 			// esm.poll.failed for the operator alias.
 			l.emitAuditDual(
@@ -766,9 +956,11 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 				t.ID.String(), t.AppID.String(), t.Kind,
 			)
 		}
-		if err := poller.Nack(ctx, t, retryItems, triggerReasonBrokerError); err != nil {
-			l.log.Warn("sched trigger tick: poller nack",
-				"trigger_id", t.ID.String(), "err", err)
+		if len(brokerNackItems) > 0 {
+			if err := poller.Nack(ctx, t, brokerNackItems, triggerReasonBrokerError); err != nil {
+				l.log.Warn("sched trigger tick: poller nack",
+					"trigger_id", t.ID.String(), "err", err)
+			}
 		}
 	}
 	if len(dlqIDs) > 0 {
@@ -776,19 +968,21 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 			attribute.String("gregale.trigger.kind", t.Kind),
 			attribute.Int("gregale.trigger.records", len(dlqIDs)))
 		defer dlqSpan.End()
+		finalizedItems := make(map[string]bool, len(dlqItems))
 		for i, id := range dlqIDs {
 			reason := dlqReasons[i]
 			lastErr := dlqErrors[i]
 			attempts := dlqAttempts[i]
-			if err := store.InsertTriggerDeadLetter(ctx, id, t.ID.String(), reason, "drop", []byte(lastErr)); err != nil {
-				l.log.Warn("sched trigger tick: insert dlq", "id", id, "err", err)
-			}
-			if !isQueuePoller {
-				if err := store.MarkTriggerRecordDeadLetter(ctx, id, lastErr); err != nil {
-					l.log.Warn("sched trigger tick: mark dlq",
-						"id", id, "err", err)
+			if isQueuePoller {
+				if err := store.InsertTriggerDeadLetter(ctx, id, t.ID.String(), reason, "drop", []byte(lastErr)); err != nil {
+					l.log.Warn("sched trigger tick: insert dlq", "id", id, "err", err)
+					continue
 				}
+			} else if err := routeTriggerClaimToDLQ(ctx, store, claimedByID[id], t.ID.String(), reason, []byte(lastErr)); err != nil {
+				l.log.Warn("sched trigger tick: route claimed dlq", "id", id, "err", err)
+				continue
 			}
+			finalizedItems[dlqItems[i]] = true
 			// Audit: trigger.dlq, dual-emitted as
 			// esm.drain.dlq for the operator alias.
 			l.emitAuditDual(
@@ -818,6 +1012,9 @@ func (l *Loop) dispatchOneTrigger(ctx context.Context, t sqlc.Trigger, store sto
 		poisonItems := make([]string, 0, len(dlqItems))
 		maxAttemptItems := make([]string, 0, len(dlqItems))
 		for i, item := range dlqItems {
+			if !finalizedItems[item] {
+				continue
+			}
 			if dlqReasons[i] == triggerReasonMaxAttempts {
 				maxAttemptItems = append(maxAttemptItems, item)
 			} else {
@@ -1006,18 +1203,11 @@ func readGatewayDispatchResponse(body io.Reader) ([]byte, error) {
 //
 // If the row hasn't been inserted yet (rate-limit fires before
 // the InsertTriggerRecord loop on the next dispatch step), the
-// lookup returns an empty UUID — we skip the DLQ insert + skip
-// the MarkTriggerRecordDeadLetter call. The caller (the
-// rate-limit-deny branch above) MUST then ack the broker offset
-// so the records don't re-poll forever. Pre-CRIT-1 the deny
-// branches returned without ack'ing; CRIT-1 closes that hole
-// — see dispatch_triggers.go:394-419.
+// lookup returns an empty UUID. Without a durable terminal receipt,
+// the broker handle must be retried rather than acknowledged.
 //
-// The poisoned-response path at dispatch_triggers.go:354 calls
-// this helper with row UUIDs already (it walks the `claimed`
-// result-set and reads c.ID.String()). That works because the
-// UUID lookup self-resolves: the row is by construction present,
-// so the lookup returns the same UUID we passed in.
+// Claimed broker records pass their item identifiers and claim generations
+// directly; the generation guards the row transition and its DLQ receipt.
 // handleRateLimitedBatch is the CRIT-1 (PR #993 / issue #757
 // closure) seam for the rate-limit-deny branches. Pre-CRIT-1 each
 // deny branch returned immediately after deadLetterAll WITHOUT
@@ -1027,8 +1217,9 @@ func readGatewayDispatchResponse(body io.Reader) ([]byte, error) {
 //
 //  1. deadLetterAll inserts the trigger_dead_letter audit row
 //     (the disposition is preserved).
-//  2. poller.Ack advances the broker offset so the records don't
-//     re-poll.
+//  2. poller.Ack advances only handles with committed terminal receipts.
+//     Handles without receipts are retried, including the whole Kafka batch
+//     when an offset commit could skip unfinished lower offsets.
 //
 // Extracted so the test surface (TestRateLimitDeny_AcksBrokerOffset)
 // can pin the dual-call sequence without driving the full dispatch
@@ -1051,16 +1242,27 @@ func (l *Loop) handleRateLimitedBatch(ctx context.Context, poller triggerSource,
 		l.deadLetterAllWithMark(ctx, t.AppID.String(), t.AccountID.String(), t.ID.String(), items, triggerReasonRateLimited, "wake rate limit exceeded", store, false)
 		return
 	}
-	l.deadLetterAllForApp(ctx, t.AppID.String(), t.AccountID.String(), t.ID.String(), items, triggerReasonRateLimited, "wake rate limit exceeded", store)
+	finalized := l.deadLetterAllForApp(ctx, t.AppID.String(), t.AccountID.String(), t.ID.String(), items, triggerReasonRateLimited, "wake rate limit exceeded", store)
+	unfinalized := missingItemIDs(items, finalized)
 	if terminal, ok := poller.(terminalNacker); ok {
 		// Queue rows have not yet produced trigger_records, so Ack would
 		// incorrectly mark the invocation successful. Move them directly
 		// to the queue's terminal state; external brokers keep the legacy
 		// Ack-after-DLQ offset advance.
-		_ = terminal.NackTerminal(ctx, t, items, triggerReasonRateLimited)
+		_ = terminal.NackTerminal(ctx, t, finalized, triggerReasonRateLimited)
+		if len(unfinalized) > 0 {
+			_ = poller.Nack(ctx, t, unfinalized, triggerReasonBrokerError)
+		}
 		return
 	}
-	_ = poller.Ack(ctx, t, items)
+	if poller.Kind() == "kafka" && len(unfinalized) > 0 {
+		_ = poller.Nack(ctx, t, items, triggerReasonBrokerError)
+		return
+	}
+	_ = poller.Ack(ctx, t, finalized)
+	if len(unfinalized) > 0 {
+		_ = poller.Nack(ctx, t, unfinalized, triggerReasonBrokerError)
+	}
 }
 
 // deadLetterAll retains the narrow test seam used by the trigger unit tests.
@@ -1070,25 +1272,35 @@ func (l *Loop) deadLetterAll(ctx context.Context, triggerID string, ids []string
 	l.deadLetterAllWithMark(ctx, "", "", triggerID, ids, reason, detail, store, true)
 }
 
-func (l *Loop) deadLetterAllForApp(ctx context.Context, appID, accountID, triggerID string, ids []string, reason, detail string, store storeLike) {
-	l.deadLetterAllWithMark(ctx, appID, accountID, triggerID, ids, reason, detail, store, true)
+func (l *Loop) deadLetterAllForApp(ctx context.Context, appID, accountID, triggerID string, ids []string, reason, detail string, store storeLike, claimed ...sqlc.TriggerRecord) []string {
+	return l.deadLetterAllWithMark(ctx, appID, accountID, triggerID, ids, reason, detail, store, true, claimed...)
 }
 
 // deadLetterAllWithMark writes the durable DLQ rows and optionally performs
 // the trigger-record transition. Queue pollers set mark=false because they
 // transition trigger_records and invocations together in one SQL statement.
-func (l *Loop) deadLetterAllWithMark(ctx context.Context, appID, accountID, triggerID string, ids []string, reason, detail string, store storeLike, mark bool) {
+func (l *Loop) deadLetterAllWithMark(ctx context.Context, appID, accountID, triggerID string, ids []string, reason, detail string, store storeLike, mark bool, claimed ...sqlc.TriggerRecord) []string {
 	if store == nil || len(ids) == 0 {
-		return
+		return nil
 	}
+	claimedByItem := make(map[string]sqlc.TriggerRecord, len(claimed))
+	for _, record := range claimed {
+		claimedByItem[record.ItemIdentifier] = record
+	}
+	var finalized []string
 	for _, id := range ids {
-		uuid, lookupErr := store.TriggerRecordIDByItemIdentifier(ctx, triggerID, id)
-		if lookupErr != nil {
-			l.log.Warn("sched trigger tick: dlq record_id lookup",
-				"trigger_id", triggerID,
-				"item_identifier", id,
-				"err", lookupErr)
-			continue
+		record, isClaimed := claimedByItem[id]
+		uuid := record.ID.String()
+		if !isClaimed {
+			var lookupErr error
+			uuid, lookupErr = store.TriggerRecordIDByItemIdentifier(ctx, triggerID, id)
+			if lookupErr != nil {
+				l.log.Warn("sched trigger tick: dlq record_id lookup",
+					"trigger_id", triggerID,
+					"item_identifier", id,
+					"err", lookupErr)
+				continue
+			}
 		}
 		// Empty UUID = row not yet in trigger_records (rate-limit
 		// fired before InsertTriggerRecord). Skip — the broker
@@ -1100,15 +1312,38 @@ func (l *Loop) deadLetterAllWithMark(ctx context.Context, appID, accountID, trig
 				"reason", reason)
 			continue
 		}
-		if err := store.InsertTriggerDeadLetter(ctx, uuid, triggerID, reason, "drop", []byte(detail)); err != nil {
-			l.log.Warn("sched trigger tick: insert dlq", "id", uuid, "err", err)
-			continue
-		}
-		if mark {
-			if err := store.MarkTriggerRecordDeadLetter(ctx, uuid, reason); err != nil {
-				l.log.Warn("sched trigger tick: mark dlq", "id", uuid, "err", err)
+		if mark && isClaimed {
+			if err := routeTriggerClaimToDLQ(ctx, store, record, triggerID, reason, []byte(detail)); err != nil {
+				l.log.Warn("sched trigger tick: route claimed dlq", "id", uuid, "err", err)
+				continue
+			}
+		} else if mark {
+			if router, ok := store.(state.PendingTriggerDeadLetterRouter); ok {
+				changed, err := router.RoutePendingTriggerDeadLetterByItem(ctx, triggerID, id, reason, []byte(detail))
+				if err != nil {
+					l.log.Warn("sched trigger tick: route pending dlq", "id", uuid, "err", err)
+					continue
+				}
+				if !changed {
+					continue
+				}
+			} else {
+				if err := store.InsertTriggerDeadLetter(ctx, uuid, triggerID, reason, "drop", []byte(detail)); err != nil {
+					l.log.Warn("sched trigger tick: insert dlq", "id", uuid, "err", err)
+					continue
+				}
+				if err := store.MarkTriggerRecordDeadLetter(ctx, uuid, reason); err != nil {
+					l.log.Warn("sched trigger tick: mark dlq", "id", uuid, "err", err)
+					continue
+				}
+			}
+		} else {
+			if err := store.InsertTriggerDeadLetter(ctx, uuid, triggerID, reason, "drop", []byte(detail)); err != nil {
+				l.log.Warn("sched trigger tick: insert dlq", "id", uuid, "err", err)
+				continue
 			}
 		}
+		finalized = append(finalized, id)
 		if l.ops != nil {
 			l.ops.ObserveDLQEvent(appID, reason)
 		}
@@ -1123,6 +1358,7 @@ func (l *Loop) deadLetterAllWithMark(ctx context.Context, appID, accountID, trig
 			})
 		}
 	}
+	return finalized
 }
 
 // markRetryAll marks records below the attempt cap as state='retry' and
@@ -1143,13 +1379,10 @@ func (l *Loop) markRetryAll(ctx context.Context, t sqlc.Trigger, claimed []sqlc.
 		// gateway/network failure follows the same curve as a per-record
 		// retry result instead of the old fixed two-second delay.
 		nextFireAt := time.Now().Add(l.computeTransportRetryBackoff(ctx, t, c.Attempts+1))
-		if err := store.MarkTriggerRecordRetry(ctx, c.ID.String(), errMsg, nextFireAt); err != nil {
+		if err := retryTriggerClaim(ctx, store, c, errMsg, nextFireAt); err != nil {
 			l.log.Warn("sched trigger tick: mark retry", "id", c.ID.String(), "err", err)
+			continue
 		}
-		// Even when the audit-row update fails, release the broker
-		// handle so the durable source can be retried and the next tick
-		// can repair the row. Dropping it here would strand the item in
-		// the poller's in-flight set.
 		retryItems = append(retryItems, c.ItemIdentifier)
 	}
 	return retryItems, exhausted
@@ -1192,6 +1425,49 @@ func retryExhausted(nextAttempt, maxAttempts int32) bool {
 	return nextAttempt >= int32(effective)
 }
 
+// ackTerminalTriggerRedeliveries removes durable terminal receipts from the
+// batch before rate limiting and claim. Ack follows the committed DB state.
+func ackTerminalTriggerRedeliveries(ctx context.Context, store storeLike, poller triggerSource, t sqlc.Trigger, batch []SourceRecord) ([]SourceRecord, error) {
+	reader, ok := store.(state.TriggerTerminalRecordReader)
+	if !ok || len(batch) == 0 {
+		return batch, nil
+	}
+	terminal, err := reader.ListTerminalTriggerRecordItems(ctx, t.ID.String(), batchItemIDs(batch))
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("dispatch trigger terminal receipt lookup: %w", err),
+			poller.Nack(ctx, t, batchItemIDs(batch), triggerReasonBrokerError))
+	}
+	if len(terminal) == 0 {
+		return batch, nil
+	}
+	terminalSet := make(map[string]bool, len(terminal))
+	for _, id := range terminal {
+		terminalSet[id] = true
+	}
+	remaining := make([]SourceRecord, 0, len(batch)-len(terminal))
+	for _, record := range batch {
+		if !terminalSet[record.ItemIdentifier] {
+			remaining = append(remaining, record)
+		}
+	}
+	// Kafka commits the highest offset per partition. A terminal item later
+	// in this batch must not commit past an earlier item that still needs its
+	// application result. Rewind the terminal handles and process the live
+	// subset first; the next poll can Ack terminal redeliveries on their own.
+	if poller.Kind() == "kafka" && len(remaining) > 0 {
+		if err := poller.Nack(ctx, t, terminal, triggerReasonBrokerError); err != nil {
+			return nil, errors.Join(fmt.Errorf("dispatch trigger defer terminal Kafka receipt: %w", err),
+				poller.Nack(ctx, t, batchItemIDs(remaining), triggerReasonBrokerError))
+		}
+		return remaining, nil
+	}
+	if err := poller.Ack(ctx, t, terminal); err != nil {
+		return nil, errors.Join(fmt.Errorf("dispatch trigger terminal receipt acknowledgement: %w", err),
+			poller.Nack(ctx, t, batchItemIDs(remaining), triggerReasonBrokerError))
+	}
+	return remaining, nil
+}
+
 // batchItemIDs walks the batch and returns the item identifiers
 // for Ack/Nack on the poller.
 func batchItemIDs(batch []SourceRecord) []string {
@@ -1220,6 +1496,20 @@ func claimedItemIDs(claimed []sqlc.TriggerRecord) []string {
 		out = append(out, c.ItemIdentifier)
 	}
 	return out
+}
+
+func missingItemIDs(all, completed []string) []string {
+	set := make(map[string]struct{}, len(completed))
+	for _, id := range completed {
+		set[id] = struct{}{}
+	}
+	var missing []string
+	for _, id := range all {
+		if _, ok := set[id]; !ok {
+			missing = append(missing, id)
+		}
+	}
+	return missing
 }
 
 // unclaimedItemIDs returns the broker identifiers from batch that are not

@@ -2807,6 +2807,20 @@ func (c *Client) PostTriggersBatchCreate(ctx context.Context, req CreateTriggerB
 	return out, c.do(ctx, "POST", "/v1/triggers:batch_create", req, &out)
 }
 
+func (c *Client) GetTriggerWorkBinding(ctx context.Context, id string) (TriggerWorkBinding, error) {
+	var out TriggerWorkBinding
+	return out, c.do(ctx, "GET", "/v1/triggers/"+id+"/work-binding", nil, &out)
+}
+
+func (c *Client) PutTriggerWorkBinding(ctx context.Context, id string, binding TriggerWorkBinding) (TriggerWorkBinding, error) {
+	var out TriggerWorkBinding
+	return out, c.do(ctx, "PUT", "/v1/triggers/"+id+"/work-binding", binding, &out)
+}
+
+func (c *Client) DeleteTriggerWorkBinding(ctx context.Context, id string) error {
+	return c.do(ctx, "DELETE", "/v1/triggers/"+id+"/work-binding", nil, nil)
+}
+
 // FireCron manually triggers a cron fire-now (issue #791 PR-C /
 // ADR-090). The endpoint is asynchronous: apid inserts a pending row
 // into cron_fire_now_requests and emits db.NotifyCronRunNow; schedd
@@ -3139,6 +3153,25 @@ func (c *Client) InvokeApp(ctx context.Context, slug string, req InvokeRequest) 
 func (c *Client) InvokeAppAsync(ctx context.Context, slug string, req InvokeRequest) (AsyncInvokeResponse, error) {
 	var out AsyncInvokeResponse
 	return out, c.do(ctx, "POST", "/v1/apps/"+slug+"/invoke/async", req, &out)
+}
+
+func (c *Client) ListAppWorkPolicies(ctx context.Context, slug string) (WorkPolicyListResponse, error) {
+	var out WorkPolicyListResponse
+	return out, c.do(ctx, http.MethodGet, "/v1/apps/"+url.PathEscape(slug)+"/work-policies", nil, &out)
+}
+
+func (c *Client) UpsertAppWorkPolicy(ctx context.Context, slug, name string, req UpsertWorkPolicyRequest) (WorkPolicyResponse, error) {
+	var out WorkPolicyResponse
+	return out, c.do(ctx, http.MethodPut, "/v1/apps/"+url.PathEscape(slug)+"/work-policies/"+url.PathEscape(name), req, &out)
+}
+
+func (c *Client) DeleteAppWorkPolicy(ctx context.Context, slug, name string) error {
+	return c.do(ctx, http.MethodDelete, "/v1/apps/"+url.PathEscape(slug)+"/work-policies/"+url.PathEscape(name), nil, nil)
+}
+
+func (c *Client) CancelPendingAppWork(ctx context.Context, slug, name string, req CancelPendingWorkRequest) (CancelPendingWorkResponse, error) {
+	var out CancelPendingWorkResponse
+	return out, c.do(ctx, http.MethodPost, "/v1/apps/"+url.PathEscape(slug)+"/work-policies/"+url.PathEscape(name)+"/cancel-pending", req, &out)
 }
 
 // QueueSend enqueues a payload on the per-app FIFO queue. Cap-checked

@@ -15010,9 +15010,22 @@ const invocationSelectCols = `id, app_id, account_id, source, queue_name, state,
        quota_reserved, last_error, created_at, instance_id, outcome,
        deadline_at, retry_policy, result_retention_until,
        last_replayed_at, on_success_destination_id,
-       on_failure_destination_id`
+       on_failure_destination_id, work_policy_name, work_key_digest,
+       work_expires_at, work_sequence, work_policy_revision,
+       work_fairness_digest, work_fairness_limit`
 
 func (s *PgStore) EnqueueInvocation(ctx context.Context, inv Invocation) (Invocation, error) {
+	if inv.WorkPolicyName != "" {
+		return Invocation{}, fmt.Errorf("state: use EnqueueKeyedInvocation for policy work")
+	}
+	return enqueueInvocationRow(ctx, s.pool, inv)
+}
+
+type invocationRowWriter interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+func enqueueInvocationRow(ctx context.Context, q invocationRowWriter, inv Invocation) (Invocation, error) {
 	// Preserve caller-supplied IDs for idempotent producers (event fanout). An
 	// empty ID keeps the historical database-generated UUID behavior.
 	var invocationID any
@@ -15060,25 +15073,31 @@ func (s *PgStore) EnqueueInvocation(ctx context.Context, inv Invocation) (Invoca
 	if inv.OnFailureDestinationID != "" {
 		onFailureDestination = inv.OnFailureDestinationID
 	}
-	row := s.pool.QueryRow(ctx, `
+	row := q.QueryRow(ctx, `
 		insert into invocations
 			(id, app_id, account_id, source, queue_name, state, method, path,
 			 payload, headers, due_at, scheduled_at, cron_id,
 			 ack_url, lease_expires_at,
 			 deadline_at, retry_policy, result_retention_until,
-			 on_success_destination_id, on_failure_destination_id)
+			 on_success_destination_id, on_failure_destination_id,
+			 work_policy_name, work_key_digest, work_expires_at,
+			 work_sequence, work_policy_revision, work_fairness_digest,
+			 work_fairness_limit)
 		values
 			(coalesce($1::uuid, gen_random_uuid()), $2, $3, $4, $5,
 			 coalesce(nullif($6,''),'pending'), $7, $8,
 			 $9, $10, $11, $12, $13,
 			 nullif($14,''), $15,
-			 $16, $17, $18, $19, $20)
+			 $16, $17, $18, $19, $20, nullif($21,''), $22, $23, $24, $25, $26, $27)
 		returning `+invocationSelectCols,
 		invocationID, inv.AppID, inv.AccountID, string(inv.Source), inv.QueueName, string(inv.State),
 		inv.Method, inv.Path, payload, headers, inv.DueAt.UTC(),
 		scheduledAt, cronID, inv.AckURL, leaseExpires,
 		deadlineAt, retryPolicy, retentionUntil,
-		onSuccessDestination, onFailureDestination)
+		onSuccessDestination, onFailureDestination, inv.WorkPolicyName,
+		inv.WorkKeyDigest, inv.WorkExpiresAt, nullableWorkSequence(inv.WorkSequence),
+		nullableWorkSequence(inv.WorkPolicyRevision), inv.WorkFairnessDigest,
+		nullableWorkFairnessLimit(inv.WorkFairnessLimit))
 	out, err := scanInvocation(row)
 	if err != nil {
 		return Invocation{}, mapErr(err)
@@ -15121,14 +15140,46 @@ func (s *PgStore) ListDueInvocations(ctx context.Context, now time.Time, limit i
 		  from invocations i
 		 where i.state = 'pending' and i.due_at <= $1
 		   and (i.source <> 'queue' or i.queue_name = '')
-		   and not exists (
+		   and (i.work_policy_name is not null or not exists (
 		       select 1
 		         from triggers t
-		        where t.app_id = i.app_id
+		         where t.app_id = i.app_id
 		          and t.kind = 'queue'
 		          and t.enabled
 		          and t.source = i.source
-		   )
+		   ))
+		   and (i.work_policy_name is null or not exists (
+		       select 1 from invocations older
+		       where older.app_id = i.app_id
+		         and older.work_policy_name = i.work_policy_name
+		         and older.work_key_digest = i.work_key_digest
+		         and older.work_sequence < i.work_sequence
+		         and older.state in ('pending','dispatching')
+		   ))
+		   and (i.work_policy_name is null or not exists (
+		       select 1 from trigger_records older
+		       join triggers source on source.id=older.trigger_id
+		       where source.app_id=i.app_id
+		         and older.work_policy_name=i.work_policy_name
+		         and older.work_key_digest=i.work_key_digest
+		         and older.work_sequence<i.work_sequence
+		         and older.state in ('pending','retry','claimed')
+		   ))
+		   and (i.work_fairness_limit is null or ((
+		       select count(*) from invocations active
+		       where active.app_id = i.app_id
+		         and active.work_policy_name = i.work_policy_name
+		         and active.work_fairness_digest = i.work_fairness_digest
+		         and active.state = 'dispatching'
+		         and active.lease_expires_at > $1
+		   ) + (
+		       select count(*) from trigger_records active
+		       join triggers source on source.id=active.trigger_id
+		       where source.app_id=i.app_id
+		         and active.work_policy_name=i.work_policy_name
+		         and active.work_fairness_digest=i.work_fairness_digest
+		         and active.state='claimed' and active.claim_expires_at > $1
+		   )) < i.work_fairness_limit)
 		 order by i.due_at
 		 for update skip locked
 		 limit $2`, now.UTC(), limit)
@@ -15180,14 +15231,46 @@ func (s *PgStore) ListDueInvocationsAfter(ctx context.Context, now time.Time, af
 		  from invocations i
 		 where i.state = 'pending' and i.due_at <= $1
 		   and (i.source <> 'queue' or i.queue_name = '')
-		   and not exists (
+		   and (i.work_policy_name is not null or not exists (
 		       select 1
 		         from triggers t
-		        where t.app_id = i.app_id
+		         where t.app_id = i.app_id
 		          and t.kind = 'queue'
 		          and t.enabled
 		          and t.source = i.source
-		   )
+		   ))
+		   and (i.work_policy_name is null or not exists (
+		       select 1 from invocations older
+		       where older.app_id = i.app_id
+		         and older.work_policy_name = i.work_policy_name
+		         and older.work_key_digest = i.work_key_digest
+		         and older.work_sequence < i.work_sequence
+		         and older.state in ('pending','dispatching')
+		   ))
+		   and (i.work_policy_name is null or not exists (
+		       select 1 from trigger_records older
+		       join triggers source on source.id=older.trigger_id
+		       where source.app_id=i.app_id
+		         and older.work_policy_name=i.work_policy_name
+		         and older.work_key_digest=i.work_key_digest
+		         and older.work_sequence<i.work_sequence
+		         and older.state in ('pending','retry','claimed')
+		   ))
+		   and (i.work_fairness_limit is null or ((
+		       select count(*) from invocations active
+		       where active.app_id = i.app_id
+		         and active.work_policy_name = i.work_policy_name
+		         and active.work_fairness_digest = i.work_fairness_digest
+		         and active.state = 'dispatching'
+		         and active.lease_expires_at > $1
+		   ) + (
+		       select count(*) from trigger_records active
+		       join triggers source on source.id=active.trigger_id
+		       where source.app_id=i.app_id
+		         and active.work_policy_name=i.work_policy_name
+		         and active.work_fairness_digest=i.work_fairness_digest
+		         and active.state='claimed' and active.claim_expires_at > $1
+		   )) < i.work_fairness_limit)
 		   and ($3::boolean or (i.due_at, i.id) > ($4::timestamptz, $5::uuid))
 		 order by i.due_at, i.id
 		 for update skip locked
@@ -15230,6 +15313,7 @@ func (s *PgStore) ClaimInvocation(ctx context.Context, id, instanceID string, le
 		       received_at = now(),
 		       attempts = attempts + 1
 		 where id = $1 and state = 'pending'
+		   and work_policy_name is null
 		 returning `+invocationSelectCols, id, instanceID, leaseText)
 	inv, err := scanInvocation(row)
 	if err != nil {
@@ -15306,6 +15390,17 @@ func (s *PgStore) RequeueExpiredInvocations(ctx context.Context, now time.Time, 
 }
 
 func (s *PgStore) CompleteInvocation(ctx context.Context, id string, result json.RawMessage) error {
+	return s.completeInvocation(ctx, id, 0, result)
+}
+
+func (s *PgStore) CompleteKeyedInvocation(ctx context.Context, id string, attempt int, result json.RawMessage) error {
+	if attempt <= 0 {
+		return ErrNotFound
+	}
+	return s.completeInvocation(ctx, id, attempt, result)
+}
+
+func (s *PgStore) completeInvocation(ctx context.Context, id string, attempt int, result json.RawMessage) error {
 	// outcome (issue #791) is stamped alongside state so the cron
 	// run-history read never has to infer success from state.
 	//
@@ -15324,6 +15419,8 @@ func (s *PgStore) CompleteInvocation(ctx context.Context, id string, result json
 			select id, account_id, quota_reserved
 			  from invocations
 			 where id = $1 and state = 'dispatching'
+			   and ((work_policy_name is null and $3 = 0)
+			        or (work_policy_name is not null and attempts = $3 and $3 > 0))
 			 for update
 		)
 		update invocations as invocation
@@ -15336,7 +15433,7 @@ func (s *PgStore) CompleteInvocation(ctx context.Context, id string, result json
 		       quota_reserved = false
 		  from target
 		 where invocation.id = target.id
-		 returning target.account_id, target.quota_reserved`, id, nullableJSON(result)).Scan(&accountID, &quotaReserved); err != nil {
+		 returning target.account_id, target.quota_reserved`, id, nullableJSON(result), attempt).Scan(&accountID, &quotaReserved); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
 		}
@@ -15453,6 +15550,8 @@ func (s *PgStore) FailInvocation(ctx context.Context, id string, lastError strin
 					select id, account_id, quota_reserved
 					  from invocations
 					 where id = $1 and state in ('dispatching','pending')
+					   and (work_policy_name is null or (state = 'pending' and $5 = 0)
+					        or (state = 'dispatching' and attempts = $5 and $5 > 0))
 					 for update
 				)
 				update invocations as invocation
@@ -15471,7 +15570,7 @@ func (s *PgStore) FailInvocation(ctx context.Context, id string, lastError strin
 				  from target
 				 where invocation.id = target.id
 				 returning target.account_id, invocation.state, target.quota_reserved`
-		args = []any{id, retryText, lastError, budget}
+		args = []any{id, retryText, lastError, budget, failOpts.ClaimAttempt}
 		terminalSelect = true
 	case retryAfter > 0:
 		retryText := strconv.FormatInt(retryAfter.Microseconds(), 10) + " microseconds"
@@ -15479,6 +15578,8 @@ func (s *PgStore) FailInvocation(ctx context.Context, id string, lastError strin
 					select id, account_id, quota_reserved
 					  from invocations
 					 where id = $1 and state in ('dispatching','pending')
+					   and (work_policy_name is null or (state = 'pending' and $4 = 0)
+					        or (state = 'dispatching' and attempts = $4 and $4 > 0))
 					 for update
 				)
 				update invocations as invocation
@@ -15491,13 +15592,15 @@ func (s *PgStore) FailInvocation(ctx context.Context, id string, lastError strin
 				  from target
 				 where invocation.id = target.id
 				 returning target.account_id, invocation.state, target.quota_reserved`
-		args = []any{id, retryText, lastError}
+		args = []any{id, retryText, lastError, failOpts.ClaimAttempt}
 		terminalSelect = true
 	default:
 		query = `with target as materialized (
 					select id, account_id, quota_reserved
 					  from invocations
 					 where id = $1 and state in ('dispatching','pending')
+					   and (work_policy_name is null or (state = 'pending' and $4 = 0)
+					        or (state = 'dispatching' and attempts = $4 and $4 > 0))
 					 for update
 				)
 				update invocations as invocation
@@ -15509,7 +15612,7 @@ func (s *PgStore) FailInvocation(ctx context.Context, id string, lastError strin
 				  from target
 				 where invocation.id = target.id
 				 returning target.account_id, invocation.state, target.quota_reserved`
-		args = []any{id, lastError, string(failOpts.Outcome)}
+		args = []any{id, lastError, string(failOpts.Outcome), failOpts.ClaimAttempt}
 		terminalSelect = true
 	}
 	if !terminalSelect {
@@ -15590,6 +15693,7 @@ func (s *PgStore) CancelInvocation(ctx context.Context, id string) error {
 			select id, account_id, quota_reserved
 			  from invocations
 			 where id = $1 and state in ('pending','dispatching')
+			   and (work_policy_name is null or state = 'pending')
 			 for update
 		)
 		update invocations as invocation
@@ -15603,12 +15707,16 @@ func (s *PgStore) CancelInvocation(ctx context.Context, id string) error {
 		// Distinguish "already terminal" from "not found" so the
 		// apid handler can choose the right response. Read
 		// inside the tx for read-after-write consistency.
-		var exists bool
-		if e := tx.QueryRow(ctx, `select exists(select 1 from invocations where id = $1)`, id).Scan(&exists); e != nil {
+		var currentState string
+		var currentPolicy *string
+		if e := tx.QueryRow(ctx, `select state, work_policy_name from invocations where id = $1`, id).
+			Scan(&currentState, &currentPolicy); e != nil && !errors.Is(e, pgx.ErrNoRows) {
 			return e
-		}
-		if !exists {
+		} else if errors.Is(e, pgx.ErrNoRows) {
 			return ErrNotFound
+		}
+		if currentPolicy != nil && currentState == string(InvocationDispatching) {
+			return ErrConflict
 		}
 		return nil
 	}
@@ -16200,6 +16308,13 @@ func scanInvocationCols(scan func(...any) error) (Invocation, error) {
 	var outcome *string
 	var deadlineAt, retentionUntil, lastReplayedAt *time.Time
 	var retryPolicy []byte
+	var workPolicyName *string
+	var workKeyDigest []byte
+	var workExpiresAt *time.Time
+	var workSequence *int64
+	var workPolicyRevision *int64
+	var workFairnessDigest []byte
+	var workFairnessLimit *int
 	if err := scan(
 		&inv.ID, &inv.AppID, &inv.AccountID, &source, &queueName, &state, &inv.Method, &inv.Path,
 		&payload, &headers, &inv.DueAt, &scheduledAt, &cronID, &ackURL,
@@ -16207,11 +16322,28 @@ func scanInvocationCols(scan func(...any) error) (Invocation, error) {
 		&inv.QuotaReserved, &lastErr, &inv.CreatedAt, &instanceID, &outcome,
 		&deadlineAt, &retryPolicy, &retentionUntil,
 		&lastReplayedAt, &onSuccessDestination, &onFailureDestination,
+		&workPolicyName, &workKeyDigest, &workExpiresAt, &workSequence, &workPolicyRevision,
+		&workFairnessDigest, &workFairnessLimit,
 	); err != nil {
 		return Invocation{}, err
 	}
 	inv.Source = InvocationSource(source)
 	inv.QueueName = queueName
+	if workPolicyName != nil {
+		inv.WorkPolicyName = *workPolicyName
+	}
+	inv.WorkKeyDigest = workKeyDigest
+	inv.WorkFairnessDigest = workFairnessDigest
+	if workFairnessLimit != nil {
+		inv.WorkFairnessLimit = *workFairnessLimit
+	}
+	inv.WorkExpiresAt = workExpiresAt
+	if workSequence != nil {
+		inv.WorkSequence = *workSequence
+	}
+	if workPolicyRevision != nil {
+		inv.WorkPolicyRevision = *workPolicyRevision
+	}
 	inv.State = InvocationState(state)
 	if len(payload) > 0 {
 		inv.Payload = payload
@@ -29615,15 +29747,31 @@ func (s *PgStore) ListEnabledTriggers(ctx context.Context) ([]sqlc.Trigger, erro
 // lets concurrent schedd replicas each claim disjoint row sets —
 // ADR-099 PR-C precedent for claim_job_tasks.
 func (s *PgStore) ClaimTriggerRecords(ctx context.Context, triggerID string, limit int32) ([]sqlc.TriggerRecord, error) {
-	rows, err := s.triggerQueries().ClaimTriggerRecords(ctx, s.pool, sqlc.ClaimTriggerRecordsParams{TriggerID: mustPgUUID(triggerID), Limit: limit})
+	if limit <= 0 {
+		return nil, nil
+	}
+	rows, err := s.pool.Query(ctx, `select item_identifier from trigger_records
+		where trigger_id=$1 and ((state in ('pending','retry') and next_fire_at<=clock_timestamp())
+		  or (state='claimed' and claim_expires_at<=clock_timestamp()))
+		order by next_fire_at, id limit $2`, triggerID, limit)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("state: list trigger claim candidates: %w", err)
 	}
-	out := make([]sqlc.TriggerRecord, len(rows))
-	for i, r := range rows {
-		out[i] = claimTriggerRecordRowToTriggerRecord(r)
+	items := make([]string, 0, limit)
+	for rows.Next() {
+		var item string
+		if err := rows.Scan(&item); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("state: scan trigger claim candidate: %w", err)
+		}
+		items = append(items, item)
 	}
-	return out, nil
+	readErr := rows.Err()
+	rows.Close()
+	if readErr != nil {
+		return nil, fmt.Errorf("state: list trigger claim candidates: %w", readErr)
+	}
+	return s.ClaimTriggerRecordsByItems(ctx, triggerID, items)
 }
 
 // InsertTriggerRecord persists a single broker-delivered record
@@ -29893,26 +30041,6 @@ func triggerEnabledRowToTrigger(r sqlc.ListEnabledTriggersRow) sqlc.Trigger {
 	}
 }
 
-// claimTriggerRecordRowToTriggerRecord converts a ClaimTriggerRecordsRow
-// back to the model type. Same sqlc v1.31 dedicated-Row pattern as the
-// trigger row helpers above.
-func claimTriggerRecordRowToTriggerRecord(r sqlc.ClaimTriggerRecordsRow) sqlc.TriggerRecord {
-	return sqlc.TriggerRecord{
-		ID:               r.ID,
-		TriggerID:        r.TriggerID,
-		ItemIdentifier:   r.ItemIdentifier,
-		Payload:          r.Payload,
-		Headers:          r.Headers,
-		Metadata:         r.Metadata,
-		State:            r.State,
-		Attempts:         r.Attempts,
-		NextFireAt:       r.NextFireAt,
-		ReceivedAt:       r.ReceivedAt,
-		LastError:        r.LastError,
-		LastDispatchedAt: r.LastDispatchedAt,
-	}
-}
-
 // listTriggerRecordRowToTriggerRecord converts a ListTriggerRecordsForTriggerRow
 // back to the model type.
 func listTriggerRecordRowToTriggerRecord(r sqlc.ListTriggerRecordsForTriggerRow) sqlc.TriggerRecord {
@@ -29995,7 +30123,15 @@ func (s *PgStore) RetryTriggerRecordByOperator(ctx context.Context, id string) e
 		       attempts = 0,
 		       last_error = null,
 		       next_fire_at = now()
-		 where id = $1`,
+		 where id = $1
+		   and not exists (
+		       select 1 from triggers t
+		       join invocations i on i.app_id = t.app_id
+		         and i.id::text = trigger_records.item_identifier
+		       where t.id = trigger_records.trigger_id
+		         and t.kind = 'queue' and i.source = 'queue'
+		         and i.state in ('superseded', 'cancelled', 'expired')
+		   )`,
 		id)
 	if err != nil {
 		return fmt.Errorf("state: retry trigger_record %s: %w", id, err)
@@ -31791,13 +31927,31 @@ func (s *PgStore) ClaimInvocationWithCap(ctx context.Context, id, instanceID str
 	// Read account_id off the row, then upsert the cap row with
 	// maxInflight from the caller. The upsert is a no-op for
 	// accounts that already have a counter row.
-	var accountID string
+	var accountID, appID string
+	var workPolicyName *string
+	var workKeyDigest []byte
+	var workFairnessDigest []byte
+	var workFairnessLimit *int
 	if err := tx.QueryRow(ctx,
-		`select account_id from invocations where id = $1`, id).Scan(&accountID); err != nil {
+		`select account_id, app_id, work_policy_name, work_key_digest,
+		 work_fairness_digest, work_fairness_limit from invocations where id = $1`, id).Scan(
+		&accountID, &appID, &workPolicyName, &workKeyDigest,
+		&workFairnessDigest, &workFairnessLimit); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return Invocation{}, ErrNotFound
 		}
 		return Invocation{}, fmt.Errorf("state: invocations claim cap lookup: %w", err)
+	}
+	if workPolicyName != nil {
+		if err := lockKeyedClaimTx(ctx, tx, id, appID, *workPolicyName, workKeyDigest); err != nil {
+			return Invocation{}, err
+		}
+		if workFairnessLimit != nil {
+			if err := lockFairnessClaimTx(ctx, tx, appID, *workPolicyName,
+				workFairnessDigest, *workFairnessLimit); err != nil {
+				return Invocation{}, err
+			}
+		}
 	}
 	if _, _, err := s.upsertAccountAsyncQuotaTx(ctx, tx, accountID, maxInflight); err != nil {
 		return Invocation{}, err

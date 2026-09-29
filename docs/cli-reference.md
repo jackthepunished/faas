@@ -429,7 +429,7 @@ Retry a bounded batch of terminal failures classified as retryable; pass --event
 
 Reliably send work to another Gregale application
 
-`gregale send <target-app> --type <TYPE> --data <J|@file|-> [--id <ID>] [--source <SOURCE>] [--time <RFC3339>] [--queue-name <QUEUE>] [--idempotency-key <KEY>]`
+`gregale send <target-app> --type <TYPE> --data <J|@file|-> [--id <ID>] [--source <SOURCE>] [--time <RFC3339>] [--queue-name <QUEUE>] [--work-policy <NAME>] [--work-key <JSON>] [--work-fairness-key <JSON>] [--idempotency-key <KEY>]`
 
 | Flag | Meaning | |
 |---|---|---|
@@ -439,6 +439,9 @@ Reliably send work to another Gregale application
 | `--source <SOURCE>` | event source |  |
 | `--time <RFC3339>` | event time |  |
 | `--queue-name <QUEUE>` | target logical queue name |  |
+| `--work-policy <NAME>` | named work policy for an unnamed queue |  |
+| `--work-key <JSON>` | JSON scalar identifying related work |  |
+| `--work-fairness-key <JSON>` | JSON scalar shared by related work keys |  |
 | `--idempotency-key <KEY>` | stable key for retrying an uncertain send |  |
 
 
@@ -1241,6 +1244,9 @@ Schedule a deferred invocation
 | `--payload <JSON|@FILE|->` | JSON request payload |  |
 | `--method <METHOD>` | HTTP method (default POST) |  |
 | `--path <PATH>` | app path (default /) |  |
+| `--work-policy <NAME>` | named app work policy |  |
+| `--work-key <JSON>` | JSON scalar identifying related work |  |
+| `--work-fairness-key <JSON>` | JSON scalar shared by related work keys |  |
 | `--header <NAME:VALUE>` | request header (repeatable) |  |
 | `--max-attempts <N>` | maximum delivery attempts |  |
 | `--retry-base-seconds <N>` | base retry delay in seconds |  |
@@ -2118,7 +2124,7 @@ gregale inspect my-api --upstreams
 
 Functional smoke test (invoke [--async] &lt;slug&gt; [--payload J|@file|-]; slug defaults to linked context)
 
-`gregale invoke [<slug>] [--async] [--payload <J|@file|->] [--on-success-webhook <ID>] [--on-failure-webhook <ID>]`
+`gregale invoke [<slug>] [--async] [--payload <J|@file|->] [--on-success-webhook <ID>] [--on-failure-webhook <ID>] [--work-policy <NAME>] [--work-key <JSON>] [--work-fairness-key <JSON>]`
 
 | Flag | Meaning | |
 |---|---|---|
@@ -2126,6 +2132,9 @@ Functional smoke test (invoke [--async] &lt;slug&gt; [--payload J|@file|-]; slug
 | `--payload <J|@file|->` | JSON payload (inline \| @file \| -) |  |
 | `--on-success-webhook <ID>` | app webhook id for completed invocation callbacks |  |
 | `--on-failure-webhook <ID>` | app webhook id for failed or dead-lettered callbacks |  |
+| `--work-policy <NAME>` | named app work policy for async invocation |  |
+| `--work-key <JSON>` | JSON scalar application key for async invocation |  |
+| `--work-fairness-key <JSON>` | JSON scalar fairness group for async invocation |  |
 
 
 ## run
@@ -2579,6 +2588,9 @@ Enqueue a wake request
 |---|---|---|
 | `--payload <J>` | JSON payload (inline \| @file \| -) |  |
 | `--queue-name <QUEUE>` | logical queue name |  |
+| `--work-policy <NAME>` | named work policy for an unnamed queue |  |
+| `--work-key <JSON>` | JSON scalar identifying related work |  |
+| `--work-fairness-key <JSON>` | JSON scalar shared by related work keys |  |
 
 ### queue receive
 
