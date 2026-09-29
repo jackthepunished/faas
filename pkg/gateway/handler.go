@@ -495,6 +495,7 @@ const (
 	rateLimitScopeAccount = "account"
 	rateLimitScopeRule    = "rule"
 	rateLimitScopeRoute   = "route"
+	rateLimitScopePreAuth = "preauth"
 )
 
 // centralRateLimitDegradedCooldown bounds outage logging and audit writes to
@@ -896,6 +897,7 @@ type Handler struct {
 	declaredRoutes DeclaredRouteMatcher
 	limiter        *Limiter
 	preAuthLimiter *preAuthSourceLimiter
+	preAuthCentral CentralBackend
 	// routeLimiter is the per-rule token-bucket throttle (ADR-091
 	// D20.5 amendment, issue #881). Same underlying *Limiter type as
 	// limiter + accountLimiter but constructed with NewLimiterWithLRU
@@ -1463,7 +1465,8 @@ func (h *Handler) WithLimiter(l *Limiter) *Handler {
 // WithCentralBackend (ADR-104 amendment 5, issue #881 Phase 4 C3)
 // installs the production CentralBackend on every per-process
 // Limiter the Handler owns (per-app, per-account, per-rule,
-// per-consumer). nil is accepted — the call sites fall back to
+// per-consumer), and makes it available to opted-in pre-auth routes.
+// nil is accepted — the call sites fall back to
 // the noopCentralBackend default. Production wiring lives in
 // cmd/gatewayd-internal/run.go's centralBackendFromConfig helper
 // and is conditioned on cfg.RateLimit.Mode == "central".
@@ -1476,10 +1479,20 @@ func (h *Handler) WithCentralBackend(central CentralBackend) *Handler {
 	if central == nil {
 		return h
 	}
+	h.preAuthCentral = central
 	for _, limiter := range h.limiters() {
 		limiter.central = central
 		limiter.centralErrorObserver = h.observeCentralRateLimitDegraded
 	}
+	return h
+}
+
+// WithPreAuthCentralBackend enables the separately opt-in, shared source
+// budget on exact pre-auth routes. It is wired at boot even when the general
+// app/account limiter remains in local mode. A nil backend leaves those routes
+// on observable local fallback. Call before serving requests.
+func (h *Handler) WithPreAuthCentralBackend(central CentralBackend) *Handler {
+	h.preAuthCentral = central
 	return h
 }
 
@@ -1493,7 +1506,7 @@ func (h *Handler) observeCentralRateLimitDegraded(ctx context.Context, scope str
 		return
 	}
 	switch scope {
-	case rateLimitScopeApp, rateLimitScopeAccount, rateLimitScopeRule:
+	case rateLimitScopeApp, rateLimitScopeAccount, rateLimitScopeRule, rateLimitScopePreAuth:
 	default:
 		scope = "other"
 	}
