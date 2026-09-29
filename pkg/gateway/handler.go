@@ -6563,6 +6563,12 @@ haveApp:
 			wakeSpan.RecordError(err)
 		}
 		wakeSpan.End()
+		// Scheduler work used the traced wake context above. Keep the same
+		// request-local trace on the downstream request so the first-byte event
+		// can attach its gateway phases to the wake ID.
+		if platformWakeTrace != nil {
+			r = r.WithContext(withWakePhaseTrace(r.Context(), platformWakeTrace))
+		}
 		if err != nil {
 			if showWakePage && r.Context().Err() == nil && wakeCtx.Err() == context.DeadlineExceeded && errors.Is(err, context.DeadlineExceeded) && h.gate.WakeInProgress(app.ID) {
 				// The caller's short wait expired, but the detached wake is
@@ -7112,6 +7118,7 @@ haveApp:
 		// can distinguish raw-bytes sessions from plain HTTP
 		// without re-deriving from Connection/Upgrade.
 		r.Header.Set("x-faas-upgrade", "true")
+		platformWakeTrace.markProxyStarted(time.Now())
 		h.rawByNode(target).ServeHTTP(w, r)
 		// Per-request accounting still fires for the raw path
 		// (issue #676 / ADR-080): the upgrade request is one
