@@ -22,6 +22,8 @@ Public surface:
   request's project release to managed service calls.
 * `verify_webhook` - verify signed outbound deliveries against their raw body
   and return the stable delivery ID for receiver-side deduplication.
+* `pre_auth_target_digest` - opaque login-target signal for selected failed
+  responses on opt-in pre-auth routes.
 """
 
 from ._rfc7807 import (
@@ -48,6 +50,7 @@ from .idempotency import (
     mint_idempotency_key,
     with_idempotency_key,
 )
+from .pre_auth_target import PRE_AUTH_TARGET_HEADER, pre_auth_target_digest
 from .release_context import (
     GREGALE_RELEASE_HEADER,
     GREGALE_REVISION_HEADER,
@@ -95,6 +98,8 @@ __all__ = (
     "WEBHOOK_TIMESTAMP_HEADER",
     "WEBHOOK_DELIVERY_ID_HEADER",
     "DEFAULT_WEBHOOK_TIMESTAMP_TOLERANCE",
+    "PRE_AUTH_TARGET_HEADER",
+    "pre_auth_target_digest",
     "Problem",
     "FaasError",
     "FaasProblemError",
