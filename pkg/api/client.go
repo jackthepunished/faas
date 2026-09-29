@@ -4816,6 +4816,39 @@ func (c *Client) ListInvoices(ctx context.Context, month, before string, limit i
 	return out, c.do(ctx, "GET", path, nil, &out)
 }
 
+// PlaceAccountAbuseHold places an ADR-361 account abuse hold via
+// POST /v1/admin/accounts/{id}/abuse-hold. note is the operator's audit note
+// (3..500 chars). Operator-only, like credits.
+func (c *Client) PlaceAccountAbuseHold(ctx context.Context, accountID, note string) (AccountAbuseHoldActionResponse, error) {
+	return c.changeAccountAbuseHold(ctx, http.MethodPost, accountID, note)
+}
+
+// ReleaseAccountAbuseHold releases an ADR-361 account abuse hold via
+// DELETE /v1/admin/accounts/{id}/abuse-hold. note is the operator's audit
+// note (3..500 chars).
+func (c *Client) ReleaseAccountAbuseHold(ctx context.Context, accountID, note string) (AccountAbuseHoldActionResponse, error) {
+	return c.changeAccountAbuseHold(ctx, http.MethodDelete, accountID, note)
+}
+
+func (c *Client) changeAccountAbuseHold(ctx context.Context, method, accountID, note string) (AccountAbuseHoldActionResponse, error) {
+	body, err := json.Marshal(AccountAbuseHoldAction{Note: note})
+	if err != nil {
+		return AccountAbuseHoldActionResponse{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, method,
+		c.baseURL+"/v1/admin/accounts/"+accountID+"/abuse-hold", bytes.NewReader(body))
+	if err != nil {
+		return AccountAbuseHoldActionResponse{}, err
+	}
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	req.Header.Set("Idempotency-Key", newUUIDv4())
+	req.Header.Set("Content-Type", "application/json")
+	var out AccountAbuseHoldActionResponse
+	return out, c.doReq(c.http, req, &out)
+}
+
 // IssueAccountCredit issues a positive-cents credit to the named
 // account via POST /v1/admin/accounts/{id}/credits (issue #279).
 // accountID is the target account's UUID. idemKey is the
