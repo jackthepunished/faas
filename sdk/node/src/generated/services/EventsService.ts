@@ -13,6 +13,8 @@ import type { RegisterEventSchemaRequest } from '../models/RegisterEventSchemaRe
 import type { RegisterEventSchemaResponse } from '../models/RegisterEventSchemaResponse.js';
 import type { ReplayEventFanoutFailureRequest } from '../models/ReplayEventFanoutFailureRequest.js';
 import type { ReplayEventFanoutFailureResponse } from '../models/ReplayEventFanoutFailureResponse.js';
+import type { ReplayRetryableEventFanoutFailuresRequest } from '../models/ReplayRetryableEventFanoutFailuresRequest.js';
+import type { ReplayRetryableEventFanoutFailuresResponse } from '../models/ReplayRetryableEventFanoutFailuresResponse.js';
 import type { CancelablePromise } from '../core/CancelablePromise.js';
 import { OpenAPI } from '../core/OpenAPI.js';
 import { request as __request } from '../core/request.js';
@@ -306,6 +308,58 @@ export class EventsService {
         401: `code: unauthorized`,
         404: `code: not_found`,
         409: `code: conflict`,
+        429: `429 application/problem+json response. Authentication throttling uses
+        \`auth_rate_limited\`; plan and usage limits use their specific stable
+        codes such as \`plan_limit_concurrency\` and \`quota_exhausted\`.
+        `,
+      },
+    });
+  }
+  /**
+   * Replay a bounded batch of retryable event recipient failures.
+   * Requeues up to 100 terminal recipients for the app whose stable failure
+   * classification marks them retryable. Optional event_source and event_id
+   * narrow the action to one published event and must be supplied together.
+   * Non-retryable recipients are left alone, and an event being processed
+   * by the fanout worker is not modified. A replayed event can accept more
+   * recipients while pending; if has_more remains true while the worker is
+   * processing it, repeat the request after that event settles.
+   *
+   * @returns ReplayRetryableEventFanoutFailuresResponse Bounded replay accepted.
+   * @throws ApiError
+   */
+  public static replayRetryableEventFanoutFailures({
+    slug,
+    requestBody,
+    idempotencyKey,
+  }: {
+    /**
+     * App slug. Lowercase letters, digits, hyphens; must start and end with alnum.
+     */
+    slug: string,
+    requestBody: ReplayRetryableEventFanoutFailuresRequest,
+    /**
+     * Idempotency key for the POST. Stored for 24h. On replay the server
+     * returns the original response with `Idempotent-Replayed: true`.
+     *
+     */
+    idempotencyKey?: string,
+  }): CancelablePromise<ReplayRetryableEventFanoutFailuresResponse> {
+    return __request(OpenAPI, {
+      method: 'POST',
+      url: '/v1/apps/{slug}/event-deliveries:replay-retryable-fanout-failures',
+      path: {
+        'slug': slug,
+      },
+      headers: {
+        'Idempotency-Key': idempotencyKey,
+      },
+      body: requestBody,
+      mediaType: 'application/json',
+      errors: {
+        400: `code: bad_request — generic 400 envelope. Specific codes (missing Upload-Offset header on PATCH /v1/uploads/{id}, malformed JSON body, plan cap exceeded as \`source_too_large\`) ship as the \`code\` field.`,
+        401: `code: unauthorized`,
+        404: `code: not_found`,
         429: `429 application/problem+json response. Authentication throttling uses
         \`auth_rate_limited\`; plan and usage limits use their specific stable
         codes such as \`plan_limit_concurrency\` and \`quota_exhausted\`.
