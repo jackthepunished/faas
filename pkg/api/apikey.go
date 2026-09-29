@@ -386,6 +386,10 @@ const (
 	ScopeStorageWrite          = "storage:write"
 	ScopeManagedPostgresManage = "postgres:manage"
 	ScopeManagedPostgresRead   = "postgres:read"
+	// Project-environment CI can read non-secret environment state and record
+	// qualification without gaining deployment or secret access.
+	ScopeProjectEnvironmentRead    = "project_environments:read"
+	ScopeProjectEnvironmentQualify = "project_environments:qualify"
 	// ScopeGithubManage controls customer-facing GitHub installation and
 	// repository binding operations. It is intentionally separate from
 	// deploy:write so a CI key cannot silently take over a source-control
@@ -406,28 +410,30 @@ const (
 // validScopes is the closed set of scope strings the API accepts. The
 // order is not significant — callers can pass scopes in any order.
 var validScopes = map[string]struct{}{
-	ScopeAdmin:                    {},
-	ScopeAppsRead:                 {},
-	ScopeDeployWrite:              {},
-	ScopeSecretsRead:              {},
-	ScopeSecretsWrite:             {},
-	ScopeUsageRead:                {},
-	ScopeEnvRead:                  {},
-	ScopeEnvWrite:                 {},
-	ScopeRegistryCredentialsRead:  {},
-	ScopeRegistryCredentialsWrite: {},
-	ScopeUpstreamsWrite:           {},
-	ScopeMetricsWrite:             {},
-	ScopeDelayedTasksRead:         {},
-	ScopeDelayedTasksWrite:        {},
-	ScopeEventsPublish:            {},
-	ScopeQueuesSend:               {},
-	ScopeStorageManage:            {},
-	ScopeStorageRead:              {},
-	ScopeStorageWrite:             {},
-	ScopeManagedPostgresManage:    {},
-	ScopeManagedPostgresRead:      {},
-	ScopeGithubManage:             {},
+	ScopeAdmin:                     {},
+	ScopeAppsRead:                  {},
+	ScopeDeployWrite:               {},
+	ScopeSecretsRead:               {},
+	ScopeSecretsWrite:              {},
+	ScopeUsageRead:                 {},
+	ScopeEnvRead:                   {},
+	ScopeEnvWrite:                  {},
+	ScopeRegistryCredentialsRead:   {},
+	ScopeRegistryCredentialsWrite:  {},
+	ScopeUpstreamsWrite:            {},
+	ScopeMetricsWrite:              {},
+	ScopeDelayedTasksRead:          {},
+	ScopeDelayedTasksWrite:         {},
+	ScopeEventsPublish:             {},
+	ScopeQueuesSend:                {},
+	ScopeStorageManage:             {},
+	ScopeStorageRead:               {},
+	ScopeStorageWrite:              {},
+	ScopeManagedPostgresManage:     {},
+	ScopeManagedPostgresRead:       {},
+	ScopeProjectEnvironmentRead:    {},
+	ScopeProjectEnvironmentQualify: {},
+	ScopeGithubManage:              {},
 }
 
 // IsValidScope reports whether s is in the allowed scope vocabulary.
@@ -555,13 +561,15 @@ var (
 
 	// Object-storage route surfaces. Admin remains the universal escape
 	// hatch; session-cookie principals are implicitly admin in requireScope.
-	ScopesStorageManageSurface         = []string{ScopeAdmin, ScopeStorageManage}
-	ScopesStorageReadSurface           = []string{ScopeAdmin, ScopeStorageRead}
-	ScopesStorageWriteSurface          = []string{ScopeAdmin, ScopeStorageWrite}
-	ScopesStorageListSurface           = []string{ScopeAdmin, ScopeStorageManage, ScopeStorageRead, ScopeStorageWrite}
-	ScopesManagedPostgresManageSurface = []string{ScopeAdmin, ScopeManagedPostgresManage}
-	ScopesManagedPostgresReadSurface   = []string{ScopeAdmin, ScopeManagedPostgresRead}
-	ScopesGithubManageSurface          = []string{ScopeAdmin, ScopeGithubManage}
+	ScopesStorageManageSurface             = []string{ScopeAdmin, ScopeStorageManage}
+	ScopesStorageReadSurface               = []string{ScopeAdmin, ScopeStorageRead}
+	ScopesStorageWriteSurface              = []string{ScopeAdmin, ScopeStorageWrite}
+	ScopesStorageListSurface               = []string{ScopeAdmin, ScopeStorageManage, ScopeStorageRead, ScopeStorageWrite}
+	ScopesManagedPostgresManageSurface     = []string{ScopeAdmin, ScopeManagedPostgresManage}
+	ScopesManagedPostgresReadSurface       = []string{ScopeAdmin, ScopeManagedPostgresRead}
+	ScopesProjectEnvironmentReadSurface    = []string{ScopeAdmin, ScopeAppsRead, ScopeProjectEnvironmentRead}
+	ScopesProjectEnvironmentQualifySurface = []string{ScopeAdmin, ScopeDeployWrite, ScopeProjectEnvironmentQualify}
+	ScopesGithubManageSurface              = []string{ScopeAdmin, ScopeGithubManage}
 	// Tenant-self scopes are intentionally not satisfied by account admin keys.
 	ScopesPlatformTenantUsageReadSurface         = []string{ScopePlatformTenantUsageRead}
 	ScopesPlatformTenantStatementsReadSurface    = []string{ScopePlatformTenantStatementsRead}
