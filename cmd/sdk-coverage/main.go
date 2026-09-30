@@ -273,6 +273,15 @@ var sdkMethodExclude = map[string]bool{
 //
 // Key = "<METHOD> <path>"; value = SDK method name.
 var methodRouteMap = map[string]string{
+	"POST /v1/apps/{slug}/issue-events":                     "IngestIssueEvent",
+	"POST /v1/apps/{slug}/issue-events/otlp/{signal}":       "IngestIssueOTLP",
+	"GET /v1/apps/{slug}/issues":                            "ListIssues",
+	"GET /v1/apps/{slug}/issues/{issue_id}":                 "GetIssue",
+	"POST /v1/apps/{slug}/issues/{issue_id}/actions":        "ActOnIssue",
+	"POST /v1/apps/{slug}/issue-ingest-tokens":              "CreateIssueIngestToken",
+	"GET /v1/apps/{slug}/issue-ingest-tokens":               "ListIssueIngestTokens",
+	"DELETE /v1/apps/{slug}/issue-ingest-tokens/{token_id}": "RevokeIssueIngestToken",
+
 	"GET /v1/dev/bridges":                                                     "ListDevBridges",
 	"GET /v1/dev/bridges/{id}/activity":                                       "GetDevBridgeActivity",
 	"POST /v1/dev/bridges":                                                    "CreateDevBridge",

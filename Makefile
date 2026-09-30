@@ -1339,3 +1339,7 @@ test-flags-metal: ## Validate Node Flags refresh after native VM restore (root, 
 	@test -r "$$FAAS_BUILDER_BASE_PATH" || (echo "FAAS_BUILDER_BASE_PATH must name a readable builder base" >&2; exit 1)
 	@cd sdk/node && npm ci --ignore-scripts --no-audit --no-fund && npm run build
 	@RUN_REGEX='^TestFeatureFlagsNativeParkRestoreMetal$$' $(MAKE) test-metal PKGS=./cmd/e2e/...
+
+.PHONY: test-issues
+test-issues: ## Real PostgreSQL and SDK process acceptance for Gregale Issues
+	@bash scripts/test-issues.sh
