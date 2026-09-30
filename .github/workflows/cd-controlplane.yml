@@ -128,7 +128,13 @@ jobs:
           cache: true
 
       - name: Install pinned config renderer
-        run: python3 -m pip install --quiet 'ansible-core==2.21.2'
+        # A per-job venv: the self-hosted fleet runner (Ubuntu 24.04) has no
+        # system pip and marks its interpreter externally managed (PEP 668).
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/ansible-venv"
+          "$RUNNER_TEMP/ansible-venv/bin/python" -m pip install --quiet 'ansible-core==2.21.2'
+          echo "$RUNNER_TEMP/ansible-venv/bin" >> "$GITHUB_PATH"
 
       - name: Install pinned cosign verifier
         env:
@@ -150,6 +156,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # The bundle manifest records each file's mode. The fleet runner's
+          # service runs with UMask=0077, while the control plane extracts
+          # release.tar.gz as root with the archive's modes; use the hosted
+          # runner's umask so both sides agree (bin/apid 0755, not 0700).
+          umask 0022
           CANONICAL_ROOT="$RUNNER_TEMP/gregale-canonical"
           mkdir -p "$CANONICAL_ROOT"
           # GitHub's by-tag response can lag asset uploads while the by-ID
@@ -287,6 +298,8 @@ jobs:
       - name: Build immutable release bundle
         run: |
           set -euo pipefail
+          # Same umask as the canonical download step: see there.
+          umask 0022
           BUNDLE_ROOT="${RUNNER_TEMP}/faas-release/${RELEASE_ID}"
           mkdir -p "${BUNDLE_ROOT}/bin" "${BUNDLE_ROOT}/systemd" "${BUNDLE_ROOT}/optional-systemd" "${BUNDLE_ROOT}/tmpfiles.d" "${BUNDLE_ROOT}/prometheus" "${BUNDLE_ROOT}/statuspage"
           PROM_BOX_LABEL="$(ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes "root@${CP_HOST}" hostname)"
@@ -867,8 +880,15 @@ jobs:
               exit 1
             }
           }
-          assert_process_credential faas-apid /etc/faas/apid-storage.env
-          assert_process_credential faas-schedd /etc/faas/storage.env
+          # Registry credentials exist only when OCI is the backend or the
+          # migration fallback. A GCS-only fleet authenticates with the VM
+          # identity (ADC) and has no FAAS_OCI_* values to compare.
+          if grep -Eq '^FAAS_STORAGE_(FALLBACK_)?BACKEND=oci$' /etc/faas/storage.env; then
+            assert_process_credential faas-apid /etc/faas/apid-storage.env
+            assert_process_credential faas-schedd /etc/faas/storage.env
+          else
+            echo "storage.env selects GCS without an OCI fallback; no registry credentials to verify"
+          fi
           sudo -u faas-apid /opt/faas/current/bin/gregalectl artifact lifecycle-check \
             --env-file /etc/faas/storage.env \
             --lifecycle-env-file /etc/faas/apid-storage.env \

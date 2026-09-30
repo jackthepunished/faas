@@ -121,3 +121,96 @@ func TestCDStagesTargetTheSelectedEnvironment(t *testing.T) {
 		t.Error("cd-compute's online-runner probe does not look for the selected fleet's label")
 	}
 }
+
+// Jobs on the self-hosted fleet runner cannot pip-install into the system
+// interpreter: Ubuntu 24.04 ships no pip and marks python3 externally
+// managed (PEP 668). cd-controlplane moved onto the fleet runner and failed
+// its first run at `python3 -m pip install`. Python tools go into a per-job
+// venv, and the runner role installs python3-venv so the venv can be made.
+func TestFleetRunnerJobsInstallPythonToolsInAVenv(t *testing.T) {
+	for _, name := range []string{"cd-platform.yml", "cd-controlplane.yml", "cd-compute.yml", "pki-renew.yml"} {
+		for i, line := range strings.Split(readWorkflow(t, name), "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.Contains(trimmed, "pip install") && !strings.Contains(trimmed, "-venv/bin/") {
+				t.Errorf("%s:%d installs Python packages outside a venv: %s", name, i+1, trimmed)
+			}
+		}
+	}
+	controlPlane := readWorkflow(t, "cd-controlplane.yml")
+	for _, want := range []string{
+		`python3 -m venv "$RUNNER_TEMP/ansible-venv"`,
+		`echo "$RUNNER_TEMP/ansible-venv/bin" >> "$GITHUB_PATH"`,
+	} {
+		if !strings.Contains(controlPlane, want) {
+			t.Errorf("cd-controlplane renderer install lost %q", want)
+		}
+	}
+	role, err := os.ReadFile(filepath.Join("..", "..", "deploy", "ansible", "roles", "github_actions_runner", "tasks", "main.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(role), "      - python3-venv\n") {
+		t.Error("github_actions_runner does not install python3-venv")
+	}
+}
+
+// deployctl verifies every bundle file's mode against the manifest built on
+// the runner. The fleet runner's service umask is 0077, so without an
+// explicit umask the runner recorded bin/apid as 0700 while the control
+// plane unpacked it as 0755, and activation failed on production-us.
+func TestCDControlPlaneBundleStepsPinTheUmask(t *testing.T) {
+	workflow := readWorkflow(t, "cd-controlplane.yml")
+	for _, step := range []string{"Download and verify canonical release", "Build immutable release bundle"} {
+		start := strings.Index(workflow, "      - name: "+step+"\n")
+		if start < 0 {
+			t.Fatalf("cd-controlplane lost step %q", step)
+		}
+		body := workflow[start+1:]
+		if next := strings.Index(body, "\n      - name: "); next >= 0 {
+			body = body[:next]
+		}
+		if !strings.Contains(body, "\n          umask 0022\n") {
+			t.Errorf("step %q builds bundle content without pinning umask 0022", step)
+		}
+	}
+}
+
+// The compute join's gregalectl verifies the signed release by running
+// `cosign` from PATH. The first dedicated fleet runner had no system cosign
+// ("exec: cosign: executable file not found"), so the pinned verifier this
+// workflow installs must be the one on PATH.
+func TestCDComputePutsThePinnedCosignOnPath(t *testing.T) {
+	workflow := readWorkflow(t, "cd-compute.yml")
+	start := strings.Index(workflow, "      - name: Install pinned cosign verifier\n")
+	if start < 0 {
+		t.Fatal("cd-compute lost its pinned cosign verifier step")
+	}
+	body := workflow[start+1:]
+	if next := strings.Index(body, "\n      - name: "); next >= 0 {
+		body = body[:next]
+	}
+	if !strings.Contains(body, `echo "$RUNNER_TEMP/release-tools" >> "$GITHUB_PATH"`) {
+		t.Error("cd-compute installs a pinned cosign but does not put it on PATH for the join")
+	}
+}
+
+// A GCS-only fleet has no FAAS_OCI_* registry credentials: storage uses the
+// VM identity. cd-controlplane's credential-source check required them
+// unconditionally, so the first production-us rollout failed after a
+// successful activation. The assertions must be gated on OCI being in use.
+func TestCDControlPlaneCredentialCheckAllowsGCSOnlyStorage(t *testing.T) {
+	workflow := readWorkflow(t, "cd-controlplane.yml")
+	gate := strings.Index(workflow, `if grep -Eq '^FAAS_STORAGE_(FALLBACK_)?BACKEND=oci$' /etc/faas/storage.env; then`)
+	if gate < 0 {
+		t.Fatal("cd-controlplane checks registry credentials without asking whether OCI is in use")
+	}
+	for _, call := range []string{
+		"assert_process_credential faas-apid /etc/faas/apid-storage.env",
+		"assert_process_credential faas-schedd /etc/faas/storage.env",
+	} {
+		i := strings.Index(workflow, "            "+call)
+		if i < 0 || i < gate {
+			t.Errorf("%q is not inside the OCI-in-use branch", call)
+		}
+	}
+}
