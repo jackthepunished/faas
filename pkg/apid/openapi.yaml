@@ -37277,6 +37277,7 @@ components:
         value: { type: string, description: 'Plaintext env-var value. Stored as-is; do NOT use this surface for credentials.', example: "debug" }
 
     ExportAppEnvRequest:
+      description: Explicit acknowledgement required before downloading potentially sensitive plaintext env values.
       type: object
       required: [acknowledge_sensitive_values]
       properties:
@@ -37286,6 +37287,7 @@ components:
           description: Explicit acknowledgement that plaintext downloaded values may be sensitive.
 
     AppEnvExportResponse:
+      description: Mutable plaintext environment values from one authorized app scope, excluding sealed secrets.
       type: object
       required: [app_slug, scope, values]
       properties:

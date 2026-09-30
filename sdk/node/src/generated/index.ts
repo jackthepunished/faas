@@ -65,6 +65,7 @@ export type { APIKeyExportResponse } from './models/APIKeyExportResponse.js';
 export type { APIKeyResponse } from './models/APIKeyResponse.js';
 export type { AppConfiguredResources } from './models/AppConfiguredResources.js';
 export type { AppEffectiveLimits } from './models/AppEffectiveLimits.js';
+export type { AppEnvExportResponse } from './models/AppEnvExportResponse.js';
 export type { AppEnvListResponse } from './models/AppEnvListResponse.js';
 export type { AppEnvResponse } from './models/AppEnvResponse.js';
 export type { AppErrorRequestItem } from './models/AppErrorRequestItem.js';
@@ -395,6 +396,7 @@ export type { ExecutionNetworkPolicy } from './models/ExecutionNetworkPolicy.js'
 export type { ExecutionResponse } from './models/ExecutionResponse.js';
 export type { ExecutionUsage } from './models/ExecutionUsage.js';
 export type { ExecutionUsageSummaryResponse } from './models/ExecutionUsageSummaryResponse.js';
+export type { ExportAppEnvRequest } from './models/ExportAppEnvRequest.js';
 export type { FeatureFlag } from './models/FeatureFlag.js';
 export type { FeatureFlagVersion } from './models/FeatureFlagVersion.js';
 export type { FieldError } from './models/FieldError.js';
