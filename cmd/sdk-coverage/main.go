@@ -303,6 +303,7 @@ var methodRouteMap = map[string]string{
 	"GET /v1/executions/{id}":                    "GetExecution",
 	"DELETE /v1/executions/{id}":                 "CancelExecution",
 	"POST /v1/account/restore":                   "RestoreAccount",
+	"GET /v1/account/overage-cap":                "GetOverageCap",   // saved monthly spend cap
 	"POST /v1/account/overage-cap":               "RaiseOverageCap", // issue #561 spend cap
 	"POST /v1/account/mfa/disable-email":         "PostAccountMfaDisableEmail",
 	"POST /v1/account/mfa/disable-email/confirm": "PostAccountMfaDisableEmailConfirm",

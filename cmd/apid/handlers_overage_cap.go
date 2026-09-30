@@ -19,7 +19,5 @@ func (s *server) getOverageCap(w http.ResponseWriter, r *http.Request, acct stat
 	if found {
 		capCents = &cents
 	}
-	writeJSON(w, http.StatusOK, struct {
-		OverageCapCents *int64 `json:"overage_cap_cents"`
-	}{OverageCapCents: capCents})
+	writeJSON(w, http.StatusOK, api.AccountOverageCapResponse{OverageCapCents: capCents})
 }

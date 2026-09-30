@@ -23,6 +23,7 @@ export type { AccountDeployRateLimit } from './AccountDeployRateLimit.js';
 export type { AccountEgressAllowlistExtraResponse } from './AccountEgressAllowlistExtraResponse.js';
 export type { AccountExportResponse } from './AccountExportResponse.js';
 export type { AccountLimits } from './AccountLimits.js';
+export type { AccountOverageCapResponse } from './AccountOverageCapResponse.js';
 export type { AccountRateLimitsResponse } from './AccountRateLimitsResponse.js';
 export type { AccountResponse } from './AccountResponse.js';
 export type { AccountSLOResponse } from './AccountSLOResponse.js';
