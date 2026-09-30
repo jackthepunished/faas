@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/onebox-faas/faas/pkg/api"
 )
@@ -142,5 +144,77 @@ func TestEnvExportDoesNotPersistIdempotencyValues(t *testing.T) {
 	response := e.do(t, "POST", path, request, headers)
 	if response.Code != 200 || !strings.Contains(response.Body.String(), "second") || response.Header().Get("Idempotent-Replayed") == "true" {
 		t.Fatal("export persisted/replayed a plaintext response")
+	}
+}
+
+func TestEnvExportSessionMFAGate(t *testing.T) {
+	for _, pending := range []bool{true, false} {
+		e := setupWithMFA(t, api.PlanHobby, pending, false)
+		response := e.do(t, "POST", "/v1/apps/missing-app/env-export", api.ExportAppEnvRequest{AcknowledgeSensitiveValues: true})
+		expected := http.StatusNotFound // cleared session reaches the ownership lookup
+		if pending {
+			expected = http.StatusForbidden
+		}
+		if response.Code != expected {
+			t.Fatalf("pending %t: %d %s", pending, response.Code, response.Body.String())
+		}
+		if pending && !strings.Contains(response.Body.String(), api.CodeMFARequired) {
+			t.Fatal("pending session bypassed the MFA gate")
+		}
+	}
+}
+
+func TestEnvExportRejectsCrossOriginSession(t *testing.T) {
+	e := setupWithMFA(t, api.PlanHobby, false, false)
+	request := httptest.NewRequest("POST", "/v1/apps/missing-app/env-export", strings.NewReader(`{"acknowledge_sensitive_values":true}`))
+	request.AddCookie(e.cookie)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Origin", "https://untrusted.example")
+	request.Header.Set("Sec-Fetch-Site", "cross-site")
+	response := httptest.NewRecorder()
+	e.h.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden || !strings.Contains(response.Body.String(), "cross-origin") {
+		t.Fatalf("cross-origin export: %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestEnvExportAuditContainsMetadataOnly(t *testing.T) {
+	e := setup(t, api.PlanHobby)
+	app := createApp(t, e, "export-audit")
+	sentinel := "private-value-never-log-or-audit"
+	if err := e.store.UpsertAppEnv(context.Background(), e.acct.ID, app.ID, "PUBLIC", sentinel); err != nil {
+		t.Fatal(err)
+	}
+	response := e.do(t, "POST", "/v1/apps/"+app.Slug+"/env-export", api.ExportAppEnvRequest{AcknowledgeSensitiveValues: true}, nil)
+	if response.Code != 200 {
+		t.Fatal(response.Body.String())
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		audit := e.do(t, "GET", "/v1/audit-events?kind_prefix=env.exported", nil, nil)
+		var result api.ListAuditEventsResponse
+		if err := json.Unmarshal(audit.Body.Bytes(), &result); err != nil {
+			t.Fatal(err)
+		}
+		for _, event := range result.Events {
+			if event.Kind != "env.exported" {
+				continue
+			}
+			if strings.Contains(string(event.Data), sentinel) || strings.Contains(string(event.Data), "PUBLIC") {
+				t.Fatal("plaintext or key list in export audit")
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(event.Data, &payload); err != nil {
+				t.Fatal(err)
+			}
+			if payload["app_id"] != app.ID || payload["scope"] != "default" || payload["count"] != float64(1) {
+				t.Fatalf("wrong export audit %v", payload)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("export audit did not arrive")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
