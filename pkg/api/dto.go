@@ -692,6 +692,30 @@ type ScenarioTestWorkload struct {
 	AppSlug  string `json:"app_slug"`
 }
 
+// InjectScenarioTestChaosRequest installs bounded request faults on service
+// calls within one registered scenario run. The server supplies the expiry;
+// callers cannot choose an absolute timestamp or target an unregistered app.
+type InjectScenarioTestChaosRequest struct {
+	DurationMS int64                   `json:"duration_ms"`
+	Rules      []ScenarioTestChaosRule `json:"rules"`
+}
+
+// ScenarioTestChaosRule describes one bounded fault for scenario service calls.
+type ScenarioTestChaosRule struct {
+	From       string `json:"from,omitempty"`
+	To         string `json:"to"`
+	Kind       string `json:"kind"`
+	Percent    int    `json:"percent"`
+	LatencyMS  int64  `json:"latency_ms,omitempty"`
+	StatusCode int    `json:"status_code,omitempty"`
+	Seed       uint64 `json:"seed"`
+}
+
+type InjectScenarioTestChaosResponse struct {
+	ExpiresAt      time.Time `json:"expires_at"`
+	RulesInstalled int       `json:"rules_installed"`
+}
+
 // UpdateAppRequest is the partial-update payload for PATCH /v1/apps/{slug}.
 // All fields are pointers so the wire form can distinguish "not set" from
 // "set to zero".
