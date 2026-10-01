@@ -1698,6 +1698,8 @@ export class AppsService {
     state,
     environment,
     assignee,
+    sort = 'recent',
+    minCustomers,
     cursor,
   }: {
     /**
@@ -1717,6 +1719,14 @@ export class AppsService {
      */
     assignee?: string,
     /**
+     * Issue ordering; impact ranks by verified distinct customers in the fixed 24-hour window.
+     */
+    sort?: 'recent' | 'impact',
+    /**
+     * Return issues affecting at least this many verified distinct customers in the fixed 24-hour window.
+     */
+    minCustomers?: number,
+    /**
      * Opaque next_cursor from the previous issue page.
      */
     cursor?: string,
@@ -1731,6 +1741,8 @@ export class AppsService {
         'state': state,
         'environment': environment,
         'assignee': assignee,
+        'sort': sort,
+        'min_customers': minCustomers,
         'cursor': cursor,
       },
       errors: {
