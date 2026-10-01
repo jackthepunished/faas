@@ -5470,6 +5470,8 @@ type StorageUsage struct {
 // invoice URLs and PDF URLs are session-scoped; we never hand them to
 // the customer via this API.
 type Invoice struct {
+	Details           *InvoiceDetails
+	Lifecycle         *InvoiceLifecycle
 	ID                string
 	AccountID         string
 	Provider          string // "stripe" | "paddle" | "polar"
@@ -5500,6 +5502,10 @@ type Invoice struct {
 	CreatedAt                time.Time
 	UpdatedAt                time.Time
 }
+
+// InvoicePlanUnknown marks provider-history imports whose old billing plan
+// cannot be proven from the provider document. It is not a valid account plan.
+const InvoicePlanUnknown api.Plan = "unknown"
 
 // InvoiceRefund is the durable local projection of a provider refund. The
 // provider handle and caller idempotency key are independently unique per

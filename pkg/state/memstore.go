@@ -16972,7 +16972,7 @@ func (m *MemStore) ListInvoicesForAccount(_ context.Context, accountID string, m
 		if !before.IsZero() && !inv.PeriodEnd.Before(before) {
 			continue
 		}
-		all = append(all, inv)
+		all = append(all, cloneInvoice(inv))
 	}
 	sort.Slice(all, func(i, j int) bool {
 		if !all[i].PeriodEnd.Equal(all[j].PeriodEnd) {
@@ -16996,7 +16996,7 @@ func (m *MemStore) GetInvoiceByID(_ context.Context, id string) (Invoice, error)
 	defer m.mu.Unlock()
 	for _, inv := range m.invoices {
 		if inv.ID == id {
-			return inv, nil
+			return cloneInvoice(inv), nil
 		}
 	}
 	return Invoice{}, ErrNotFound
@@ -17020,7 +17020,7 @@ func (m *MemStore) GetInvoiceByProviderID(_ context.Context, accountID, provider
 		}
 	}
 	if found {
-		return matched, nil
+		return cloneInvoice(matched), nil
 	}
 	return Invoice{}, ErrNotFound
 }
@@ -17029,6 +17029,9 @@ func (m *MemStore) GetInvoiceByProviderID(_ context.Context, accountID, provider
 // ingestion. MemStore keeps the existing row id and created_at on updates so
 // list ordering and idempotency match Postgres.
 func (m *MemStore) UpsertInvoice(_ context.Context, inv Invoice) error {
+	if err := ValidateInvoiceDetails(inv.Details); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if inv.AccountID == "" || inv.Provider == "" || inv.ProviderInvoiceID == "" {
@@ -17046,11 +17049,15 @@ func (m *MemStore) UpsertInvoice(_ context.Context, inv Invoice) error {
 	if inv.Status == "" {
 		inv.Status = "open"
 	}
-	if !inv.Plan.Valid() {
+	if !inv.Plan.Valid() && inv.Plan != InvoicePlanUnknown {
 		inv.Plan = api.PlanFree
 	}
 	for id, existing := range m.invoices {
 		if existing.AccountID == inv.AccountID && existing.Provider == inv.Provider && existing.ProviderInvoiceID == inv.ProviderInvoiceID {
+			inv.Details = mergeInvoiceDetails(existing.Details, stampInvoiceLines(existing.Details, inv.Details, time.Now().UTC()))
+			if err := ValidateInvoiceDetails(inv.Details); err != nil {
+				return err
+			}
 			inv.ID = existing.ID
 			inv.CreatedAt = existing.CreatedAt
 			if inv.ProviderChargeID == "" {
@@ -17064,6 +17071,12 @@ func (m *MemStore) UpsertInvoice(_ context.Context, inv Invoice) error {
 				inv.CreatedAt = time.Now().UTC()
 			}
 			inv.UpdatedAt = time.Now().UTC()
+			inv.Lifecycle = existing.Lifecycle
+			var err error
+			inv.Lifecycle, err = advanceInvoiceLifecycle(inv, inv.UpdatedAt)
+			if err != nil {
+				return err
+			}
 			m.invoices[id] = inv
 			return nil
 		}
@@ -17077,7 +17090,18 @@ func (m *MemStore) UpsertInvoice(_ context.Context, inv Invoice) error {
 	if inv.UpdatedAt.IsZero() {
 		inv.UpdatedAt = inv.CreatedAt
 	}
-	m.invoices[inv.ID] = inv
+	inv.Details = stampInvoiceLines(nil, inv.Details, time.Now().UTC())
+	if err := ValidateInvoiceDetails(inv.Details); err != nil {
+		return err
+	}
+	observed := time.Now().UTC()
+	inv.Lifecycle = newInvoiceLifecycle(observed)
+	var err error
+	inv.Lifecycle, err = advanceInvoiceLifecycle(inv, observed)
+	if err != nil {
+		return err
+	}
+	m.invoices[inv.ID] = cloneInvoice(inv)
 	return nil
 }
 
@@ -17264,7 +17288,7 @@ func (m *MemStore) SeedInvoiceForTest(inv Invoice) {
 	if inv.Currency == "" {
 		inv.Currency = "eur"
 	}
-	m.invoices[inv.ID] = inv
+	m.invoices[inv.ID] = cloneInvoice(inv)
 }
 
 // --- credits (issue #279) ----------------------------------------------------
