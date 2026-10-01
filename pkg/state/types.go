@@ -3686,6 +3686,8 @@ type TCPListener struct {
 	Enabled      bool
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
+	TLSMode      api.TCPListenerTLSMode
+	TLSHostname  string
 }
 
 // AppWebhookClaimLease is the recovery deadline assigned to each claimed row.
@@ -8674,4 +8676,19 @@ const (
 
 func (e *AppLogDrainQuotaError) Error() string {
 	return fmt.Sprintf("state: app log drain quota exceeded (scope=%s, limit=%d, observed=%d)", e.Scope, e.Limit, e.Observed)
+}
+
+// UDPListener is an app-owned UDP endpoint with a stable public port.
+// Its port namespace is independent from TCP listener endpoints.
+type UDPListener struct {
+	ID           string
+	AppID        string
+	AccountID    string
+	ListenerName string
+	GuestPort    int
+	PublicPort   int
+	Protocol     string
+	Enabled      bool
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }
