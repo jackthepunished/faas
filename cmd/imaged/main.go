@@ -558,7 +558,7 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 			},
 		}
 		h.WithHostingSmoke(func(ctx context.Context, app state.App, dep state.Deployment) (apihostingreceipt.SmokeResult, error) {
-			return verifier.VerifyDeployment(ctx, app.Slug, imaged.HostingHealthPath(app, dep), dep.ID)
+			return imaged.VerifyHostingDeployment(ctx, verifier, app, dep)
 		})
 		if smokeURL == "" {
 			log.Warn("imaged: API hosting readiness smoke required but public origin is unset; deployments will fail closed")
@@ -655,6 +655,13 @@ func (d runDeps) run(ctx context.Context, log *slog.Logger) error {
 	assignedBases, err := h.EnsureAssignedBases(ctx, arch, getenv)
 	if err != nil {
 		return err
+	}
+	profileBases, err := h.EnsureExecutionProfileBases(ctx, arch, getenv)
+	if err != nil {
+		return err
+	}
+	for _, base := range profileBases {
+		log.Info("imaged execution profile base ready", "profile", base.Runtime, "digest", base.ConfigDigest, "skipped", base.Skipped)
 	}
 	if prestageOnlyFromEnv(getenv) {
 		log.Info("imaged runtime-base pre-stage complete",
