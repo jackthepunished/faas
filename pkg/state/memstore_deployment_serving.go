@@ -10,11 +10,19 @@ import "time"
 // m.mu.
 func (m *MemStore) putDeploymentLocked(id string, d Deployment) {
 	prev, existed := m.deployments[id]
+	if existed && prev.Status == DeploySnapshotting && d.Status == DeployFailed {
+		// Mirrors the deployment_failed_rollback_keeps_target trigger
+		// (migration 20261005013455209): a release re-primed by a rollback
+		// that fails stays a rollback target.
+		if _, served := m.deploymentServingEndedAt[id]; served {
+			d.Status = DeploySuperseded
+		}
+	}
 	m.deployments[id] = d
 	switch {
 	case deploymentServing(d):
 		delete(m.deploymentServingEndedAt, id)
-	case existed && deploymentServing(prev):
+	case existed && deploymentServing(prev) && d.Status != DeploySnapshotting:
 		if m.deploymentServingEndedAt == nil {
 			m.deploymentServingEndedAt = map[string]time.Time{}
 		}
