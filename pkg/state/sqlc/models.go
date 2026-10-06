@@ -3867,6 +3867,9 @@ type ObjectDeletion struct {
 	LifecycleBinding        []byte
 	TargetProviderVersionID string
 	RecoveryClaimed         bool
+	ProtectionRequired      bool
+	ProtectionVerified      bool
+	DeletionVerified        bool
 }
 
 type ObjectLifecycleScan struct {
@@ -4077,6 +4080,9 @@ type ObjectStorageMultipartUpload struct {
 	EncryptionVerified         bool
 	FixedAdmission             bool
 	EncryptionDefaultRevision  int64
+	ProtectionSnapshot         []byte
+	ProtectionLeaseToken       string
+	ProtectionVerified         bool
 }
 
 type ObjectStorageRequestMetric struct {
@@ -4209,6 +4215,9 @@ type ObjectUploadCompletion struct {
 	EncryptionDefaultRevision int64
 	SourceBucketID            pgtype.UUID
 	SourceCopyGrantID         pgtype.UUID
+	ProtectionSnapshot        []byte
+	ProtectionDispatched      bool
+	ProtectionVerified        bool
 }
 
 type ObjectUploadRoute struct {
@@ -4227,22 +4236,23 @@ type ObjectUploadRoute struct {
 }
 
 type ObjectVersionProtection struct {
-	ID              pgtype.UUID
-	BucketID        pgtype.UUID
-	AccountID       pgtype.UUID
-	AppID           pgtype.UUID
-	ObjectKey       string
-	PublicVersionID string
-	NativeVersionID string
-	Intent          []byte
-	State           string
-	LeaseToken      string
-	LeaseUntil      pgtype.Timestamptz
-	RetryAt         pgtype.Timestamptz
-	Dispatched      bool
-	LastErrorCode   string
-	CreatedAt       pgtype.Timestamptz
-	UpdatedAt       pgtype.Timestamptz
+	ID                pgtype.UUID
+	BucketID          pgtype.UUID
+	AccountID         pgtype.UUID
+	AppID             pgtype.UUID
+	ObjectKey         string
+	PublicVersionID   string
+	NativeVersionID   string
+	Intent            []byte
+	State             string
+	LeaseToken        string
+	LeaseUntil        pgtype.Timestamptz
+	RetryAt           pgtype.Timestamptz
+	Dispatched        bool
+	LastErrorCode     string
+	CreatedAt         pgtype.Timestamptz
+	UpdatedAt         pgtype.Timestamptz
+	EventHoldBaseline []byte
 }
 
 type ObjectVersionReference struct {

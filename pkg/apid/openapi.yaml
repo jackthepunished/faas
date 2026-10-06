@@ -2174,7 +2174,7 @@ paths:
     put:
       operationId: putObjectVersionRetention
       summary: Request a durable exact version retention change
-      description: Accept durable retention intent with storage manage scope, a bucket write grant and backend enrollment. Recovery verifies readback without repeating a dispatched PUT. Fixed dates round upward to milliseconds. Event hold changes and governance bypass are unsupported.
+      description: Accept durable retention intent with storage manage scope, a bucket write grant and backend enrollment. Recovery verifies readback without repeating a dispatched PUT. Fixed dates round upward to milliseconds. Separately enrolled event holds support ON with one days or years duration and OFF without a duration. Releasing an active hold preserves its observed retention bound and verifies the provider-calculated final date. Governance bypass is unsupported.
       tags: [storage]
       requestBody:
         required: true
@@ -2223,7 +2223,7 @@ paths:
     put:
       operationId: putObjectVersionLegalHold
       summary: Request a durable exact version legal hold change
-      description: Accept durable legal hold intent with storage manage scope, a bucket write grant and backend enrollment. Recovery verifies readback without repeating a dispatched PUT. Fixed dates round upward to milliseconds. Event hold changes and governance bypass are unsupported.
+      description: Accept durable independent ON or OFF legal hold intent with storage manage scope, a bucket write grant and backend enrollment. Recovery verifies exact-version readback without repeating a dispatched PUT. Retention and event hold policies remain independent.
       tags: [storage]
       requestBody:
         required: true
@@ -31055,7 +31055,7 @@ components:
         state: { type: string, enum: [prepared, dispatched, completed, failed] }
         version_id: { type: string, description: Selected public version UUID or new public marker UUID or null when acknowledged; private provider IDs are never exposed. }
         delete_marker: { type: boolean }
-        last_error_code: { type: string, enum: [provider_uncertain, configuration, preparation_failed, preparation_expired, provider_rejected] }
+        last_error_code: { type: string, enum: [provider_uncertain, configuration, preparation_failed, preparation_expired, provider_rejected, object_protected], description: object_protected defers a lifecycle target under retention or a hold until a later scan. }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
     ObjectTaggingRequest:
@@ -34321,6 +34321,8 @@ components:
         content_language: { type: string, maxLength: 255, description: Content-Language value for PUT. }
         metadata: { type: object, additionalProperties: { type: string, maxLength: 2048 }, maxProperties: 90, description: PUT-only x-amz-meta-* values. }
         tags: { type: object, additionalProperties: { type: string, maxLength: 256 }, maxProperties: 10, description: PUT-only S3 object tags. }
+        protection:
+          $ref: '#/components/schemas/ObjectWriteProtection'
         encryption: { $ref: '#/components/schemas/ObjectEncryption' }
     ObjectSignedRequest:
       description: Temporary bearer capability. Bucket object GET/HEAD/PUT URLs use the branded S3 gateway; a PUT URL dispatches at most one write. Multipart part URLs retain their separate contract. Do not log or persist URLs.
@@ -34470,10 +34472,19 @@ components:
         encryption: { $ref: '#/components/schemas/ObjectEncryption', description: Verified active default for new implicit writes. }
         desired_encryption: { $ref: '#/components/schemas/ObjectEncryption', description: Requested default awaiting native verification. }
         updated_at: { type: string, format: date-time }
+    ObjectWriteProtection:
+      type: object
+      additionalProperties: false
+      description: Fixed or enrolled event retention and an independent legal hold for a new object version. Omitted retention inherits the immutable admitted bucket default. Event hold ON requires one days or years duration and permits an optional minimum date. Event hold OFF on creation requires an explicit fixed date and no duration. Governance bypass is unsupported.
+      properties:
+        retention:
+          $ref: '#/components/schemas/ObjectVersionRetention'
+        legal_hold:
+          $ref: '#/components/schemas/ObjectVersionLegalHold'
     ObjectVersionRetention:
       type: object
       additionalProperties: false
-      description: Verified native retention, or a fixed-retention intent. An empty object requests a clear; active retention cannot be shortened without bypass, which is unsupported. Event hold fields are observation only for this contract.
+      description: Verified native retention or a retention intent. An empty object requests a clear. Active fixed retention cannot be shortened and active COMPLIANCE cannot be downgraded. Enrolled event hold ON requires one duration; OFF omits duration and lets the provider fix the final date from the existing hold. Observed dates and requested minimum dates are preserved. Governance bypass is unsupported. For new writes, OFF requires a fixed date; an undated OFF is reserved for releasing an existing hold.
       properties:
         mode: { type: string, enum: [GOVERNANCE, COMPLIANCE] }
         retain_until_date: { type: string, format: date-time }
@@ -34488,7 +34499,7 @@ components:
         status: { type: string, enum: [ON, OFF] }
     ObjectVersionRetentionRequest:
       type: object
-      description: Stable identity and fixed retention intent for an owned version.
+      description: Stable identity and fixed or enrolled event hold retention intent for an owned version. ON requires a duration; OFF omits duration and requires a previously active hold unless a fixed date is supplied.
       additionalProperties: false
       required: [id, retention]
       properties:
@@ -34537,12 +34548,14 @@ components:
         updated_at: { type: string, format: date-time }
     ObjectLockCapabilities:
       type: object
-      description: Enrolled bucket configuration, default event holds, fixed version retention and legal-hold capabilities without a native health check.
+      description: Enrolled bucket configuration, default and per-version event holds, fixed version retention and legal-hold capabilities without a native health check.
       additionalProperties: false
-      required: [bucket_configuration, default_event_hold, version_retention, version_legal_hold]
+      required: [bucket_configuration, default_event_hold, version_retention, version_legal_hold, version_event_hold, write_event_hold]
       properties:
         bucket_configuration: { type: boolean }
         default_event_hold: { type: boolean }
+        version_event_hold: { type: boolean, description: Separately enrolled durable per-version event hold mutations. }
+        write_event_hold: { type: boolean, description: Separately enrolled event holds on new writes and captured bucket defaults. }
         version_retention: { type: boolean }
         version_legal_hold: { type: boolean }
     ObjectRetentionPeriod:
@@ -34715,6 +34728,8 @@ components:
         key: { type: string, minLength: 1, maxLength: 1024 }
         size_bytes: { type: integer, format: int64, minimum: 1, maximum: 5497558138880 }
         content_type: { type: string, maxLength: 255 }
+        protection:
+          $ref: '#/components/schemas/ObjectWriteProtection'
         encryption: { $ref: '#/components/schemas/ObjectEncryption' }
     ObjectMultipartPartSignRequest:
       description: Requested lifetime for one exact-length part capability.
