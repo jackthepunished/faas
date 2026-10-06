@@ -590,3 +590,18 @@ A renumber plus a CI uniqueness gate is worth its own PR.
 - [ADR-521: customer operations above execution ledgers](521-customer-operations.md) — typed application contracts, customer ownership, separate business and delivery outcomes, and controlled recovery
 
 - [ADR-571: S3 write proof custody and owned cleanup](571-s3-write-proof-custody-and-owned-cleanup.md) — retain pending key evidence and coordinate protected version/account cleanup.
+
+## Events and delivery
+
+- [ADR-606: Independent event recipient routing and recovery](606-independent-event-recipient-routing.md)
+- [ADR-607: Unified event receipt inspection](607-unified-event-receipts.md)
+- [ADR-608: Trusted handler replay lineage in event receipts](608-event-receipt-replay-lineage.md)
+- [ADR-609: Safe recovery for failed keyed invocations](609-safe-keyed-invocation-replay.md)
+- [ADR-610 · Keyed dead-letter replay respects running claims](610-keyed-dead-letter-replay-claim-exclusion.md)
+- [ADR-611 · Invocation-backed event delivery attempt history](611-invocation-backed-event-attempt-history.md)
+- [ADR-612: Durable deduplication for plain invocation replay](612-durable-plain-invocation-replay.md)
+- [ADR-613: Atomic event routing handoff](613-atomic-event-routing-handoff.md)
+- [ADR-614: Event delivery backpressure and fair routing](614-event-delivery-backpressure.md)
+- [ADR-615: Customer event storage admission](615-customer-event-storage-admission.md)
+- [ADR-616: Bounded event routing history](616-bounded-event-routing-history.md)
+- [ADR-617: Event consumer backlog inspection](617-event-consumer-backlog-inspection.md)

@@ -6577,8 +6577,7 @@ select i.*
 		       where older.app_id = i.app_id
 		         and older.work_policy_name = i.work_policy_name
 		         and older.work_key_digest = i.work_key_digest
-		         and older.work_sequence < i.work_sequence
-		         and older.state in ('pending','dispatching')
+		         and ((older.work_sequence < i.work_sequence and older.state='pending') or older.state='dispatching')
 		   ))
 		   and (i.work_policy_name is null or not exists (
 		       select 1 from trigger_records older
@@ -6586,8 +6585,7 @@ select i.*
 		       where source.app_id=i.app_id
 		         and older.work_policy_name=i.work_policy_name
 		         and older.work_key_digest=i.work_key_digest
-		         and older.work_sequence<i.work_sequence
-		         and older.state in ('pending','retry','claimed')
+		         and ((older.work_sequence<i.work_sequence and older.state in ('pending','retry')) or older.state='claimed')
 		   ))
 		   and (i.work_fairness_limit is null or ((
 		       select count(*) from invocations active
@@ -6628,8 +6626,7 @@ select i.*
 		       where older.app_id = i.app_id
 		         and older.work_policy_name = i.work_policy_name
 		         and older.work_key_digest = i.work_key_digest
-		         and older.work_sequence < i.work_sequence
-		         and older.state in ('pending','dispatching')
+		         and ((older.work_sequence < i.work_sequence and older.state='pending') or older.state='dispatching')
 		   ))
 		   and (i.work_policy_name is null or not exists (
 		       select 1 from trigger_records older
@@ -6637,8 +6634,7 @@ select i.*
 		       where source.app_id=i.app_id
 		         and older.work_policy_name=i.work_policy_name
 		         and older.work_key_digest=i.work_key_digest
-		         and older.work_sequence<i.work_sequence
-		         and older.state in ('pending','retry','claimed')
+		         and ((older.work_sequence<i.work_sequence and older.state in ('pending','retry')) or older.state='claimed')
 		   ))
 		   and (i.work_fairness_limit is null or ((
 		       select count(*) from invocations active
@@ -6826,8 +6822,8 @@ ORDER BY i.created_at DESC,i.id DESC LIMIT sqlc.arg(page_limit)::bigint;
 
 -- name: RetryProductionQueueDeadLetter :one
 UPDATE invocations i SET state='pending',attempts=0,last_error=NULL,outcome=NULL,due_at=now(),lease_expires_at=NULL,
-    instance_id=NULL,last_replayed_at=now(),completed_at=NULL,quota_reserved=false
-FROM production_invocation_work p WHERE p.id=i.id AND i.id=$1 AND i.account_id=$2 AND i.state='dead_letter'
+    instance_id=NULL,last_replayed_at=now(),completed_at=NULL,quota_reserved=false,replay_generation=i.replay_generation+1,work_decision=NULL,outcome_code=''
+FROM production_invocation_work p WHERE p.id=i.id AND i.id=$1 AND i.account_id=$2 AND i.state='dead_letter' AND NOT EXISTS(SELECT 1 FROM customer_operation_executions e WHERE e.invocation_id=i.id)
 RETURNING i.*;
 
 -- name: ListProductionDeadLetterEvents :many
@@ -6857,6 +6853,7 @@ SELECT d.* FROM dead_letter_events d JOIN production_dead_letter_events p ON p.i
 WHERE d.account_id=sqlc.arg(account_id)::uuid
     AND (sqlc.narg(app_id)::uuid IS NULL OR d.app_id=sqlc.narg(app_id)::uuid)
     AND (NOT sqlc.arg(open_only)::boolean OR d.replayed_at IS NULL)
+    AND d.id=ANY(sqlc.arg(event_ids)::uuid[])
 ORDER BY d.last_failed_at DESC,d.id DESC LIMIT sqlc.arg(page_limit)::bigint FOR UPDATE OF d SKIP LOCKED;
 
 -- name: DeleteProductionDeadLetterEvent :execrows
@@ -6866,9 +6863,9 @@ DELETE FROM dead_letter_events d USING production_dead_letter_events p WHERE p.i
 
 -- name: ReplayProductionDeadLetterInvocation :execrows
 UPDATE invocations i SET state='pending',attempts=0,last_error=NULL,outcome=NULL,due_at=now(),lease_expires_at=NULL,
-    instance_id=NULL,last_replayed_at=now(),completed_at=NULL,quota_reserved=false
+    instance_id=NULL,last_replayed_at=now(),completed_at=NULL,quota_reserved=false,replay_generation=i.replay_generation+1,work_decision=NULL,outcome_code=''
 FROM production_invocation_work p WHERE p.id=i.id AND i.id=sqlc.arg(invocation_id)::uuid
-    AND i.account_id=sqlc.arg(account_id)::uuid AND i.app_id=sqlc.arg(app_id)::uuid AND i.state='dead_letter';
+    AND i.account_id=sqlc.arg(account_id)::uuid AND i.app_id=sqlc.arg(app_id)::uuid AND i.state='dead_letter' AND NOT EXISTS(SELECT 1 FROM customer_operation_executions e WHERE e.invocation_id=i.id);
 
 -- name: DeleteProductionDeadLetterEvents :execrows
 WITH victims AS (SELECT d.id FROM dead_letter_events d JOIN production_dead_letter_events p ON p.id=d.id
@@ -8685,6 +8682,25 @@ ORDER BY totals.request_count DESC, totals.decision_type, totals.decision_value
 LIMIT 101;
 
 -- name: EnqueueInvocationRow :one
+WITH replay_parent AS (
+  SELECT i.id, i.replay_root_invocation_id, coalesce(i.replay_root_created_at, i.created_at) AS root_created_at
+  FROM invocations i JOIN apps a ON a.id=i.app_id AND a.account_id=i.account_id
+  WHERE i.id=sqlc.narg(replayed_from_invocation_id)::uuid
+    AND i.account_id=sqlc.arg(account_id)::uuid AND i.app_id=sqlc.arg(app_id)::uuid
+    AND i.deployment_scope=coalesce(nullif(sqlc.arg(deployment_scope)::text, ''),
+      CASE WHEN a.project_id IS NOT NULL AND coalesce(a.preview_of_slug, '')='' THEN 'production' ELSE 'default' END)
+    AND i.platform_tenant_id IS NOT DISTINCT FROM sqlc.narg(platform_tenant_id)::uuid
+    AND i.state IN ('failed', 'dead_letter') AND sqlc.arg(source)::text='replay'
+    AND (i.work_policy_name IS NULL OR (
+      i.work_policy_name=nullif(sqlc.arg(work_policy_name)::text, '')
+      AND i.work_key_digest=sqlc.narg(work_key_digest)::bytea
+      AND i.work_policy_revision IS NOT DISTINCT FROM sqlc.narg(work_policy_revision)::bigint
+      AND i.work_fairness_digest IS NOT DISTINCT FROM sqlc.narg(work_fairness_digest)::bytea
+      AND i.work_fairness_limit IS NOT DISTINCT FROM sqlc.narg(work_fairness_limit)::int
+      AND i.work_expires_at IS NOT DISTINCT FROM sqlc.narg(work_expires_at)::timestamptz
+    ))
+  FOR SHARE OF i, a
+)
 INSERT INTO invocations (
   id, app_id, account_id, source, queue_name, state, method, path,
   payload, headers, due_at, scheduled_at, cron_id, ack_url, lease_expires_at,
@@ -8693,8 +8709,8 @@ INSERT INTO invocations (
   work_policy_name, work_key_digest, work_expires_at,
   work_sequence, work_policy_revision, work_fairness_digest,
   work_fairness_limit, platform_tenant_id, deployment_scope, queue_binding_id,
-  occurrence_id, start_deadline_at, failure_rules, environment_id
-) VALUES (
+  occurrence_id, start_deadline_at, failure_rules, environment_id, replayed_from_invocation_id, replay_root_invocation_id, replay_root_created_at
+) SELECT
   coalesce(sqlc.narg(id)::uuid, gen_random_uuid()), sqlc.arg(app_id), sqlc.arg(account_id),
   sqlc.arg(source), sqlc.arg(queue_name), coalesce(nullif(sqlc.arg(state)::text, ''), 'pending'),
   sqlc.arg(method), sqlc.arg(path), sqlc.arg(payload), sqlc.arg(headers), sqlc.arg(due_at),
@@ -8705,8 +8721,11 @@ INSERT INTO invocations (
   sqlc.narg(work_key_digest), sqlc.narg(work_expires_at), sqlc.narg(work_sequence),
   sqlc.narg(work_policy_revision), sqlc.narg(work_fairness_digest), sqlc.narg(work_fairness_limit),
   sqlc.narg(platform_tenant_id), nullif(sqlc.arg(deployment_scope)::text, ''), sqlc.narg(queue_binding_id),
-  sqlc.narg(occurrence_id)::uuid, sqlc.narg(start_deadline_at)::timestamptz, sqlc.narg(failure_rules)::jsonb, sqlc.narg(environment_id)::uuid
-) RETURNING *;
+  sqlc.narg(occurrence_id)::uuid, sqlc.narg(start_deadline_at)::timestamptz, sqlc.narg(failure_rules)::jsonb,
+  sqlc.narg(environment_id)::uuid, replay_parent.id, coalesce(replay_parent.replay_root_invocation_id, replay_parent.id), replay_parent.root_created_at
+FROM (SELECT 1) seed LEFT JOIN replay_parent ON true
+WHERE sqlc.narg(replayed_from_invocation_id)::uuid IS NULL OR replay_parent.id IS NOT NULL
+RETURNING *;
 
 -- Queue binding/consumer publication (ADR-393). Parent locks also serialize
 -- trigger admission, so quota checks and the projection share the same commit.
@@ -8957,16 +8976,16 @@ select i.id::text from invocations i cross join consumer
 		      where older.app_id = i.app_id
 		        and older.work_policy_name = i.work_policy_name
 		        and older.work_key_digest = i.work_key_digest
-		        and older.work_sequence < i.work_sequence
-		        and older.state in ('pending','dispatching')))
+		        and ((older.work_sequence < i.work_sequence and older.state='pending')
+		          or older.state='dispatching')))
 		  and (i.work_policy_name is null or not exists (
 		      select 1 from trigger_records older
 		      join triggers source on source.id=older.trigger_id
 		      where source.app_id=i.app_id
 		        and older.work_policy_name=i.work_policy_name
 		        and older.work_key_digest=i.work_key_digest
-		        and older.work_sequence<i.work_sequence
-		        and older.state in ('pending','retry','claimed')))
+		        and ((older.work_sequence<i.work_sequence and older.state in ('pending','retry'))
+		          or older.state='claimed')))
 		  and (i.work_fairness_limit is null or (
 		      select count(*) from invocations active
 		      where active.app_id = i.app_id

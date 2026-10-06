@@ -4879,6 +4879,39 @@ END $$;
 
 
 --
+-- Name: guard_event_delivery_replay(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_event_delivery_replay() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE slot event_delivery_slots%ROWTYPE; caps event_delivery_capacity%ROWTYPE;
+ consumer_count bigint; app_count bigint; account_count bigint; scope text;
+BEGIN
+ IF NEW.state NOT IN ('pending','dispatching') THEN RETURN NEW; END IF;
+ IF TG_OP = 'UPDATE' AND OLD.state IN ('pending','dispatching') THEN RETURN NEW; END IF;
+ SELECT * INTO slot FROM event_delivery_slots WHERE invocation_id=NEW.id;
+ IF NOT FOUND AND NEW.replayed_from_invocation_id IS NOT NULL THEN
+  SELECT * INTO slot FROM event_delivery_slots WHERE invocation_id=NEW.replayed_from_invocation_id;
+ END IF;
+ IF slot.invocation_id IS NULL THEN RETURN NEW; END IF;
+ SELECT * INTO STRICT caps FROM event_delivery_capacity WHERE account_id=slot.account_id FOR UPDATE;
+ SELECT count(*), count(*) FILTER (WHERE s.app_id=slot.app_id),
+   count(*) FILTER (WHERE s.app_id=slot.app_id AND s.subscription_id=slot.subscription_id)
+ INTO account_count, app_count, consumer_count
+ FROM event_delivery_slots s JOIN invocations i ON i.id=s.invocation_id
+ WHERE s.account_id=slot.account_id AND i.state IN ('pending','dispatching') AND i.id<>NEW.id;
+ scope := CASE WHEN consumer_count>=caps.consumer_limit THEN 'consumer'
+   WHEN app_count>=caps.app_limit THEN 'app' WHEN account_count>=caps.account_limit THEN 'account' END;
+ IF scope IS NOT NULL THEN
+  RAISE EXCEPTION 'event delivery capacity exhausted: %',scope USING ERRCODE='23514', CONSTRAINT='event_delivery_capacity', DETAIL=scope;
+ END IF;
+ INSERT INTO event_delivery_slots VALUES (NEW.id,slot.account_id,slot.app_id,slot.subscription_id) ON CONFLICT DO NOTHING;
+ RETURN NEW;
+END $$;
+
+
+--
 -- Name: guard_held_queue_consumer_receipt(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -6640,6 +6673,50 @@ $$;
 
 
 --
+-- Name: project_event_routing_backlog_recipient(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.project_event_routing_backlog_recipient() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF TG_OP='DELETE' THEN
+        PERFORM refresh_event_routing_backlog(OLD.outbox_id,OLD.subscription_id);
+        RETURN OLD;
+    END IF;
+    PERFORM refresh_event_routing_backlog(NEW.outbox_id,NEW.subscription_id);
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: project_event_routing_backlog_root(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.project_event_routing_backlog_root() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE sub text;
+BEGIN
+    IF TG_OP='INSERT' THEN
+        PERFORM refresh_event_routing_backlog(NEW.id);
+    ELSIF (NEW.recipient_snapshot,NEW.state,NEW.available_at,NEW.lease_until,NEW.recipient_claims,NEW.created_at,NEW.account_id)
+       IS DISTINCT FROM (OLD.recipient_snapshot,OLD.state,OLD.available_at,OLD.lease_until,OLD.recipient_claims,OLD.created_at,OLD.account_id) THEN
+        PERFORM refresh_event_routing_backlog(NEW.id);
+    ELSE
+        FOR sub IN SELECT k FROM (
+            SELECT jsonb_object_keys(NEW.recipient_progress) AS k
+            UNION SELECT jsonb_object_keys(OLD.recipient_progress) AS k
+        ) keys WHERE NEW.recipient_progress->k IS DISTINCT FROM OLD.recipient_progress->k ORDER BY k
+        LOOP PERFORM refresh_event_routing_backlog(NEW.id,sub); END LOOP;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: project_release_member_policy_changed(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -7676,6 +7753,51 @@ $$;
 
 
 --
+-- Name: record_invocation_attempt_history(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.record_invocation_attempt_history() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+  recorded_at timestamptz := clock_timestamp();
+  attempt_outcome text;
+BEGIN
+  IF NEW.source NOT IN ('async_invoke','replay') THEN RETURN NEW; END IF;
+  -- Both writes share the execution transaction. No backfill or pre-claim attempts.
+  IF OLD.state='dispatching' AND (NEW.state<>'dispatching'
+      OR NEW.attempts<>OLD.attempts OR NEW.replay_generation<>OLD.replay_generation) THEN
+    attempt_outcome := CASE
+      WHEN NEW.replay_generation<>OLD.replay_generation THEN 'unknown'
+      WHEN NEW.state='completed' THEN 'succeeded'
+      WHEN NEW.outcome='uncertain' THEN 'unknown'
+      WHEN NEW.state='pending' AND NEW.last_error='dispatch lease expired; requeued' THEN 'unknown'
+      WHEN NEW.state='pending' THEN 'retry'
+      WHEN NEW.state='failed' THEN 'failed'
+      WHEN NEW.state='dead_letter' THEN 'dead_letter'
+      WHEN NEW.state='cancelled' THEN 'cancelled'
+      ELSE 'unknown' END;
+    UPDATE invocation_attempt_history SET
+      finished_at=greatest(recorded_at,started_at), outcome=attempt_outcome,
+      error_detail=left(coalesce(NEW.last_error,''),1024),
+      next_attempt_at=CASE WHEN NEW.state='pending' THEN NEW.due_at END,
+      retain_until=least(coalesce(NEW.result_retention_until,recorded_at+interval '30 days'),recorded_at+interval '30 days')
+    WHERE invocation_id=OLD.id AND replay_generation=OLD.replay_generation
+      AND attempt=OLD.attempts AND outcome='running';
+  END IF;
+  IF NEW.state='dispatching' AND NEW.attempts>0 AND (OLD.state<>'dispatching'
+      OR NEW.attempts<>OLD.attempts OR NEW.replay_generation<>OLD.replay_generation) THEN
+    INSERT INTO invocation_attempt_history(invocation_id,account_id,app_id,
+      root_invocation_id,root_created_at,replay_generation,attempt,started_at,outcome,retain_until)
+    VALUES(NEW.id,NEW.account_id,NEW.app_id,coalesce(NEW.replay_root_invocation_id,NEW.id),
+      coalesce(NEW.replay_root_created_at,NEW.created_at),NEW.replay_generation,NEW.attempts,
+      recorded_at,'running',recorded_at+interval '30 days');
+  END IF;
+  RETURN NEW;
+END $$;
+
+
+--
 -- Name: record_job_task_attempt(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -7758,6 +7880,36 @@ BEGIN
     VALUES ('project_release', release_uuid, app_uuid, 'updated');
     PERFORM pg_notify('app_changed', app_uuid::text);
 END;
+$$;
+
+
+--
+-- Name: refresh_event_routing_backlog(bigint, text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.refresh_event_routing_backlog(p_outbox_id bigint, p_subscription_id text DEFAULT NULL::text) RETURNS void
+    LANGUAGE sql
+    AS $$
+WITH candidates AS MATERIALIZED (
+    SELECT * FROM event_routing_backlog_source
+    WHERE outbox_id=p_outbox_id AND (p_subscription_id IS NULL OR subscription_id=p_subscription_id)
+      AND routing_state IN ('pending','processing')
+), inserted AS (
+    INSERT INTO event_routing_backlog SELECT * FROM candidates ORDER BY subscription_id
+    ON CONFLICT (outbox_id,subscription_id) DO UPDATE SET
+        account_id=excluded.account_id,app_id=excluded.app_id,accepted_at=excluded.accepted_at,
+        routing_mode=excluded.routing_mode,routing_state=excluded.routing_state,capacity_scope=excluded.capacity_scope,
+        attempts=excluded.attempts,capacity_deferrals=excluded.capacity_deferrals,
+        next_attempt_at=excluded.next_attempt_at,lease_until=excluded.lease_until
+    WHERE (event_routing_backlog.account_id,event_routing_backlog.app_id,event_routing_backlog.accepted_at,
+           event_routing_backlog.routing_mode,event_routing_backlog.routing_state,event_routing_backlog.capacity_scope,
+           event_routing_backlog.attempts,event_routing_backlog.capacity_deferrals,event_routing_backlog.next_attempt_at,event_routing_backlog.lease_until)
+       IS DISTINCT FROM (excluded.account_id,excluded.app_id,excluded.accepted_at,excluded.routing_mode,excluded.routing_state,
+                         excluded.capacity_scope,excluded.attempts,excluded.capacity_deferrals,excluded.next_attempt_at,excluded.lease_until)
+)
+DELETE FROM event_routing_backlog b WHERE b.outbox_id=p_outbox_id
+    AND (p_subscription_id IS NULL OR b.subscription_id=p_subscription_id)
+    AND NOT EXISTS (SELECT 1 FROM candidates c WHERE c.subscription_id=b.subscription_id);
 $$;
 
 
@@ -13006,6 +13158,33 @@ CREATE TABLE public.environment_workload_graphs (
 
 
 --
+-- Name: event_delivery_capacity; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.event_delivery_capacity (
+    account_id uuid NOT NULL,
+    consumer_limit integer NOT NULL,
+    app_limit integer NOT NULL,
+    account_limit integer NOT NULL,
+    CONSTRAINT event_delivery_capacity_account_limit_check CHECK ((account_limit > 0)),
+    CONSTRAINT event_delivery_capacity_app_limit_check CHECK ((app_limit > 0)),
+    CONSTRAINT event_delivery_capacity_consumer_limit_check CHECK ((consumer_limit > 0))
+);
+
+
+--
+-- Name: event_delivery_slots; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.event_delivery_slots (
+    invocation_id uuid NOT NULL,
+    account_id uuid NOT NULL,
+    app_id uuid NOT NULL,
+    subscription_id text NOT NULL
+);
+
+
+--
 -- Name: event_fanout_attempt_history; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -13021,8 +13200,15 @@ CREATE TABLE public.event_fanout_attempt_history (
     retryable boolean DEFAULT false NOT NULL,
     last_error text DEFAULT ''::text NOT NULL,
     occurred_at timestamp with time zone DEFAULT now() NOT NULL,
+    capacity_scope text DEFAULT ''::text NOT NULL,
+    capacity_deferrals bigint DEFAULT 0 NOT NULL,
+    details_truncated boolean DEFAULT false NOT NULL,
+    history_bytes bigint GENERATED ALWAYS AS ((((((((128)::bigint + octet_length(subscription_id)) + octet_length(action)) + octet_length(state)) + octet_length(failure_code)) + octet_length(last_error)) + octet_length(capacity_scope))) STORED NOT NULL,
     CONSTRAINT event_fanout_attempt_history_action_check CHECK ((action = ANY (ARRAY['fanout_attempt'::text, 'operator_replay'::text]))),
     CONSTRAINT event_fanout_attempt_history_attempts_check CHECK ((attempts >= 0)),
+    CONSTRAINT event_fanout_attempt_history_capacity_deferrals_check CHECK ((capacity_deferrals >= 0)),
+    CONSTRAINT event_fanout_attempt_history_capacity_scope_check CHECK ((capacity_scope = ANY (ARRAY[''::text, 'consumer'::text, 'app'::text, 'account'::text]))),
+    CONSTRAINT event_fanout_attempt_history_history_bytes_check CHECK ((history_bytes >= 0)),
     CONSTRAINT event_fanout_attempt_history_state_check CHECK ((state = ANY (ARRAY['pending'::text, 'filtered'::text, 'enqueued'::text, 'failed'::text])))
 );
 
@@ -13038,6 +13224,42 @@ ALTER TABLE public.event_fanout_attempt_history ALTER COLUMN id ADD GENERATED AL
     NO MINVALUE
     NO MAXVALUE
     CACHE 1
+);
+
+
+--
+-- Name: event_fanout_history_summaries; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.event_fanout_history_summaries (
+    outbox_id bigint NOT NULL,
+    subscription_id text NOT NULL,
+    app_id uuid NOT NULL,
+    observed_outcomes bigint DEFAULT 0 NOT NULL,
+    capacity_deferrals bigint DEFAULT 0 NOT NULL,
+    coalesced_outcomes bigint DEFAULT 0 NOT NULL,
+    compacted_outcomes bigint DEFAULT 0 NOT NULL,
+    compacted_through_id bigint DEFAULT 0 NOT NULL,
+    compacted_through_at timestamp with time zone,
+    first_capacity_wait_at timestamp with time zone,
+    last_capacity_wait_at timestamp with time zone,
+    last_capacity_scope text DEFAULT ''::text NOT NULL,
+    last_outcome_capacity_scope text DEFAULT ''::text NOT NULL,
+    last_was_coalesced boolean DEFAULT false NOT NULL,
+    latest_id bigint DEFAULT 0 NOT NULL,
+    latest_failure_id bigint DEFAULT 0 NOT NULL,
+    latest_replay_id bigint DEFAULT 0 NOT NULL,
+    next_prune_at timestamp with time zone,
+    CONSTRAINT event_fanout_history_summarie_last_outcome_capacity_scope_check CHECK ((last_outcome_capacity_scope = ANY (ARRAY[''::text, 'consumer'::text, 'app'::text, 'account'::text]))),
+    CONSTRAINT event_fanout_history_summaries_capacity_deferrals_check CHECK ((capacity_deferrals >= 0)),
+    CONSTRAINT event_fanout_history_summaries_coalesced_outcomes_check CHECK ((coalesced_outcomes >= 0)),
+    CONSTRAINT event_fanout_history_summaries_compacted_outcomes_check CHECK ((compacted_outcomes >= 0)),
+    CONSTRAINT event_fanout_history_summaries_compacted_through_id_check CHECK ((compacted_through_id >= 0)),
+    CONSTRAINT event_fanout_history_summaries_last_capacity_scope_check CHECK ((last_capacity_scope = ANY (ARRAY[''::text, 'consumer'::text, 'app'::text, 'account'::text]))),
+    CONSTRAINT event_fanout_history_summaries_latest_failure_id_check CHECK ((latest_failure_id >= 0)),
+    CONSTRAINT event_fanout_history_summaries_latest_id_check CHECK ((latest_id >= 0)),
+    CONSTRAINT event_fanout_history_summaries_latest_replay_id_check CHECK ((latest_replay_id >= 0)),
+    CONSTRAINT event_fanout_history_summaries_observed_outcomes_check CHECK ((observed_outcomes >= 0))
 );
 
 
@@ -13064,6 +13286,13 @@ CREATE TABLE public.event_fanout_outbox (
     delivered_at timestamp with time zone,
     recipient_snapshot jsonb,
     recipient_progress jsonb DEFAULT '{}'::jsonb NOT NULL,
+    recipient_claims boolean DEFAULT false NOT NULL,
+    customer_storage_bytes bigint GENERATED ALWAYS AS (
+CASE
+    WHEN ("left"(source, 8) = 'gregale.'::text) THEN (0)::bigint
+    ELSE (((octet_length((payload)::text))::bigint + (octet_length((event_data)::text))::bigint) + (octet_length((COALESCE(recipient_snapshot, '[]'::jsonb))::text))::bigint)
+END) STORED NOT NULL,
+    CONSTRAINT event_fanout_outbox_customer_storage_bytes_check CHECK ((customer_storage_bytes >= 0)),
     CONSTRAINT event_fanout_outbox_recipient_progress_check CHECK ((jsonb_typeof(recipient_progress) = 'object'::text)),
     CONSTRAINT event_fanout_outbox_recipient_snapshot_check CHECK (((recipient_snapshot IS NULL) OR (jsonb_typeof(recipient_snapshot) = 'array'::text))),
     CONSTRAINT event_fanout_outbox_state_check CHECK ((state = ANY (ARRAY['pending'::text, 'processing'::text, 'delivered'::text])))
@@ -13085,6 +13314,127 @@ ALTER TABLE public.event_fanout_outbox ALTER COLUMN id ADD GENERATED ALWAYS AS I
 
 
 --
+-- Name: event_fanout_recipients; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.event_fanout_recipients (
+    outbox_id bigint NOT NULL,
+    subscription_id text NOT NULL,
+    app_id uuid NOT NULL,
+    recipient jsonb NOT NULL,
+    state text NOT NULL,
+    generation bigint DEFAULT 1 NOT NULL,
+    attempts integer DEFAULT 0 NOT NULL,
+    total_attempts integer DEFAULT 0 NOT NULL,
+    available_at timestamp with time zone DEFAULT now() NOT NULL,
+    claim_token uuid,
+    lease_until timestamp with time zone,
+    capacity_deferrals integer DEFAULT 0 NOT NULL,
+    generation_capacity_deferrals integer DEFAULT 0 NOT NULL,
+    CONSTRAINT event_fanout_recipients_attempts_check CHECK ((attempts >= 0)),
+    CONSTRAINT event_fanout_recipients_capacity_deferrals_check CHECK ((capacity_deferrals >= 0)),
+    CONSTRAINT event_fanout_recipients_check CHECK ((total_attempts >= attempts)),
+    CONSTRAINT event_fanout_recipients_check1 CHECK ((((state = 'processing'::text) AND (claim_token IS NOT NULL) AND (lease_until IS NOT NULL)) OR ((state <> 'processing'::text) AND (claim_token IS NULL) AND (lease_until IS NULL)))),
+    CONSTRAINT event_fanout_recipients_generation_capacity_deferrals_check CHECK ((generation_capacity_deferrals >= 0)),
+    CONSTRAINT event_fanout_recipients_generation_check CHECK ((generation > 0)),
+    CONSTRAINT event_fanout_recipients_recipient_check CHECK ((jsonb_typeof(recipient) = 'object'::text)),
+    CONSTRAINT event_fanout_recipients_state_check CHECK ((state = ANY (ARRAY['pending'::text, 'processing'::text, 'filtered'::text, 'enqueued'::text, 'failed'::text])))
+);
+
+
+--
+-- Name: event_routing_backlog; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.event_routing_backlog (
+    outbox_id bigint NOT NULL,
+    subscription_id text NOT NULL,
+    account_id uuid NOT NULL,
+    app_id uuid NOT NULL,
+    accepted_at timestamp with time zone NOT NULL,
+    routing_mode text NOT NULL,
+    routing_state text NOT NULL,
+    capacity_scope text NOT NULL,
+    attempts integer NOT NULL,
+    capacity_deferrals integer NOT NULL,
+    next_attempt_at timestamp with time zone,
+    lease_until timestamp with time zone,
+    CONSTRAINT event_routing_backlog_attempts_check CHECK ((attempts >= 0)),
+    CONSTRAINT event_routing_backlog_capacity_deferrals_check CHECK ((capacity_deferrals >= 0)),
+    CONSTRAINT event_routing_backlog_capacity_scope_check CHECK ((capacity_scope = ANY (ARRAY[''::text, 'consumer'::text, 'app'::text, 'account'::text]))),
+    CONSTRAINT event_routing_backlog_routing_mode_check CHECK ((routing_mode = ANY (ARRAY['event'::text, 'recipient'::text]))),
+    CONSTRAINT event_routing_backlog_routing_state_check CHECK ((routing_state = ANY (ARRAY['pending'::text, 'processing'::text])))
+);
+
+
+--
+-- Name: event_routing_backlog_source; Type: VIEW; Schema: public; Owner: -
+--
+
+CREATE VIEW public.event_routing_backlog_source AS
+ SELECT o.id AS outbox_id,
+    (s.recipient ->> 'id'::text) AS subscription_id,
+    o.account_id,
+    ((s.recipient ->> 'app_id'::text))::uuid AS app_id,
+    o.created_at AS accepted_at,
+        CASE
+            WHEN o.recipient_claims THEN 'recipient'::text
+            ELSE 'event'::text
+        END AS routing_mode,
+    effective.routing_state,
+        CASE
+            WHEN (effective.routing_state = 'pending'::text) THEN COALESCE((p.progress ->> 'capacity_scope'::text), ''::text)
+            ELSE ''::text
+        END AS capacity_scope,
+        CASE
+            WHEN o.recipient_claims THEN COALESCE(r.total_attempts, ((p.progress ->> 'attempts'::text))::integer, 0)
+            ELSE COALESCE(((p.progress ->> 'attempts'::text))::integer, 0)
+        END AS attempts,
+    GREATEST(COALESCE(((p.progress ->> 'capacity_deferrals'::text))::integer, 0),
+        CASE
+            WHEN o.recipient_claims THEN COALESCE(r.capacity_deferrals, 0)
+            ELSE 0
+        END) AS capacity_deferrals,
+        CASE
+            WHEN (effective.routing_state = 'pending'::text) THEN
+            CASE
+                WHEN o.recipient_claims THEN COALESCE(r.available_at, ((p.progress ->> 'next_attempt_at'::text))::timestamp with time zone, o.available_at)
+                ELSE COALESCE(((p.progress ->> 'next_attempt_at'::text))::timestamp with time zone,
+                CASE
+                    WHEN (o.state = 'pending'::text) THEN o.available_at
+                    ELSE NULL::timestamp with time zone
+                END)
+            END
+            ELSE NULL::timestamp with time zone
+        END AS next_attempt_at,
+        CASE
+            WHEN o.recipient_claims THEN r.lease_until
+            ELSE o.lease_until
+        END AS lease_until
+   FROM ((((public.event_fanout_outbox o
+     CROSS JOIN LATERAL jsonb_array_elements(o.recipient_snapshot) s(recipient))
+     CROSS JOIN LATERAL ( SELECT COALESCE((o.recipient_progress -> (s.recipient ->> 'id'::text)), '{}'::jsonb) AS progress) p)
+     LEFT JOIN public.event_fanout_recipients r ON (((r.outbox_id = o.id) AND (r.subscription_id = (s.recipient ->> 'id'::text)))))
+     CROSS JOIN LATERAL ( SELECT
+                CASE
+                    WHEN o.recipient_claims THEN COALESCE(r.state, (p.progress ->> 'state'::text), 'pending'::text)
+                    ELSE COALESCE((p.progress ->> 'state'::text), 'pending'::text)
+                END AS routing_state) effective)
+  WHERE ((o.state = ANY (ARRAY['pending'::text, 'processing'::text])) AND (NULLIF((s.recipient ->> 'app_id'::text), ''::text) IS NOT NULL) AND (((s.recipient -> 'workflow'::text) IS NULL) OR ((s.recipient -> 'workflow'::text) = 'null'::jsonb)));
+
+
+--
+-- Name: event_routing_fairness; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.event_routing_fairness (
+    account_id uuid NOT NULL,
+    subscription_id text NOT NULL,
+    last_claimed_at timestamp with time zone NOT NULL
+);
+
+
+--
 -- Name: event_schemas; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -13098,6 +13448,15 @@ CREATE TABLE public.event_schemas (
     CONSTRAINT event_schemas_event_type_check CHECK (((char_length(event_type) >= 1) AND (char_length(event_type) <= 256))),
     CONSTRAINT event_schemas_source_check CHECK (((char_length(source) >= 1) AND (char_length(source) <= 256))),
     CONSTRAINT event_schemas_version_check CHECK ((version ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'::text))
+);
+
+
+--
+-- Name: event_storage_admission; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.event_storage_admission (
+    account_id uuid NOT NULL
 );
 
 
@@ -13999,6 +14358,47 @@ ALTER SEQUENCE public.instance_billing_intervals_id_seq OWNED BY public.instance
 
 
 --
+-- Name: invocation_attempt_history; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.invocation_attempt_history (
+    id bigint NOT NULL,
+    invocation_id uuid NOT NULL,
+    account_id uuid NOT NULL,
+    app_id uuid NOT NULL,
+    root_invocation_id uuid NOT NULL,
+    root_created_at timestamp with time zone NOT NULL,
+    replay_generation bigint NOT NULL,
+    attempt integer NOT NULL,
+    started_at timestamp with time zone NOT NULL,
+    finished_at timestamp with time zone,
+    outcome text NOT NULL,
+    error_detail text DEFAULT ''::text NOT NULL,
+    next_attempt_at timestamp with time zone,
+    retain_until timestamp with time zone NOT NULL,
+    CONSTRAINT invocation_attempt_history_attempt_check CHECK ((attempt > 0)),
+    CONSTRAINT invocation_attempt_history_check CHECK (((outcome = 'running'::text) = (finished_at IS NULL))),
+    CONSTRAINT invocation_attempt_history_check1 CHECK (((finished_at IS NULL) OR (finished_at >= started_at))),
+    CONSTRAINT invocation_attempt_history_outcome_check CHECK ((outcome = ANY (ARRAY['running'::text, 'succeeded'::text, 'retry'::text, 'failed'::text, 'dead_letter'::text, 'cancelled'::text, 'unknown'::text]))),
+    CONSTRAINT invocation_attempt_history_replay_generation_check CHECK ((replay_generation >= 0))
+);
+
+
+--
+-- Name: invocation_attempt_history_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+ALTER TABLE public.invocation_attempt_history ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (
+    SEQUENCE NAME public.invocation_attempt_history_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+--
 -- Name: invocation_environment_queue_admissions; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -14038,6 +14438,29 @@ CREATE TABLE public.invocation_environment_queue_receipts (
     CONSTRAINT invocation_environment_queue_receipts_check CHECK ((lease_expires_at > issued_at)),
     CONSTRAINT invocation_environment_queue_receipts_owner_hash_check CHECK ((owner_hash ~ '^[a-f0-9]{64}$'::text)),
     CONSTRAINT invocation_environment_queue_receipts_token_hash_check CHECK ((token_hash ~ '^[a-f0-9]{64}$'::text))
+);
+
+
+--
+-- Name: invocation_keyed_replays; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.invocation_keyed_replays (
+    parent_invocation_id uuid NOT NULL,
+    replay_invocation_id uuid NOT NULL,
+    CONSTRAINT invocation_keyed_replays_check CHECK ((parent_invocation_id <> replay_invocation_id))
+);
+
+
+--
+-- Name: invocation_plain_replays; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.invocation_plain_replays (
+    parent_invocation_id uuid NOT NULL,
+    replay_invocation_id uuid NOT NULL,
+    replay_created_at timestamp with time zone NOT NULL,
+    CONSTRAINT invocation_plain_replays_check CHECK ((parent_invocation_id <> replay_invocation_id))
 );
 
 
@@ -14183,6 +14606,8 @@ CREATE TABLE public.invocations (
     replay_generation bigint DEFAULT 0 NOT NULL,
     outcome_code text DEFAULT ''::text NOT NULL,
     environment_id uuid,
+    replay_root_invocation_id uuid,
+    replay_root_created_at timestamp with time zone,
     CONSTRAINT invocation_deployment_scope_check CHECK ((deployment_scope ~ '^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$'::text)),
     CONSTRAINT invocation_platform_tenant_source CHECK (((platform_tenant_id IS NULL) OR (source = ANY (ARRAY['async_invoke'::text, 'replay'::text, 'queue'::text])))),
     CONSTRAINT invocation_queue_binding_source CHECK (((queue_binding_id IS NULL) OR (source = 'queue'::text))),
@@ -14190,6 +14615,7 @@ CREATE TABLE public.invocations (
     CONSTRAINT invocations_outcome_code_check CHECK ((octet_length(outcome_code) <= 64)),
     CONSTRAINT invocations_queue_name_shape CHECK (((queue_name = ''::text) OR (queue_name ~ '^[a-z][a-z0-9-]{0,62}$'::text))),
     CONSTRAINT invocations_replay_generation_check CHECK ((replay_generation >= 0)),
+    CONSTRAINT invocations_replay_lineage_check CHECK (((replay_root_invocation_id IS NULL) OR ((source = 'replay'::text) AND (replayed_from_invocation_id IS NOT NULL) AND (replayed_from_invocation_id <> id) AND (replay_root_invocation_id <> id) AND (replay_root_created_at IS NOT NULL)))),
     CONSTRAINT invocations_source_check CHECK ((source = ANY (ARRAY['async_invoke'::text, 'inbound_webhook'::text, 'queue'::text, 'delayed_task'::text, 'cron'::text, 'replay'::text, 'esm'::text]))),
     CONSTRAINT invocations_state_check CHECK ((state = ANY (ARRAY['pending'::text, 'dispatching'::text, 'completed'::text, 'failed'::text, 'cancelled'::text, 'dead_letter'::text, 'superseded'::text, 'expired'::text]))),
     CONSTRAINT invocations_work_fairness_check CHECK ((((work_fairness_digest IS NULL) AND (work_fairness_limit IS NULL)) OR ((work_policy_name IS NOT NULL) AND (work_fairness_digest IS NOT NULL) AND (work_fairness_limit IS NOT NULL) AND (length(work_fairness_digest) = 32) AND ((work_fairness_limit >= 1) AND (work_fairness_limit <= 1000))))),
@@ -22254,11 +22680,35 @@ ALTER TABLE ONLY public.environment_workload_qualification_requests
 
 
 --
+-- Name: event_delivery_capacity event_delivery_capacity_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.event_delivery_capacity
+    ADD CONSTRAINT event_delivery_capacity_pkey PRIMARY KEY (account_id);
+
+
+--
+-- Name: event_delivery_slots event_delivery_slots_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.event_delivery_slots
+    ADD CONSTRAINT event_delivery_slots_pkey PRIMARY KEY (invocation_id);
+
+
+--
 -- Name: event_fanout_attempt_history event_fanout_attempt_history_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.event_fanout_attempt_history
     ADD CONSTRAINT event_fanout_attempt_history_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: event_fanout_history_summaries event_fanout_history_summaries_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.event_fanout_history_summaries
+    ADD CONSTRAINT event_fanout_history_summaries_pkey PRIMARY KEY (outbox_id, subscription_id);
 
 
 --
@@ -22278,11 +22728,43 @@ ALTER TABLE ONLY public.event_fanout_outbox
 
 
 --
+-- Name: event_fanout_recipients event_fanout_recipients_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.event_fanout_recipients
+    ADD CONSTRAINT event_fanout_recipients_pkey PRIMARY KEY (outbox_id, subscription_id);
+
+
+--
+-- Name: event_routing_backlog event_routing_backlog_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.event_routing_backlog
+    ADD CONSTRAINT event_routing_backlog_pkey PRIMARY KEY (outbox_id, subscription_id);
+
+
+--
+-- Name: event_routing_fairness event_routing_fairness_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.event_routing_fairness
+    ADD CONSTRAINT event_routing_fairness_pkey PRIMARY KEY (account_id, subscription_id);
+
+
+--
 -- Name: event_schemas event_schemas_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.event_schemas
     ADD CONSTRAINT event_schemas_pkey PRIMARY KEY (account_id, source, event_type, version);
+
+
+--
+-- Name: event_storage_admission event_storage_admission_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.event_storage_admission
+    ADD CONSTRAINT event_storage_admission_pkey PRIMARY KEY (account_id);
 
 
 --
@@ -22726,6 +23208,22 @@ ALTER TABLE ONLY public.instances
 
 
 --
+-- Name: invocation_attempt_history invocation_attempt_history_invocation_id_replay_generation__key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.invocation_attempt_history
+    ADD CONSTRAINT invocation_attempt_history_invocation_id_replay_generation__key UNIQUE (invocation_id, replay_generation, attempt);
+
+
+--
+-- Name: invocation_attempt_history invocation_attempt_history_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.invocation_attempt_history
+    ADD CONSTRAINT invocation_attempt_history_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: invocation_environment_queue_admissions invocation_environment_queue_admissions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -22739,6 +23237,38 @@ ALTER TABLE ONLY public.invocation_environment_queue_admissions
 
 ALTER TABLE ONLY public.invocation_environment_queue_receipts
     ADD CONSTRAINT invocation_environment_queue_receipts_pkey PRIMARY KEY (invocation_id);
+
+
+--
+-- Name: invocation_keyed_replays invocation_keyed_replays_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.invocation_keyed_replays
+    ADD CONSTRAINT invocation_keyed_replays_pkey PRIMARY KEY (parent_invocation_id);
+
+
+--
+-- Name: invocation_keyed_replays invocation_keyed_replays_replay_invocation_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.invocation_keyed_replays
+    ADD CONSTRAINT invocation_keyed_replays_replay_invocation_id_key UNIQUE (replay_invocation_id);
+
+
+--
+-- Name: invocation_plain_replays invocation_plain_replays_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.invocation_plain_replays
+    ADD CONSTRAINT invocation_plain_replays_pkey PRIMARY KEY (parent_invocation_id);
+
+
+--
+-- Name: invocation_plain_replays invocation_plain_replays_replay_invocation_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.invocation_plain_replays
+    ADD CONSTRAINT invocation_plain_replays_replay_invocation_id_key UNIQUE (replay_invocation_id);
 
 
 --
@@ -27566,6 +28096,13 @@ CREATE UNIQUE INDEX environment_qualification_reserved_instance_unique_idx ON pu
 
 
 --
+-- Name: event_delivery_slots_consumer; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX event_delivery_slots_consumer ON public.event_delivery_slots USING btree (account_id, app_id, subscription_id);
+
+
+--
 -- Name: event_fanout_attempt_history_app_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -27580,10 +28117,24 @@ CREATE INDEX event_fanout_attempt_history_recipient_idx ON public.event_fanout_a
 
 
 --
+-- Name: event_fanout_customer_storage_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX event_fanout_customer_storage_idx ON public.event_fanout_outbox USING btree (account_id) INCLUDE (customer_storage_bytes, state, created_at) WHERE (customer_storage_bytes > 0);
+
+
+--
 -- Name: event_fanout_failure_history_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX event_fanout_failure_history_idx ON public.event_fanout_outbox USING btree (account_id, created_at DESC, id DESC) WHERE (last_error IS NOT NULL);
+
+
+--
+-- Name: event_fanout_history_summaries_prune_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX event_fanout_history_summaries_prune_idx ON public.event_fanout_history_summaries USING btree (next_prune_at, outbox_id, subscription_id) WHERE (next_prune_at IS NOT NULL);
 
 
 --
@@ -27605,6 +28156,41 @@ CREATE INDEX event_fanout_outbox_pending_idx ON public.event_fanout_outbox USING
 --
 
 CREATE INDEX event_fanout_outbox_retention_idx ON public.event_fanout_outbox USING btree (delivered_at, id) WHERE (state = 'delivered'::text);
+
+
+--
+-- Name: event_fanout_recipients_due_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX event_fanout_recipients_due_idx ON public.event_fanout_recipients USING btree (available_at, outbox_id, subscription_id) WHERE (state = 'pending'::text);
+
+
+--
+-- Name: event_fanout_recipients_lease_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX event_fanout_recipients_lease_idx ON public.event_fanout_recipients USING btree (lease_until, outbox_id, subscription_id) WHERE (state = 'processing'::text);
+
+
+--
+-- Name: event_outbox_unattributed_age; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX event_outbox_unattributed_age ON public.event_fanout_outbox USING btree (account_id, created_at, id) WHERE ((recipient_snapshot IS NULL) AND (state = ANY (ARRAY['pending'::text, 'processing'::text])));
+
+
+--
+-- Name: event_routing_backlog_account_age; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX event_routing_backlog_account_age ON public.event_routing_backlog USING btree (account_id, accepted_at, outbox_id, subscription_id);
+
+
+--
+-- Name: event_routing_backlog_consumer_age; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX event_routing_backlog_consumer_age ON public.event_routing_backlog USING btree (account_id, app_id, subscription_id, accepted_at, outbox_id);
 
 
 --
@@ -28203,6 +28789,20 @@ CREATE INDEX instances_watchdog_state_idx ON public.instances USING btree (state
 
 
 --
+-- Name: invocation_attempt_history_retention_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX invocation_attempt_history_retention_idx ON public.invocation_attempt_history USING btree (retain_until, id) WHERE (outcome <> 'running'::text);
+
+
+--
+-- Name: invocation_attempt_history_root_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX invocation_attempt_history_root_idx ON public.invocation_attempt_history USING btree (account_id, app_id, root_invocation_id, id DESC);
+
+
+--
 -- Name: invocation_environment_queue_domain_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -28354,6 +28954,13 @@ CREATE INDEX invocations_platform_tenant_idx ON public.invocations USING btree (
 --
 
 CREATE INDEX invocations_queue_binding_scope_idx ON public.invocations USING btree (app_id, queue_binding_id, deployment_scope, state, created_at) WHERE ((source = 'queue'::text) AND (state = ANY (ARRAY['pending'::text, 'dispatching'::text, 'dead_letter'::text])));
+
+
+--
+-- Name: invocations_replay_root_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX invocations_replay_root_idx ON public.invocations USING btree (account_id, replay_root_invocation_id, created_at DESC, id DESC) WHERE (replay_root_invocation_id IS NOT NULL);
 
 
 --
@@ -32256,6 +32863,27 @@ CREATE TRIGGER environment_workload_intent_guard BEFORE INSERT OR DELETE OR UPDA
 
 
 --
+-- Name: invocations event_delivery_replay_capacity; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER event_delivery_replay_capacity AFTER INSERT OR UPDATE OF state ON public.invocations FOR EACH ROW EXECUTE FUNCTION public.guard_event_delivery_replay();
+
+
+--
+-- Name: event_fanout_recipients event_routing_backlog_recipient; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER event_routing_backlog_recipient AFTER INSERT OR DELETE OR UPDATE ON public.event_fanout_recipients FOR EACH ROW EXECUTE FUNCTION public.project_event_routing_backlog_recipient();
+
+
+--
+-- Name: event_fanout_outbox event_routing_backlog_root; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER event_routing_backlog_root AFTER INSERT OR UPDATE OF recipient_snapshot, recipient_progress, state, available_at, lease_until, recipient_claims, created_at, account_id ON public.event_fanout_outbox FOR EACH ROW EXECUTE FUNCTION public.project_event_routing_backlog_root();
+
+
+--
 -- Name: events events_enqueue_fanout; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -32456,6 +33084,13 @@ CREATE TRIGGER instances_started_at_set_trg BEFORE INSERT ON public.instances FO
 --
 
 CREATE TRIGGER instances_worker_admission_identity BEFORE UPDATE OF state, mode ON public.instances FOR EACH ROW EXECUTE FUNCTION public.guard_worker_admission_identity();
+
+
+--
+-- Name: invocations invocation_attempt_history_transition; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER invocation_attempt_history_transition AFTER UPDATE OF state, attempts, replay_generation ON public.invocations FOR EACH ROW EXECUTE FUNCTION public.record_invocation_attempt_history();
 
 
 --
@@ -36056,11 +36691,43 @@ ALTER TABLE ONLY public.environment_workload_qualification_requests
 
 
 --
+-- Name: event_delivery_capacity event_delivery_capacity_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.event_delivery_capacity
+    ADD CONSTRAINT event_delivery_capacity_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: event_delivery_slots event_delivery_slots_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.event_delivery_slots
+    ADD CONSTRAINT event_delivery_slots_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.event_delivery_capacity(account_id) ON DELETE CASCADE;
+
+
+--
+-- Name: event_delivery_slots event_delivery_slots_invocation_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.event_delivery_slots
+    ADD CONSTRAINT event_delivery_slots_invocation_id_fkey FOREIGN KEY (invocation_id) REFERENCES public.invocations(id) ON DELETE CASCADE;
+
+
+--
 -- Name: event_fanout_attempt_history event_fanout_attempt_history_outbox_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.event_fanout_attempt_history
     ADD CONSTRAINT event_fanout_attempt_history_outbox_id_fkey FOREIGN KEY (outbox_id) REFERENCES public.event_fanout_outbox(id) ON DELETE CASCADE;
+
+
+--
+-- Name: event_fanout_history_summaries event_fanout_history_summaries_outbox_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.event_fanout_history_summaries
+    ADD CONSTRAINT event_fanout_history_summaries_outbox_id_fkey FOREIGN KEY (outbox_id) REFERENCES public.event_fanout_outbox(id) ON DELETE CASCADE;
 
 
 --
@@ -36072,11 +36739,43 @@ ALTER TABLE ONLY public.event_fanout_outbox
 
 
 --
+-- Name: event_fanout_recipients event_fanout_recipients_outbox_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.event_fanout_recipients
+    ADD CONSTRAINT event_fanout_recipients_outbox_id_fkey FOREIGN KEY (outbox_id) REFERENCES public.event_fanout_outbox(id) ON DELETE CASCADE;
+
+
+--
+-- Name: event_routing_backlog event_routing_backlog_outbox_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.event_routing_backlog
+    ADD CONSTRAINT event_routing_backlog_outbox_id_fkey FOREIGN KEY (outbox_id) REFERENCES public.event_fanout_outbox(id) ON DELETE CASCADE;
+
+
+--
+-- Name: event_routing_fairness event_routing_fairness_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.event_routing_fairness
+    ADD CONSTRAINT event_routing_fairness_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
+
+
+--
 -- Name: event_schemas event_schemas_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.event_schemas
     ADD CONSTRAINT event_schemas_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: event_storage_admission event_storage_admission_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.event_storage_admission
+    ADD CONSTRAINT event_storage_admission_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.accounts(id) ON DELETE CASCADE;
 
 
 --
@@ -36552,6 +37251,14 @@ ALTER TABLE ONLY public.instances
 
 
 --
+-- Name: invocation_attempt_history invocation_attempt_history_invocation_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.invocation_attempt_history
+    ADD CONSTRAINT invocation_attempt_history_invocation_id_fkey FOREIGN KEY (invocation_id) REFERENCES public.invocations(id) ON DELETE CASCADE;
+
+
+--
 -- Name: invocation_environment_queue_admissions invocation_environment_queue_admissions_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -36621,6 +37328,22 @@ ALTER TABLE ONLY public.invocation_environment_queue_admissions
 
 ALTER TABLE ONLY public.invocation_environment_queue_receipts
     ADD CONSTRAINT invocation_environment_queue_receipts_invocation_id_fkey FOREIGN KEY (invocation_id) REFERENCES public.invocations(id) ON DELETE CASCADE;
+
+
+--
+-- Name: invocation_keyed_replays invocation_keyed_replays_parent_invocation_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.invocation_keyed_replays
+    ADD CONSTRAINT invocation_keyed_replays_parent_invocation_id_fkey FOREIGN KEY (parent_invocation_id) REFERENCES public.invocations(id) ON DELETE CASCADE;
+
+
+--
+-- Name: invocation_plain_replays invocation_plain_replays_parent_invocation_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.invocation_plain_replays
+    ADD CONSTRAINT invocation_plain_replays_parent_invocation_id_fkey FOREIGN KEY (parent_invocation_id) REFERENCES public.invocations(id) ON DELETE CASCADE;
 
 
 --
@@ -40233,3 +40956,5 @@ ALTER TABLE ONLY public.workflow_webhook_receipts
 
 --
 --
+
+
