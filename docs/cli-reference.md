@@ -5712,7 +5712,11 @@ gregale edge-rules update RULE_ID --kind validate --validate-mode observe
 
 Delete one edge rule
 
-`gregale edge-rules rm <id>`
+`gregale edge-rules rm [--yes] <id>`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--yes` | skip the typed confirmation (alias: --quiet) |  |
 
 
 ## openapi
@@ -8547,11 +8551,12 @@ Replay one event or --all
 
 Purge one event or --all
 
-`gregale dlq purge [--all] [--limit <N>] <app> [<event-id>]`
+`gregale dlq purge [--all] [--yes] [--limit <N>] <app> [<event-id>]`
 
 | Flag | Meaning | |
 |---|---|---|
-| `--all` | purge all events |  |
+| `--all` | purge all events (asks for typed confirmation) |  |
+| `--yes` | skip the --all confirmation (for scripts) |  |
 | `--limit <N>` | page size (1..200) |  |
 
 
@@ -9635,7 +9640,7 @@ Manage deployment traffic split (available on every plan)
 
 Set the traffic split for a deployment
 
-`gregale traffic set [--app <SLUG>] --deployment <ID> --percent <N> [<slug>]`
+`gregale traffic set [--app <SLUG>] --deployment <ID> --percent <N>`
 
 | Flag | Meaning | |
 |---|---|---|
@@ -9643,11 +9648,18 @@ Set the traffic split for a deployment
 | `--deployment <ID>` | deployment id or vN revision to set the traffic split on | required |
 | `--percent <N>` | traffic weight in [0, 100]; -1 = unset (server default 100) | required |
 
+Examples:
+
+```sh
+gregale traffic set my-api --deployment v7 --percent 30
+gregale traffic set --app my-api --deployment v7 --percent 30
+```
+
 ### traffic promote
 
 Promote a live deployment to 100% production traffic
 
-`gregale traffic promote [--app <SLUG>] --deployment <ID> [--if-serving <ID>] [--require-bindings] [--max-verification-age <DURATION>] [--allow-unsupported] [--require-application-ack] [--route-removal-mode <MODE>] [--route-readiness <PATH>] [--route-mapping <PATH>] [--route-owner-approval <PATH>] [--route-evidence-max-age <DURATION>] [<slug>]`
+`gregale traffic promote [--app <SLUG>] --deployment <ID> [--if-serving <ID>] [--require-bindings] [--max-verification-age <DURATION>] [--allow-unsupported] [--require-application-ack] [--route-removal-mode <MODE>] [--route-readiness <PATH>] [--route-mapping <PATH>] [--route-owner-approval <PATH>] [--route-evidence-max-age <DURATION>]`
 
 | Flag | Meaning | |
 |---|---|---|
@@ -9663,6 +9675,13 @@ Promote a live deployment to 100% production traffic
 | `--route-mapping <PATH>` | reviewed successor mapping JSON |  |
 | `--route-owner-approval <PATH>` | owner attestation bound to this exact change |  |
 | `--route-evidence-max-age <DURATION>` | maximum evidence age (default and maximum 72h) |  |
+
+Examples:
+
+```sh
+gregale traffic promote my-api --deployment v7
+gregale traffic promote --app my-api --deployment v7 --if-serving v6
+```
 
 ### traffic status
 

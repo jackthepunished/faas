@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -367,7 +368,7 @@ func (w *customerConsoleWriter) Write(p []byte) (int, error) {
 		}
 		line := append([]byte(nil), w.pending[:newline+1]...)
 		w.pending = w.pending[newline+1:]
-		if firecrackerControlLine(line) {
+		if firecrackerControlLine(line) || guestInitStageLine(line) {
 			continue
 		}
 		if _, err := w.ring.Write("stdout", line); err != nil {
@@ -375,6 +376,14 @@ func (w *customerConsoleWriter) Write(p []byte) (int, error) {
 		}
 	}
 	return len(p), nil
+}
+
+// guestInitStageLine matches guest-init's internal boot-progress markers
+// ("guest-init: stage pivot"). They are kept in the unfiltered console file for
+// operators; customers saw them at the top of every job task log (hunt #8).
+// guest-init's app restart and crash lines stay customer-visible.
+func guestInitStageLine(line []byte) bool {
+	return bytes.HasPrefix(bytes.TrimSpace(line), []byte("guest-init: stage "))
 }
 
 // stripFirecrackerTimestamp drops the wall-clock token Firecracker's logger
@@ -425,6 +434,7 @@ func firecrackerControlLine(line []byte) bool {
 	}
 	for _, marker := range []string{
 		"running firecracker",
+		"successfully started microvm",
 		"firecracker exiting",
 		"host cpu vendor",
 		"snapshot cpu vendor",
@@ -5777,6 +5787,16 @@ func (v *JailerVMM) waitReadyWithProbe(ctx context.Context, l Lease, healthcheck
 	// so the wake.readiness_200 emit can carry the elapsed_ms
 	// field. Keep it local: one JailerVMM serves many concurrent instances.
 	readinessStartedAt := time.Now()
+	// A guest that stops during startup (crash-looped workload, guest-init
+	// exit) can never become ready: stop probing at once and report what the
+	// workload printed instead of waiting out the whole startup deadline.
+	ctx, stopGuestWatch := v.cancelOnGuestStop(ctx, l.Instance)
+	defer stopGuestWatch()
+	defer func() {
+		if err != nil && errors.Is(context.Cause(ctx), errGuestStopped) && !v.guestStopRequested(l.Instance) {
+			err = v.guestStoppedDuringStartup(l)
+		}
+	}()
 
 	if healthcheckGRPC {
 		conn, connErr := grpc.NewClient("passthrough:///"+addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -5984,6 +6004,9 @@ func (v *JailerVMM) waitReadyOrCharacterized(ctx context.Context, l Lease, healt
 			receiptReceived = true
 			if receipt.err != nil {
 				if requiresCharacterization {
+					if v.guestExitedWithin(l.Instance, guestExitReportGrace) {
+						return v.guestStoppedDuringStartup(l)
+					}
 					return fmt.Errorf("execution mode %q requires a valid characterization report: %w", executionMode, receipt.err)
 				}
 				continue
@@ -5994,6 +6017,9 @@ func (v *JailerVMM) waitReadyOrCharacterized(ctx context.Context, l Lease, healt
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-characterizationDeadline:
+			if v.guestExitedWithin(l.Instance, 0) {
+				return v.guestStoppedDuringStartup(l)
+			}
 			return fmt.Errorf("execution mode %q did not produce a valid characterization report before the startup deadline", executionMode)
 		}
 	}
@@ -6048,6 +6074,124 @@ func characterizationReadinessMismatch(report api.CharacterizationReport, execut
 		}
 	}
 	return nil
+}
+
+// errGuestStopped is the readiness context's cancel cause when the
+// Firecracker process of the instance exits before the guest became ready.
+var errGuestStopped = errors.New("guest stopped during startup")
+
+// cancelOnGuestStop derives a context that is cancelled with errGuestStopped
+// when the instance's Firecracker process exits. production-us hunt #8: a
+// public nginx image crash-looped and guest-init exited (kernel panic) 1.5 s
+// after boot, yet readiness probed the dead guest for its full 2-minute
+// deadline and then reported "app_not_listening" with no app output.
+func (v *JailerVMM) cancelOnGuestStop(ctx context.Context, instance string) (context.Context, func()) {
+	v.mu.Lock()
+	rec := v.recs[instance]
+	v.mu.Unlock()
+	if rec == nil || rec.done == nil {
+		return ctx, func() {}
+	}
+	ctx, cancel := context.WithCancelCause(ctx)
+	stop := make(chan struct{})
+	go func() {
+		select {
+		case <-rec.done:
+			cancel(errGuestStopped)
+		case <-stop:
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, func() {
+		close(stop)
+		cancel(nil)
+	}
+}
+
+// guestExitReportGrace bounds how long a failed characterization receipt
+// waits for the Firecracker exit that usually follows a guest-init exit
+// (kernel panic, then VMM stop, ~1 s later).
+const guestExitReportGrace = 2 * time.Second
+
+// guestExitedWithin reports whether the instance's Firecracker process exited
+// on its own, waiting at most grace. production-us hunt #8: a worker whose
+// command crash-looped surfaced only "requires a valid characterization
+// report: context deadline exceeded" because the receipt failed first; the
+// workload's own error was in the console tail (H8-20).
+func (v *JailerVMM) guestExitedWithin(instance string, grace time.Duration) bool {
+	v.mu.Lock()
+	rec := v.recs[instance]
+	v.mu.Unlock()
+	if rec == nil || rec.done == nil {
+		return false
+	}
+	if grace <= 0 {
+		select {
+		case <-rec.done:
+			return !v.guestStopRequested(instance)
+		default:
+			return false
+		}
+	}
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case <-rec.done:
+		return !v.guestStopRequested(instance)
+	case <-timer.C:
+		return false
+	}
+}
+
+// guestStopRequested reports whether vmmd itself stopped the instance (an
+// explicit destroy owns that exit and its error).
+func (v *JailerVMM) guestStopRequested(instance string) bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	rec := v.recs[instance]
+	return rec != nil && rec.stopping
+}
+
+// guestStoppedDuringStartup reports a guest that stopped before readiness,
+// with the workload's own last output lines, in the same form as a
+// characterization report of a workload that exited during startup.
+func (v *JailerVMM) guestStoppedDuringStartup(l Lease) error {
+	var lines []string
+	if ring := v.LogRing(l.Instance); ring != nil {
+		for _, line := range ring.Snapshot(0) {
+			lines = append(lines, line.Line)
+		}
+	}
+	if tail := workloadOutputTail(lines, 20); tail != "" {
+		return fmt.Errorf("workload stopped during startup (guest %s exited before becoming ready): %s", l.Instance, tail)
+	}
+	return fmt.Errorf("workload stopped during startup (guest %s exited before becoming ready)", l.Instance)
+}
+
+// kernelLogLine matches guest kernel messages ("[    1.445781] ...") that the
+// serial console interleaves with workload output.
+var kernelLogLine = regexp.MustCompile(`^\[\s*\d+\.\d+\]`)
+
+// workloadOutputTail keeps the last max non-empty lines that are not guest
+// kernel messages (a guest-init exit ends in a kernel panic trace that would
+// otherwise push the workload's own error out of the tail).
+func workloadOutputTail(lines []string, max int) string {
+	kept := make([]string, 0, max)
+	for i := len(lines) - 1; i >= 0 && len(kept) < max; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" || kernelLogLine.MatchString(line) {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	for i, j := 0, len(kept)-1; i < j; i, j = i+1, j-1 {
+		kept[i], kept[j] = kept[j], kept[i]
+	}
+	tail := []rune(strings.Join(kept, "\n"))
+	if len(tail) > 4096 {
+		tail = tail[len(tail)-4096:]
+	}
+	return string(tail)
 }
 
 // notReadyProblem shapes the deadline-expired error from the TCP

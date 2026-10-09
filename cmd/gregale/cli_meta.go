@@ -2469,7 +2469,9 @@ var cliCommands = []cliCommand{
 				{Name: "validate-apply-while-streaming", Short: "also validate streaming requests"},
 				{Name: "validate-reject-unknown-fields", Short: "reject fields not declared by the schema"},
 			}},
-			{Name: subRm, Short: "Delete one edge rule", Positionals: []string{"<id>"}},
+			{Name: subRm, Short: "Delete one edge rule", Positionals: []string{"<id>"}, Flags: []cliFlag{
+				{Name: "yes", Short: "skip the typed confirmation (alias: --quiet)", Bool: true},
+			}},
 		},
 		Flags: []cliFlag{
 			{Name: "app", Short: "app slug", Req: true, Value: "slug"},
@@ -3460,7 +3462,8 @@ var cliCommands = []cliCommand{
 				{Name: "limit", Short: "maximum events (1..200)", Value: "N"},
 			}},
 			{Name: "purge", Short: "Purge one event or --all", Positionals: []string{"<app>", "[<event-id>]"}, Flags: []cliFlag{
-				{Name: "all", Short: "purge all events"},
+				{Name: "all", Short: "purge all events (asks for typed confirmation)"},
+				{Name: "yes", Short: "skip the --all confirmation (for scripts)", Bool: true},
 				{Name: "limit", Short: "page size (1..200)", Value: "N"},
 			}},
 		},
@@ -3932,9 +3935,15 @@ var cliCommands = []cliCommand{
 		Short:   "Manage deployment traffic split (available on every plan)",
 		Subcommands: []cliSub{
 			{
-				Name:        "set",
-				Short:       "Set the traffic split for a deployment",
-				Positionals: []string{"[<slug>]"},
+				Name:  "set",
+				Short: "Set the traffic split for a deployment",
+				// hunt #8: the slug is accepted only before the flags; listing it
+				// as a positional rendered it after them, an order the parser
+				// rejects.
+				Examples: []string{
+					"gregale traffic set my-api --deployment v7 --percent 30",
+					"gregale traffic set --app my-api --deployment v7 --percent 30",
+				},
 				Flags: []cliFlag{
 					{Name: "app", Short: "app slug; only needed to resolve a vN revision outside a linked project", Value: "SLUG"},
 					{Name: "deployment", Short: "deployment id or vN revision to set the traffic split on", Req: true, Value: "ID"},
@@ -3942,9 +3951,12 @@ var cliCommands = []cliCommand{
 				},
 			},
 			{
-				Name:        "promote",
-				Short:       "Promote a live deployment to 100% production traffic",
-				Positionals: []string{"[<slug>]"},
+				Name:  "promote",
+				Short: "Promote a live deployment to 100% production traffic",
+				Examples: []string{
+					"gregale traffic promote my-api --deployment v7",
+					"gregale traffic promote --app my-api --deployment v7 --if-serving v6",
+				},
 				Flags: []cliFlag{
 					{Name: "app", Short: "app slug; only needed to resolve a vN revision outside a linked project", Value: "SLUG"},
 					{Name: "deployment", Short: "deployment id or vN revision to promote", Req: true, Value: "ID"},
