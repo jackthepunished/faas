@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS public.gregale_customer_operation_workflow_states (
     from_state text NOT NULL DEFAULT '' CHECK (from_state = '' OR from_state ~ '^[a-z][a-z0-9-]{0,63}$'),
     state text NOT NULL CHECK (state ~ '^[a-z][a-z0-9-]{0,63}$'),
     revision bigint NOT NULL CHECK (revision BETWEEN 1 AND 9007199254740991),
+    evidence_milestones jsonb NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(evidence_milestones) = 'array' AND jsonb_array_length(evidence_milestones) <= 16),
     occurred_at timestamptz NOT NULL CHECK (isfinite(occurred_at)),
     acknowledged_at timestamptz CHECK (acknowledged_at IS NULL OR isfinite(acknowledged_at)),
     PRIMARY KEY (operation_id, id),
@@ -60,6 +61,10 @@ CREATE TABLE IF NOT EXISTS public.gregale_customer_operation_workflow_states (
 -- Upgrade installations created by the earlier workflow state snapshot schema.
 ALTER TABLE public.gregale_customer_operation_workflow_states
     ADD COLUMN IF NOT EXISTS from_state text NOT NULL DEFAULT '';
+
+ALTER TABLE public.gregale_customer_operation_workflow_states
+    ADD COLUMN IF NOT EXISTS evidence_milestones jsonb NOT NULL DEFAULT '[]'::jsonb
+        CHECK (jsonb_typeof(evidence_milestones) = 'array' AND jsonb_array_length(evidence_milestones) <= 16);
 
 -- Preserve the latest known app state on the counter, independently of
 -- per-Operation outbox rows that may be removed after their receipt expires.
@@ -81,3 +86,73 @@ WHERE c.last_state IS NULL
       AND s.workflow = c.workflow
       AND s.instance_id = c.instance_id
   );
+
+-- Application-reported workflow blockers replace the previous list with each revision.
+ALTER TABLE public.gregale_customer_operation_workflow_states
+    ADD COLUMN IF NOT EXISTS blockers jsonb NOT NULL DEFAULT '[]'::jsonb
+        CHECK (jsonb_typeof(blockers) = 'array' AND jsonb_array_length(blockers) <= 16),
+    ADD COLUMN IF NOT EXISTS blockers_only boolean NOT NULL DEFAULT false;
+
+-- Resolution facts share the business write and state report outbox.
+ALTER TABLE public.gregale_customer_operation_workflow_states
+    ADD COLUMN IF NOT EXISTS blocker_resolutions jsonb NOT NULL DEFAULT '[]'::jsonb
+        CHECK (jsonb_typeof(blocker_resolutions) = 'array' AND jsonb_array_length(blocker_resolutions) <= 16);
+
+-- Blocker episodes survive outbox cleanup. The marker detects older SDK writers.
+ALTER TABLE public.gregale_customer_operation_workflow_state_counters
+    ADD COLUMN IF NOT EXISTS last_blockers jsonb NOT NULL DEFAULT '[]'::jsonb
+        CHECK (jsonb_typeof(last_blockers) = 'array' AND jsonb_array_length(last_blockers) <= 16),
+    ADD COLUMN IF NOT EXISTS last_blockers_revision bigint NOT NULL DEFAULT 0
+        CHECK (last_blockers_revision BETWEEN 0 AND 9007199254740991);
+UPDATE public.gregale_customer_operation_workflow_state_counters c
+SET last_blockers=s.blockers, last_blockers_revision=c.revision
+FROM public.gregale_customer_operation_workflow_states s
+WHERE s.platform_tenant_id=c.platform_tenant_id AND s.workflow=c.workflow
+  AND s.instance_id=c.instance_id AND s.revision=c.revision
+  AND c.last_blockers_revision=0;
+
+-- Business workflow deadlines are optional snapshot facts.
+ALTER TABLE public.gregale_customer_operation_workflow_states
+ ADD COLUMN IF NOT EXISTS deadline_at text NOT NULL DEFAULT '',
+ ADD COLUMN IF NOT EXISTS deadline_only boolean NOT NULL DEFAULT false;
+ALTER TABLE public.gregale_customer_operation_workflow_state_counters
+ ADD COLUMN IF NOT EXISTS last_deadline_at text NOT NULL DEFAULT '',
+ ADD COLUMN IF NOT EXISTS last_deadline_revision bigint NOT NULL DEFAULT 0
+   CHECK (last_deadline_revision BETWEEN 0 AND 9007199254740991);
+UPDATE public.gregale_customer_operation_workflow_state_counters c
+SET last_deadline_at=s.deadline_at,last_deadline_revision=c.revision
+FROM public.gregale_customer_operation_workflow_states s
+WHERE s.platform_tenant_id=c.platform_tenant_id AND s.workflow=c.workflow
+ AND s.instance_id=c.instance_id AND s.revision=c.revision AND c.last_deadline_revision=0;
+
+-- Explicit terminal outcomes share the business transaction and outbox.
+ALTER TABLE public.gregale_customer_operation_workflow_states
+ ADD COLUMN IF NOT EXISTS outcome_code text NOT NULL DEFAULT '',
+ ADD COLUMN IF NOT EXISTS outcome_description text NOT NULL DEFAULT '',
+ ADD COLUMN IF NOT EXISTS outcome_only boolean NOT NULL DEFAULT false;
+ALTER TABLE public.gregale_customer_operation_workflow_state_counters
+ ADD COLUMN IF NOT EXISTS last_outcome_code text NOT NULL DEFAULT '',
+ ADD COLUMN IF NOT EXISTS last_outcome_description text NOT NULL DEFAULT '',
+ ADD COLUMN IF NOT EXISTS last_outcome_revision bigint NOT NULL DEFAULT 0
+  CHECK (last_outcome_revision BETWEEN 0 AND 9007199254740991);
+UPDATE public.gregale_customer_operation_workflow_state_counters c
+SET last_outcome_code=s.outcome_code,last_outcome_description=s.outcome_description,last_outcome_revision=c.revision
+FROM public.gregale_customer_operation_workflow_states s
+WHERE s.platform_tenant_id=c.platform_tenant_id AND s.workflow=c.workflow
+ AND s.instance_id=c.instance_id AND s.revision=c.revision AND c.last_outcome_revision=0;
+
+-- Direct workflow prerequisites persist independently of receipt cleanup.
+ALTER TABLE public.gregale_customer_operation_workflow_states
+ ADD COLUMN IF NOT EXISTS depends_on jsonb NOT NULL DEFAULT '[]'::jsonb
+  CHECK (jsonb_typeof(depends_on)='array' AND jsonb_array_length(depends_on)<=16),
+ ADD COLUMN IF NOT EXISTS dependencies_only boolean NOT NULL DEFAULT false;
+ALTER TABLE public.gregale_customer_operation_workflow_state_counters
+ ADD COLUMN IF NOT EXISTS last_dependencies jsonb NOT NULL DEFAULT '[]'::jsonb
+  CHECK (jsonb_typeof(last_dependencies)='array' AND jsonb_array_length(last_dependencies)<=16),
+ ADD COLUMN IF NOT EXISTS last_dependencies_revision bigint NOT NULL DEFAULT 0
+  CHECK (last_dependencies_revision BETWEEN 0 AND 9007199254740991);
+UPDATE public.gregale_customer_operation_workflow_state_counters c
+SET last_dependencies=s.depends_on,last_dependencies_revision=c.revision
+FROM public.gregale_customer_operation_workflow_states s
+WHERE s.platform_tenant_id=c.platform_tenant_id AND s.workflow=c.workflow
+ AND s.instance_id=c.instance_id AND s.revision=c.revision AND c.last_dependencies_revision=0;

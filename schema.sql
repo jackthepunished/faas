@@ -14574,6 +14574,15 @@ CREATE TABLE public.customer_operation_workflow_guest_claims (
 --
 
 CREATE TABLE public.customer_operation_workflow_state_reports (
+    contract_version integer DEFAULT 1 NOT NULL,
+    evidence_milestones jsonb DEFAULT '[]'::jsonb NOT NULL,
+    blockers jsonb DEFAULT '[]'::jsonb NOT NULL,
+    blockers_only boolean DEFAULT false NOT NULL,
+    blocker_resolutions jsonb DEFAULT '[]'::jsonb NOT NULL,
+    CONSTRAINT customer_operation_workflow_state_reports_blocker_resolutions_check CHECK (((jsonb_typeof(blocker_resolutions) = 'array'::text) AND (jsonb_array_length(blocker_resolutions) <= 16))),
+    CONSTRAINT customer_operation_workflow_state_reports_blockers_check CHECK (((jsonb_typeof(blockers) = 'array'::text) AND (jsonb_array_length(blockers) <= 16))),
+    CONSTRAINT customer_operation_workflow_state_reports_contract_version_check CHECK (((contract_version >= 1) AND (contract_version <= 1000000))),
+    CONSTRAINT customer_operation_workflow_state_reports_evidence_check CHECK (((jsonb_typeof(evidence_milestones) = 'array'::text) AND (jsonb_array_length(evidence_milestones) <= 16))),
     operation_id uuid NOT NULL,
     id uuid NOT NULL,
     workflow text NOT NULL,
@@ -14620,6 +14629,27 @@ CREATE TABLE public.customer_operation_workflow_states (
     CONSTRAINT customer_operation_workflow_states_updated_at_check CHECK (isfinite(updated_at)),
     CONSTRAINT customer_operation_workflow_states_workflow_check CHECK ((workflow ~ '^[a-z][a-z0-9-]{0,62}$'::text))
 );
+
+CREATE INDEX customer_operation_workflow_states_attention_idx ON public.customer_operation_workflow_states USING btree (account_id, app_id, scope, updated_at DESC);
+
+ALTER TABLE customer_operation_workflow_state_reports
+ ADD COLUMN deadline_at text NOT NULL DEFAULT '',
+ ADD COLUMN deadline_only boolean NOT NULL DEFAULT false;
+
+ALTER TABLE customer_operation_workflow_state_reports
+ ADD COLUMN outcome_code text NOT NULL DEFAULT '',
+ ADD COLUMN outcome_description text NOT NULL DEFAULT '',
+ ADD COLUMN outcome_only boolean NOT NULL DEFAULT false;
+
+ALTER TABLE customer_operation_workflow_state_reports
+ ADD COLUMN depends_on jsonb NOT NULL DEFAULT '[]'::jsonb
+  CHECK (jsonb_typeof(depends_on)='array' AND jsonb_array_length(depends_on)<=16),
+ ADD COLUMN dependencies_only boolean NOT NULL DEFAULT false;
+
+CREATE INDEX customer_operation_workflow_dependency_lookup
+ ON customer_operation_workflow_state_reports USING gin (depends_on jsonb_path_ops)
+ WHERE jsonb_array_length(depends_on)>0;
+
 
 
 --
