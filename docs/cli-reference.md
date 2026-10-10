@@ -54,7 +54,7 @@ Automation: put `--non-interactive` before the command to disable prompts and br
 | [`routes`](#routes) | Analyze route changes, migrations, lifecycle and production policies |
 | [`env`](#env) | Clone project environments or manage app runtime env/secrets |
 | [`init`](#init) | Scaffold a project from a built-in template |
-| [`inspect`](#inspect) | Explain an app from its runtime, deployment, API, data, scaling, and release signals (slug defaults to linked context) |
+| [`inspect`](#inspect) | Explain an app from its runtime, deployment, API, data, scaling, and release signals (linked app or interactive picker) |
 | [`invoke`](#invoke) | Functional smoke test (invoke [--async] &lt;slug&gt; [--payload J\|@file\|-]; slug defaults to linked context) |
 | [`run`](#run) | Run untrusted code in an isolated disposable microVM |
 | [`runs`](#runs) | Inspect or cancel isolated disposable runs |
@@ -74,11 +74,11 @@ Automation: put `--non-interactive` before the command to disable prompts and br
 | [`profile`](#profile) | Manage named API connections and isolated credentials |
 | [`context`](#context) | Show the linked project and default app context |
 | [`signup`](#signup) | Create a new account (signup [--email-only EMAIL \| --password-stdin]) |
-| [`logs`](#logs) | Query runtime logs and HTTP request events |
+| [`logs`](#logs) | Query runtime logs and HTTP request events (linked app or interactive picker) |
 | [`metrics`](#metrics) | Per-app or account-wide metrics (slug defaults to linked context) |
 | [`analytics`](#analytics) | Historical request analytics (analytics &lt;slug&gt; [--since 24h] [--by route\|country\|referrer_host\|ua_family\|status]; slug defaults to linked context) |
 | [`mfa`](#mfa) | Manage account MFA (mfa enroll\|confirm\|verify\|recover\|disable) |
-| [`open`](#open) | Open the app&#39;s URL (slug defaults to linked context) |
+| [`open`](#open) | Open the app&#39;s URL (linked app or interactive picker) |
 | [`orgs`](#orgs) | Manage orgs, members, and workspace activity |
 | [`overage-cap`](#overage-cap) | Set / clear the account&#39;s overage cap (--clear \| &lt;cents&gt;) |
 | [`park`](#park) | Park an app cold (kill all live instances) |
@@ -110,7 +110,7 @@ Automation: put `--non-interactive` before the command to disable prompts and br
 | [`upload-cache`](#upload-cache) | Inspect or clean resumable source-upload recovery state |
 | [`webhooks`](#webhooks) | Manage app and account release webhooks (webhooks account &lt;verb&gt;) |
 | [`whoami`](#whoami) | Show the authenticated account |
-| [`completion`](#completion) | Print a shell completion script (bash\|zsh\|fish\|powershell) |
+| [`completion`](#completion) | Generate shell completion scripts or install them interactively |
 | [`man`](#man) | Print the gregale(1) man page (or gregale-&lt;command&gt;(1) with one arg) |
 
 ## mcp
@@ -1217,10 +1217,12 @@ gregale bindings probe-policy INTEGRATION_ID --path /health --method GET --expec
 
 Evaluate recorded binding evidence and runtime freshness for CI
 
-`gregale bindings check [--scope <SCOPE>] [--max-verification-age <DURATION>] [--deployment <ID|vN>] [--allow-unsupported] [--require-application-ack] [--wait] [--timeout <DURATION>] [--poll-interval <DURATION>] <app>`
+`gregale bindings check [--interactive] [--app <SLUG>] [--scope <SCOPE>] [--max-verification-age <DURATION>] [--deployment <ID|vN>] [--allow-unsupported] [--require-application-ack] [--wait] [--timeout <DURATION>] [--poll-interval <DURATION>] [<app>]`
 
 | Flag | Meaning | |
 |---|---|---|
+| `--interactive` | choose a live deployment and readiness options |  |
+| `--app <SLUG>` | app slug (linked app or picker in interactive mode) |  |
 | `--scope <SCOPE>` | require the selected deployment to use this scope (default its current scope) |  |
 | `--max-verification-age <DURATION>` | maximum age of passed probe evidence (default 10m) |  |
 | `--deployment <ID|vN>` | exact live deployment whose evidence must pass, including zero-traffic candidates |  |
@@ -1233,6 +1235,7 @@ Evaluate recorded binding evidence and runtime freshness for CI
 Examples:
 
 ```sh
+gregale bindings check --app my-api --interactive
 gregale bindings check my-api --max-verification-age 10m --json
 gregale bindings check my-api --scope production
 gregale bindings check my-api --deployment v12 --max-verification-age 10m --json
@@ -1354,15 +1357,22 @@ Per-app alert rules (alerts list|add|info|update|rm|rotate-secret|preset|actions
 
 Read or wait for automatic rollback status, deployment evidence and service handoffs
 
-`gregale alerts actions --app <slug> [--fire <UUID>] [--wait] [--timeout <duration>] [--poll-interval <duration>]`
+`gregale alerts actions [--interactive] [--app <slug>] [--fire <UUID>] [--wait] [--timeout <duration>] [--poll-interval <duration>]`
 
 | Flag | Meaning | |
 |---|---|---|
-| `--app <slug>` | app slug | required |
+| `--interactive` | choose an action, inspect details, and optionally follow it |  |
+| `--app <slug>` | app slug (linked app or picker in interactive mode) |  |
 | `--fire <UUID>` | one production alert delivery UUID |  |
 | `--wait` | wait for the selected fire to complete |  |
 | `--timeout <duration>` | wait deadline (default 10m) |  |
 | `--poll-interval <duration>` | poll interval (default 2s) |  |
+
+Examples:
+
+```sh
+gregale alerts actions --app my-api --interactive
+```
 
 ### alerts list
 
@@ -1416,25 +1426,40 @@ Show one alert rule and its last delivery
 
 List a rule&#39;s webhook deliveries, newest first
 
-`gregale alerts deliveries --app <slug> [--limit <N>] [--include-test] <alert-id>`
+`gregale alerts deliveries [--app <slug>] [--interactive] [--limit <N>] [--include-test] [<alert-id>]`
 
 | Flag | Meaning | |
 |---|---|---|
-| `--app <slug>` | app slug | required |
+| `--app <slug>` | app slug (linked app or picker in interactive mode) |  |
+| `--interactive` | choose a rule and delivery options |  |
 | `--limit <N>` | max deliveries (1..100, default 20) |  |
 | `--include-test` | include test deliveries |  |
+
+Examples:
+
+```sh
+gregale alerts deliveries --app my-api --interactive
+```
 
 ### alerts update
 
 Update one alert rule
 
-`gregale alerts update [--action <ACTION>] [--post-deploy-rollback-window <duration>] [--webhook-secret-stdin] <alert-id>`
+`gregale alerts update [--interactive] [--app <slug>] [--action <ACTION>] [--post-deploy-rollback-window <duration>] [--webhook-secret-stdin] [<alert-id>]`
 
 | Flag | Meaning | |
 |---|---|---|
+| `--interactive` | choose a rule, edit current settings, and confirm changes |  |
+| `--app <slug>` | app slug (linked app or picker in interactive mode) |  |
 | `--action <ACTION>` | alert action | one of `webhook` · `rollback` · `demote` · `promote` |
 | `--post-deploy-rollback-window <duration>` | completed-release rollback window (0 off; up to 1h) |  |
 | `--webhook-secret-stdin` | read the replacement webhook secret from stdin |  |
+
+Examples:
+
+```sh
+gregale alerts update --app my-api --interactive
+```
 
 ### alerts rm
 
@@ -1465,19 +1490,26 @@ List the global alert preset catalog
 
 #### alerts preset enable
 
-Create an app alert from a preset; supply a webhook secret via stdin or --webhook-secret
+Create an app alert from a preset or choose one interactively
 
-`gregale alerts preset enable --app <slug> --webhook-url <URL> [--webhook-secret-stdin] [--webhook-secret <VALUE>] [--action <ACTION>] [--cooldown-minutes <N>] [--enabled] <preset-name>`
+`gregale alerts preset enable [--interactive] [--app <slug>] [--webhook-url <URL>] [--webhook-secret-stdin] [--webhook-secret <VALUE>] [--action <ACTION>] [--cooldown-minutes <N>] [--enabled] [<preset-name>]`
 
 | Flag | Meaning | |
 |---|---|---|
-| `--app <slug>` | app slug | required |
-| `--webhook-url <URL>` | HTTPS webhook receiver URL | required |
+| `--interactive` | choose a preset, review its rule, and enter a hidden signing secret |  |
+| `--app <slug>` | app slug (interactive mode can use linked app or picker) |  |
+| `--webhook-url <URL>` | HTTPS webhook receiver URL (required unless interactive) |  |
 | `--webhook-secret-stdin` | read the webhook signing secret from stdin |  |
 | `--webhook-secret <VALUE>` | signing secret (prefer --webhook-secret-stdin) |  |
 | `--action <ACTION>` | alert action (default webhook) | one of `webhook` · `rollback` · `demote` · `promote` |
 | `--cooldown-minutes <N>` | cooldown override; 0 uses the preset default |  |
 | `--enabled` | rule is enabled by default; --enabled=false disables it |  |
+
+Examples:
+
+```sh
+gregale alerts preset enable --app my-api --interactive
+```
 
 
 ## audit-events
@@ -2579,10 +2611,11 @@ Explain default-scope serving health and missing evidence
 
 Preview, save, apply or update app resource and runtime settings
 
-`gregale app <slug> scale [--plan] [--out <PATH>] [--apply <PATH>] [--confirm] [--environment <SLUG>] [--profile <PROFILE>] [--ram <MB>] [--cpu-millicores <250|500|1000>] [--max-concurrency <N>] [--concurrency-overflow <POLICY>] [--max-queue-depth <N>] [--max-queue-wait <DURATION>] [--max-queue-wait-ms <MS>] [--wake-max-queue-depth <N>] [--wake-max-queue-wait-seconds <SECONDS>] [--idle <SECONDS>] [--request-timeout <SECONDS>] [--min <N>] [--autoscale-target-rps <N>] [--autoscale-target-cpu-pct <1..100>] [--warm-snapshot] [--no-warm-snapshot] [--warm-snapshot-min-requests <N>] [--warm-snapshot-min-ms <MS>] [--warm-pool-size <N>] [--require-authn] [--no-require-authn] [--head-wakes[=true|false]] [--crawler-policy <POLICY>] [--health-path <PATH>] [--health-path-wakes] [--no-health-path-wakes] [--app-protocol <PROTOCOL>]`
+`gregale app <slug> scale [--interactive] [--plan] [--out <PATH>] [--apply <PATH>] [--confirm] [--environment <SLUG>] [--profile <PROFILE>] [--ram <MB>] [--cpu-millicores <250|500|1000>] [--max-concurrency <N>] [--concurrency-overflow <POLICY>] [--max-queue-depth <N>] [--max-queue-wait <DURATION>] [--max-queue-wait-ms <MS>] [--wake-max-queue-depth <N>] [--wake-max-queue-wait-seconds <SECONDS>] [--idle <SECONDS>] [--request-timeout <SECONDS>] [--min <N>] [--autoscale-target-rps <N>] [--autoscale-target-cpu-pct <1..100>] [--warm-snapshot] [--no-warm-snapshot] [--warm-snapshot-min-requests <N>] [--warm-snapshot-min-ms <MS>] [--warm-pool-size <N>] [--require-authn] [--no-require-authn] [--head-wakes[=true|false]] [--crawler-policy <POLICY>] [--health-path <PATH>] [--health-path-wakes] [--no-health-path-wakes] [--app-protocol <PROTOCOL>]`
 
 | Flag | Meaning | |
 |---|---|---|
+| `--interactive` | choose resource settings with a guided preview and confirmation |  |
 | `--plan` | show changes and supported plan effects without applying them |  |
 | `--out <PATH>` | write a reusable plan JSON to a new file (requires --plan) |  |
 | `--apply <PATH>` | apply a saved scale plan JSON file |  |
@@ -2620,6 +2653,7 @@ Preview, save, apply or update app resource and runtime settings
 Examples:
 
 ```sh
+gregale app my-api scale --interactive
 gregale app my-api scale --plan --ram 512 --out scale-change.json
 gregale app my-api scale --apply scale-change.json --confirm
 ```
@@ -3419,6 +3453,23 @@ Manage scheduled HTTP requests and deployment commands
 
 `gregale crons [<subcommand>]`
 
+### crons next
+
+Show upcoming expression times across app tasks, with state and policy caveats
+
+`gregale crons next [--app <SLUG>]`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--app <SLUG>` | app slug (linked app or picker by default) |  |
+
+Examples:
+
+```sh
+gregale crons next --app my-api
+gregale crons next --app my-api --json
+```
+
 ### crons list
 
 List cron rules
@@ -3433,12 +3484,13 @@ List cron rules
 
 Schedule an HTTP request or deployment command
 
-`gregale crons add --app <slug> --schedule <EXPR> [--path <PATH>] [--command <EXEC>] [--arg <ARG>] [--shell] [--timeout-seconds <N>] [--max-output-bytes <N>] [--timezone <TZ>] [--skip-if-running] [--retry-max] [--retry-backoff-seconds] [--schedule-policy <JSON>] [--failure-rules <JSON>]`
+`gregale crons add [--interactive] [--app <slug>] [--schedule <EXPR>] [--path <PATH>] [--command <EXEC>] [--arg <ARG>] [--shell] [--timeout-seconds <N>] [--max-output-bytes <N>] [--timezone <TZ>] [--skip-if-running] [--retry-max] [--retry-backoff-seconds] [--schedule-policy <JSON>] [--failure-rules <JSON>]`
 
 | Flag | Meaning | |
 |---|---|---|
-| `--app <slug>` | app slug | required |
-| `--schedule <EXPR>` | five-field cron expression | required |
+| `--interactive` | choose an HTTP path, schedule, and timezone, preview run times, and confirm creation |  |
+| `--app <slug>` | app slug (interactive mode can use linked app or picker) |  |
+| `--schedule <EXPR>` | five-field cron expression (required unless interactive) |  |
 | `--path <PATH>` | HTTP request path (mutually exclusive with --command) |  |
 | `--command <EXEC>` | executable for a deployment command cron |  |
 | `--arg <ARG>` | append one command argument (repeatable) |  |
@@ -3452,6 +3504,12 @@ Schedule an HTTP request or deployment command
 | `--schedule-policy <JSON>` | versioned schedule policy JSON |  |
 | `--failure-rules <JSON>` | versioned failure and outcome-code rules JSON |  |
 
+Examples:
+
+```sh
+gregale crons add --app my-api --interactive
+```
+
 ### crons info
 
 Show one cron rule
@@ -3462,10 +3520,12 @@ Show one cron rule
 
 Update one cron rule
 
-`gregale crons update [--schedule <EXPR>] [--path <PATH>] [--timezone <TZ>] [--enable] [--disable] [--skip-if-running] [--allow-overlap] [--retry-max] [--retry-backoff-seconds <N>] [--schedule-policy <JSON>] [--failure-rules <JSON>] <id>`
+`gregale crons update [--interactive] [--app <SLUG>] [--schedule <EXPR>] [--path <PATH>] [--timezone <TZ>] [--enable] [--disable] [--skip-if-running] [--allow-overlap] [--retry-max] [--retry-backoff-seconds <N>] [--schedule-policy <JSON>] [--failure-rules <JSON>] [<id>]`
 
 | Flag | Meaning | |
 |---|---|---|
+| `--interactive` | choose an HTTP task, edit current values, preview times, and confirm changes |  |
+| `--app <SLUG>` | app slug for interactive task selection (linked app or picker by default) |  |
 | `--schedule <EXPR>` | new five-field cron expression |  |
 | `--path <PATH>` | HTTP request path |  |
 | `--timezone <TZ>` | IANA timezone |  |
@@ -3478,6 +3538,12 @@ Update one cron rule
 | `--schedule-policy <JSON>` | replace versioned schedule policy JSON |  |
 | `--failure-rules <JSON>` | replace versioned failure and outcome-code rules JSON |  |
 
+Examples:
+
+```sh
+gregale crons update --app my-api --interactive
+```
+
 ### crons rm
 
 Delete one cron rule
@@ -3486,27 +3552,60 @@ Delete one cron rule
 
 ### crons run
 
-Fire one cron immediately
+Fire one cron immediately or choose and follow a manual request
 
-`gregale crons run <cron-id>`
+`gregale crons run [--interactive] [--app <SLUG>] [--timeout <DURATION>] [<cron-id>]`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--interactive` | choose a task, review and confirm one manual run, then follow its request |  |
+| `--app <SLUG>` | app slug for interactive selection (linked app or picker by default) |  |
+| `--timeout <DURATION>` | maximum interactive follow duration (default 2m) |  |
+
+Examples:
+
+```sh
+gregale crons run --app my-api --interactive
+gregale crons run <cron-id>
+```
 
 ### crons fire-now
 
-Show the status of a manual fire request
+Read or follow an existing manual fire request
 
-`gregale crons fire-now <request-id>`
+`gregale crons fire-now [--wait] [--timeout <DURATION>] <request-id>`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--wait` | follow the existing request until terminal status |  |
+| `--timeout <DURATION>` | maximum wait duration (default 2m; requires --wait) |  |
+
+Examples:
+
+```sh
+gregale crons fire-now REQUEST_ID --wait --timeout 5m
+```
 
 ### crons runs
 
 Show execution history
 
-`gregale crons runs [--before <CURSOR>] [--limit <N>] [--run <TASK-ID>] <id>`
+`gregale crons runs [--interactive] [--app <SLUG>] [--before <CURSOR>] [--limit <N>] [--run <TASK-ID>] [<id>]`
 
 | Flag | Meaning | |
 |---|---|---|
+| `--interactive` | choose a task, browse runs, and inspect command output |  |
+| `--app <SLUG>` | app slug for interactive selection (linked app or picker by default) |  |
 | `--before <CURSOR>` | pagination cursor for older runs |  |
 | `--limit <N>` | max runs to show (1..100) |  |
 | `--run <TASK-ID>` | show details and captured output for one command run |  |
+
+Examples:
+
+```sh
+gregale crons runs --app my-api --interactive
+gregale crons runs <id>
+```
 
 ### crons occurrences
 
@@ -3720,15 +3819,27 @@ List jobs in this account
 | `--offset <N>` | starting offset (&gt;= 0) |  |
 | `--all` | walk every page using --limit and --offset |  |
 
+### jobs next
+
+Show upcoming recurring Job expression times and readiness
+
+Examples:
+
+```sh
+gregale jobs next
+gregale jobs next --json
+```
+
 ### jobs add
 
 Create a new job
 
-`gregale jobs add --image <REF> [--command <ARGV>] [--ram <MB>] [--timeout <SECONDS>] [--parallelism <N>] [--retries <N>] [--schedule <EXPR>] [--timezone <TZ>] [--schedule-policy <JSON>] [--failure-rules <JSON>] <name>`
+`gregale jobs add [--interactive] [--image <REF>] [--command <ARGV>] [--ram <MB>] [--timeout <SECONDS>] [--parallelism <N>] [--retries <N>] [--schedule <EXPR>] [--timezone <TZ>] [--schedule-policy <JSON>] [--failure-rules <JSON>] [<name>]`
 
 | Flag | Meaning | |
 |---|---|---|
-| `--image <REF>` | OCI image | required |
+| `--interactive` | choose a name, image, command, resources, and optional recurring schedule |  |
+| `--image <REF>` | OCI image (required unless interactive) |  |
 | `--command <ARGV>` | comma-separated entrypoint (e.g. /bin/sh,-c,echo hi) |  |
 | `--ram <MB>` | billable memory in MB (0 = plan default) |  |
 | `--timeout <SECONDS>` | per-task wall-clock deadline (0 = plan default) |  |
@@ -3739,20 +3850,39 @@ Create a new job
 | `--schedule-policy <JSON>` | versioned recurring schedule policy JSON |  |
 | `--failure-rules <JSON>` | versioned exit-code and outcome retry rules JSON |  |
 
+Examples:
+
+```sh
+gregale jobs add --interactive
+```
+
 ### jobs info
 
-Show one job
+Show a Job or wait for its image to be ready
 
-`gregale jobs info <name>`
+`gregale jobs info [--wait-ready] [--timeout <DURATION>] [--poll-interval <DURATION>] <name>`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--wait-ready` | wait for selected image preparation |  |
+| `--timeout <DURATION>` | maximum image wait (default 5m) |  |
+| `--poll-interval <DURATION>` | polling interval (default 2s) |  |
+
+Examples:
+
+```sh
+gregale jobs info my-job --wait-ready --timeout 5m
+```
 
 ### jobs update
 
 Update one job
 
-`gregale jobs update [--image <REF>] [--command <ARGV>] [--ram <MB>] [--timeout <SECONDS>] [--parallelism <N>] [--retries <N>] [--pause] [--resume] [--schedule <EXPR>] [--timezone <TZ>] [--unschedule] [--schedule-policy <JSON>] [--failure-rules <JSON>] <name>`
+`gregale jobs update [--interactive] [--image <REF>] [--command <ARGV>] [--ram <MB>] [--timeout <SECONDS>] [--parallelism <N>] [--retries <N>] [--pause] [--resume] [--schedule <EXPR>] [--timezone <TZ>] [--unschedule] [--schedule-policy <JSON>] [--failure-rules <JSON>] [<name>]`
 
 | Flag | Meaning | |
 |---|---|---|
+| `--interactive` | choose a Job, edit resources and schedule, and confirm changes |  |
 | `--image <REF>` | new OCI image |  |
 | `--command <ARGV>` | new comma-separated entrypoint |  |
 | `--ram <MB>` | new RAM (MB) |  |
@@ -3767,20 +3897,37 @@ Update one job
 | `--schedule-policy <JSON>` | replace versioned recurring schedule policy JSON |  |
 | `--failure-rules <JSON>` | replace versioned exit-code and outcome retry rules JSON |  |
 
+Examples:
+
+```sh
+gregale jobs update --interactive
+```
+
 ### jobs rm
 
 Soft-delete one job
 
-`gregale jobs rm <name>`
+`gregale jobs rm [--interactive] [<name>]`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--interactive` | choose a Job, review configuration, and confirm removal |  |
+
+Examples:
+
+```sh
+gregale jobs rm --interactive
+```
 
 ### jobs run
 
 Dispatch a new run (fan-out N tasks)
 
-`gregale jobs run [--tasks <N>] [--retries <N>] [--timeout <SECONDS>] [--input <ID=REF>] [--input-manifest-uri <URI>] [--input-manifest-sha256 <DIGEST>] [--parallelism <N>] [--flexible] [--eligible-at <RFC3339>] [--latest-start-at <RFC3339>] [--fail-fast] [--failure-rules <JSON>] <job-name>`
+`gregale jobs run [--interactive] [--tasks <N>] [--retries <N>] [--timeout <SECONDS>] [--input <ID=REF>] [--input-manifest-uri <URI>] [--input-manifest-sha256 <DIGEST>] [--parallelism <N>] [--flexible] [--eligible-at <RFC3339>] [--latest-start-at <RFC3339>] [--fail-fast] [--failure-rules <JSON>] [<job-name>]`
 
 | Flag | Meaning | |
 |---|---|---|
+| `--interactive` | choose a Job, review settings, and confirm one run |  |
 | `--tasks <N>` | number of tasks to fan out (or use --input) |  |
 | `--retries <N>` | override retry max for this run |  |
 | `--timeout <SECONDS>` | override task timeout for this run |  |
@@ -3793,6 +3940,13 @@ Dispatch a new run (fan-out N tasks)
 | `--latest-start-at <RFC3339>` | latest task start |  |
 | `--fail-fast` | cancel unstarted tasks after permanent failure |  |
 | `--failure-rules <JSON>` | override versioned exit-code and outcome retry rules for this run |  |
+
+Examples:
+
+```sh
+gregale jobs run --interactive
+gregale jobs run <job-name>
+```
 
 ### jobs runs
 
@@ -3810,60 +3964,154 @@ List runs for one job
 
 Inspect recurring schedule decisions
 
-`gregale jobs occurrences [--before <ID>] [--cursor <ID>] [--all] [--limit <N>] <name>`
+`gregale jobs occurrences [--interactive] [--before <ID>] [--cursor <ID>] [--all] [--limit <N>] [<name>]`
 
 | Flag | Meaning | |
 |---|---|---|
+| `--interactive` | choose a Job and browse scheduled occurrence decisions |  |
 | `--before <ID>` | alias for --cursor |  |
 | `--cursor <ID>` | opaque continuation cursor |  |
 | `--all` | walk every page using --limit and --cursor |  |
 | `--limit <N>` | max occurrence decisions (1..200) |  |
 
+Examples:
+
+```sh
+gregale jobs occurrences --interactive
+```
+
+### jobs wait
+
+Follow one Job run until completion
+
+`gregale jobs wait [--interactive] [--timeout <DURATION>] [--poll-interval <DURATION>] [<name>] [<run-id>]`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--interactive` | choose a Job and run |  |
+| `--timeout <DURATION>` | maximum wait duration (default 10m) |  |
+| `--poll-interval <DURATION>` | polling interval (default 2s) |  |
+
+Examples:
+
+```sh
+gregale jobs wait --interactive
+gregale jobs wait my-job RUN_ID --timeout 10m --json
+```
+
 ### jobs cancel
 
 Cancel a run
 
-`gregale jobs cancel <name> <run-id>`
+`gregale jobs cancel [--interactive] [<name>] [<run-id>]`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--interactive` | choose an unfinished run, review progress, and confirm cancellation |  |
+
+Examples:
+
+```sh
+gregale jobs cancel --interactive
+```
 
 ### jobs tasks
 
 List tasks for one run
 
-`gregale jobs tasks <name> <run-id>`
+`gregale jobs tasks [--interactive] [<name>] [<run-id>]`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--interactive` | choose a run, browse task pages, and filter unsuccessful tasks |  |
+
+Examples:
+
+```sh
+gregale jobs tasks --interactive
+```
 
 ### jobs attempts
 
 List retained attempts for one task
 
-`gregale jobs attempts <name> <run-id> <task-index>`
+`gregale jobs attempts [--interactive] [<name>] [<run-id>] [<task-index>]`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--interactive` | choose a task and inspect retained attempts and output |  |
+
+Examples:
+
+```sh
+gregale jobs attempts --interactive
+```
 
 ### jobs retry
 
 Retry one failed task
 
-`gregale jobs retry <name> <run-id> <task-index>`
+`gregale jobs retry [--interactive] [<name>] [<run-id>] [<task-index>]`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--interactive` | choose a failed task, review eligibility, and confirm one retry |  |
+
+Examples:
+
+```sh
+gregale jobs retry --interactive
+```
 
 ### jobs replay-failed
 
 Replay unsuccessful tasks in a linked run
 
-`gregale jobs replay-failed <name> <run-id>`
+`gregale jobs replay-failed [--interactive] [<name>] [<run-id>]`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--interactive` | choose a source run, review unsuccessful tasks, and confirm replay |  |
+
+Examples:
+
+```sh
+gregale jobs replay-failed --interactive
+```
 
 ### jobs artifact-url
 
 Verify a managed result and get a signed URL
 
-`gregale jobs artifact-url <name> <run-id> <task-index> <artifact-name>`
+`gregale jobs artifact-url [--interactive] [<name>] [<run-id>] [<task-index>] [<artifact-name>]`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--interactive` | choose a task and managed output artifact |  |
+
+Examples:
+
+```sh
+gregale jobs artifact-url --interactive
+gregale jobs artifact-url <name> <run-id> <task-index> <artifact-name>
+```
 
 ### jobs logs
 
 Tail logs for one task
 
-`gregale jobs logs [--max-bytes <N>] <name> <run-id> <task-index>`
+`gregale jobs logs [--interactive] [--max-bytes <N>] [<name>] [<run-id>] [<task-index>]`
 
 | Flag | Meaning | |
 |---|---|---|
+| `--interactive` | choose a Job, run, and task to inspect |  |
 | `--max-bytes <N>` | maximum log payload size (1..1048576) |  |
+
+Examples:
+
+```sh
+gregale jobs logs --interactive
+```
 
 ### jobs registry
 
@@ -3879,24 +4127,38 @@ List registry credentials for the job
 
 Store a registry credential for the job
 
-`gregale jobs registry set --registry <HOST> --user <USER> [--password-stdin] [--password <PASSWORD>] <job>`
+`gregale jobs registry set [--interactive] --registry <HOST> --user <USER> [--password-stdin] [--password <PASSWORD>] [<job>]`
 
 | Flag | Meaning | |
 |---|---|---|
+| `--interactive` | choose a Job, enter a hidden token, and review add or replace |  |
 | `--registry <HOST>` | registry host | required |
 | `--user <USER>` | registry user | required |
 | `--password-stdin` | read the password from stdin |  |
 | `--password <PASSWORD>` | registry password (prefer --password-stdin) |  |
 
+Examples:
+
+```sh
+gregale jobs registry set --interactive
+```
+
 #### jobs registry rm
 
 Remove a registry credential from the job
 
-`gregale jobs registry rm --registry <HOST> <job>`
+`gregale jobs registry rm [--interactive] [--registry <HOST>] [<job>]`
 
 | Flag | Meaning | |
 |---|---|---|
-| `--registry <HOST>` | registry host | required |
+| `--interactive` | choose a credential, review metadata, and confirm removal |  |
+| `--registry <HOST>` | registry host (required unless interactive) |  |
+
+Examples:
+
+```sh
+gregale jobs registry rm --interactive
+```
 
 
 ## automations
@@ -4653,15 +4915,17 @@ gregale deployment advance v42 --app my-api --expected-step 1
 
 Show the release diff and rollback target
 
-`gregale deployment summary --app <SLUG> <id|vN>`
+`gregale deployment summary [--interactive] [--app <SLUG>] [<id|vN>]`
 
 | Flag | Meaning | |
 |---|---|---|
-| `--app <SLUG>` | app slug | required |
+| `--interactive` | choose a release from app history and show its summary |  |
+| `--app <SLUG>` | app slug (defaults to linked context or interactive picker) |  |
 
 Examples:
 
 ```sh
+gregale deployment summary --app my-api --interactive
 gregale deployment summary v42 --app my-api
 gregale deployment summary v42 --app my-api --json
 ```
@@ -4891,6 +5155,25 @@ gregale deploy --path packages/api --source=worktree
 Manage custom domains
 
 `gregale domains [<subcommand>]`
+
+### domains setup
+
+Guide DNS setup, wait for verification and TLS, and offer a default-domain change
+
+`gregale domains setup --app <SLUG> [--environment <SLUG>] [--timeout <DURATION>] [--poll-interval <DURATION>] <domain>`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--app <SLUG>` | app to attach to | required |
+| `--environment <SLUG>` | project environment to route to |  |
+| `--timeout <DURATION>` | verification wait deadline (default 10m, maximum 1h) |  |
+| `--poll-interval <DURATION>` | verification interval (5s..1m, default 10s) |  |
+
+Examples:
+
+```sh
+gregale domains setup api.example.com --app my-api
+```
 
 ### domains list
 
@@ -7255,10 +7538,11 @@ gregale env pull --app my-api --scope staging
 
 Push KEY=VALUE pairs to sealed secrets (use --restart to apply now)
 
-`gregale env push [--app <slug>] [--scope <SCOPE>] [-f <PATH>] [--from-stdin] [--restart] [--secret-scan <MODE>]`
+`gregale env push [--dry-run] [--app <slug>] [--scope <SCOPE>] [-f <PATH>] [--from-stdin] [--restart] [--secret-scan <MODE>]`
 
 | Flag | Meaning | |
 |---|---|---|
+| `--dry-run` | preview key changes, scan findings, and quota without uploading or restarting |  |
 | `--app <slug>` | app slug (defaults to linked context) |  |
 | `--scope <SCOPE>` | env scope (defaults to linked project environment) |  |
 | `-f <PATH>` | input file (default .env) |  |
@@ -7269,6 +7553,7 @@ Push KEY=VALUE pairs to sealed secrets (use --restart to apply now)
 Examples:
 
 ```sh
+gregale env push --app my-api --dry-run
 printf 'LOG_LEVEL=info\n' | gregale env push --app my-api --from-stdin
 gregale env push --app my-api --restart
 ```
@@ -7316,7 +7601,7 @@ gregale init --template hello-node --path ./my-api
 
 ## inspect
 
-Explain an app from its runtime, deployment, API, data, scaling, and release signals (slug defaults to linked context)
+Explain an app from its runtime, deployment, API, data, scaling, and release signals (linked app or interactive picker)
 
 `gregale inspect [<slug>] [--upstreams] [--scope <scope>] [--errors] [--watch] [--interval <DURATION>] [--timeout <DURATION>] [--json]`
 
@@ -7553,54 +7838,90 @@ List grouped issues
 
 Read evidence and release history
 
-`gregale issues get --app <SLUG> <issue-id>`
+`gregale issues get --app <SLUG> [--interactive] [<issue-id>]`
 
 | Flag | Meaning | |
 |---|---|---|
 | `--app <SLUG>` | application slug | required |
+| `--interactive` | browse issues by state and order, then inspect one |  |
+
+Examples:
+
+```sh
+gregale issues get --app my-api --interactive
+gregale issues get --app <SLUG> <issue-id>
+```
 
 ### issues assign
 
 Assign an issue to an account
 
-`gregale issues assign --app <SLUG> [--assignee <UUID>] <issue-id>`
+`gregale issues assign --app <SLUG> [--interactive] [--assignee <UUID>] [<issue-id>]`
 
 | Flag | Meaning | |
 |---|---|---|
 | `--app <SLUG>` | application slug | required |
+| `--interactive` | choose an open issue, assign to yourself or unassign, and confirm ownership |  |
 | `--assignee <UUID>` | owner account UUID (empty unassigns) |  |
+
+Examples:
+
+```sh
+gregale issues assign --app my-api --interactive
+```
 
 ### issues resolve
 
 Resolve in a deployment
 
-`gregale issues resolve --app <SLUG> --deployment <UUID> <issue-id>`
+`gregale issues resolve --app <SLUG> [--interactive] [--deployment <UUID>] [<issue-id>]`
 
 | Flag | Meaning | |
 |---|---|---|
 | `--app <SLUG>` | application slug | required |
-| `--deployment <UUID>` | deployment UUID that fixed the issue | required |
+| `--interactive` | choose an open issue and fixing release, then confirm resolution |  |
+| `--deployment <UUID>` | fixing deployment UUID (required unless interactive) |  |
+
+Examples:
+
+```sh
+gregale issues resolve --app my-api --interactive
+```
 
 ### issues reopen
 
 Reopen an issue
 
-`gregale issues reopen --app <SLUG> <issue-id>`
+`gregale issues reopen --app <SLUG> [--interactive] [<issue-id>]`
 
 | Flag | Meaning | |
 |---|---|---|
 | `--app <SLUG>` | application slug | required |
+| `--interactive` | choose a resolved or ignored issue, review its state, and confirm reopening |  |
+
+Examples:
+
+```sh
+gregale issues reopen --app my-api --interactive
+```
 
 ### issues ignore
 
 Ignore until a timestamp
 
-`gregale issues ignore --app <SLUG> --until <RFC3339> <issue-id>`
+`gregale issues ignore --app <SLUG> [--interactive] [--until <RFC3339>] [<issue-id>]`
 
 | Flag | Meaning | |
 |---|---|---|
 | `--app <SLUG>` | application slug | required |
-| `--until <RFC3339>` | ignore until (RFC3339) | required |
+| `--interactive` | choose an open issue and duration, then confirm expiry |  |
+| `--until <RFC3339>` | ignore until RFC3339 (required unless interactive) |  |
+
+Examples:
+
+```sh
+gregale issues ignore --app my-api --interactive
+```
 
 ### issues impact-alert
 
@@ -8565,13 +8886,22 @@ printf '%s' "$GREGALE_TOKEN" | gregale login --token-stdin
 
 Link this checkout to a Gregale project
 
-`gregale link <project-slug> [--app <slug>] [--environment <environment>] [--no-gitignore]`
+`gregale link [<project-slug>] [--interactive] [--app <slug>] [--environment <environment>] [--no-gitignore]`
 
 | Flag | Meaning | |
 |---|---|---|
+| `--interactive` | choose project, app, and environment, review defaults, and confirm saving |  |
 | `--app <slug>` | workload/app slug for app-scoped commands |  |
 | `--environment <environment>` | default project environment scope |  |
 | `--no-gitignore` | do not add .gregale/ to .gitignore |  |
+
+Examples:
+
+```sh
+gregale link --interactive
+gregale link my-project --interactive
+gregale link my-project --app my-api --environment staging
+```
 
 
 ## logout
@@ -8623,9 +8953,21 @@ gregale --profile staging profile check --timeout 5s --json
 
 ### profile use
 
-Select the default connection
+Select the default connection or choose and check one interactively
 
-`gregale profile use <name>`
+`gregale profile use [--interactive] [--timeout <DURATION>] [<name>]`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--interactive` | choose a saved connection, check its identity, and confirm switching |  |
+| `--timeout <DURATION>` | interactive connection check deadline (default 10s) |  |
+
+Examples:
+
+```sh
+gregale profile use staging
+gregale profile use --interactive
+```
 
 ### profile remove
 
@@ -8655,12 +8997,14 @@ Create a new account (signup [--email-only EMAIL | --password-stdin])
 
 ## logs
 
-Query runtime logs and HTTP request events
+Query runtime logs and HTTP request events (linked app or interactive picker)
 
-`gregale logs [<slug>] [--follow] [--deployment <ID>] [--release <ID|vN>] [--source <SOURCE>] [--grep <SUBSTR>] [--since <15m|3d|RFC3339>] [--level <LEVEL>] [--status <100..599>] [--route <PATH>] [--request <ID>] [--trace <TRACE_ID>] [--limit <N>] [--all] [--explain] [--archive] [--instance <ID>] [--date <YYYY-MM-DD>]`
+`gregale logs [<slug>] [--view <NAME>] [--interactive] [--follow] [--deployment <ID>] [--release <ID|vN>] [--source <SOURCE>] [--grep <SUBSTR>] [--since <15m|3d|RFC3339>] [--level <LEVEL>] [--status <100..599>] [--route <PATH>] [--request <ID>] [--trace <TRACE_ID>] [--limit <N>] [--all] [--explain] [--archive] [--instance <ID>] [--date <YYYY-MM-DD>]`
 
 | Flag | Meaning | |
 |---|---|---|
+| `--view <NAME>` | reuse a named local log view (only app target may be supplied alongside) |  |
+| `--interactive` | choose source, time window, and filters and show the equivalent command |  |
 | `--follow` | stream logs until interrupted |  |
 | `--deployment <ID>` | deployment id or vN revision (default: latest) |  |
 | `--release <ID|vN>` | release id or revision (alias for --deployment) |  |
@@ -8682,9 +9026,52 @@ Query runtime logs and HTTP request events
 Examples:
 
 ```sh
+gregale logs my-api --interactive
 gregale logs my-api --follow
 gregale logs my-api --since 1h --level error
+gregale logs views save runtime-errors --since 1h --level error
+gregale logs my-api --view runtime-errors
 ```
+
+### logs views
+
+Manage reusable local log filters
+
+#### logs views list
+
+List saved log views
+
+`gregale logs views list`
+
+#### logs views show
+
+Show saved filters
+
+`gregale logs views show <name>`
+
+#### logs views delete
+
+Delete a local log view
+
+`gregale logs views delete <name>`
+
+#### logs views save
+
+Save filters as a named view
+
+`gregale logs views save [--source <SOURCE>] [--since <DURATION>] [--level <LEVEL>] [--grep <TEXT>] [--follow] [--status <100..599>] [--route <PATH>] [--limit <1..200>] [--replace] <name>`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--source <SOURCE>` | runtime (default) or http | one of `runtime` · `http` |
+| `--since <DURATION>` | relative window (default 15m) |  |
+| `--level <LEVEL>` | runtime log level |  |
+| `--grep <TEXT>` | runtime text filter |  |
+| `--follow` | follow runtime output |  |
+| `--status <100..599>` | exact HTTP status |  |
+| `--route <PATH>` | HTTP route filter |  |
+| `--limit <1..200>` | HTTP page size (default 100) |  |
+| `--replace` | replace an existing view |  |
 
 
 ## metrics
@@ -8772,9 +9159,14 @@ Disable MFA
 
 ## open
 
-Open the app&#39;s URL (slug defaults to linked context)
+Open the app&#39;s URL (linked app or interactive picker)
 
-`gregale open [<subcommand>] [<slug>]`
+`gregale open [<subcommand>] [<slug>] [--app <SLUG>] [--dashboard]`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--app <SLUG>` | app slug (same as the &lt;slug&gt; positional; defaults to linked context) |  |
+| `--dashboard` | open the dashboard page instead of the live URL |  |
 
 ### open docs
 
@@ -9624,10 +10016,11 @@ Show bearer token rotation state
 
 Restore a previous deployment, or check an exact historical rollback
 
-`gregale rollback [<subcommand>] <slug> [--to <deployment_id|vN>] [--expected-current <deployment_id|vN>] [--reason <TEXT>] [--wait] [--timeout <duration>] [--poll-interval <duration>] [--json]`
+`gregale rollback [<subcommand>] <slug> [--interactive] [--to <deployment_id|vN>] [--expected-current <deployment_id|vN>] [--reason <TEXT>] [--wait] [--timeout <duration>] [--poll-interval <duration>] [--json]`
 
 | Flag | Meaning | |
 |---|---|---|
+| `--interactive` | choose and review a historical release, confirm, and follow rollback progress |  |
 | `--to <deployment_id|vN>` | target deployment id or vN revision (e.g. v41) |  |
 | `--expected-current <deployment_id|vN>` | exact completed serving deployment; requires --to |  |
 | `--reason <TEXT>` | one-line reason of at most 256 bytes; requires --expected-current |  |
@@ -9639,6 +10032,7 @@ Restore a previous deployment, or check an exact historical rollback
 Examples:
 
 ```sh
+gregale rollback my-api --interactive
 gregale rollback my-api
 gregale rollback my-api --to v41
 gregale rollback my-api --to v41 --expected-current v42 --wait
@@ -10004,20 +10398,27 @@ Plan a promotion
 
 #### projects environments promote
 
-Promote workloads
+Promote workloads or choose environments interactively
 
-`gregale projects environments promote --from <ENV> --to <ENV> [--sync-config] [--yes] [--idempotency-key <KEY>] [--wait] [--progress] [--timeout <SECONDS|DURATION>]`
+`gregale projects environments promote [--interactive] [--from <ENV>] [--to <ENV>] [--sync-config] [--yes] [--idempotency-key <KEY>] [--wait] [--progress] [--timeout <SECONDS|DURATION>]`
 
 | Flag | Meaning | |
 |---|---|---|
-| `--from <ENV>` | source environment | required |
-| `--to <ENV>` | target environment | required |
+| `--interactive` | choose source and destination, review changes, confirm, and follow progress |  |
+| `--from <ENV>` | source environment (required unless interactive) |  |
+| `--to <ENV>` | target environment (required unless interactive) |  |
 | `--sync-config` | copy source non-secret environment configuration to the target |  |
 | `--yes` | confirm the promotion |  |
 | `--idempotency-key <KEY>` | stable key for retrying this promotion |  |
 | `--wait` | wait for the promotion to reach a terminal status |  |
 | `--progress` | print promotion transitions while waiting (human output only) |  |
 | `--timeout <SECONDS|DURATION>` | maximum wait for promotion completion (seconds, or a duration such as 10m) |  |
+
+Examples:
+
+```sh
+gregale projects environments promote my-project --interactive
+```
 
 #### projects environments status
 
@@ -10163,11 +10564,12 @@ gregale secrets list --app my-api --older-than 90d
 
 Set a sealed secret; ephemeral values disable VM snapshots for the scope
 
-`gregale secrets set --app <slug> [--from-stdin] [--scope <SCOPE>] [--class <CLASS>] [--restart] [<KEY=VALUE>...]`
+`gregale secrets set --app <slug> [--interactive] [--from-stdin] [--scope <SCOPE>] [--class <CLASS>] [--restart] [<KEY=VALUE>...]`
 
 | Flag | Meaning | |
 |---|---|---|
 | `--app <slug>` | app slug | required |
+| `--interactive` | enter hidden values and confirm names, scope, and retention before saving |  |
 | `--from-stdin` | read KEY=VALUE pairs from stdin |  |
 | `--scope <SCOPE>` | env scope to write (defaults to linked project environment) |  |
 | `--class <CLASS>` | retention: persistent by default; ephemeral disables init/warm captures and forces cold boots; omission preserves an existing class | one of `persistent` · `ephemeral` |
@@ -10176,6 +10578,7 @@ Set a sealed secret; ephemeral values disable VM snapshots for the scope
 Examples:
 
 ```sh
+gregale secrets set --app my-api --interactive
 gregale secrets set --app my-api DATABASE_URL="$DATABASE_URL"
 printf '%s\n' "DATABASE_URL=$DATABASE_URL" | gregale secrets set --app my-api --from-stdin
 gregale secrets set --app my-api DATABASE_URL="$DATABASE_URL" --restart
@@ -10186,10 +10589,11 @@ gregale secrets set --app my-api SESSION_TOKEN="$SESSION_TOKEN" --class ephemera
 
 Remove a sealed secret (alias: rm)
 
-`gregale secrets unset --app <slug> [--scope <SCOPE>] [--restart] [--wait-for-ack] [--timeout <DURATION>] <KEY>`
+`gregale secrets unset [--interactive] --app <slug> [--scope <SCOPE>] [--restart] [--wait-for-ack] [--timeout <DURATION>] [<KEY>]`
 
 | Flag | Meaning | |
 |---|---|---|
+| `--interactive` | choose a secret name, review scope and runtime options, and confirm removal |  |
 | `--app <slug>` | app slug | required |
 | `--scope <SCOPE>` | env scope to delete from (defaults to linked project environment) |  |
 | `--restart` | restart the app so running instances drop the removed secret now |  |
@@ -10199,6 +10603,7 @@ Remove a sealed secret (alias: rm)
 Examples:
 
 ```sh
+gregale secrets unset --app my-api --interactive
 gregale secrets unset --app my-api OLD_API_KEY
 gregale secrets unset --app my-api OLD_API_KEY --scope staging
 gregale secrets unset --app my-api OLD_API_KEY --wait-for-ack
@@ -10930,9 +11335,25 @@ Show the authenticated account
 
 ## completion
 
-Print a shell completion script (bash|zsh|fish|powershell)
+Generate shell completion scripts or install them interactively
 
 `gregale completion [<subcommand>]`
+
+### completion install
+
+Choose a shell, review files, and confirm completion setup
+
+`gregale completion install --interactive`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--interactive` | guide shell completion installation | required |
+
+Examples:
+
+```sh
+gregale completion install --interactive
+```
 
 ### completion bash
 
