@@ -341,9 +341,9 @@ jobs:
   tests:
     name: "light: tests (shard ${{ matrix.shard }})"
     runs-on: ubuntu-latest
-    # A PR touching pkg/state runs a third of its race tests (~10-12 min)
-    # beside its other packages after a cold compile; 20 min cancels it.
-    timeout-minutes: 30
+    # Cold API race compilation can take 14 minutes; allow setup and the
+    # existing 16-minute per-package test budget to finish afterward.
+    timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
@@ -430,6 +430,17 @@ jobs:
           set -euo pipefail
           PKGS="$(python3 scripts/ci/affected_packages.py test --shard "$SHARD" --shards 3 < "$RUNNER_TEMP/changed-paths.txt")"
           SPLIT="$(python3 scripts/ci/affected_packages.py split < "$RUNNER_TEMP/changed-paths.txt")"
+          # The API integration suite also needs test-name sharding. Keep every
+          # selected API test while avoiding a whole-suite run on shard 1.
+          SELECTED_PKGS="$(python3 scripts/ci/affected_packages.py test --shard 1 --shards 1 < "$RUNNER_TEMP/changed-paths.txt")"
+          if [[ " $SELECTED_PKGS " == *" ./cmd/apid "* ]]; then
+            read -r -a TEST_PACKAGES <<< "$PKGS"
+            PKGS=""
+            for pkg in "${TEST_PACKAGES[@]}"; do
+              if [[ "$pkg" != ./cmd/apid ]]; then PKGS+=" $pkg"; fi
+            done
+            SPLIT="$SPLIT ./cmd/apid"
+          fi
           if [[ -z "$PKGS" && -z "$SPLIT" ]]; then
             echo "no affected Go packages assigned to shard $SHARD"
             exit 0
