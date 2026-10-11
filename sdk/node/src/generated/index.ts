@@ -474,6 +474,7 @@ export type { DurableEntityRetryResponse } from './models/DurableEntityRetryResp
 export type { DurableEntityScope } from './models/DurableEntityScope.js';
 export type { DurableEntityStateExport } from './models/DurableEntityStateExport.js';
 export type { DurableEntityValidatorDeploymentInfo } from './models/DurableEntityValidatorDeploymentInfo.js';
+export type { EdgeProtectionResponse } from './models/EdgeProtectionResponse.js';
 export type { EdgeRuleAsyncAction } from './models/EdgeRuleAsyncAction.js';
 export type { EdgeRuleBudgetAction } from './models/EdgeRuleBudgetAction.js';
 export type { EdgeRuleCacheAction } from './models/EdgeRuleCacheAction.js';
@@ -503,6 +504,8 @@ export type { EdgeRuleStatsResponse } from './models/EdgeRuleStatsResponse.js';
 export type { EdgeRuleSuggestion } from './models/EdgeRuleSuggestion.js';
 export type { EdgeRuleThrottleAction } from './models/EdgeRuleThrottleAction.js';
 export type { EdgeRuleValidateAction } from './models/EdgeRuleValidateAction.js';
+export type { EdgeRuleValidateParameters } from './models/EdgeRuleValidateParameters.js';
+export type { EdgeRuleWAFAction } from './models/EdgeRuleWAFAction.js';
 export type { EgressCircuitBreakerPolicy } from './models/EgressCircuitBreakerPolicy.js';
 export type { EgressFlowLogEntry } from './models/EgressFlowLogEntry.js';
 export type { EgressFlowLogResponse } from './models/EgressFlowLogResponse.js';
@@ -1290,6 +1293,7 @@ export type { PlatformTenantUsageBucketResponse } from './models/PlatformTenantU
 export type { PlatformTenantUsageResponse } from './models/PlatformTenantUsageResponse.js';
 export type { PlatformTenantWebhookListResponse } from './models/PlatformTenantWebhookListResponse.js';
 export type { PlatformTenantWebhookResponse } from './models/PlatformTenantWebhookResponse.js';
+export type { PreAuthEnforcementSuggestion } from './models/PreAuthEnforcementSuggestion.js';
 export type { PreAuthFailedResponseLimit } from './models/PreAuthFailedResponseLimit.js';
 export type { PreAuthObservationsResponse } from './models/PreAuthObservationsResponse.js';
 export type { PreAuthPolicyObservation } from './models/PreAuthPolicyObservation.js';
