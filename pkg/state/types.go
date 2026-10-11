@@ -7667,6 +7667,7 @@ type EdgeRuleRedirectAction struct {
 	StatusCode int               `json:"status_code"`
 	To         string            `json:"to"`
 	Headers    map[string]string `json:"headers,omitempty"`
+	Template   bool              `json:"template,omitempty"` // ADR-968
 }
 
 // EdgeRuleHeaderOp is one mutation. Action ∈ {add,set,remove}; Value
@@ -7674,9 +7675,10 @@ type EdgeRuleRedirectAction struct {
 // blacklist (Host, Content-Length, Transfer-Encoding, Connection,
 // x-faas-*) at apply time.
 type EdgeRuleHeaderOp struct {
-	Name   string `json:"name"`
-	Value  string `json:"value,omitempty"`
-	Action string `json:"action"`
+	Name     string `json:"name"`
+	Value    string `json:"value,omitempty"`
+	Action   string `json:"action"`
+	Template bool   `json:"template,omitempty"` // ADR-968
 }
 
 // EdgeRuleHeadersAction mutates request headers BEFORE auth and
