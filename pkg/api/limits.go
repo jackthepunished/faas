@@ -9324,12 +9324,75 @@ const (
 	RouteHealthProbeUnauthenticatedShare = 0.5
 )
 
+// ServiceWakeAhead bounds opt-in wake-ahead along measured service edges
+// (ADR-977). A cold wake of a caller app opens a follow window; a service call
+// from that caller inside it is a hit for the edge. A target is woken ahead
+// only after ServiceWakeAheadMinWakes observed caller wakes, when at least
+// ServiceWakeAheadMinCallShare of them called it and at least
+// ServiceWakeAheadMinColdShare of those calls found it parked (or warm only
+// because of a wake-ahead). Wake-ahead never starts while fleet residency is
+// at or above ServiceWakeAheadMaxResidentPercent of the admission ceiling.
+const (
+	ServiceWakeAheadFollowWindow       = 10 * time.Second
+	ServiceWakeAheadMinWakes           = 20
+	ServiceWakeAheadMinCallShare       = 0.5
+	ServiceWakeAheadMinColdShare       = 0.5
+	ServiceWakeAheadMaxTargets         = 3
+	ServiceWakeAheadMaxDepth           = 2
+	ServiceWakeAheadMaxResidentPercent = 60
+	ServiceWakeAheadMaxApps            = 4096
+	ServiceWakeAheadMaxEdgesPerApp     = 16
+	// Edge statistics halve once a caller has this many observed wakes, so
+	// the prediction follows changes in the call pattern.
+	ServiceWakeAheadDecayWakes  = 200
+	ServiceWakeAheadWakeTimeout = 30 * time.Second
+	// The opt-in setting and fleet residency are cached this long.
+	ServiceWakeAheadCacheTTL = 30 * time.Second
+)
+
+// RoutePriority bounds per-app route priorities for the warm-capacity queue
+// (ADR-978): at most RoutePriorityMaxRules rules, cached by each gateway for
+// RoutePriorityCacheTTL and read only when a request has to queue.
+const (
+	RoutePriorityMaxRules = 20
+	RoutePriorityCacheTTL = 30 * time.Second
+	RoutePriorityMaxApps  = 4096
+)
+
 // RouteHealthPooled bounds stage-pooled evidence for low-traffic routes
 // (ADR-846): two equal halves of at least RouteHealthPooledMinSpan in total,
 // covering at most the newest RouteHealthPooledMaxSpan of the stage.
 const (
 	RouteHealthPooledMinSpan = 4 * time.Minute
 	RouteHealthPooledMaxSpan = 30 * time.Minute
+)
+
+// RouteAdvice bounds the route advisor (ADR-976): it reads retained request
+// telemetry for the busiest RouteAdviceMaxRoutes routes and only suggests a
+// rule for a route with at least RouteAdviceMinRequests in the window.
+const (
+	RouteAdviceDefaultSince = 7 * 24 * time.Hour
+	RouteAdviceMaxRoutes    = 50
+	RouteAdviceMinRequests  = 200
+	// A cache suggestion needs this share of anonymous 2xx traffic and an
+	// estimated hit share of at least RouteAdviceCacheMinHitShare.
+	RouteAdviceCacheMinAnonymousShare = 0.95
+	RouteAdviceCacheMinHitShare       = 0.2
+	// An async suggestion needs this share of timed-out requests (and at
+	// least RouteAdviceAsyncMinTimeouts of them) or a p95 at or above
+	// RouteAdviceAsyncMinP95.
+	RouteAdviceAsyncMinTimeoutShare = 0.01
+	RouteAdviceAsyncMinTimeouts     = 5
+	RouteAdviceAsyncMinP95          = 10 * time.Second
+	// A throttle suggestion needs one consumer with at least this share of
+	// the route, another consumer to protect, anonymous traffic at or below
+	// RouteAdviceThrottleMaxAnonymousShare, and an estimated throttled share
+	// of at least RouteAdviceThrottleMinExcessShare. The suggested limit is
+	// RouteAdviceThrottleHeadroom times the next busiest consumer's peak.
+	RouteAdviceThrottleMinTopShare       = 0.5
+	RouteAdviceThrottleMaxAnonymousShare = 0.01
+	RouteAdviceThrottleMinExcessShare    = 0.01
+	RouteAdviceThrottleHeadroom          = 2
 )
 
 // RouteHealth bounds the opt-in observed-traffic canary guard (ADR-454).
