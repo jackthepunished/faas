@@ -1742,6 +1742,7 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("PUT /v1/apps/{slug}/consumer-plans/{plan_id}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.updateAPIConsumerPlanLimits))))
 	mux.HandleFunc("GET /v1/apps/{slug}/consumers/{consumer_id}/plan-assignments", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listAPIConsumerPlanAssignments))))
 	mux.HandleFunc("POST /v1/apps/{slug}/consumers/{consumer_id}/plan-assignments", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.assignAPIConsumerPlan)))))
+	mux.HandleFunc("GET /v1/apps/{slug}/consumers/{consumer_id}/usage-alerts", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listAPIConsumerUsageAlerts))))
 	mux.HandleFunc("GET /v1/apps/{slug}/consumers/{consumer_id}/usage/quote", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getAPIConsumerUsageQuote))))
 	mux.HandleFunc("GET /v1/apps/{slug}/consumers/{consumer_id}/usage-completeness", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getAPIConsumerUsageCompleteness))))
 	// Durable API consumer usage statements snapshot the quote for an explicit

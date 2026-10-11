@@ -850,7 +850,9 @@ type MemStore struct {
 	// apiConsumerTelemetryHours is seeded by tests; the in-memory store keeps
 	// no request telemetry of its own (ADR-954).
 	apiConsumerTelemetryHours map[string]APIConsumerTelemetryHour
-	apiConsumerUsageEvents    map[string]usageEventIdentity
+	// apiConsumerUsageAlerts are recorded plan alert crossings (ADR-849).
+	apiConsumerUsageAlerts []APIConsumerUsageAlert
+	apiConsumerUsageEvents map[string]usageEventIdentity
 	// apiConsumerRateCards is keyed by card ID. The production table is
 	// append-only and unique on (app_id, effective_from); MemStore mirrors
 	// both invariants for handler tests.

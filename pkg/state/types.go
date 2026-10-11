@@ -954,8 +954,21 @@ type PlatformTenantRateCard struct {
 	Currency               string
 	Unit                   string
 	PriceMillicentsPerUnit int64
-	EffectiveFrom          time.Time
-	CreatedAt              time.Time
+	// IncludedUnitsPerMonth are free units per tenant per UTC calendar month
+	// across every attributed app (ADR-975).
+	IncludedUnitsPerMonth int64
+	// Tiers is an optional graduated ladder counted per tenant per UTC month
+	// across every attributed app (ADR-975); it replaces the flat price and
+	// allowance, and PriceMillicentsPerUnit records the last step's price.
+	Tiers         []APIConsumerRateCardTier
+	EffectiveFrom time.Time
+	CreatedAt     time.Time
+}
+
+// MonthlyPricing reports whether the card prices usage by its position in
+// the tenant's UTC month, so statements must re-price whole months.
+func (c PlatformTenantRateCard) MonthlyPricing() bool {
+	return c.IncludedUnitsPerMonth > 0 || len(c.Tiers) > 0
 }
 
 // APIConsumerUsageStatementStatus is the lifecycle of an immutable usage
@@ -3689,6 +3702,7 @@ const (
 	AppWebhookEventPreviewCreated                   AppWebhookEvent = "preview.created"
 	AppWebhookEventBudgetThreshold                  AppWebhookEvent = "budget.threshold"
 	AppWebhookEventUsageStatementFinalized          AppWebhookEvent = "usage_statement.finalized"
+	AppWebhookEventConsumerUsageThreshold           AppWebhookEvent = "consumer.usage_threshold"
 	AppWebhookEventPlatformTenantStatementFinalized AppWebhookEvent = "platform_tenant.statement.finalized"
 	AppWebhookEventDebugRegressionDetected          AppWebhookEvent = "debug.regression.detected"
 	AppWebhookEventDebugRegressionResolved          AppWebhookEvent = "debug.regression.resolved"
@@ -3755,6 +3769,7 @@ var AllAppWebhookEvents = []AppWebhookEvent{
 	AppWebhookEventPreviewCreated,
 	AppWebhookEventBudgetThreshold,
 	AppWebhookEventUsageStatementFinalized,
+	AppWebhookEventConsumerUsageThreshold,
 	AppWebhookEventPlatformTenantStatementFinalized,
 	AppWebhookEventDebugRegressionDetected,
 	AppWebhookEventDebugRegressionResolved,
