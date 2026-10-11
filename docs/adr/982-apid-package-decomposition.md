@@ -1,4 +1,4 @@
-# ADR-977: Decompose cmd/apid into pkg/apid domain packages
+# ADR-982: Decompose cmd/apid into pkg/apid domain packages
 
 - **Status:** accepted
 - **Date:** 2026-10-11

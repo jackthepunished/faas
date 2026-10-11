@@ -792,6 +792,6 @@ A renumber plus a CI uniqueness gate is worth its own PR.
 
 - [ADR-948: Built validator artifacts and project publication](948-built-validator-artifacts-and-project-publication.md)
 
-- [ADR-967: Scenario TCP fault injection](967-scenario-tcp-fault-injection.md)
+- [ADR-981: Scenario TCP fault injection](981-scenario-tcp-fault-injection.md)
 
-- [ADR-977: Decompose cmd/apid into pkg/apid domain packages](977-apid-package-decomposition.md)
+- [ADR-982: Decompose cmd/apid into pkg/apid domain packages](982-apid-package-decomposition.md)

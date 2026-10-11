@@ -4718,7 +4718,7 @@ func bearerToken(r *http.Request) string {
 }
 
 // writeJSON, decodeJSON, decodeJSONSized and notFound are facades over
-// pkg/apid/httpkit (ADR-977); new and lifted code calls httpkit directly.
+// pkg/apid/httpkit (ADR-982); new and lifted code calls httpkit directly.
 func writeJSON(w http.ResponseWriter, status int, v any) { httpkit.WriteJSON(w, status, v) }
 
 const defaultJSONBodyMaxBytes = httpkit.DefaultJSONBodyMaxBytes
