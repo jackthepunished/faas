@@ -4453,6 +4453,13 @@ const (
 	// still books BillableRAMMB. See MeasuredChargeMB.
 	MeasuredChargeFloorMB         = 64
 	MeasuredChargeHeadroomPercent = 25
+	// The sample a measured charge starts from is the larger of an
+	// instance's latest resident memory and its p95 over the last
+	// MeasuredChargeWindowSeconds, sampled every MeasuredChargeSampleSeconds
+	// (ADR-909 proposal 1).
+	MeasuredChargeWindowSeconds = 600
+	MeasuredChargeSampleSeconds = 5
+	MeasuredChargePercentile    = 95
 	// MeasuredAdmissionMaxOvercommitPercent caps reservations on a node
 	// under measured admission (ADR-909): Σ(ram_mb + 8) may reach this
 	// share of the admission ceiling while measured charges stay under the
@@ -4460,6 +4467,10 @@ const (
 	// measurement may be before admission falls back to reservations.
 	MeasuredAdmissionMaxOvercommitPercent = 200
 	MeasuredAdmissionSampleMaxAgeMillis   = 2000
+	// MeasuredEvictionTargetPercent: under measured admission, when a node's
+	// measured memory exceeds its admission ceiling, schedd evicts until it
+	// is back under this share of the ceiling (ADR-909 proposal 3).
+	MeasuredEvictionTargetPercent = 90
 	// SnapshotVMOverheadMB is temporary host-side headroom applied only while
 	// Firecracker creates a full snapshot. The snapshot operation allocates
 	// bookkeeping and copy-on-write pages in the host process in addition to
