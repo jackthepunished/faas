@@ -13,6 +13,7 @@ Automation: put `--non-interactive` before the command to disable prompts and br
 | [`bucket`](#bucket) | Manage object encryption, Object Lock, copy sources, tags, versioning, lifecycle rules, receipts and capacity |
 | [`bindings`](#bindings) | Inspect app bindings, verification, runtime freshness, and rotation progress |
 | [`capabilities`](#capabilities) | Show feature maturity and plan availability |
+| [`ai`](#ai) | AI gateway: providers, hard token and cost caps, per-app guardrails, prices, usage, routes, key pools, alerts and request logs |
 | [`alerts`](#alerts) | Per-app alert rules (alerts list\|add\|info\|update\|rm\|rotate-secret\|preset\|actions --app &lt;slug&gt;) |
 | [`audit-events`](#audit-events) | Audit-log query (audit-events list\|get &lt;id&gt;) |
 | [`commit`](#commit) | Manage transactional PostgreSQL outbox sources (internal) |
@@ -1367,6 +1368,128 @@ gregale bindings smoke public-api billing --caller-deployment v12 --target-deplo
 Show feature maturity and plan availability
 
 `gregale capabilities`
+
+
+## ai
+
+AI gateway: providers, hard token and cost caps, per-app guardrails, prices, usage, routes, key pools, alerts and request logs
+
+`gregale ai [<subcommand>]`
+
+Examples:
+
+```sh
+gregale ai policy <integration-id> --provider anthropic --daily-tokens 2000000 --daily-cost 25 --request-log on
+gregale ai guardrails <integration-id> --app my-api --rpm 60 --models 'gpt-4o-mini,o3*' --max-output-tokens 2048
+gregale ai prices set <integration-id> --price model=gpt-4o-mini,input=0.15,cached=0.075,output=0.60
+gregale ai usage <integration-id> --date 2026-10-11
+gregale ai routes create --name chat --format openai --target <openai-id> --target <anthropic-id>:claude-sonnet-4
+printf '%s\n' "$SECOND_KEY" | gregale ai keys add <integration-id> --label second --from-stdin
+gregale ai logs <integration-id> --limit 20
+```
+
+### ai policy
+
+Set the AI provider and token or cost limits (unchanged flags keep their values)
+
+`gregale ai policy [--provider <PROVIDER>] [--daily-tokens <N>] [--daily-cost <EUR>] [--monthly-cost <EUR>] [--request-log <on|off>] <integration-id>`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--provider <PROVIDER>` | AI provider | one of `openai` · `anthropic` · `gemini` · `azure_openai` · `bedrock` · `vertex` · `off` |
+| `--daily-tokens <N>` | UTC-day input+output token limit, or none |  |
+| `--daily-cost <EUR>` | UTC-day cost limit in EUR, or none |  |
+| `--monthly-cost <EUR>` | calendar-month cost limit in EUR, or none |  |
+| `--request-log <on|off>` | log per-call metadata for 7 days | one of `on` · `off` |
+
+### ai app-limit
+
+Set or clear one app&#39;s own daily AI token limit
+
+`gregale ai app-limit --app <slug> --daily-tokens <N> <integration-id>`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--app <slug>` | bound app slug | required |
+| `--daily-tokens <N>` | token limit, or none | required |
+
+### ai guardrails
+
+Set one app&#39;s per-minute limits, model allow-list and output-token ceiling (unchanged flags keep their values)
+
+`gregale ai guardrails --app <slug> [--rpm <N>] [--tpm <N>] [--models <LIST>] [--max-output-tokens <N>] <integration-id>`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--app <slug>` | bound app slug | required |
+| `--rpm <N>` | admitted calls per UTC minute, or none |  |
+| `--tpm <N>` | tokens per UTC minute, or none |  |
+| `--models <LIST>` | comma-separated models or prefixes ending in *, or none |  |
+| `--max-output-tokens <N>` | per-request output-token ceiling, or none |  |
+
+### ai prices
+
+Show the price list, or replace it with: prices set &lt;integration-id&gt; --price ...
+
+`gregale ai prices [--price <SPEC>] [set] <integration-id>`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--price <SPEC>` | model=PREFIX,input=EUR,output=EUR[,cached=EUR][,cache-write=EUR] per million tokens (repeat; none clears) |  |
+
+### ai usage
+
+Show one UTC day of token usage and cost by caller and model
+
+`gregale ai usage [--date <YYYY-MM-DD>] <integration-id>`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--date <YYYY-MM-DD>` | UTC day within the last 90 days |  |
+
+### ai routes
+
+List, create, update (set) or delete (rm) AI fallback routes
+
+`gregale ai routes [--name <NAME>] [--format <FORMAT>] [--target <TARGET>] <list|create|set|rm> [<route-id>]`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--name <NAME>` | route name for create |  |
+| `--format <FORMAT>` | route format for create: native or openai (translates OpenAI chat completions) | one of `native` · `openai` |
+| `--target <TARGET>` | &lt;integration-id&gt;[:&lt;model&gt;] in fallback order (repeat) |  |
+
+### ai keys
+
+List, add (value from stdin) or remove (rm) extra provider keys
+
+`gregale ai keys [--label <LABEL>] [--from-stdin] <list|add|rm> <integration-id> [<key-id>]`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--label <LABEL>` | key label for add |  |
+| `--from-stdin` | read the key value from stdin for add |  |
+
+### ai alerts
+
+List budget alerts recorded at 80% and 100%
+
+`gregale ai alerts [--limit <N>] <integration-id>`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--limit <N>` | alerts to show, 1 to 100 |  |
+
+### ai logs
+
+Page the opt-in AI request log, newest first
+
+`gregale ai logs [--limit <N>] [--before <TIME>] <integration-id>`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--limit <N>` | calls to show, 1 to 200 |  |
+| `--before <TIME>` | show calls before this RFC 3339 time |  |
 
 
 ## alerts

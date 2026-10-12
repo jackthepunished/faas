@@ -676,6 +676,52 @@ const (
 // below are at or below this value. See ADR-257.
 const MaxOutboundRequestsPerDay int64 = 100_000_000
 
+// AI gateway bounds on outbound integrations (ADR-988). The token limit is a
+// structural bound on a customer-selected spend guard for the customer's own
+// provider key, not a plan allowance. Usage rows are UTC-day rollups; the
+// model cap stops a customer-chosen origin from inflating them.
+const (
+	MaxOutboundAITokensPerDay        int64 = 100_000_000_000
+	OutboundAIUsageRetentionDays           = 90
+	OutboundAIUsageModelsPerDay            = 32
+	OutboundAIModelNameMaxBytes            = 128
+	OutboundAIUsageJSONParseMaxBytes       = 1 << 20
+	OutboundAIUsageEventMaxBytes           = 256 << 10
+	// OutboundAIMaxTokensPerResponse clamps each provider-reported count so
+	// a misbehaving origin cannot overflow the daily rollup counters.
+	OutboundAIMaxTokensPerResponse int64 = 1_000_000_000
+	// OutboundAIRequestBufferMaxBytes bounds the AI POST body the gateway
+	// keeps for retries, exact-match caching and route fallback (ADR-990).
+	// Larger bodies stream unbuffered without those features.
+	OutboundAIRequestBufferMaxBytes int64 = 4 << 20
+	// Customer price lists and cost budgets (ADR-990). Prices are millicents
+	// per million tokens; cost limits are millicents per UTC day or month.
+	MaxOutboundAICostMillicents         int64 = 1_000_000_000_000
+	MaxOutboundAIPriceMillicentsPerMTok int64 = 1_000_000_000
+	OutboundAIPriceEntriesMax                 = 64
+	// AI fallback routes (ADR-990).
+	OutboundAIRouteTargetsMax     = 5
+	MaxOutboundAIRoutesPerAccount = 25
+	// Admission-time reservations (ADR-991): the output reserve when a call
+	// names no output ceiling, and the bytes per estimated input token.
+	OutboundAIDefaultOutputReserveTokens int64 = 4096
+	OutboundAIReserveBytesPerToken       int64 = 4
+	// Per-app AI guardrails on a binding (ADR-991).
+	MaxOutboundAIRequestsPerMinute       = 100_000
+	MaxOutboundAITokensPerMinute   int64 = 1_000_000_000
+	MaxOutboundAIMaxOutputTokens         = 1_000_000
+	OutboundAIAllowedModelsMax           = 32
+	// Extra sealed provider keys per integration (ADR-991) and the local
+	// cooldown a key gets after a 429 without Retry-After.
+	OutboundIntegrationCredentialKeysMax        = 8
+	OutboundCredentialKeyDefaultCooldownSeconds = 30
+	OutboundAIRequestLogRetentionDays           = 7
+	OutboundAIRequestLogPageMax                 = 200
+	OutboundAIBudgetAlertsPageMax               = 100
+	OutboundAIBudgetAlertWarnPercent            = 80
+	OutboundAIBudgetAlertFullPercent            = 100
+)
+
 // Operator-only managed realtime resume preview safety bounds. These are not
 // plan entitlements or a billing allowance; product limits are decided before
 // the preview is promoted.
