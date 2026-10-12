@@ -1960,11 +1960,24 @@ func (s *server) deleteApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 // open. The tombstone lookup is deliberately separate from loadApp so normal
 // customer reads continue to hide deleted slugs.
 func (s *server) restoreApp(w http.ResponseWriter, r *http.Request, acct state.Account) {
+	expectedID, err := readLegacyRestoreIdentity(r)
+	if err != nil {
+		api.WriteProblem(w, api.ErrValidation("restore accepts only a valid optional expected_app_id"))
+		return
+	}
 	app, err := s.store.AppBySlugIncludingDeleted(r.Context(), r.PathValue("slug"))
 	if err != nil || app.AccountID != acct.ID {
 		s.notFound(w, "no such app")
 		return
 	}
+	if expectedID != "" && app.ID != expectedID {
+		writeRestoreIdentityConflict(w)
+		return
+	}
+	s.restoreOwnedApp(w, r, acct, app)
+}
+
+func (s *server) restoreOwnedApp(w http.ResponseWriter, r *http.Request, acct state.Account, app state.App) {
 	limits := api.MustLimitsFor(acct.Plan)
 	restored, err := s.restoreAppWithActivity(r.Context(), r, acct, app, limits)
 	if err != nil {
@@ -1976,7 +1989,7 @@ func (s *server) restoreApp(w http.ResponseWriter, r *http.Request, acct state.A
 		if errors.Is(err, state.ErrConflict) {
 			api.WriteProblem(w, api.NewProblem(http.StatusConflict,
 				api.CodeAppNotRestorable, "App not restorable",
-				"the seven-day app deletion grace window has lapsed"))
+				"the deletion window is closed or the app cannot be restored in its current state"))
 			return
 		}
 		api.WriteProblem(w, api.ErrCapacity("could not restore app"))
