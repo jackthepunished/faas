@@ -2,12 +2,28 @@
 
 ## Delivery status
 
-The user requested a PR for the work already done and a durable handoff, deferring further implementation after recurring filesystem/resource failures. Implementation is stopped. Nothing was merged, deployed, or tested against customer/provider traffic.
+The user freed storage and authorized continuing K–M inline. K implementation has resumed and is now implemented locally; publication and final checks are recorded below. Nothing was merged, deployed, or tested against customer/provider traffic. Earlier K/runtime sections below are retained as historical evidence and are superseded by this checkpoint.
+
+### Resume checkpoint — K implementation
+
+- Fresh immutable main pins: frontend `b583966538e6097b3270c3c010c353e65115f554`; backend `35a53399ad554ba7ff39dd07eb707e683294ca0e`. Relevant backend contracts remain unchanged from `e9527df9`. Dirty main worktrees remain untouched.
+- Backend store remains draft #4614. Separate API branch `feat/deleted-app-recovery-api` is based on published store/handoff `5ebdf37`. Local API commit `68194b1b0d18396c667f0d383f8957ed3af5b189` has the exact same tree `b3fad628cd96a11be0e0d7ab2a2f4f1e7b59d170` as published API commit `57262165306f7377dc223441c933b9d3445dfb61`.
+- API implements owned bounded GET `/v1/deleted-apps`, exact-ID GET, and dedicated POST `/v1/deleted-apps/{id}/restore`, strict account-bound cursor/query/body validation, lifecycle blockers, exact-ID/slug-collision fencing, Go SDK and mirrored OpenAPI. Existing deploy-write/MFA/origin/quota/purge protections remain. Dedicated restore has no idempotent replay or legacy fallback.
+- Frontend branch `feat/console-deleted-app-recovery`, base J: atomic commits `cf4e242` contract/read client, `e6934da` durable reviewed restore, `fbc51f3` Recently deleted inventory/review/reconciliation/route/mock. Follow-up regression/format cleanup is pending commit. This is a real journey, not a placeholder.
+- Frontend reads whitelist account-owned metadata before caching. Review and submit each refresh exact identity/context/deadline. Nonsecret session-scoped attempt identity precedes POST; automatic retries are disabled. Reload/lost-response recovery uses explicit reads and exact ID, distinguishes accepted intent, observed restored metadata, and unverified execution health.
+- Current backend store tests: MemStore2 + actual PostgreSQL1 GREEN with no skips, full migrations/new index. Focused API15 top-level plus quota/capacity subtests GREEN; SDK/coverage/AST/OpenAPI/SQLc checks pass. Full API and server packages pass. Full state package had one unrelated `TestObjectEncryptionMultipartJournalMem` timing failure; the unchanged test passed in isolation afterward. Do not call that full state run green. Build/vet final status remains pending at this checkpoint.
+- Frontend focused7 files/27 tests + typecheck pass; existing real HTTP mock regression plus UI45 tests pass after correcting a deployment-free restored fixture to `undeployed`. Full check/build final status remains pending.
+- Mobile Edge mock walkthrough passes: bounded 25-row pagination, Back/Forward/reload, keyboard/Escape, foreign account cursor rejection, expiry/purge/null metadata blockers, quota failure, accepted response loss then reload/read-only exact-ID reconciliation, denied reads, delayed navigation. Zero page errors; only two deliberate fixture restore POSTs. No live app was deleted to test.
+- One fresh GPT-6.1 Sol/High final reviewer found no verified Important/Critical blockers. No implementer fan-out or repeated A–J/L3 review.
+- C: now has about18GB free; native Linux `GOTMPDIR=/home/bahadir/.cache/gregale-k-native-tmp` avoids NTFS permission/time truncation problems. Task Go cache remains on D:. Tests use UTC and GOMAXPROCS4. Own private PostgreSQL is active on55439 during qualification; stop only that fixture afterward.
+- First remaining scope after K publication: L1 companions safe read projection; then L2 MCP guidance and M precisely limited reads. L1/L2/M have no product implementation yet. Unsupported M clone/enforce/traffic-moving controls remain gated; no staging qualification authority was inferred.
+
+Durable current ledger: frontend `.superpowers/sdd/2026-10-11-console-deleted-app-recovery/progress.md`. Its latest checkpoint and logs override the historical stop record below.
 
 - A–J are implemented in the existing open frontend stack. Their implementation/reviews should not be repeated.
 - L3 OpenAPI comparison is implemented, verified locally, pushed, and open in [faas-web#169](https://github.com/poyrazK/faas-web/pull/169).
-- K has a committed backend account-owned deleted-app **store foundation only**, published in draft [faas#4614](https://github.com/poyrazK/faas/pull/4614). It provides no customer REST endpoint or console recovery journey yet.
-- K API/SDK/console, L1 companions, L2 MCP, and M remain incomplete. Unsupported M operations remain gated.
+- K has a published store foundation in draft [faas#4614](https://github.com/poyrazK/faas/pull/4614), a published API branch, and locally implemented console recovery. K release checks/PR publication remain pending at this checkpoint.
+- L1 companions, L2 MCP, and M remain incomplete. Unsupported M operations remain gated.
 - The backend store draft must not close [faas#4423](https://github.com/poyrazK/faas/issues/4423) or [faas-web#154](https://github.com/poyrazK/faas-web/issues/154). Neither issue's full requirements are implemented.
 
 Authoritative specification: frontend `docs/superpowers/plans/2026-10-08-console-capability-coverage.md`. Tracking parent: [faas-web#134](https://github.com/poyrazK/faas-web/issues/134).
