@@ -745,6 +745,7 @@ A renumber plus a CI uniqueness gate is worth its own PR.
 - [ADR-840: App-scoped route removal coverage](840-app-scoped-route-removal-coverage.md)
 - [ADR-841: Operation deprecation and sunset headers](841-route-deprecation-headers.md)
 - [ADR-903: Gregale route sunset report](829-route-sunset-report.md)
+- [ADR-906: Frozen instances](906-frozen-instances.md)
 - [ADR-830: Saved sunset report comparisons](830-route-sunset-regression-tracking.md)
 - [ADR-831: Deployment-specific route lifecycle metadata](831-deployment-route-lifecycle.md)
 - [ADR-842: Lifecycle guidance on cached responses](842-cached-route-lifecycle.md)
