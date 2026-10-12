@@ -125,28 +125,29 @@ Scaffold, deploy and verify stateless MCP servers
 
 ### mcp init
 
-Create a Node, Go, or Python MCP starter
+Create an MCP starter in Node, Go or Python
 
-`gregale mcp init --path <DIR> [--language <LANGUAGE>]`
+`gregale mcp init --path <DIR> [--language <LANGUAGE>] [--runtime <RUNTIME>]`
 
 | Flag | Meaning | |
 |---|---|---|
 | `--path <DIR>` | empty destination directory | required |
-| `--language <LANGUAGE>` | starter language (default node) | one of `node` · `go` · `python` |
+| `--language <LANGUAGE>` | starter language alias | one of `node` · `go` · `python` |
+| `--runtime <RUNTIME>` | starter language (node, go or python; default node) | one of `node` · `go` · `python` |
 
 Examples:
 
 ```sh
 gregale mcp init --path ./my-mcp
-gregale mcp init --language go --path ./my-mcp-go
-gregale mcp init --language python --path ./my-mcp-python
+gregale mcp init --path ./my-mcp --runtime go
+gregale mcp init --path ./my-mcp --runtime python
 ```
 
 ### mcp deploy
 
-Deploy the worktree, enable streaming and verify MCP discovery
+Pin the candidate catalog to its revision, verify MCP discovery and promote
 
-`gregale mcp deploy [--path <DIR>] --name <SLUG> [--profile <NAME>] [--token-env <ENV>] [--secrets-file <PATH>] [--timeout <SECONDS>]`
+`gregale mcp deploy [--path <DIR>] --name <SLUG> [--profile <NAME>] [--token-env <ENV>] [--secrets-file <PATH>] [--release-policy <PATH>] [--idempotency-key <KEY>] [--mcp-task-migration-override] [--timeout <SECONDS>]`
 
 | Flag | Meaning | |
 |---|---|---|
@@ -155,6 +156,9 @@ Deploy the worktree, enable streaming and verify MCP discovery
 | `--profile <NAME>` | app resource profile | one of `micro` · `small` · `medium` · `large` · `xlarge` |
 | `--token-env <ENV>` | client token for external OAuth verification |  |
 | `--secrets-file <PATH>` | sealed app secrets |  |
+| `--release-policy <PATH>` | role-specific catalog baselines to verify before promotion |  |
+| `--idempotency-key <KEY>` | retry identity printed by a failed submission |  |
+| `--mcp-task-migration-override` | allow this deployment to replace incompatible MCP task workers once |  |
 | `--timeout <SECONDS>` | deployment wait timeout in seconds (default 1200) |  |
 
 Examples:
@@ -163,11 +167,36 @@ Examples:
 gregale mcp deploy --path ./my-mcp --name my-mcp --profile small
 ```
 
+### mcp status
+
+Qualify serving MCP replicas and watch hosting health or catalog changes
+
+`gregale mcp status --app <SLUG> [--endpoint <PATH>] [--token-env <ENV>] [--release-policy <PATH>] [--timeout <DURATION>] [--watch] [--interval <DURATION>]`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--app <SLUG>` | Gregale MCP app slug | required |
+| `--endpoint <PATH>` | literal MCP endpoint path (default /mcp) |  |
+| `--token-env <ENV>` | MCP client bearer token environment variable |  |
+| `--release-policy <PATH>` | role-specific catalog baselines and token environments |  |
+| `--timeout <DURATION>` | overall replica qualification deadline (default 10s) |  |
+| `--watch` | poll until interrupted and report status changes |  |
+| `--interval <DURATION>` | poll interval with --watch (default 30s) |  |
+
+Examples:
+
+```sh
+gregale mcp status --app my-mcp
+gregale mcp status --app my-mcp --token-env MCP_READER_TOKEN
+gregale mcp status --app my-mcp --release-policy release.json --json
+gregale mcp status --app my-mcp --watch --interval 15s --json
+```
+
 ### mcp doctor
 
 Check discovery, Origin rejection, compatibility and optional streaming
 
-`gregale mcp doctor [--url <URL>] [--app <SLUG>] [--endpoint <PATH>] [--token-env <ENV>] [--legacy] [--tool <NAME>] [--uri <URI>] [--prompt <NAME>] [--stream-tool <NAME>] [--arguments <JSON>] [--arguments-file <PATH>] [--name <NAME>] [--timeout <DURATION>] [<slug>]`
+`gregale mcp doctor [--url <URL>] [--app <SLUG>] [--endpoint <PATH>] [--token-env <ENV>] [--legacy] [--tool <NAME>] [--uri <URI>] [--prompt <NAME>] [--stream-tool <NAME>] [--arguments <JSON>] [--arguments-file <PATH>] [--name <NAME>] [--timeout <DURATION>]`
 
 | Flag | Meaning | |
 |---|---|---|
@@ -195,7 +224,7 @@ gregale mcp doctor --app my-mcp --legacy --stream-tool stream_demo
 
 Discover tool schemas without invoking tools
 
-`gregale mcp tools [--url <URL>] [--app <SLUG>] [--endpoint <PATH>] [--token-env <ENV>] [--legacy] [--tool <NAME>] [--uri <URI>] [--prompt <NAME>] [--stream-tool <NAME>] [--arguments <JSON>] [--arguments-file <PATH>] [--name <NAME>] [--timeout <DURATION>] [<slug>]`
+`gregale mcp tools [--url <URL>] [--app <SLUG>] [--endpoint <PATH>] [--token-env <ENV>] [--legacy] [--tool <NAME>] [--uri <URI>] [--prompt <NAME>] [--stream-tool <NAME>] [--arguments <JSON>] [--arguments-file <PATH>] [--name <NAME>] [--timeout <DURATION>]`
 
 | Flag | Meaning | |
 |---|---|---|
@@ -223,7 +252,7 @@ gregale mcp tools --app my-mcp
 
 Discover resource and template definitions without reading contents
 
-`gregale mcp resources [--url <URL>] [--app <SLUG>] [--endpoint <PATH>] [--token-env <ENV>] [--legacy] [--tool <NAME>] [--uri <URI>] [--prompt <NAME>] [--stream-tool <NAME>] [--arguments <JSON>] [--arguments-file <PATH>] [--name <NAME>] [--timeout <DURATION>] [<slug>]`
+`gregale mcp resources [--url <URL>] [--app <SLUG>] [--endpoint <PATH>] [--token-env <ENV>] [--legacy] [--tool <NAME>] [--uri <URI>] [--prompt <NAME>] [--stream-tool <NAME>] [--arguments <JSON>] [--arguments-file <PATH>] [--name <NAME>] [--timeout <DURATION>]`
 
 | Flag | Meaning | |
 |---|---|---|
@@ -251,7 +280,7 @@ gregale mcp resources --app my-mcp
 
 Read one explicitly selected resource URI
 
-`gregale mcp resource-read [--url <URL>] [--app <SLUG>] [--endpoint <PATH>] [--token-env <ENV>] [--legacy] [--tool <NAME>] [--uri <URI>] [--prompt <NAME>] [--stream-tool <NAME>] [--arguments <JSON>] [--arguments-file <PATH>] [--name <NAME>] [--timeout <DURATION>] [<slug>]`
+`gregale mcp resource-read [--url <URL>] [--app <SLUG>] [--endpoint <PATH>] [--token-env <ENV>] [--legacy] [--tool <NAME>] [--uri <URI>] [--prompt <NAME>] [--stream-tool <NAME>] [--arguments <JSON>] [--arguments-file <PATH>] [--name <NAME>] [--timeout <DURATION>]`
 
 | Flag | Meaning | |
 |---|---|---|
@@ -1557,7 +1586,7 @@ Add an alert rule
 |---|---|---|
 | `--app <slug>` | app slug | required |
 | `--name <NAME>` | rule name (3..120 chars) | required |
-| `--metric <METRIC>` | metric, e.g. error_rate_pct or latency_p95_ms |  |
+| `--metric <METRIC>` | metric; MCP task gauges: mcp_tasks_oldest_age_seconds, mcp_tasks_metrics_stale (includes min=0 observer heartbeat) |  |
 | `--comparison <OP>` | gt\|gte\|lt\|lte |  |
 | `--threshold <N>` | threshold value |  |
 | `--window-spec <WINDOW>` | 5m\|15m\|1h\|6h\|24h\|7d\|15d |  |
@@ -1573,6 +1602,8 @@ Examples:
 
 ```sh
 printf '%s\n' "$WEBHOOK_SECRET" | gregale alerts add --app my-api --name p95-latency --metric latency_p95_ms --comparison gt --threshold 800 --window-spec 15m --webhook-url https://hooks.example.com/gregale --webhook-secret-stdin
+printf '%s\n' "$WEBHOOK_SECRET" | gregale alerts add --app mcp-worker --name mcp-oldest-task-age --metric mcp_tasks_oldest_age_seconds --comparison gt --threshold 300 --window-spec 5m --webhook-url https://hooks.example.com/gregale --webhook-secret-stdin
+printf '%s\n' "$WEBHOOK_SECRET" | gregale alerts add --app mcp-worker --name mcp-task-metrics-stale --metric mcp_tasks_metrics_stale --comparison gt --threshold 0 --window-spec 5m --webhook-url https://hooks.example.com/gregale --webhook-secret-stdin
 ```
 
 ### alerts info
@@ -5458,6 +5489,22 @@ gregale deployment wait v42 --app my-api
 gregale deployment latest --app my-api
 ```
 
+### deployment retry-hold
+
+Schedule an MCP promotion hold retry with all activation checks
+
+`gregale deployment retry-hold [--app <SLUG>] <ID|vN>`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--app <SLUG>` | app slug, to resolve a vN revision |  |
+
+Examples:
+
+```sh
+gregale deployment retry-hold v42 --app my-api
+```
+
 ### deployment runtime
 
 Inspect runtime identity or preview a published runtime change
@@ -5655,7 +5702,7 @@ Retry a failed deployment from a specific stage (--from=&lt;stage&gt;)
 
 Deploy an app, function, or project
 
-`gregale deploy [--image <REF>] [--tarball <PATH>] [--path <DIR>] [--source <auto|head|worktree>] [--worktree] [--repo <OWNER/NAME>] [--repository <OWNER/NAME>] [--install-id <N>] [--production-branch <BRANCH>] [--ref <REF>] [--source-branch <BRANCH>] [--github] [--pinned-sha <SHA>] [--pin-action] [--template <NAME>] [--dockerfile] [--runtime <RUNTIME>] [--handler <HANDLER>] [--name <SLUG>] [--profile <PROFILE>] [--vcpu <N>] [--execution-mode <request|service|worker|job>] [--restart-policy <no|on-failure|always|unless-stopped>] [--startup-deadline-s <SECONDS>] [--max-retries <N>] [--function] [--app] [--yes] [--only <SLUGS>] [--project] [--environment <SLUG>] [--reason <text>] [--tag <TAG>] [--deployed-by <NAME>] [--pr-number <N>] [--exclude <SLUGS>] [--show-affected] [--persist-exclude] [--project-slug <SLUG>] [--canary-preset <PRESET>] [--canary-stages <STAGES>] [--safe] [--require-authn] [--no-require-authn] [--platform-tenant-required] [--no-platform-tenant-required] [--app-protocol <PROTOCOL>] [--traffic-percent <PERCENT>] [--no-traffic] [--rollback-on-5xx] [--healthcheck-path <PATH>] [--healthcheck-grpc] [--healthcheck-grpc-service <SERVICE>] [--disable-startup-cpu-boost] [--no-triggers] [--wait] [--no-wait] [--create-only] [--timeout <SECONDS>] [--idempotency-key <KEY>] [--secrets-file <PATH>] [--secret-scan <on|off>] [--diff] [--dry-run] [--plan] [--strict] [--lenient] [--server-diff] [--doctor-strict] [--no-doctor]`
+`gregale deploy [--image <REF>] [--tarball <PATH>] [--path <DIR>] [--source <auto|head|worktree>] [--worktree] [--repo <OWNER/NAME>] [--repository <OWNER/NAME>] [--install-id <N>] [--production-branch <BRANCH>] [--ref <REF>] [--source-branch <BRANCH>] [--github] [--pinned-sha <SHA>] [--pin-action] [--template <NAME>] [--dockerfile] [--runtime <RUNTIME>] [--handler <HANDLER>] [--name <SLUG>] [--profile <PROFILE>] [--vcpu <N>] [--execution-mode <request|service|worker|job>] [--restart-policy <no|on-failure|always|unless-stopped>] [--startup-deadline-s <SECONDS>] [--max-retries <N>] [--function] [--app] [--yes] [--only <SLUGS>] [--project] [--environment <SLUG>] [--reason <text>] [--tag <TAG>] [--deployed-by <NAME>] [--pr-number <N>] [--exclude <SLUGS>] [--show-affected] [--persist-exclude] [--project-slug <SLUG>] [--canary-preset <PRESET>] [--canary-stages <STAGES>] [--safe] [--require-authn] [--no-require-authn] [--platform-tenant-required] [--no-platform-tenant-required] [--app-protocol <PROTOCOL>] [--traffic-percent <PERCENT>] [--no-traffic] [--rollback-on-5xx] [--healthcheck-path <PATH>] [--healthcheck-grpc] [--healthcheck-grpc-service <SERVICE>] [--disable-startup-cpu-boost] [--mcp-task-migration-override] [--no-triggers] [--wait] [--no-wait] [--create-only] [--timeout <SECONDS>] [--idempotency-key <KEY>] [--secrets-file <PATH>] [--secret-scan <on|off>] [--diff] [--dry-run] [--plan] [--strict] [--lenient] [--server-diff] [--doctor-strict] [--no-doctor]`
 
 | Flag | Meaning | |
 |---|---|---|
@@ -5713,6 +5760,7 @@ Deploy an app, function, or project
 | `--healthcheck-grpc` | use standard gRPC health for startup readiness |  |
 | `--healthcheck-grpc-service <SERVICE>` | service name for --healthcheck-grpc; empty checks overall health |  |
 | `--disable-startup-cpu-boost` | disable temporary CPU boost during VM startup |  |
+| `--mcp-task-migration-override` | allow this deployment to replace incompatible MCP task workers once |  |
 | `--no-triggers` | skip gregale.yaml trigger and async-route changes |  |
 | `--wait` | wait for deployment to become live (default) |  |
 | `--no-wait` | return after deployment is queued |  |

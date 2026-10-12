@@ -7100,6 +7100,11 @@ func (s *PgStore) createDeployment(ctx context.Context, d Deployment, activity *
 	if err != nil {
 		return Deployment{}, 0, err
 	}
+	if d.MCPTaskMigrationOverride {
+		if _, err := tx.Exec(ctx, `INSERT INTO deployment_mcp_task_migration_overrides (deployment_id) VALUES ($1)`, created.ID); err != nil {
+			return Deployment{}, 0, fmt.Errorf("state: record MCP task migration override: %w", err)
+		}
+	}
 	if len(cloneInputs) > 0 {
 		if err := attachCloneDeploymentTx(ctx, tx, *cloneInputs[0], cloneRecord, created); err != nil {
 			return Deployment{}, 0, err
@@ -7788,9 +7793,10 @@ func (s *PgStore) updateDeploymentTraffic(ctx context.Context, id string, newPer
 	// (2) Confirm the target row is 'live'. A superseded/failed row
 	// can't accept traffic — operators route traffic to live rows.
 	var status string
+	var currentTrafficPercent int
 	if err := tx.QueryRow(ctx,
-		`select status from deployments where id = $1`,
-		id).Scan(&status); err != nil {
+		`select status, traffic_percent from deployments where id = $1`,
+		id).Scan(&status, &currentTrafficPercent); err != nil {
 		return Deployment{}, fmt.Errorf("state: read deployment status %s: %w", id, err)
 	}
 	if status != string(DeployLive) {
@@ -7898,6 +7904,14 @@ func (s *PgStore) updateDeploymentTraffic(ctx context.Context, id string, newPer
 		if (expectedServingID[0] == "" && servingCount != 0) || (expectedServingID[0] != "" && (servingCount != 1 || !sameDeploymentID(servingID, expectedServingID[0]) || servingPercent != 100)) {
 			return Deployment{}, fmt.Errorf("state: expected serving deployment %s, found %s: %w",
 				expectedServingID[0], servingID, ErrTrafficServingChanged)
+		}
+	}
+	if newPercent == 100 && currentTrafficPercent != 100 && len(siblings) > 0 {
+		if err := checkMCPTaskCompatibilityReportTx(ctx, tx, appID, id); err != nil {
+			return Deployment{}, err
+		}
+		if err := consumeMCPTaskMigrationOverrideTx(ctx, tx, id); err != nil {
+			return Deployment{}, err
 		}
 	}
 
@@ -8621,12 +8635,13 @@ func (s *PgStore) ListDeploymentsForOperator(ctx context.Context, filter Operato
 		   and ($3::uuid is null or d.app_id = $3::uuid)
 		   and (cardinality($4::text[]) = 0 or d.status = any($4::text[]))
 		   and ($5::timestamptz is null or d.created_at < $5::timestamptz)
+           and (not $9::boolean or not exists (select 1 from deployment_mcp_task_holds h where h.deployment_id=d.id))
 		 order by
 		   case when $6 then d.created_at end asc,
 		   case when $6 then d.id end asc,
 		   case when not $6 then d.created_at end desc,
 		   case when not $6 then d.id end desc
-		 limit $7 offset $8`, filter.IncludeDeleted, accountID, appID, statuses, createdBefore, filter.OldestFirst, filter.Limit, filter.Offset)
+		 limit $7 offset $8`, filter.IncludeDeleted, accountID, appID, statuses, createdBefore, filter.OldestFirst, filter.Limit, filter.Offset, filter.ExcludeMCPTaskHolds)
 	if err != nil {
 		return nil, err
 	}
@@ -9433,18 +9448,22 @@ func (s *PgStore) captureDeploymentOpenAPISnapshotTx(ctx context.Context, tx pgx
 }
 
 func (s *PgStore) MarkDeploymentLive(ctx context.Context, id string) error {
-	return s.markDeploymentLive(ctx, id, false)
+	return s.markDeploymentLive(ctx, id, false, false)
 }
 
 func (s *PgStore) MarkGitDrivenDeploymentLiveIfLatest(ctx context.Context, id string) error {
 	return s.MarkDeploymentLiveIfLatest(ctx, id)
 }
 
-func (s *PgStore) MarkDeploymentLiveIfLatest(ctx context.Context, id string) error {
-	return s.markDeploymentLive(ctx, id, true)
+func (s *PgStore) MarkMCPTaskRecoveryDeploymentLive(ctx context.Context, id string, fenceLatest bool) error {
+	return s.markDeploymentLive(ctx, id, fenceLatest, true)
 }
 
-func (s *PgStore) markDeploymentLive(ctx context.Context, id string, fenceLatest bool) (resultErr error) {
+func (s *PgStore) MarkDeploymentLiveIfLatest(ctx context.Context, id string) error {
+	return s.markDeploymentLive(ctx, id, true, false)
+}
+
+func (s *PgStore) markDeploymentLive(ctx context.Context, id string, fenceLatest, recovery bool) (resultErr error) {
 	defer func() { resultErr = mapErr(resultErr) }()
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -9483,7 +9502,8 @@ func (s *PgStore) markDeploymentLive(ctx context.Context, id string, fenceLatest
 		return err
 	}
 	var appManifestJSON []byte
-	if err := tx.QueryRow(ctx, `select coalesce(manifest, '{}'::jsonb) from apps where id = $1 for update`, appID).Scan(&appManifestJSON); err != nil {
+	var appStatus string
+	if err := tx.QueryRow(ctx, `select coalesce(manifest, '{}'::jsonb), status from apps where id = $1 for update`, appID).Scan(&appManifestJSON, &appStatus); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
 		}
@@ -9498,6 +9518,17 @@ func (s *PgStore) markDeploymentLive(ctx context.Context, id string, fenceLatest
 			return ErrNotFound
 		}
 		return fmt.Errorf("state: mark deployment live load: %w", err)
+	}
+	if recovery {
+		if dep.Status == DeploySuperseded {
+			return ErrDeploymentSuperseded
+		}
+		if dep.Status.IsTerminal() || dep.DeletedAt != nil || appStatus == string(AppDeleted) {
+			return ErrInvalidStateTransition
+		}
+		if dep.Status == DeployLive {
+			return nil
+		}
 	}
 	// Graph activation owns deployment promotion for every managed workload in
 	// the scope, including after the temporary hold has been lifted.
@@ -9538,8 +9569,8 @@ func (s *PgStore) markDeploymentLive(ctx context.Context, id string, fenceLatest
 	if err := requireDeploymentLayerArtifactsTx(ctx, tx, dep.ID); err != nil {
 		return err
 	}
-	if fenceLatest {
-		if !dep.Kind.RequiresLatestRevision() || dep.Revision <= 0 {
+	if fenceLatest || recovery {
+		if fenceLatest && (!dep.Kind.RequiresLatestRevision() || dep.Revision <= 0) {
 			return ErrInvalidStateTransition
 		}
 		if dep.Status == DeploySuperseded {
@@ -9638,6 +9669,14 @@ func (s *PgStore) markDeploymentLive(ctx context.Context, id string, fenceLatest
 		}
 		if len(siblings) == 0 && dep.TrafficPercent != 100 && dep.TrafficPercent != 0 {
 			return fmt.Errorf("state: manual split has no live base deployment: %w", ErrTrafficPercentSumInvalid)
+		}
+		if dep.TrafficPercent == 100 && len(siblings) > 0 {
+			if err := checkMCPTaskCompatibilityReportTx(ctx, tx, dep.AppID, dep.ID); err != nil {
+				return err
+			}
+			if err := consumeMCPTaskMigrationOverrideTx(ctx, tx, dep.ID); err != nil {
+				return err
+			}
 		}
 
 		now := time.Now().UTC()
@@ -10131,6 +10170,9 @@ func (s *PgStore) cancelDeploymentTx(ctx context.Context, id, principal string, 
 		if err != nil {
 			return Deployment{}, nil, fmt.Errorf("CancelDeploymentTx: enqueue activity: %w", err)
 		}
+	}
+	if err := cancelMCPTaskHoldTx(ctx, tx, id, principal); err != nil {
+		return Deployment{}, nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Deployment{}, nil, fmt.Errorf("CancelDeploymentTx: commit: %w", err)

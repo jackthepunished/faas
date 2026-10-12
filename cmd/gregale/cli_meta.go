@@ -829,7 +829,7 @@ var cliCommands = []cliCommand{
 			{Name: "add", Short: "Add an alert rule", Flags: []cliFlag{
 				{Name: "app", Short: "app slug", Req: true, Value: "slug"},
 				{Name: "name", Short: "rule name (3..120 chars)", Req: true, Value: "NAME"},
-				{Name: "metric", Short: "metric, e.g. error_rate_pct or latency_p95_ms", Value: "METRIC"},
+				{Name: "metric", Short: "metric; MCP task gauges: mcp_tasks_oldest_age_seconds, mcp_tasks_metrics_stale (includes min=0 observer heartbeat)", Value: "METRIC"},
 				{Name: "comparison", Short: "gt|gte|lt|lte", Value: "OP"},
 				{Name: "threshold", Short: "threshold value", Value: "N"},
 				{Name: "window-spec", Short: "5m|15m|1h|6h|24h|7d|15d", Value: "WINDOW"},
@@ -840,7 +840,7 @@ var cliCommands = []cliCommand{
 				{Name: "post-deploy-rollback-window", Short: "completed-release rollback window (0 off; up to 1h)", Value: "duration"},
 				{Name: "webhook-secret-stdin", Short: "read the webhook signing secret from stdin (this or --webhook-secret is required)"},
 				{Name: "webhook-secret", Short: "webhook signing secret (prefer --webhook-secret-stdin)", Value: "VALUE"},
-			}, Examples: []string{`printf '%s\n' "$WEBHOOK_SECRET" | gregale alerts add --app my-api --name p95-latency --metric latency_p95_ms --comparison gt --threshold 800 --window-spec 15m --webhook-url https://hooks.example.com/gregale --webhook-secret-stdin`}},
+			}, Examples: []string{`printf '%s\n' "$WEBHOOK_SECRET" | gregale alerts add --app my-api --name p95-latency --metric latency_p95_ms --comparison gt --threshold 800 --window-spec 15m --webhook-url https://hooks.example.com/gregale --webhook-secret-stdin`, `printf '%s\n' "$WEBHOOK_SECRET" | gregale alerts add --app mcp-worker --name mcp-oldest-task-age --metric mcp_tasks_oldest_age_seconds --comparison gt --threshold 300 --window-spec 5m --webhook-url https://hooks.example.com/gregale --webhook-secret-stdin`, `printf '%s\n' "$WEBHOOK_SECRET" | gregale alerts add --app mcp-worker --name mcp-task-metrics-stale --metric mcp_tasks_metrics_stale --comparison gt --threshold 0 --window-spec 5m --webhook-url https://hooks.example.com/gregale --webhook-secret-stdin`}},
 			{Name: "info", Short: "Show one alert rule and its last delivery", Positionals: []string{"<alert-id>"}, Flags: []cliFlag{
 				{Name: "app", Short: "app slug", Req: true, Value: "slug"},
 			}},
@@ -1944,6 +1944,7 @@ var cliCommands = []cliCommand{
 			"gregale deployment latest --app my-api",
 		},
 		Subcommands: []cliSub{
+			{Name: "retry-hold", Positionals: []string{"<ID|vN>"}, Short: "Schedule an MCP promotion hold retry with all activation checks", Examples: []string{"gregale deployment retry-hold v42 --app my-api"}, Flags: []cliFlag{{Name: "app", Value: "SLUG", Short: "app slug, to resolve a vN revision"}}},
 			{Name: "runtime", Positionals: []string{"<ID|vN>"}, Short: "Inspect runtime identity or preview a published runtime change", Examples: []string{"gregale deployment runtime v42 --app my-function", "gregale deployment runtime v42 --app my-function --target RELEASE_ID --json"}, Flags: []cliFlag{{Name: "app", Value: "SLUG", Short: "app slug for a vN revision"}, {Name: "target", Value: "RELEASE_ID", Short: "published runtime release to preview without applying"}}},
 			{Name: "advance", Positionals: []string{"<ID|vN>"}, Short: "Advance a canary by one stage with route enforcement", Examples: []string{"gregale deployment advance DEPLOYMENT_UUID --expected-step 1", "gregale deployment advance v42 --app my-api --expected-step 1"}, Flags: []cliFlag{{Name: "expected-step", Value: "N", Short: "observed current canary step (see deployment summary)", Req: true}, {Name: "app", Value: "SLUG", Short: "app slug, to resolve a vN revision"}}},
 			{Name: "summary", Short: "Show the release diff and rollback target", Examples: []string{"gregale deployment summary --app my-api --interactive", "gregale deployment summary v42 --app my-api", "gregale deployment summary v42 --app my-api --json"}, Positionals: []string{"[<id|vN>]"}, Flags: []cliFlag{
@@ -2117,6 +2118,7 @@ var cliCommands = []cliCommand{
 			{Name: "healthcheck-grpc", Short: "use standard gRPC health for startup readiness"},
 			{Name: "healthcheck-grpc-service", Short: "service name for --healthcheck-grpc; empty checks overall health", Value: "SERVICE"},
 			{Name: "disable-startup-cpu-boost", Short: "disable temporary CPU boost during VM startup"},
+			{Name: "mcp-task-migration-override", Short: "allow this deployment to replace incompatible MCP task workers once"},
 			{Name: "no-triggers", Short: "skip gregale.yaml trigger and async-route changes"},
 			{Name: "wait", Short: "wait for deployment to become live (default)"},
 			{Name: "no-wait", Short: "return after deployment is queued"},
