@@ -593,6 +593,7 @@ from .create_edge_rule_request_validate_mode import CreateEdgeRuleRequestValidat
 from .create_environment_git_source_request import CreateEnvironmentGitSourceRequest
 from .create_environment_git_source_request_approval_policy import CreateEnvironmentGitSourceRequestApprovalPolicy
 from .create_environment_git_source_request_mode import CreateEnvironmentGitSourceRequestMode
+from .create_environment_git_source_request_provider import CreateEnvironmentGitSourceRequestProvider
 from .create_execution_artifact_grant_request import CreateExecutionArtifactGrantRequest
 from .create_financial_budget_request import CreateFinancialBudgetRequest
 from .create_inbound_webhook_endpoint_request import CreateInboundWebhookEndpointRequest
@@ -1061,6 +1062,7 @@ from .environment_git_source import EnvironmentGitSource
 from .environment_git_source_spec import EnvironmentGitSourceSpec
 from .environment_git_source_spec_approval_policy import EnvironmentGitSourceSpecApprovalPolicy
 from .environment_git_source_spec_mode import EnvironmentGitSourceSpecMode
+from .environment_git_source_spec_provider import EnvironmentGitSourceSpecProvider
 from .environment_git_source_update import EnvironmentGitSourceUpdate
 from .environment_git_source_update_mode import EnvironmentGitSourceUpdateMode
 from .environment_job_schedule import EnvironmentJobSchedule
@@ -4676,6 +4678,7 @@ __all__ = (
     "CreateEnvironmentGitSourceRequest",
     "CreateEnvironmentGitSourceRequestApprovalPolicy",
     "CreateEnvironmentGitSourceRequestMode",
+    "CreateEnvironmentGitSourceRequestProvider",
     "CreateExecutionArtifactGrantRequest",
     "CreateFinancialBudgetRequest",
     "CreateInboundWebhookEndpointRequest",
@@ -5126,6 +5129,7 @@ __all__ = (
     "EnvironmentGitSourceSpec",
     "EnvironmentGitSourceSpecApprovalPolicy",
     "EnvironmentGitSourceSpecMode",
+    "EnvironmentGitSourceSpecProvider",
     "EnvironmentGitSourceUpdate",
     "EnvironmentGitSourceUpdateMode",
     "EnvironmentJobSchedule",
