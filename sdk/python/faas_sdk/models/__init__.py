@@ -3269,6 +3269,7 @@ from .rotate_org_api_key_response import RotateOrgAPIKeyResponse
 from .route_advice_evidence import RouteAdviceEvidence
 from .route_advice_impact import RouteAdviceImpact
 from .route_advice_response import RouteAdviceResponse
+from .route_advice_setting import RouteAdviceSetting
 from .route_advice_suggestion import RouteAdviceSuggestion
 from .route_advice_suggestion_kind import RouteAdviceSuggestionKind
 from .route_assigned_check import RouteAssignedCheck
@@ -3458,6 +3459,10 @@ from .route_policy_receipt import RoutePolicyReceipt
 from .route_policy_rule_usage import RoutePolicyRuleUsage
 from .route_priorities_response import RoutePrioritiesResponse
 from .route_priorities_response_source import RoutePrioritiesResponseSource
+from .route_priority_queue_class import RoutePriorityQueueClass
+from .route_priority_queue_class_class import RoutePriorityQueueClassClass
+from .route_priority_queue_stats import RoutePriorityQueueStats
+from .route_priority_queue_stats_source import RoutePriorityQueueStatsSource
 from .route_priority_rule import RoutePriorityRule
 from .route_priority_rule_class import RoutePriorityRuleClass
 from .route_priority_rule_method import RoutePriorityRuleMethod
@@ -3587,7 +3592,10 @@ from .service_rollout_handoff_response_action import ServiceRolloutHandoffRespon
 from .service_rollout_handoff_response_phase import ServiceRolloutHandoffResponsePhase
 from .service_rollout_recovery_receipt import ServiceRolloutRecoveryReceipt
 from .service_rollout_recovery_receipt_status import ServiceRolloutRecoveryReceiptStatus
+from .service_wake_ahead_learned import ServiceWakeAheadLearned
+from .service_wake_ahead_learned_source import ServiceWakeAheadLearnedSource
 from .service_wake_ahead_response import ServiceWakeAheadResponse
+from .service_wake_ahead_target import ServiceWakeAheadTarget
 from .session_info import SessionInfo
 from .session_list_response import SessionListResponse
 from .sessions_revoke_all_response import SessionsRevokeAllResponse
@@ -7168,6 +7176,7 @@ __all__ = (
     "RouteAdviceEvidence",
     "RouteAdviceImpact",
     "RouteAdviceResponse",
+    "RouteAdviceSetting",
     "RouteAdviceSuggestion",
     "RouteAdviceSuggestionKind",
     "RouteAssignedCheck",
@@ -7357,6 +7366,10 @@ __all__ = (
     "RoutePolicyRuleUsage",
     "RoutePrioritiesResponse",
     "RoutePrioritiesResponseSource",
+    "RoutePriorityQueueClass",
+    "RoutePriorityQueueClassClass",
+    "RoutePriorityQueueStats",
+    "RoutePriorityQueueStatsSource",
     "RoutePriorityRule",
     "RoutePriorityRuleClass",
     "RoutePriorityRuleMethod",
@@ -7482,7 +7495,10 @@ __all__ = (
     "ServiceRolloutHandoffResponsePhase",
     "ServiceRolloutRecoveryReceipt",
     "ServiceRolloutRecoveryReceiptStatus",
+    "ServiceWakeAheadLearned",
+    "ServiceWakeAheadLearnedSource",
     "ServiceWakeAheadResponse",
+    "ServiceWakeAheadTarget",
     "SessionInfo",
     "SessionListResponse",
     "SessionsRevokeAllResponse",
