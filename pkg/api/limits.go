@@ -10500,6 +10500,13 @@ const (
 // Review decisions retain a bounded journal independent of item reviews.
 const OperationWorkflowPlaybookReviewsMax = 32
 
+// Checklist watches are durable within a readiness subscription; polling rotates a bounded sample.
+const OperationWorkflowPlaybookEvidenceWatchesPerSubscriptionMax = 20
+const OperationWorkflowPlaybookEvidenceWatchesPerPassMax = 5
+
+// Application playbook outcome waits use the existing ten-year business observation bound.
+const OperationWorkflowPlaybookOutcomeDeadlineMaxSeconds = OperationWorkflowFreshnessMaxSeconds
+
 // Bounded S3 checksum snapshots and object-attribute wire metadata.
 const MaxObjectMultipartChecksumSnapshotBytes = 2 << 20
 const MaxObjectChecksumValueBytes = 128
