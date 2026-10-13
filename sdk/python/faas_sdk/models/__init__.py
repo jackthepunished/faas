@@ -3531,6 +3531,7 @@ from .scenario_test_chaos_matches_response import ScenarioTestChaosMatchesRespon
 from .scenario_test_chaos_rule import ScenarioTestChaosRule
 from .scenario_test_chaos_rule_direction import ScenarioTestChaosRuleDirection
 from .scenario_test_chaos_rule_kind import ScenarioTestChaosRuleKind
+from .scenario_test_chaos_rule_status_code_type_0 import ScenarioTestChaosRuleStatusCodeType0
 from .scenario_test_workload import ScenarioTestWorkload
 from .schedule_occurrence_response import ScheduleOccurrenceResponse
 from .schedule_occurrence_response_status import ScheduleOccurrenceResponseStatus
@@ -7442,6 +7443,7 @@ __all__ = (
     "ScenarioTestChaosRule",
     "ScenarioTestChaosRuleDirection",
     "ScenarioTestChaosRuleKind",
+    "ScenarioTestChaosRuleStatusCodeType0",
     "ScenarioTestWorkload",
     "ScheduleOccurrenceResponse",
     "ScheduleOccurrenceResponseStatus",
