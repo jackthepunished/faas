@@ -381,7 +381,10 @@ type server struct {
 	// interactiveAppTasksEnabled additionally admits ADR-1037 interactive
 	// sessions (`gregale app exec -it`). It requires appTaskAPIEnabled.
 	interactiveAppTasksEnabled bool
-	outboundProbeGatewayURL    string
+	// imageRunsEnabled is the operator gate for POST /v1/image-runs
+	// (ADR-1161, FAAS_IMAGE_RUNS).
+	imageRunsEnabled        bool
+	outboundProbeGatewayURL string
 	// runtimeConfig is the durable operator configuration snapshot. It is
 	// deliberately in-memory for request hot paths; the admin handler writes
 	// Postgres and the notification reconciler refreshes this snapshot.
@@ -781,6 +784,12 @@ func (s *server) WithRealtimeAccessPreviewEnabled(enabled bool) *server {
 // interactive app-task admission.
 func (s *server) WithInteractiveAppTasksEnabled(enabled bool) *server {
 	s.interactiveAppTasksEnabled = enabled
+	return s
+}
+
+// WithImageRunsEnabled attaches the image-run gate (ADR-1161).
+func (s *server) WithImageRunsEnabled(enabled bool) *server {
+	s.imageRunsEnabled = enabled
 	return s
 }
 
@@ -2376,6 +2385,7 @@ func (s *server) handler() http.Handler {
 	// empty lists on Free (read gate is not in the plan).
 	mux.HandleFunc("GET /v1/jobs", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.listJobs))))
 	mux.HandleFunc("POST /v1/jobs", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createJob)))))
+	mux.HandleFunc("POST /v1/image-runs", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.idempotent(s.createImageRun)))))
 	mux.HandleFunc("GET /v1/jobs/{name}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesReadSurface...)(s.getJob))))
 	mux.HandleFunc("PATCH /v1/jobs/{name}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.updateJob))))
 	mux.HandleFunc("DELETE /v1/jobs/{name}", s.authLimited(s.requireMFA(s.requireScope(api.ScopesDeployWriteSurface...)(s.deleteJob))))
