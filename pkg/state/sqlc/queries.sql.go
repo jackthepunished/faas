@@ -9193,7 +9193,9 @@ VALUES($1::uuid,$2::text,$3::text,$4::text,$5::text,'pending',0,true,
  $11::jsonb->'deployment_inputs'->'override_healthcheck',$11::jsonb->'deployment_inputs'->'override_liveness_probe',
  $11::jsonb->'deployment_inputs'->'override_readiness_probe',coalesce($11::jsonb->'deployment_inputs'->'override_main_depends_on','[]'::jsonb),
  coalesce($11::jsonb->'deployment_inputs'->'sidecars','[]'::jsonb),coalesce($11::jsonb->'deployment_inputs'->'workflows','[]'::jsonb),
- coalesce(($11::jsonb->'deployment_inputs'->>'full_rootfs_allow_auto')::boolean,false),($11::jsonb->'deployment_inputs'->>'full_rootfs_override')::boolean,
+ coalesce(($11::jsonb->'deployment_inputs'->>'full_rootfs_allow_auto')::boolean,false),
+ coalesce(($11::jsonb->'deployment_inputs'->>'full_rootfs_override')::boolean,
+          nullif(($11::jsonb->'source'->>'full_rootfs')::boolean,false)),
  coalesce(($11::jsonb->'deployment_inputs'->>'min_instances')::integer,0),
  (SELECT coalesce(array_agg(value ORDER BY position),ARRAY[]::text[]) FROM jsonb_array_elements_text(coalesce($11::jsonb->'deployment_inputs'->'release_command','[]'::jsonb)) WITH ORDINALITY AS elements(value,position)),
  coalesce(($11::jsonb->'deployment_inputs'->>'release_command_shell')::boolean,false),
@@ -12677,6 +12679,42 @@ func (q *Queries) EnvironmentGitOpsCandidateByInput(ctx context.Context, db DBTX
 	var id pgtype.UUID
 	err := row.Scan(&id)
 	return id, err
+}
+
+const environmentGitOpsHasServingManagedWorkload = `-- name: EnvironmentGitOpsHasServingManagedWorkload :one
+SELECT EXISTS (
+  SELECT 1 FROM deployments d
+  JOIN apps a ON a.id = d.app_id
+  WHERE a.account_id = $1::uuid
+    AND a.project_id = $2::uuid
+    AND d.scope = $3
+    AND d.environment_workload_runtime IS NOT NULL
+    AND (
+      (d.status = 'live' AND NOT d.environment_workload_held)
+      OR EXISTS (
+        SELECT 1 FROM project_release_sets rs
+        JOIN project_release_members rm ON rm.release_id = rs.id
+        WHERE rs.project_id = a.project_id AND rs.account_id = a.account_id
+          AND rs.environment_slug = $3 AND rs.active
+          AND rm.app_id = a.id AND rm.deployment_id = d.id
+      )
+    )
+) AS managed
+`
+
+type EnvironmentGitOpsHasServingManagedWorkloadParams struct {
+	AccountID pgtype.UUID
+	ProjectID pgtype.UUID
+	Scope     string
+}
+
+// ADR-568: an empty definition cannot bypass a prior managed release or the
+// router's live-scope fallback when no active release exists.
+func (q *Queries) EnvironmentGitOpsHasServingManagedWorkload(ctx context.Context, db DBTX, arg EnvironmentGitOpsHasServingManagedWorkloadParams) (bool, error) {
+	row := db.QueryRow(ctx, environmentGitOpsHasServingManagedWorkload, arg.AccountID, arg.ProjectID, arg.Scope)
+	var managed bool
+	err := row.Scan(&managed)
+	return managed, err
 }
 
 const environmentGitOpsImageCandidate = `-- name: EnvironmentGitOpsImageCandidate :one
