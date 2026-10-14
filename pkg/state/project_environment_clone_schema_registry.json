@@ -2663,6 +2663,7 @@
     "columns": [
       "app_id",
       "command",
+      "host",
       "updated_at"
     ],
     "kind": "operational"

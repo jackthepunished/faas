@@ -2325,6 +2325,7 @@ type DevWatchSetting struct {
 	AppID     pgtype.UUID
 	Command   string
 	UpdatedAt pgtype.Timestamptz
+	Host      string
 }
 
 type DeveloperSyncHistory struct {
