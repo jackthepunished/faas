@@ -1956,7 +1956,6 @@ func (s *server) deleteApp(w http.ResponseWriter, r *http.Request, acct state.Ac
 	w.WriteHeader(http.StatusNoContent)
 }
 
-
 // --- deployments -----------------------------------------------------------
 
 // getDeployment returns one deployment by id.
