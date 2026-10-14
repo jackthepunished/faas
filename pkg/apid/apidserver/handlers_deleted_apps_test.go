@@ -1,4 +1,4 @@
-package apidserver
+package apidserver_test
 
 import (
 	"context"
@@ -10,23 +10,24 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/onebox-faas/faas/pkg/api"
+	apidserver "github.com/onebox-faas/faas/pkg/apid/apidserver"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
 func TestDeletedAppsInventoryIsBoundedAndAccountOwned(t *testing.T) {
-	e := setup(t, api.PlanPro)
+	e := apidserver.Setup(t, api.PlanPro)
 	ctx := context.Background()
-	other, _ := e.store.CreateAccount(ctx, "foreign-tombstone@example.com", api.PlanPro)
+	other, _ := (*e.Store()).CreateAccount(ctx, "foreign-tombstone@example.com", api.PlanPro)
 	deadline := time.Now().Add(time.Hour)
 	for _, slug := range []string{"owned-tombstone-a", "owned-tombstone-b"} {
-		id := mustSeedApp(t, e, slug)
-		if _, err := e.store.ScheduleAppDeletion(ctx, id, deadline); err != nil {
+		id := apidserver.MustSeedApp(t, e, slug)
+		if _, err := (*e.Store()).ScheduleAppDeletion(ctx, id, deadline); err != nil {
 			t.Fatal(err)
 		}
 	}
-	foreign, _ := e.store.CreateApp(ctx, state.App{AccountID: other.ID, Slug: "foreign-tombstone", Status: state.AppActive})
-	_, _ = e.store.ScheduleAppDeletion(ctx, foreign.ID, deadline)
-	rec := e.do(t, http.MethodGet, "/v1/deleted-apps?limit=1", nil, nil)
+	foreign, _ := (*e.Store()).CreateApp(ctx, state.App{AccountID: other.ID, Slug: "foreign-tombstone", Status: state.AppActive})
+	_, _ = (*e.Store()).ScheduleAppDeletion(ctx, foreign.ID, deadline)
+	rec := e.Do(t, http.MethodGet, "/v1/deleted-apps?limit=1", nil, nil)
 	if rec.Code != 200 {
 		t.Fatalf("inventory = %d: %s", rec.Code, rec.Body)
 	}
@@ -46,7 +47,7 @@ func TestDeletedAppsInventoryIsBoundedAndAccountOwned(t *testing.T) {
 	if len(page.Apps) != 1 || !page.Apps[0].Eligible || !page.Apps[0].Until.Equal(deadline) || page.Evaluated.IsZero() || page.Next == "" {
 		t.Fatalf("page = %+v", page)
 	}
-	next := e.do(t, http.MethodGet, "/v1/deleted-apps?limit=1&cursor="+page.Next, nil, nil)
+	next := e.Do(t, http.MethodGet, "/v1/deleted-apps?limit=1&cursor="+page.Next, nil, nil)
 	if next.Code != 200 {
 		t.Fatalf("next = %d: %s", next.Code, next.Body)
 	}
@@ -60,29 +61,29 @@ func TestDeletedAppsInventoryIsBoundedAndAccountOwned(t *testing.T) {
 	if len(second.Apps) != 1 || second.Apps[0].ID == page.Apps[0].ID || second.Next != "" {
 		t.Fatalf("second = %+v", second)
 	}
-	assertProblem(t, e.do(t, http.MethodGet, "/v1/deleted-apps/"+foreign.ID, nil, nil), 404, api.CodeNotFound)
+	apidserver.AssertProblem(t, e.Do(t, http.MethodGet, "/v1/deleted-apps/"+foreign.ID, nil, nil), 404, api.CodeNotFound)
 	// A cursor generated for the original account is not accepted by another account.
 	pt, hash, _ := api.GenerateAPIKey()
-	_, _ = e.store.CreateAPIKey(ctx, other.ID, hash, "other", api.ScopesAdminOnly)
+	_, _ = (*e.Store()).CreateAPIKey(ctx, other.ID, hash, "other", api.ScopesAdminOnly)
 	otherEnv := e
-	otherEnv.key = pt
-	if out := otherEnv.do(t, http.MethodGet, "/v1/deleted-apps?cursor="+page.Next, nil, nil); out.Code != 400 {
+	*otherEnv.Key() = pt
+	if out := otherEnv.Do(t, http.MethodGet, "/v1/deleted-apps?cursor="+page.Next, nil, nil); out.Code != 400 {
 		t.Fatalf("foreign cursor = %d: %s", out.Code, out.Body)
 	}
 	for _, query := range []string{"limit=0", "limit=51", "limit=no", "cursor=not-a-cursor"} {
-		if out := e.do(t, http.MethodGet, "/v1/deleted-apps?"+query, nil, nil); out.Code != 400 {
+		if out := e.Do(t, http.MethodGet, "/v1/deleted-apps?"+query, nil, nil); out.Code != 400 {
 			t.Fatalf("%s = %d: %s", query, out.Code, out.Body)
 		}
 	}
 }
 
 func TestDeletedAppsInventoryReportsLifecycleBlockersAndRequiresAuth(t *testing.T) {
-	e := setup(t, api.PlanPro)
-	id := mustSeedApp(t, e, "expired-tombstone")
-	_, _ = e.store.ScheduleAppDeletion(context.Background(), id, time.Now().Add(-time.Hour))
+	e := apidserver.Setup(t, api.PlanPro)
+	id := apidserver.MustSeedApp(t, e, "expired-tombstone")
+	_, _ = (*e.Store()).ScheduleAppDeletion(context.Background(), id, time.Now().Add(-time.Hour))
 	read := func(want string) {
 		t.Helper()
-		r := e.do(t, http.MethodGet, "/v1/deleted-apps/"+id, nil, nil)
+		r := e.Do(t, http.MethodGet, "/v1/deleted-apps/"+id, nil, nil)
 		var out struct {
 			Eligible bool   `json:"restore_eligible"`
 			Blocker  string `json:"restore_blocker"`
@@ -96,21 +97,21 @@ func TestDeletedAppsInventoryReportsLifecycleBlockersAndRequiresAuth(t *testing.
 		}
 	}
 	read("grace_expired")
-	if err := e.store.ClaimAppDeletion(context.Background(), id); err != nil {
+	if err := (*e.Store()).ClaimAppDeletion(context.Background(), id); err != nil {
 		t.Fatal(err)
 	}
 	read("purge_started")
 	rec := httptest.NewRecorder()
-	e.h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/deleted-apps", nil))
+	(*e.H()).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/deleted-apps", nil))
 	if rec.Code != 401 {
 		t.Fatalf("unauthenticated = %d", rec.Code)
 	}
 }
 
 func TestDeletedAppsInventoryRequiresReadScopeAndPreservesDeletedSlug(t *testing.T) {
-	e := setup(t, api.PlanPro)
-	id := mustSeedApp(t, e, "deleted")
-	rec := e.do(t, http.MethodGet, "/v1/apps/deleted", nil, nil)
+	e := apidserver.Setup(t, api.PlanPro)
+	id := apidserver.MustSeedApp(t, e, "deleted")
+	rec := e.Do(t, http.MethodGet, "/v1/apps/deleted", nil, nil)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("existing slug read = %d: %s", rec.Code, rec.Body)
 	}
@@ -119,54 +120,58 @@ func TestDeletedAppsInventoryRequiresReadScopeAndPreservesDeletedSlug(t *testing
 		t.Fatalf("existing slug identity = %+v, %v", app, err)
 	}
 	pt, hash, _ := api.GenerateAPIKey()
-	if _, err := e.store.CreateAPIKey(context.Background(), e.acct.ID, hash, "write-only", []string{api.ScopeDeployWrite}); err != nil {
+	if _, err := (*e.Store()).CreateAPIKey(context.Background(), e.Acct().ID, hash, "write-only", []string{api.ScopeDeployWrite}); err != nil {
 		t.Fatal(err)
 	}
-	e.key = pt
-	if rec := e.do(t, http.MethodGet, "/v1/deleted-apps", nil, nil); rec.Code != http.StatusForbidden {
+	*e.Key() = pt
+	if rec := e.Do(t, http.MethodGet, "/v1/deleted-apps", nil, nil); rec.Code != http.StatusForbidden {
 		t.Fatalf("write-only inventory = %d: %s", rec.Code, rec.Body)
 	}
 }
 
 func TestDeletedAppsInventoryRequiresMFA(t *testing.T) {
-	e := setupWithMFA(t, api.PlanPro, true, false)
-	if rec := e.do(t, http.MethodGet, "/v1/deleted-apps", nil); rec.Code != http.StatusForbidden {
+	e := apidserver.SetupWithMFA(t, api.PlanPro, true, false)
+	request := httptest.NewRequest(http.MethodGet, "/v1/deleted-apps", nil)
+	request.AddCookie(*e.Cookie())
+	rec := httptest.NewRecorder()
+	(*e.H()).ServeHTTP(rec, request)
+	if rec.Code != http.StatusForbidden {
 		t.Fatalf("pending MFA inventory = %d: %s", rec.Code, rec.Body)
 	}
 }
 
 func TestRestoreAppRejectsChangedInventoryIdentity(t *testing.T) {
-	e := setup(t, api.PlanPro)
-	id := mustSeedApp(t, e, "replacement-tombstone")
-	_, _ = e.store.ScheduleAppDeletion(context.Background(), id, time.Now().Add(time.Hour))
-	r := e.do(t, http.MethodPost, "/v1/apps/replacement-tombstone/restore", map[string]string{"expected_app_id": uuid.NewString()}, nil)
+	e := apidserver.Setup(t, api.PlanPro)
+	id := apidserver.MustSeedApp(t, e, "replacement-tombstone")
+	_, _ = (*e.Store()).ScheduleAppDeletion(context.Background(), id, time.Now().Add(time.Hour))
+	r := e.Do(t, http.MethodPost, "/v1/apps/replacement-tombstone/restore", map[string]string{"expected_app_id": uuid.NewString()}, nil)
 	if r.Code != 409 {
 		t.Fatalf("stale restore = %d: %s", r.Code, r.Body)
 	}
-	still, err := e.store.AppBySlugIncludingDeleted(context.Background(), "replacement-tombstone")
+	still, err := (*e.Store()).AppBySlugIncludingDeleted(context.Background(), "replacement-tombstone")
 	if err != nil || still.Status != state.AppDeleted {
 		t.Fatalf("replacement was changed: %+v, %v", still, err)
 	}
 	for _, body := range []map[string]any{{"expected_app_id": "bad"}, {"expected_app_id": nil}, {"expected_app_id": ""}, {"unexpected": "field"}} {
-		if r := e.do(t, http.MethodPost, "/v1/apps/replacement-tombstone/restore", body, nil); r.Code != 400 {
+		if r := e.Do(t, http.MethodPost, "/v1/apps/replacement-tombstone/restore", body, nil); r.Code != 400 {
 			t.Fatalf("bad precondition = %d: %s", r.Code, r.Body)
 		}
 	}
-	r = e.do(t, http.MethodPost, "/v1/apps/replacement-tombstone/restore", map[string]string{"expected_app_id": id}, nil)
+	r = e.Do(t, http.MethodPost, "/v1/apps/replacement-tombstone/restore", map[string]string{"expected_app_id": id}, nil)
 	if r.Code != 200 {
 		t.Fatalf("identified restore = %d: %s", r.Code, r.Body)
 	}
-	assertProblem(t, e.do(t, http.MethodGet, "/v1/deleted-apps/"+id, nil, nil), 404, api.CodeNotFound)
+	apidserver.AssertProblem(t, e.Do(t, http.MethodGet, "/v1/deleted-apps/"+id, nil, nil), 404, api.CodeNotFound)
 }
 
 func TestRestoreDeletedAppDedicatedIdentityRoute(t *testing.T) {
-	e := setup(t, api.PlanPro)
-	id := mustSeedApp(t, e, "identified-tombstone")
-	_, _ = e.store.ScheduleAppDeletion(context.Background(), id, time.Now().Add(time.Hour))
-	if r := e.do(t, http.MethodPost, "/v1/deleted-apps/"+id+"/restore", map[string]string{"dry_run": "true"}, nil); r.Code != 400 {
+	e := apidserver.Setup(t, api.PlanPro)
+	id := apidserver.MustSeedApp(t, e, "identified-tombstone")
+	_, _ = (*e.Store()).ScheduleAppDeletion(context.Background(), id, time.Now().Add(time.Hour))
+	if r := e.Do(t, http.MethodPost, "/v1/deleted-apps/"+id+"/restore", map[string]string{"dry_run": "true"}, nil); r.Code != 400 {
 		t.Fatalf("unknown restore intent = %d: %s", r.Code, r.Body)
 	}
-	r := e.do(t, http.MethodPost, "/v1/deleted-apps/"+id+"/restore", nil, nil)
+	r := e.Do(t, http.MethodPost, "/v1/deleted-apps/"+id+"/restore", nil, nil)
 	if r.Code != 200 {
 		t.Fatalf("identified route = %d: %s", r.Code, r.Body)
 	}
@@ -174,24 +179,24 @@ func TestRestoreDeletedAppDedicatedIdentityRoute(t *testing.T) {
 	if err := json.Unmarshal(r.Body.Bytes(), &restored); err != nil || restored.ID != id {
 		t.Fatalf("restore identity = %+v, %v", restored, err)
 	}
-	if r := e.do(t, http.MethodPost, "/v1/deleted-apps/"+id+"/restore", nil, nil); r.Code != 404 {
+	if r := e.Do(t, http.MethodPost, "/v1/deleted-apps/"+id+"/restore", nil, nil); r.Code != 404 {
 		t.Fatalf("active app is no longer in deleted collection = %d", r.Code)
 	}
-	other, _ := e.store.CreateAccount(context.Background(), "foreign-restore@example.com", api.PlanPro)
-	foreign, _ := e.store.CreateApp(context.Background(), state.App{AccountID: other.ID, Slug: "foreign-restore", Status: state.AppActive})
-	_, _ = e.store.ScheduleAppDeletion(context.Background(), foreign.ID, time.Now().Add(time.Hour))
-	assertProblem(t, e.do(t, http.MethodPost, "/v1/deleted-apps/"+foreign.ID+"/restore", nil, nil), 404, api.CodeNotFound)
+	other, _ := (*e.Store()).CreateAccount(context.Background(), "foreign-restore@example.com", api.PlanPro)
+	foreign, _ := (*e.Store()).CreateApp(context.Background(), state.App{AccountID: other.ID, Slug: "foreign-restore", Status: state.AppActive})
+	_, _ = (*e.Store()).ScheduleAppDeletion(context.Background(), foreign.ID, time.Now().Add(time.Hour))
+	apidserver.AssertProblem(t, e.Do(t, http.MethodPost, "/v1/deleted-apps/"+foreign.ID+"/restore", nil, nil), 404, api.CodeNotFound)
 }
 
 func TestRestoreDeletedAppDedicatedRouteRechecksExpiryAndScope(t *testing.T) {
-	e := setup(t, api.PlanPro)
-	id := mustSeedApp(t, e, "expired-restore")
-	_, _ = e.store.ScheduleAppDeletion(context.Background(), id, time.Now().Add(-time.Hour))
-	assertProblem(t, e.do(t, http.MethodPost, "/v1/deleted-apps/"+id+"/restore", nil, nil), 409, api.CodeAppNotRestorable)
+	e := apidserver.Setup(t, api.PlanPro)
+	id := apidserver.MustSeedApp(t, e, "expired-restore")
+	_, _ = (*e.Store()).ScheduleAppDeletion(context.Background(), id, time.Now().Add(-time.Hour))
+	apidserver.AssertProblem(t, e.Do(t, http.MethodPost, "/v1/deleted-apps/"+id+"/restore", nil, nil), 409, api.CodeAppNotRestorable)
 	pt, hash, _ := api.GenerateAPIKey()
-	_, _ = e.store.CreateAPIKey(context.Background(), e.acct.ID, hash, "read-only", []string{api.ScopeAppsRead})
-	e.key = pt
-	if rec := e.do(t, http.MethodPost, "/v1/deleted-apps/"+id+"/restore", nil, nil); rec.Code != 403 {
+	_, _ = (*e.Store()).CreateAPIKey(context.Background(), e.Acct().ID, hash, "read-only", []string{api.ScopeAppsRead})
+	*e.Key() = pt
+	if rec := e.Do(t, http.MethodPost, "/v1/deleted-apps/"+id+"/restore", nil, nil); rec.Code != 403 {
 		t.Fatalf("read-only restore = %d: %s", rec.Code, rec.Body)
 	}
 }
