@@ -6217,6 +6217,12 @@ type OutboundAiRouteTarget struct {
 	Model         pgtype.Text
 }
 
+type OutboundAiSettlement struct {
+	LeaseID       pgtype.UUID
+	IntegrationID pgtype.UUID
+	SettledAt     pgtype.Timestamptz
+}
+
 type OutboundAiUsageDaily struct {
 	IntegrationID        pgtype.UUID
 	UsageDate            pgtype.Date
