@@ -1668,7 +1668,7 @@ List alert rules
 
 Add an alert rule
 
-`gregale alerts add --app <slug> --name <NAME> [--metric <METRIC>] [--comparison <OP>] [--threshold <N>] [--window-spec <WINDOW>] [--event-subscription-id <UUID>] [--failure-source <SOURCE>] --webhook-url <URL> [--action <ACTION>] [--post-deploy-rollback-window <duration>] [--webhook-secret-stdin] [--webhook-secret <VALUE>]`
+`gregale alerts add --app <slug> --name <NAME> [--metric <METRIC>] [--comparison <OP>] [--threshold <N>] [--window-spec <WINDOW>] [--event-subscription-id <UUID>] [--edge-rule-id <ID>] [--failure-source <SOURCE>] --webhook-url <URL> [--action <ACTION>] [--post-deploy-rollback-window <duration>] [--webhook-secret-stdin] [--webhook-secret <VALUE>]`
 
 | Flag | Meaning | |
 |---|---|---|
@@ -1679,6 +1679,7 @@ Add an alert rule
 | `--threshold <N>` | threshold value |  |
 | `--window-spec <WINDOW>` | 5m\|15m\|1h\|6h\|24h\|7d\|15d |  |
 | `--event-subscription-id <UUID>` | Subscription UUID for event consumer metrics |  |
+| `--edge-rule-id <ID>` | edge rule for edge_rule_hits / edge_rule_log_hits (empty = all rules) |  |
 | `--failure-source <SOURCE>` | any\|cron\|queue\|delayed_task\|async_invoke\|inbound_webhook |  |
 | `--webhook-url <URL>` | https webhook URL | required |
 | `--action <ACTION>` | alert action | one of `webhook` · `rollback` · `demote` · `promote` |
@@ -7988,7 +7989,7 @@ Add an edge rule
 |---|---|---|
 | `--app <slug>` | app slug | required |
 | `--kind <KIND>` | rule kind | required; one of `route` · `rewrite` · `redirect` · `headers` · `cors` · `jwt` · `ip` · `validate` · `limit` · `geo` · `maintenance` · `throttle` · `budget` · `cache` · `respond` · `retry` · `circuit_breaker` · `waf` · `async` |
-| `--match-host <HOST>` | host to match | required |
+| `--match-host <HOST>` | host to match; @app covers every host the app serves | required |
 | `--match-path <PATH>` | path glob to match (default / covers only the root; /** covers every path) |  |
 | `--match-method <METHOD>` | HTTP method to match (repeat for multiple) |  |
 | `--match-header <Name=Value>` | exact request header selector (repeat) |  |
@@ -8112,7 +8113,7 @@ Update one edge rule
 
 | Flag | Meaning | |
 |---|---|---|
-| `--match-host <HOST>` | new host to match |  |
+| `--match-host <HOST>` | new host to match; @app covers every host the app serves |  |
 | `--match-path <PATH>` | new path to match |  |
 | `--match-method <METHOD>` | replacement HTTP method (repeatable) |  |
 | `--match-header <NAME=VALUE>` | replacement exact request header selector (repeatable) |  |
@@ -8241,6 +8242,30 @@ List recorded versions of an app&#39;s edge-rule set (--version N shows its rule
 |---|---|---|
 | `--app <slug>` | app slug | required |
 | `--version <N>` | show the rules recorded in this version |  |
+
+### edge-rules recipes
+
+List protection recipes: ready-made rules that start in log mode
+
+### edge-rules recipe
+
+Add a protection recipe&#39;s rule to an app, in log mode unless --enforce
+
+`gregale edge-rules recipe [--app <slug>] [--host <HOST>] [--set <NAME=VALUE>] [--enforce] <recipe>`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--app <slug>` | app slug (defaults to linked project context) |  |
+| `--host <HOST>` | restrict the rule to one hostname (default: every host the app serves) |  |
+| `--set <NAME=VALUE>` | recipe parameter name=value (repeat) |  |
+| `--enforce` | enforce immediately instead of starting in log mode |  |
+
+Examples:
+
+```sh
+gregale edge-rules recipe block-unverified-bots --app my-api
+gregale edge-rules recipe allow-ips-only --app my-api --set cidrs=203.0.113.7,198.51.100.0/24
+```
 
 ### edge-rules stats
 

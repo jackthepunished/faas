@@ -878,6 +878,7 @@ var cliCommands = []cliCommand{
 				{Name: "threshold", Short: "threshold value", Value: "N"},
 				{Name: "window-spec", Short: "5m|15m|1h|6h|24h|7d|15d", Value: "WINDOW"},
 				{Name: "event-subscription-id", Short: "Subscription UUID for event consumer metrics", Value: "UUID"},
+				{Name: "edge-rule-id", Short: "edge rule for edge_rule_hits / edge_rule_log_hits (empty = all rules)", Value: "ID"},
 				{Name: "failure-source", Short: "any|cron|queue|delayed_task|async_invoke|inbound_webhook", Value: "SOURCE"},
 				{Name: "webhook-url", Short: "https webhook URL", Req: true, Value: "URL"},
 				{Name: flagNameAction, Short: "alert action", Value: "ACTION", ClosedSet: api.AllowedAlertRuleActions},
@@ -2873,7 +2874,7 @@ var cliCommands = []cliCommand{
 			}, Flags: []cliFlag{
 				{Name: "app", Short: "app slug", Value: "slug", Req: true},
 				{Name: "kind", Short: "rule kind", Value: "KIND", Req: true, ClosedSet: edgeRuleKindVocab},
-				{Name: "match-host", Short: "host to match", Value: "HOST", Req: true},
+				{Name: "match-host", Short: "host to match; @app covers every host the app serves", Value: "HOST", Req: true},
 				{Name: "match-path", Short: "path glob to match (default / covers only the root; /** covers every path)", Value: "PATH"},
 				{Name: "match-method", Short: "HTTP method to match (repeat for multiple)", Value: "METHOD"},
 				{Name: "match-header", Short: "exact request header selector (repeat)", Value: "Name=Value"},
@@ -2975,7 +2976,7 @@ var cliCommands = []cliCommand{
 				"gregale edge-rules update RULE_ID --kind validate --validate-schema @schema.json --validate-mode block",
 				"gregale edge-rules update RULE_ID --kind validate --validate-mode observe",
 			}, Flags: []cliFlag{
-				{Name: "match-host", Short: "new host to match", Value: "HOST"},
+				{Name: "match-host", Short: "new host to match; @app covers every host the app serves", Value: "HOST"},
 				{Name: "match-path", Short: "new path to match", Value: "PATH"},
 				{Name: "match-method", Short: "replacement HTTP method (repeatable)", Value: "METHOD", Repeatable: true},
 				{Name: "match-header", Short: "replacement exact request header selector (repeatable)", Value: "NAME=VALUE", Repeatable: true},
@@ -3083,6 +3084,16 @@ var cliCommands = []cliCommand{
 			{Name: "history", Short: "List recorded versions of an app's edge-rule set (--version N shows its rules)", Flags: []cliFlag{
 				{Name: "app", Short: "app slug", Req: true, Value: "slug"},
 				{Name: "version", Short: "show the rules recorded in this version", Value: "N"},
+			}},
+			{Name: "recipes", Short: "List protection recipes: ready-made rules that start in log mode"},
+			{Name: "recipe", Short: "Add a protection recipe's rule to an app, in log mode unless --enforce", Positionals: []string{"<recipe>"}, Examples: []string{
+				"gregale edge-rules recipe block-unverified-bots --app my-api",
+				"gregale edge-rules recipe allow-ips-only --app my-api --set cidrs=203.0.113.7,198.51.100.0/24",
+			}, Flags: []cliFlag{
+				{Name: "app", Short: "app slug (defaults to linked project context)", Value: "slug"},
+				{Name: "host", Short: "restrict the rule to one hostname (default: every host the app serves)", Value: "HOST"},
+				{Name: "set", Short: "recipe parameter name=value (repeat)", Value: "NAME=VALUE"},
+				{Name: "enforce", Short: "enforce immediately instead of starting in log mode", Bool: true},
 			}},
 			{Name: "stats", Short: "Per-rule match counts (matched for enforced rules, logged for log-mode rules)", Flags: []cliFlag{
 				{Name: "app", Short: "app slug", Req: true, Value: "slug"},
