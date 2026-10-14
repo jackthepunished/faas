@@ -751,6 +751,7 @@ from .debug_dependency_impact_exemplar_window import DebugDependencyImpactExempl
 from .debug_dependency_latency_item import DebugDependencyLatencyItem
 from .debug_dependency_latency_item_type import DebugDependencyLatencyItemType
 from .debug_dependency_latency_response import DebugDependencyLatencyResponse
+from .debug_dependency_query_item import DebugDependencyQueryItem
 from .debug_evidence_explanation import DebugEvidenceExplanation
 from .debug_evidence_explanation_confidence import DebugEvidenceExplanationConfidence
 from .debug_evidence_explanation_diagnosis import DebugEvidenceExplanationDiagnosis
@@ -768,6 +769,7 @@ from .debug_regression_action_request import DebugRegressionActionRequest
 from .debug_regression_action_request_action import DebugRegressionActionRequestAction
 from .debug_regression_action_response import DebugRegressionActionResponse
 from .debug_regression_item import DebugRegressionItem
+from .debug_regression_item_kind import DebugRegressionItemKind
 from .debug_regression_item_state import DebugRegressionItemState
 from .debug_regressions_response import DebugRegressionsResponse
 from .debug_replay_comparison import DebugReplayComparison
@@ -5232,6 +5234,7 @@ __all__ = (
     "DebugDependencyLatencyItem",
     "DebugDependencyLatencyItemType",
     "DebugDependencyLatencyResponse",
+    "DebugDependencyQueryItem",
     "DebugEvidenceExplanation",
     "DebugEvidenceExplanationConfidence",
     "DebugEvidenceExplanationDiagnosis",
@@ -5249,6 +5252,7 @@ __all__ = (
     "DebugRegressionActionRequestAction",
     "DebugRegressionActionResponse",
     "DebugRegressionItem",
+    "DebugRegressionItemKind",
     "DebugRegressionItemState",
     "DebugRegressionsResponse",
     "DebugReplayComparison",
