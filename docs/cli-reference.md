@@ -40,7 +40,7 @@ Automation: put `--non-interactive` before the command to disable prompts and br
 | [`delayed-task`](#delayed-task) | Schedule and inspect deferred invocations |
 | [`deployments`](#deployments) | List deployments or manage stable named URLs for immutable revisions |
 | [`deployment`](#deployment) | Inspect a deployment, wait for its rollout, advance a canary, or set its minimum instances |
-| [`deploys`](#deploys) | Deployment drill-downs (deploys show\|status\|cancel\|reorder\|clear\|clear-obsolete\|retry) |
+| [`deploys`](#deploys) | Deployment drill-downs (deploys show\|status\|logs\|cancel\|reorder\|clear\|clear-obsolete\|retry) |
 | [`deploy`](#deploy) | Deploy an app, function, or project |
 | [`domains`](#domains) | Manage custom domains |
 | [`dev`](#dev) | Sync local changes to a developer environment |
@@ -2307,7 +2307,7 @@ Add an alert rule
 | `--event-subscription-id <UUID>` | Subscription UUID for event consumer metrics |  |
 | `--edge-rule-id <ID>` | edge rule for edge_rule_hits / edge_rule_log_hits (empty = all rules) |  |
 | `--failure-source <SOURCE>` | any\|cron\|queue\|delayed_task\|async_invoke\|inbound_webhook |  |
-| `--webhook-url <URL>` | https webhook URL | required |
+| `--webhook-url <URL>` | http(s) webhook URL (https recommended: deliveries are signed, not encrypted) | required |
 | `--action <ACTION>` | alert action | one of `webhook` · `rollback` · `demote` · `promote` |
 | `--post-deploy-rollback-window <duration>` | completed-release rollback window (0 off; up to 1h) |  |
 | `--webhook-secret-stdin` | read the webhook signing secret from stdin (this or --webhook-secret is required) |  |
@@ -7177,7 +7177,7 @@ List deployments or manage stable named URLs for immutable revisions
 | `--before <CURSOR>` | alias for --cursor |  |
 | `--cursor <CURSOR>` | opaque cursor from a prior page |  |
 | `--all` | walk every page |  |
-| `--wide` | include annotation columns (by / pr / tag / reason) |  |
+| `--wide` | include the revision (vN) and annotation columns (by / pr / tag / reason) |  |
 
 Examples:
 
@@ -7350,7 +7350,7 @@ Set the per-deployment cold-wake floor
 
 ## deploys
 
-Deployment drill-downs (deploys show|status|cancel|reorder|clear|clear-obsolete|retry)
+Deployment drill-downs (deploys show|status|logs|cancel|reorder|clear|clear-obsolete|retry)
 
 `gregale deploys [<subcommand>] <id|vN> [--app <SLUG>]`
 
@@ -7399,6 +7399,23 @@ Examples:
 ```sh
 gregale deploys status 00000000000000000000000000000001
 gregale deploys status v42 --app my-api --json
+```
+
+### deploys logs
+
+Print one deployment&#39;s build and deploy log
+
+`gregale deploys logs [--app <SLUG>] [--limit <N>] <id|vN>`
+
+| Flag | Meaning | |
+|---|---|---|
+| `--app <SLUG>` | app slug; only needed to resolve a vN revision outside a linked project |  |
+| `--limit <N>` | most recent log lines to print (1-5000) |  |
+
+Examples:
+
+```sh
+gregale deploys logs v42 --app my-api
 ```
 
 ### deploys cancel
@@ -11962,7 +11979,7 @@ Create a new account (signup [--email-only EMAIL | --password-stdin])
 
 Query runtime logs and HTTP request events (linked app or interactive picker)
 
-`gregale logs [<slug>] [--dry-run] [--view <NAME>] [--saved-view] [--clear-status] [--clear-grep] [--clear-level] [--clear-route] [--latest-failure] [--latest-request-error] [--interactive] [--follow] [--deployment <ID>] [--release <ID|vN>] [--source <SOURCE>] [--grep <SUBSTR>] [--since <15m|3d|RFC3339>] [--level <LEVEL>] [--status <100..599>] [--route <PATH>] [--request <ID>] [--trace <TRACE_ID>] [--limit <N>] [--all] [--explain] [--archive] [--instance <ID>] [--date <DAY>]`
+`gregale logs [<slug>] [--dry-run] [--view <NAME>] [--saved-view] [--clear-status] [--clear-grep] [--clear-level] [--clear-route] [--latest-failure] [--latest-request-error] [--interactive] [--follow] [--deployment <ID>] [--release <ID|vN>] [--source <SOURCE>] [--grep <SUBSTR>] [--since <15m|3d|RFC3339>] [--level <LEVEL>] [--status <100..599>] [--route <METHOD /path>] [--request <ID>] [--trace <TRACE_ID>] [--limit <N>] [--all] [--explain] [--archive] [--instance <ID>] [--date <DAY>]`
 
 | Flag | Meaning | |
 |---|---|---|
@@ -11984,7 +12001,7 @@ Query runtime logs and HTTP request events (linked app or interactive picker)
 | `--since <15m|3d|RFC3339>` | lookback duration or RFC3339 timestamp |  |
 | `--level <LEVEL>` | only show lines at this level | one of `info` · `warn` · `error` |
 | `--status <100..599>` | only show HTTP requests with this status |  |
-| `--route <PATH>` | only show HTTP requests for this route |  |
+| `--route <METHOD /path>` | only show HTTP requests for this route label |  |
 | `--request <ID>` | show one HTTP request by public request id or row id |  |
 | `--trace <TRACE_ID>` | show HTTP access logs correlated with a W3C trace id |  |
 | `--limit <N>` | HTTP request page size (1..200) |  |
@@ -14909,7 +14926,7 @@ Add a webhook
 | Flag | Meaning | |
 |---|---|---|
 | `--app <slug>` | app slug | required |
-| `--target-url <URL>` | HTTPS target URL | required |
+| `--target-url <URL>` | http(s) target URL (https recommended: deliveries are signed, not encrypted) | required |
 | `--event <EVENT>` | event to deliver (repeat) |  |
 | `--retry-policy <POLICY>` | default\|aggressive\|none |  |
 | `--delivery-format <FORMAT>` | json\|cloudevents |  |
@@ -14933,7 +14950,7 @@ Update one webhook
 | Flag | Meaning | |
 |---|---|---|
 | `--app <slug>` | app slug | required |
-| `--target-url <URL>` | new HTTPS target URL |  |
+| `--target-url <URL>` | new http(s) target URL |  |
 | `--retry-policy <POLICY>` | new retry policy | one of `default` · `aggressive` · `none` |
 | `--delivery-format <FORMAT>` | new delivery format | one of `json` · `cloudevents` |
 | `--enable` | enable the webhook |  |
