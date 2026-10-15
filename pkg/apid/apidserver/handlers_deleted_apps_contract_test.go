@@ -12,6 +12,7 @@ import (
 	"github.com/onebox-faas/faas/pkg/api"
 	apidserver "github.com/onebox-faas/faas/pkg/apid/apidserver"
 	"github.com/onebox-faas/faas/pkg/state"
+	"github.com/onebox-faas/faas/pkg/state/statetest"
 )
 
 func TestDeletedAppsEmptyAndMissingLifecycleMetadata(t *testing.T) {
@@ -67,8 +68,7 @@ func TestDeletedAppsRejectsUnqualifiedScopeAndDuplicatePagination(t *testing.T) 
 }
 
 type replacedDeletedSlugStore struct {
-	state.Store
-	state.AccountDeletedAppsStore
+	MemStore    *state.MemStore
 	replacement state.App
 }
 
@@ -85,7 +85,7 @@ func TestRestoreDeletedAppRejectsReplacementSlugBeforeMutation(t *testing.T) {
 	}
 	replacement, _ := (*e.Store()).AppBySlugIncludingDeleted(context.Background(), "replacement-deleted")
 	replacement.Slug = "original-deleted"
-	*(*e.S()).Store() = replacedDeletedSlugStore{Store: (*e.Store()), AccountDeletedAppsStore: (*e.Store()), replacement: replacement}
+	*(*e.S()).Store() = statetest.NewMem(replacedDeletedSlugStore{MemStore: (*e.Store()), replacement: replacement})
 	r := e.Do(t, http.MethodPost, "/v1/deleted-apps/"+id+"/restore", nil, nil)
 	if r.Code != 409 {
 		t.Fatalf("replaced slug = %d: %s", r.Code, r.Body)
@@ -152,13 +152,17 @@ func TestDeletedAppsReportsTheAuthoritativeAccountContext(t *testing.T) {
 }
 
 type failedDeletedRestoreStore struct {
-	state.Store
-	state.AccountDeletedAppsStore
-	failure error
+	MemStore *state.MemStore
+	failure  error
 }
 
 func (s failedDeletedRestoreStore) RestoreApp(context.Context, string, api.Limits) (state.App, error) {
 	return state.App{}, s.failure
+}
+
+func (s failedDeletedRestoreStore) RestoreAppWithActivity(ctx context.Context, id string, limits api.Limits, _ state.OrgActivity) (state.App, int64, error) {
+	app, err := s.RestoreApp(ctx, id, limits)
+	return app, 0, err
 }
 
 func TestRestoreDeletedAppPreservesQuotaAndCapacityFailures(t *testing.T) {
@@ -175,7 +179,7 @@ func TestRestoreDeletedAppPreservesQuotaAndCapacityFailures(t *testing.T) {
 			e := apidserver.Setup(t, api.PlanPro)
 			id := apidserver.MustSeedApp(t, e, "recoverable-restore")
 			_, _ = (*e.Store()).ScheduleAppDeletion(context.Background(), id, time.Now().Add(time.Hour))
-			*(*e.S()).Store() = failedDeletedRestoreStore{Store: (*e.Store()), AccountDeletedAppsStore: (*e.Store()), failure: tc.failure}
+			*(*e.S()).Store() = statetest.NewMem(failedDeletedRestoreStore{MemStore: (*e.Store()), failure: tc.failure})
 			apidserver.AssertProblem(t, e.Do(t, http.MethodPost, "/v1/deleted-apps/"+id+"/restore", nil, nil), tc.status, tc.code)
 			still, _ := (*e.Store()).AppByID(context.Background(), id)
 			if still.Status != state.AppDeleted {
