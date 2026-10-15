@@ -37,7 +37,13 @@ export async function verifyBrowserCORS({ origins, url, token, expired, subject,
     const deadline = Date.now() + 30000
     while (Date.now() < deadline) {
       if (spawnError || child.exitCode !== null || child.signalCode !== null) break
-      try { port = (await readFile(join(profile, 'DevToolsActivePort'), 'utf8')).split('\n')[0]; break } catch {}
+      try {
+        // Chromium can create the file before writing its contents. Wait for
+        // a terminated port line rather than accepting an empty/partial read.
+        const contents = await readFile(join(profile, 'DevToolsActivePort'), 'utf8')
+        const match = /^([1-9]\d{0,4})\r?\n/.exec(contents)
+        if (match && Number(match[1]) <= 65535) { port = match[1]; break }
+      } catch {}
       await new Promise(resolve => setTimeout(resolve, 50))
     }
     assert.equal(spawnError, undefined, 'chromium_failed_to_start')
@@ -118,7 +124,7 @@ export async function verifyBrowserCORS({ origins, url, token, expired, subject,
       document.querySelector('[name=tags]').value = 'one,,two';
       document.querySelector('#note-form').requestSubmit();
       await new Promise(resolve => setTimeout(resolve, 50));
-      return { body: document.querySelector('#body-error').textContent, tags: document.querySelector('#tags-error').textContent, tokenCleared: document.querySelector('[name=token]').value === '' };
+      return { body: document.querySelector('#insert-body-error').textContent, tags: document.querySelector('#tags-error').textContent, tokenCleared: document.querySelector('[name=token]').value === '' };
     })()`)
     assert.equal(invalidForm.body, 'Enter a note body.')
     assert.equal(invalidForm.tags, 'Enter a name for each tag; remove extra commas.')

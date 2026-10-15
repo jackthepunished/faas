@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/state"
 )
 
@@ -170,6 +171,26 @@ func (r *InvocationsRetention) SweepOnce(ctx context.Context) (int, int, error) 
 	}
 	if attempts, ok := r.store.(state.InvocationAttemptRetentionStore); ok {
 		if _, err := attempts.PruneInvocationAttemptHistory(ctx, r.now(), 500); err != nil {
+			return retentionDeleted, 0, err
+		}
+	}
+	if ledger, ok := r.store.(state.EventExecutionLedgerRetentionStore); ok {
+		if _, err := ledger.PruneEventExecutionLedger(ctx, r.now(), api.EventExecutionLedgerPruneBatchDefault); err != nil {
+			return retentionDeleted, 0, err
+		}
+	}
+	if jobs, ok := r.store.(state.EventExecutionLineageRetryJobsStore); ok {
+		if _, err := jobs.AdvanceEventExecutionLineageRetryJobs(ctx, api.EventExecutionLineageRetryJobBatch); err != nil {
+			return retentionDeleted, 0, err
+		}
+	}
+	if backfill, ok := r.store.(state.EventExecutionLineageCaseBackfillStore); ok {
+		if _, err := backfill.AdvanceEventExecutionLineageCaseBackfills(ctx, api.EventExecutionLineageCaseBackfillBatch); err != nil {
+			return retentionDeleted, 0, err
+		}
+	}
+	if reconciliation, ok := r.store.(state.EventExecutionReconciliationStore); ok {
+		if _, err := reconciliation.AdvanceEventExecutionReconciliations(ctx, api.EventExecutionReconciliationBatch); err != nil {
 			return retentionDeleted, 0, err
 		}
 	}
