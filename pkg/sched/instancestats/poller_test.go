@@ -41,6 +41,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/onebox-faas/faas/pkg/api"
 	"github.com/onebox-faas/faas/pkg/fcvm"
 	"github.com/onebox-faas/faas/pkg/sched"
 	"github.com/onebox-faas/faas/pkg/state"
@@ -246,7 +247,16 @@ func seedTwoNodes(t *testing.T, store *state.MemStore) (state.ComputeNode, state
 // durable-fallback tests seed it via that public API.
 func seedInstance(t *testing.T, store *state.MemStore, appID, nodeID string) state.Instance {
 	t.Helper()
-	ins, err := store.CreateInstance(context.Background(), appID, "deploy-1", string(state.StateRunning), 256, nodeID, "")
+	ctx := context.Background()
+	deploymentID := "deploy-1"
+	if app, err := store.AppByID(ctx, appID); err == nil && app.OrgID != "" {
+		deployment, err := store.CreateDeployment(ctx, state.Deployment{AppID: app.ID, Kind: state.DeploymentKindImage})
+		if err != nil {
+			t.Fatal(err)
+		}
+		deploymentID = deployment.ID
+	}
+	ins, err := store.CreateInstance(ctx, appID, deploymentID, string(state.StateRunning), 256, nodeID, "")
 	if err != nil {
 		t.Fatalf("CreateInstance: %v", err)
 	}
@@ -375,6 +385,7 @@ func TestPoller_PersistentTelemetryAvoidsPerNodeDials(t *testing.T) {
 	dialer := &statsFakeDialer{}
 	p := NewPoller(store, dialer, nil, NewReader(), wire.NewOpsMetrics("schedd"), nilLogger()).
 		WithTelemetry(cache).
+		WithOwnerNodeID(live.ID).
 		WithNodeRegistry(sched.NewNodeRegistry([]state.ComputeNode{live}))
 	p.Now = func() time.Time { return now }
 
@@ -393,6 +404,31 @@ func TestPoller_PersistentTelemetryAvoidsPerNodeDials(t *testing.T) {
 	}
 	if !rows[0].SampledAt.Equal(now) {
 		t.Fatalf("row SampledAt = %v, want telemetry sample time %v", rows[0].SampledAt, now)
+	}
+}
+
+// TestPoller_SingleBoxReadsStatsDespiteTelemetryCache pins the single-box
+// posture: vmmd publishes the capacity stream only with a node name, so a
+// poller with no owner node must read Stats directly. Projecting the empty
+// stream cache dropped every in-flight request, and the idle reaper parked
+// instances mid-request.
+func TestPoller_SingleBoxReadsStatsDespiteTelemetryCache(t *testing.T) {
+	store := state.NewMemStore()
+	local, _ := seedTwoNodes(t, store)
+	ins := seedInstance(t, store, "app1", local.ID)
+	dialer := &statsFakeDialer{stats: map[string]*sched.StatsSnapshot{
+		local.TargetURL: {Instances: []sched.VMInstanceStat{{InstanceID: ins.ID, InflightRequests: 1}}},
+	}}
+	p := NewPoller(store, dialer, nil, NewReader(), nil, nilLogger()).
+		WithTelemetry(sched.NewNodeTelemetryCache()).
+		WithNodeRegistry(sched.NewNodeRegistry([]state.ComputeNode{local}))
+
+	if err := p.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	activity, ok := p.Reader.SnapshotActivity(time.Now())[ins.ID]
+	if !ok || activity.Inflight != 1 {
+		t.Fatalf("activity = %+v (found %v), want the in-flight request vmmd Stats reported", activity, ok)
 	}
 }
 
@@ -486,8 +522,12 @@ func TestPoller_TwoOwnerTelemetryViewsFormFleetWithoutFalseErrors(t *testing.T) 
 func TestPoller_FleetStatsFollowsAppOwnershipAcrossPhysicalNodes(t *testing.T) {
 	store := state.NewMemStore()
 	owner, remote := seedTwoNodes(t, store)
+	account, err := store.CreateAccount(context.Background(), "fleet-stats@example.com", api.PlanPro)
+	if err != nil {
+		t.Fatal(err)
+	}
 	app, err := store.CreateApp(context.Background(), state.App{
-		Slug: "owned-app", RAMMB: 256, NodeID: owner.ID,
+		AccountID: account.ID, Slug: "owned-app", RAMMB: 256, NodeID: owner.ID,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -498,7 +538,7 @@ func TestPoller_FleetStatsFollowsAppOwnershipAcrossPhysicalNodes(t *testing.T) {
 	// A foreign-owned app physically placed on the owner's node must not leak
 	// into the owner's scaling view.
 	foreign, err := store.CreateApp(context.Background(), state.App{
-		Slug: "foreign-app", RAMMB: 256, NodeID: remote.ID,
+		AccountID: account.ID, Slug: "foreign-app", RAMMB: 256, NodeID: remote.ID,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1384,7 +1424,7 @@ func TestPoller_PersistentRequestRateSurvivesCachedTicksAndExpires(t *testing.T)
 	ins := seedInstance(t, store, "app1", node.ID)
 	cache := sched.NewNodeTelemetryCache()
 	now := time.Unix(500, 0)
-	p := NewPoller(store, &statsFakeDialer{}, nil, NewReader(), nil, nilLogger()).WithTelemetry(cache)
+	p := NewPoller(store, &statsFakeDialer{}, nil, NewReader(), nil, nilLogger()).WithTelemetry(cache).WithOwnerNodeID(node.ID)
 	p.Now = func() time.Time { return now }
 	publish := func(count *int64) {
 		cache.Replace(node.ID, now, now, []sched.NodeTelemetry{{InstanceID: ins.ID, RequestCountTotal: count}})
