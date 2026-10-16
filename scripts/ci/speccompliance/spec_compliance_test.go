@@ -73,6 +73,7 @@ const (
 	platformTenantsFile              = "platform_tenants.go"            // ADR-226 account-level platform customers
 	platformTenantCredentialsFile    = "platform_tenant_credentials.go" // ADR-236 account-level customer credentials
 	runtimePolicyFile                = "runtime_policy.go"              // app and traffic control-plane convergence status
+	serviceMapFile                   = "service_map.go"                 // ADR-1131 account service map DTOs
 	applicationStandardsFile         = "application_standards.go"       // ADR-435 immutable application standards
 	applicationStandardResourcesFile = "application_standard_resources.go"
 	applicationStandardMutationsFile = "application_standard_mutations.go"
@@ -193,6 +194,7 @@ var routeExclude = map[string]bool{
 	"POST /v1/gitlab/disconnect":                                    true, // GitLab.com session + CSRF form
 	"POST /dashboard/install/connect":                               true, // GitHub App "Connect GitHub" button (PR-C)
 	"GET /dashboard/dev-bridges":                                    true, // ADR-379 HTML session inventory
+	"GET /dashboard/service-map":                                    true, // ADR-1131 HTML view of GET /v1/service-map
 	"GET /dashboard/dev-bridges/{id}":                               true, // ADR-379 HTML activity projection
 	"POST /dashboard/dev-bridges/{id}/revoke":                       true, // ADR-379 cookie + CSRF form
 	"POST /dashboard/apps/new":                                      true, // dashboard-only create + GitHub bind form adapter
@@ -1303,6 +1305,7 @@ func testSchemasParity(t *testing.T, root string, spec *specDoc) {
 		filepath.Join(root, "pkg", "api", platformTenantsFile),
 		filepath.Join(root, "pkg", "api", platformTenantCredentialsFile),
 		filepath.Join(root, "pkg", "api", runtimePolicyFile),
+		filepath.Join(root, "pkg", "api", serviceMapFile),
 		filepath.Join(root, "pkg", "api", applicationStandardsFile),
 		filepath.Join(root, "pkg", "api", applicationStandardResourcesFile),
 		filepath.Join(root, "pkg", "api", applicationStandardMutationsFile),

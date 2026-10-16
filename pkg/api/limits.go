@@ -5003,6 +5003,12 @@ const (
 	// The host receiver stays open longer than this window so a no-bind
 	// worker can use the entire observation budget before reporting.
 	CharacterizationDeadline = 10 * time.Second
+	// CharacterizationPreferredPortGrace is how long waitForBind waits for
+	// the app's expected port once it sees another listener first: an app
+	// may open a private TCP (ADR-576), metrics or admin port before its
+	// serving port. It delays only cold boots of apps that never bind the
+	// expected port; snapshot restores do not characterize.
+	CharacterizationPreferredPortGrace = 500 * time.Millisecond
 	// CharacterizationHostDeadline bounds the HOST receiver started during
 	// cold boot. It must outlive the guest's full observation window; otherwise
 	// a legitimate no-bind worker report is rejected before the guest is due to
@@ -9711,6 +9717,11 @@ const (
 	// through one node's proxy across all accounts, independent of the
 	// per-account plan cap.
 	ServiceTCPSessionsPerNodeMax = 8192
+	// ServiceProxyReplayBodyMaxBytes bounds the service-call bodies the node
+	// proxy buffers to make replayable (ADR-1133): only a declared
+	// Content-Length up to this size is read up front; larger, chunked and
+	// streaming bodies are forwarded unbuffered and are not replayed.
+	ServiceProxyReplayBodyMaxBytes = 1 << 20
 	// Scenario TCP impairment bounds are node-wide, independent of plan quotas.
 	ScenarioTCPChaosMaxRoutesPerNode    = 256
 	ScenarioTCPChaosMaxRateKiBPerSecond = 1_000_000
@@ -9993,6 +10004,13 @@ const (
 	ServiceWakeAheadWakeTimeout = 30 * time.Second
 	// The opt-in setting and fleet residency are cached this long.
 	ServiceWakeAheadCacheTTL = 30 * time.Second
+	// Measured edge statistics survive a gateway restart through a node-local
+	// snapshot (ADR-1132): written at most this often when they changed and
+	// on shutdown, and restored at start unless older than the max age (an
+	// idle weekend must not erase what a caller's traffic taught).
+	ServiceWakeAheadSnapshotInterval = time.Minute
+	ServiceWakeAheadSnapshotMaxAge   = 7 * 24 * time.Hour
+	ServiceWakeAheadSnapshotMaxBytes = 16 << 20
 )
 
 // RouteEvidenceWindow is how far back apid reads gateway-measured route
@@ -11275,3 +11293,16 @@ const (
 	MCPConnectionHealthMaxOffset          = 10000
 	MCPConnectionRetirementWarningSeconds = 24 * 60 * 60
 )
+
+// ServiceMapMaxEdges caps the caller → target edges returned by
+// GET /v1/service-map (ADR-1131). Edges are ranked by call volume before the
+// cap, so the busiest dependencies always survive truncation.
+const ServiceMapMaxEdges = 500
+
+// ServiceMapDefaultRange is the window used when ?range= is omitted. A map
+// needs enough traffic to show quiet edges, so it is longer than the 5m
+// default of the per-app metrics endpoints.
+const ServiceMapDefaultRange = "1h"
+
+// ServiceMapHighErrorRatePct is the edge error rate the dashboard highlights.
+const ServiceMapHighErrorRatePct = 5.0
