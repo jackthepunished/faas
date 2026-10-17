@@ -11108,6 +11108,19 @@ const (
 	// and AuthSSOMaxDomains the email domains one provider serves.
 	AuthSSOMetadataBytes = 512 << 10
 	AuthSSOMaxDomains    = 50
+	// AuthSMSMaxCountries bounds the country calling codes phone sign-in may
+	// text (AUTH_SMS_COUNTRIES).
+	AuthSMSMaxCountries = 50
+	// AuthSCIMPageSize bounds one SCIM list page, and AuthSCIMBodyBytes a
+	// SCIM request body.
+	AuthSCIMPageSize  = 100
+	AuthSCIMBodyBytes = 64 << 10
+	// AuthOAuthMaxClients bounds the OAuth clients one Auth app holds,
+	// registered by the owner or by the clients themselves (RFC 7591).
+	AuthOAuthMaxClients = 1000
+	// AuthAnonymousRetentionMaxDays bounds how long idle anonymous users may
+	// be kept before the Auth app deletes them, when the owner sets a limit.
+	AuthAnonymousRetentionMaxDays = 3650
 	// AuthUINameMaxChars bounds the hosted pages' display name.
 	AuthUINameMaxChars = 60
 	// AuthAuditRetentionMaxDays bounds activity retention. The Auth app
