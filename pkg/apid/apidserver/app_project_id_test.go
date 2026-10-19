@@ -75,6 +75,12 @@ func TestListOrgAppsReportsProjectID(t *testing.T) {
 	e := apidserver.Setup(t, api.PlanPro)
 	ctx := context.Background()
 	org := apidserver.SeedSharedOrgWithOwner(t, e, "project-id-org", "Project ID Org", api.PlanPro)
+	// CreateApp rejects a project_id that is not a project owned by the
+	// app's account and org, so the project must exist first.
+	project := state.Project{ID: projectAppProjectID, AccountID: (*e.Acct()).ID, OrgID: org.ID, Slug: "project-id-test"}
+	if _, err := (*e.Store()).CreateProject(ctx, project); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
 	for _, tc := range projectIDCases {
 		app := state.App{AccountID: (*e.Acct()).ID, OrgID: org.ID, Slug: tc.slug, Type: state.AppTypeApp, ProjectID: tc.projectID}
 		if _, err := (*e.Store()).CreateApp(ctx, app); err != nil {
