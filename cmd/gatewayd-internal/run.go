@@ -2148,6 +2148,7 @@ func runOnPool(ctx context.Context, log *slog.Logger, pool *pgxpool.Pool) error 
 				}
 				return nil
 			}, log)
+		watcher.Daemon = "gatewayd-internal" // ADR-1700 apply receipts
 		if err := watcher.Reconcile(runtimeCtx); err != nil {
 			log.Warn("gatewayd: initial runtime config reconcile failed", "err", err)
 		}

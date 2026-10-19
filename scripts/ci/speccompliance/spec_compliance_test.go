@@ -91,6 +91,7 @@ const (
 	configRevisionsFile              = "config_revisions.go"     // ADR-1451 guarded, reversible config changes
 	changeTimelineFile               = "change_timeline.go"      // ADR-751 app change timeline DTOs
 	customMetricSeriesFile           = "custom_metric_series.go" // ADR-745 custom metric history DTOs
+	operatorPlatformFlagsFile        = "operator_platform_flags.go"
 )
 
 // routeExclude lists server.go routes that are deliberately not in the
@@ -1634,6 +1635,7 @@ func testSchemasParity(t *testing.T, root string, spec *specDoc) {
 		filepath.Join(root, "pkg", "api", oidcFile),
 		filepath.Join(root, "pkg", "api", envDiffFile),
 		filepath.Join(root, "pkg", "api", operatorConfigFile),
+		filepath.Join(root, "pkg", "api", operatorPlatformFlagsFile), // ADR-1700 — platform flags
 		filepath.Join(root, "pkg", "api", obsFile),
 		filepath.Join(root, "pkg", "api", "obs_triage.go"),
 		filepath.Join(root, "pkg", "api", "obs_triage_history.go"),
