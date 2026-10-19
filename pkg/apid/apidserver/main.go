@@ -601,7 +601,7 @@ func Main() {
 	cloneWorker := flag.Bool("clone-worker", false, "run the bounded project-environment clone worker without API listeners")
 	runtimeUpgradeWorker := flag.Bool("runtime-upgrade-worker", false, "run the private runtime upgrade worker without API listeners; requires native qualification for each operation")
 	// The API mode hands off on reload; the worker modes' units do not
-	// reload (ADR-1580).
+	// reload (ADR-1736).
 	wire.HandoffDaemon("apid", func(ctx context.Context, log *slog.Logger) error {
 		if (*cloneWorker && *runtimeUpgradeWorker) || (*pipelineWorker && (*cloneWorker || *runtimeUpgradeWorker)) || (*pipelineAlerts && (*cloneWorker || *runtimeUpgradeWorker || *pipelineWorker)) {
 			return errors.New("apid: worker modes are mutually exclusive")
@@ -1199,7 +1199,7 @@ func dpaPathFromEnv(getenv func(string) string) string {
 
 func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	// stopping is the unit's SIGTERM. ctx also ends once a two-generation
-	// hand-off's successor serves (ADR-1580): this generation's background
+	// hand-off's successor serves (ADR-1736): this generation's background
 	// work stops with it while its requests finish.
 	stopping := ctx
 	ctx, endGeneration := context.WithCancel(ctx)
@@ -2171,6 +2171,8 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	go srv.runWorkflowReadinessSubscriptionWorker(ctx)
 	go srv.runWorkflowReadinessReminderWorker(ctx)
 	go srv.runApplicationStandardWorker(ctx)
+	go srv.runMigrationVerificationWorker(ctx)
+	go srv.runMigrationCutoverWorker(ctx)
 	if deps.bgBefore != nil {
 		deps.bgBefore(ctx, log, srv)
 	}
@@ -2599,7 +2601,7 @@ func runWithDeps(ctx context.Context, log *slog.Logger, deps runDeps) error {
 	defer wire.StartWatchdog(ctx, wire.NewLiveness(), ops, log)()
 	// The drain lets a connection faas-apid.socket handed over just before
 	// shutdown deliver its request; net/http drops one it reads after
-	// Shutdown began (ADR-1580).
+	// Shutdown began (ADR-1736).
 	httpDrain := wire.NewHTTPDrain(httpSrv)
 	// Requests run under streamsCtx so a hand-off's old generation can end
 	// its SSE streams and long polls before its drain bound cuts them.

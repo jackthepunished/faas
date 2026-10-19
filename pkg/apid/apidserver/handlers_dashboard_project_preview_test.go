@@ -280,12 +280,9 @@ func TestRenderProjectPreview_ShowsAsyncRouteDiff(t *testing.T) {
 	}
 }
 
-// TestPreviewDispatch_BadSlugRejected confirms a malformed slug
-// at the POST handler entrypoint returns 400 rather than
-// dispatching into a (potentially redirect-target-injecting)
-// handler body. Mirrors dashboard_cron_fire.go's
-// dashboardFireCronIDRe regex on the {id} segment of the cron
-// fire-now route.
+// TestPreviewDispatch_BadSlugRejected confirms that the
+// account-scoped project lookup hides a malformed/nonexistent slug
+// before dispatching into the POST handler body.
 func TestPreviewDispatch_BadSlugRejected(t *testing.T) {
 	srv, cookie := apidserver.NewAuthedDashboardServer(t)
 	rec := httptest.NewRecorder()

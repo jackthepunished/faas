@@ -1,9 +1,9 @@
 # Architecture Decision Records
 
-- [ADR-1739: Shared-window compound Issues alerts](1739-shared-window-issue-compound-alerts.md)
-- [ADR-1738: Offline grouping previews and reviewed regression baselines](1738-issue-grouping-previews-and-baselines.md)
-- [ADR-1737: Publish final Node build source maps with build completion](1737-builder-issue-source-map-publication.md)
-- [ADR-1736: Publish prebuilt Issues source maps during CLI deployment](1736-deploy-issue-source-map-publication.md)
+- [ADR-1745: Shared-window compound Issues alerts](1745-shared-window-issue-compound-alerts.md)
+- [ADR-1744: Offline grouping previews and reviewed regression baselines](1744-issue-grouping-previews-and-baselines.md)
+- [ADR-1743: Publish final Node build source maps with build completion](1743-builder-issue-source-map-publication.md)
+- [ADR-1742: Publish prebuilt Issues source maps during CLI deployment](1742-deploy-issue-source-map-publication.md)
 
 - [Preserve request identity in response caching](20261017214848-response-cache-request-identity.md)
 
@@ -128,7 +128,7 @@ its baseline line in the same change (the gate fails on a stale entry).
 
 | ADR | Title | Status | Source |
 |---|---|---|---|
-| 1658 | [Owner-authorized deployment response checks](1658-owner-authorized-deployment-response-checks.md) | accepted; native deployment validation pending | Exact-deployment GET checks through the trusted gateway, with bounded HTTP evidence and no forwarded account credentials |
+| 1728 | [Owner-authorized deployment response checks](1728-owner-authorized-deployment-response-checks.md) | accepted; native deployment validation pending | Exact-deployment GET checks through the trusted gateway, with bounded HTTP evidence and no forwarded account credentials |
 | 2026101709 | [Receipt-bound repairable operation transactions](2026101709-repairable-operation-transactions.md) | accepted for internal qualification | Go, Node and Python capture, business writes and receipt bindings commit together; replay survives payload compaction |
 | 2026101708 | [Application writer capture readiness](2026101708-repair-capture-readiness.md) | accepted for internal qualification | Read-only checks on the actual application writer connection |
 | 2026101707 | [Read-only selective repair readiness](2026101707-repair-readiness.md) | accepted for internal qualification | Bounded executor catalog, enrollment and policy diagnostics |
@@ -1056,19 +1056,25 @@ A renumber plus a CI uniqueness gate is worth its own PR.
 
 ## Data API execution and recovery
 
-- [ADR-1660: Data API connection-capacity observations](1660-data-api-connection-capacity-observations.md)
+- [ADR-1729: Data API connection-capacity observations](1729-data-api-connection-capacity-observations.md)
 
-- [ADR-1661: Data API runtime connection-demand observations](1661-data-api-runtime-connection-demand.md)
+- [ADR-1730: Data API runtime connection-demand observations](1730-data-api-runtime-connection-demand.md)
 
-- [ADR-1662: Data API database timing telemetry](1662-data-api-database-timing-telemetry.md)
+- [ADR-1731: Data API database timing telemetry](1731-data-api-database-timing-telemetry.md)
 
-- [ADR-1663: Data API per-user concurrent request limits](1663-data-api-user-concurrency-limits.md)
+- [ADR-1732: Data API per-user concurrent request limits](1732-data-api-user-concurrency-limits.md)
 
-- [ADR-1664: Data API lock waits and contention recovery](1664-data-api-lock-contention-policy.md)
+- [ADR-1733: Data API lock waits and contention recovery](1733-data-api-lock-contention-policy.md)
 
-- [ADR-1665: Data API deadlines across SQL transaction retries](1665-data-api-sql-retry-deadlines.md)
+- [ADR-1734: Data API deadlines across SQL transaction retries](1734-data-api-sql-retry-deadlines.md)
 
-- [ADR-1666: Owner-approved deadline grants during credential rotation](1666-data-api-deadline-grant-rotation.md)
+- [ADR-1735: Owner-approved deadline grants during credential rotation](1735-data-api-deadline-grant-rotation.md)
+
+- [ADR-1736: Zero-downtime daemon restarts](1736-zero-downtime-daemon-restarts.md)
+
+- [ADR-1737: Internal mail service with independent activation and delivery gates](2026101501-internal-mail-service.md)
+
+- [ADR-1738: Durable producer handoff for internal account-deletion email](2026101601-mail-producer-outbox.md)
 
 - [ADR-1667: Coordinated SQL refresh across credential rotation](1667-data-api-coordinated-refresh-rotation.md)
 
@@ -1491,10 +1497,21 @@ A renumber plus a CI uniqueness gate is worth its own PR.
 - [ADR-1380: Python PostgreSQL native acceptance](1380-python-postgres-native-acceptance.md)
 - [ADR-1381: Queue worker completion acceptance](1381-queue-worker-completion-acceptance.md)
 
+- [ADR-1658: Guided migration of an existing service](1658-guided-service-migration.md)
+- [ADR-1659: Resumable migration verification](1659-resumable-migration-verification.md)
+- [ADR-1660: Background migration verification and service recovery](1660-background-migration-verification.md)
+- [ADR-1661: Saved production cutover and DNS recovery](1661-guided-production-cutover.md)
+- [ADR-1662: Saved multi-service migration progress](1662-project-migration-journal.md)
+- [ADR-1663: Separate migration service names from app names](1663-migration-service-app-names.md)
+- [ADR-1664: Map migration runtime variables to selected services](1664-migration-runtime-connections.md)
+- [ADR-1665: Configure public frontend URLs before migration builds](1665-public-frontend-migration-urls.md)
+- [ADR-1666: Wait for selected APIs before migration builds](1666-migration-build-dependency-waits.md)
+
 - [ADR-1260: Initial-failure policy dry run](1260-initial-failure-policy-dry-run.md)
 - [ADR-1261: Durable first-recovery reviews](1261-durable-initial-recovery-reviews.md)
 - [ADR-1135: Sparse extent encoding for remote drives and snapshot memory](1135-sparse-extent-encoding-for-remote-artifacts.md)
-- [Operator incident evidence (2026-10-15)](20261015120000000-operator-incident-evidence.md)
+- [ADR-20261015120000000: Operator incident evidence](20261015120000000-operator-incident-evidence.md)
+- [ADR-20261016120000000: Operator alert workload summary](20261016120000000-operator-alert-workload-summary.md)
 
 
 [ADR-202610171028: Site hosting GitHub OIDC](202610171028-site-hosting-github-oidc.md) specifies explicit immutable trust and short-lived preview credentials.
