@@ -15,6 +15,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/onebox-faas/faas/pkg/api"
+	"github.com/onebox-faas/faas/pkg/apid/appaccess"
 	"github.com/onebox-faas/faas/pkg/apid/httpkit"
 	"github.com/onebox-faas/faas/pkg/state"
 )
@@ -290,7 +291,11 @@ func (s Handler) restoreOwnedApp(w http.ResponseWriter, r *http.Request, acct st
 	if err != nil {
 		var qe *state.QuotaError
 		if errors.As(err, &qe) {
-			api.WriteProblem(w, api.ErrPlanLimitApps(limits, qe.Observed))
+			api.WriteProblem(w, appaccess.QuotaProblem(qe, limits))
+			return
+		}
+		if errors.Is(err, state.ErrOrgAppAdmissionUnavailable) {
+			api.WriteProblem(w, appaccess.AdmissionUnavailableProblem())
 			return
 		}
 		if errors.Is(err, state.ErrConflict) {
