@@ -1150,6 +1150,9 @@ from .delete_deployment_scope_exclusion_response_200 import DeleteDeploymentScop
 from .delete_exclusive_operation_trigger_binding_source import DeleteExclusiveOperationTriggerBindingSource
 from .delete_financial_budget_request import DeleteFinancialBudgetRequest
 from .delete_secret_prefer import DeleteSecretPrefer
+from .deleted_app_list_response import DeletedAppListResponse
+from .deleted_app_summary import DeletedAppSummary
+from .deleted_app_summary_restore_blocker import DeletedAppSummaryRestoreBlocker
 from .deliver_app_event_request import DeliverAppEventRequest
 from .deliver_app_event_response import DeliverAppEventResponse
 from .deliver_app_event_response_status import DeliverAppEventResponseStatus
@@ -4643,7 +4646,9 @@ from .resize_managed_postgres_database_request import ResizeManagedPostgresDatab
 from .resize_managed_postgres_database_request_service_class import ResizeManagedPostgresDatabaseRequestServiceClass
 from .resolved_execution_limits import ResolvedExecutionLimits
 from .resource_profile import ResourceProfile
+from .restore_app_body import RestoreAppBody
 from .restore_automation_revision_request import RestoreAutomationRevisionRequest
+from .restore_deleted_app_body import RestoreDeletedAppBody
 from .restore_managed_postgres_database_request import RestoreManagedPostgresDatabaseRequest
 from .restore_mcp_readiness_policy_request import RestoreMCPReadinessPolicyRequest
 from .resume_automation_failure_pause_request import ResumeAutomationFailurePauseRequest
@@ -6888,6 +6893,9 @@ __all__ = (
     "DelayedTaskResponse",
     "DelayedTaskResponseState",
     "DeleteAccountSessionBody",
+    "DeletedAppListResponse",
+    "DeletedAppSummary",
+    "DeletedAppSummaryRestoreBlocker",
     "DeleteDeploymentScopeExclusionResponse200",
     "DeleteExclusiveOperationTriggerBindingSource",
     "DeleteFinancialBudgetRequest",
@@ -10115,7 +10123,9 @@ __all__ = (
     "ResizeManagedPostgresDatabaseRequestServiceClass",
     "ResolvedExecutionLimits",
     "ResourceProfile",
+    "RestoreAppBody",
     "RestoreAutomationRevisionRequest",
+    "RestoreDeletedAppBody",
     "RestoreManagedPostgresDatabaseRequest",
     "RestoreMCPReadinessPolicyRequest",
     "ResumeAutomationFailurePauseRequest",
