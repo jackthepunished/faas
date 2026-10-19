@@ -13419,6 +13419,7 @@ func (m *MemStore) CreateTriggerIfUnderQuota(_ context.Context, appID, kind, slu
 		Source:               nullableTriggerSource(source),
 		PayloadMaxBytes:      payloadMaxBytes,
 		BrokerPoisonStrategy: brokerPoisonStrategy,
+		Delivery:             api.TriggerDeliveryRecord,
 		CreatedAt:            pgtype.Timestamptz{Time: time.Now(), Valid: true},
 		UpdatedAt:            pgtype.Timestamptz{Time: time.Now(), Valid: true},
 	}
