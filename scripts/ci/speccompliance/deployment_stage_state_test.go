@@ -34,6 +34,7 @@ var stageStateSchemaPins = []struct{ schema, file, goType string }{
 	{"DeploymentStageHistoryEntry", "pkg/state/types.go", "StageStateItem"},
 	{"DeploymentDependencyGate", "pkg/state/deployment_dependency_gate.go", "DeploymentDependencyGate"},
 	{"DeploymentDependencyPin", "pkg/state/deployment_dependency_gate.go", "DeploymentDependencyPin"},
+	{"DeploymentBuildDependencyGate", "pkg/state/build_dependency_gate.go", "BuildDependencyGate"},
 	{"DeploymentHostingVerification", "pkg/state/hosting_verification.go", "HostingVerificationProgress"},
 	{"HostingRouteCheckSet", "pkg/apihostingreceipt/receipt.go", "RouteCheckSet"},
 	{"HostingRouteCheckResult", "pkg/apihostingreceipt/receipt.go", "RouteCheckResult"},

@@ -2,6 +2,7 @@
 /* istanbul ignore file */
 /* tslint:disable */
 /* eslint-disable */
+import type { DeploymentBuildDependencyGate } from './DeploymentBuildDependencyGate.js';
 import type { DeploymentDependencyGate } from './DeploymentDependencyGate.js';
 import type { DeploymentHostingVerification } from './DeploymentHostingVerification.js';
 import type { DeploymentStageHistoryEntry } from './DeploymentStageHistoryEntry.js';
@@ -27,6 +28,7 @@ export type DeploymentStageState = {
    */
   retry_restart_reason?: string;
   dependency_gate?: DeploymentDependencyGate;
+  build_dependency_gate?: DeploymentBuildDependencyGate;
   hosting_verification?: DeploymentHostingVerification;
 };
 

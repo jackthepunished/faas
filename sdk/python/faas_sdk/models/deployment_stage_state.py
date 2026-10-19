@@ -15,6 +15,7 @@ from ..models.deployment_stage_state_retry_requested_stage import (
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.deployment_build_dependency_gate import DeploymentBuildDependencyGate
     from ..models.deployment_dependency_gate import DeploymentDependencyGate
     from ..models.deployment_hosting_verification import DeploymentHostingVerification
     from ..models.deployment_stage_history_entry import DeploymentStageHistoryEntry
@@ -44,6 +45,9 @@ class DeploymentStageState:
     dependency_gate: DeploymentDependencyGate | Unset = UNSET
     """Compose dependency readiness gate pinned at admission (ADR-685). The deadline starts when the candidate
     first presents its own readiness proof."""
+    build_dependency_gate: DeploymentBuildDependencyGate | Unset = UNSET
+    """Build-time wait on the API deployments a guided service migration selected (ADR-1666). It is checked before
+    cache lookup and slot allocation and never holds a build slot while waiting."""
     hosting_verification: DeploymentHostingVerification | Unset = UNSET
     """Candidate hosting verification recovery progress (ADR-481, ADR-482). last_error_code distinguishes
     publication, gateway, transport and candidate-evidence failures; a transport failure does not attribute blame to
@@ -77,6 +81,10 @@ class DeploymentStageState:
         if not isinstance(self.dependency_gate, Unset):
             dependency_gate = self.dependency_gate.to_dict()
 
+        build_dependency_gate: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.build_dependency_gate, Unset):
+            build_dependency_gate = self.build_dependency_gate.to_dict()
+
         hosting_verification: dict[str, Any] | Unset = UNSET
         if not isinstance(self.hosting_verification, Unset):
             hosting_verification = self.hosting_verification.to_dict()
@@ -97,6 +105,8 @@ class DeploymentStageState:
             field_dict["retry_restart_reason"] = retry_restart_reason
         if dependency_gate is not UNSET:
             field_dict["dependency_gate"] = dependency_gate
+        if build_dependency_gate is not UNSET:
+            field_dict["build_dependency_gate"] = build_dependency_gate
         if hosting_verification is not UNSET:
             field_dict["hosting_verification"] = hosting_verification
 
@@ -104,6 +114,7 @@ class DeploymentStageState:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.deployment_build_dependency_gate import DeploymentBuildDependencyGate
         from ..models.deployment_dependency_gate import DeploymentDependencyGate
         from ..models.deployment_hosting_verification import DeploymentHostingVerification
         from ..models.deployment_stage_history_entry import DeploymentStageHistoryEntry
@@ -151,6 +162,13 @@ class DeploymentStageState:
         else:
             dependency_gate = DeploymentDependencyGate.from_dict(_dependency_gate)
 
+        _build_dependency_gate = d.pop("build_dependency_gate", UNSET)
+        build_dependency_gate: DeploymentBuildDependencyGate | Unset
+        if isinstance(_build_dependency_gate, Unset):
+            build_dependency_gate = UNSET
+        else:
+            build_dependency_gate = DeploymentBuildDependencyGate.from_dict(_build_dependency_gate)
+
         _hosting_verification = d.pop("hosting_verification", UNSET)
         hosting_verification: DeploymentHostingVerification | Unset
         if isinstance(_hosting_verification, Unset):
@@ -165,6 +183,7 @@ class DeploymentStageState:
             retry_requested_stage=retry_requested_stage,
             retry_restart_reason=retry_restart_reason,
             dependency_gate=dependency_gate,
+            build_dependency_gate=build_dependency_gate,
             hosting_verification=hosting_verification,
         )
 

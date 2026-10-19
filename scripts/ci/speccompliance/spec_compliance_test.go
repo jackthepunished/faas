@@ -990,6 +990,7 @@ var schemaSpecOnly = map[string]bool{
 	"DeploymentStageHistoryEntry":   true,
 	"DeploymentDependencyGate":      true,
 	"DeploymentDependencyPin":       true,
+	"DeploymentBuildDependencyGate": true,
 	"DeploymentHostingVerification": true,
 	"HostingRouteCheckSet":          true,
 	"HostingRouteCheckResult":       true,

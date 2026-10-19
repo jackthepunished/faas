@@ -86293,6 +86293,7 @@ components:
           type: string
           description: Why a retry restarted from source_download rather than retry_requested_stage.
         dependency_gate: { $ref: '#/components/schemas/DeploymentDependencyGate' }
+        build_dependency_gate: { $ref: '#/components/schemas/DeploymentBuildDependencyGate' }
         hosting_verification: { $ref: '#/components/schemas/DeploymentHostingVerification' }
     DeploymentStageHistoryEntry:
       type: object
@@ -86321,6 +86322,22 @@ components:
         deadline_at: { type: string, format: date-time }
         status: { type: string, enum: [waiting, ready, failed] }
         blocker: { type: string, description: The dependency or deadline currently blocking release. }
+    DeploymentBuildDependencyGate:
+      type: object
+      description: >-
+        Build-time wait on the API deployments a guided service migration
+        selected (ADR-1666). It is checked before cache lookup and slot
+        allocation and never holds a build slot while waiting.
+      required: [dependencies, status, deadline_at, check_after]
+      properties:
+        dependencies:
+          type: array
+          items: { $ref: '#/components/schemas/DeploymentDependencyPin' }
+        status: { type: string, enum: [waiting, ready, failed] }
+        code: { type: string, description: "Machine-readable reason while waiting or failed, for example build_dependency_not_ready or build_dependency_timeout. Absent once ready." }
+        blocker: { type: string, description: The dependency or deadline currently blocking the build. }
+        deadline_at: { type: string, format: date-time }
+        check_after: { type: string, format: date-time, description: "Earliest time the gate is re-checked. Zero time (0001-01-01T00:00:00Z) when no re-check is scheduled." }
     DeploymentDependencyPin:
       type: object
       description: A dependency deployment captured at admission; it never follows a later deployment.
