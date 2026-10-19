@@ -197,7 +197,7 @@ func (s Handler) Restore(w http.ResponseWriter, r *http.Request, acct state.Acco
 	// interpret an unknown intent (for example dry_run) as a real restoration.
 	var body *struct{}
 	err := httpkit.DecodeJSONSized(r, &body, 4096)
-	if err != io.EOF && (err != nil || body == nil) {
+	if !errors.Is(err, io.EOF) && (err != nil || body == nil) {
 		api.WriteProblem(w, api.ErrValidation("restore accepts no fields; use an empty body"))
 		return
 	}
