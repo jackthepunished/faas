@@ -9740,6 +9740,102 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /v1/admin/flags:
+    get:
+      tags: [operator]
+      operationId: listOperatorPlatformFlags
+      summary: List platform flags
+      description: |
+        Returns every catalogued platform flag (ADR-1700) with apid's live
+        definition, the per-daemon apply receipts and convergence, and the
+        shared account groups. Change a flag with
+        PATCH /v1/admin/config/{config_key}. Operator-only.
+      responses:
+        '200':
+          description: Platform flags and groups
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperatorPlatformFlagList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/admin/flags/{key}:
+    get:
+      tags: [operator]
+      operationId: getOperatorPlatformFlag
+      summary: Get a platform flag
+      description: One platform flag with its live definition, apply receipts and convergence. Operator-only.
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema: { type: string }
+          description: Platform flag key, for example ai_gateway.
+      responses:
+        '200':
+          description: Platform flag
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperatorPlatformFlag' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/admin/flags/{key}/decision:
+    get:
+      tags: [operator]
+      operationId: inspectOperatorPlatformFlag
+      summary: Explain a platform flag for an account
+      description: |
+        Evaluates the flag for one account against apid's live definition
+        and reports the matching rule, the reason, and whether the account's
+        plan is entitled to the capability the flag releases. Records
+        nothing. Operator-only.
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema: { type: string }
+          description: Platform flag key.
+        - name: account_id
+          in: query
+          required: true
+          schema: { type: string, format: uuid }
+          description: Account to evaluate.
+      responses:
+        '200':
+          description: Decision
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperatorPlatformFlagDecision' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/admin/accounts/{id}/flags:
+    get:
+      tags: [operator]
+      operationId: listOperatorAccountPlatformFlags
+      summary: List platform flags for an account
+      description: Every platform flag decided for one account, with plan entitlement. Operator-only.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+          description: Account ID.
+      responses:
+        '200':
+          description: Decisions for the account
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperatorAccountPlatformFlags' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
 
   # ─── Account ──────────────────────────────────────────────────────────────
 
@@ -29646,7 +29742,8 @@ paths:
         `snapshot_prepare` / `readiness`) is enforced at the
         database layer by `deployments_stage_state_current_check`,
         so a malformed row would never reach the wire. The
-        `current` field is the stage the deploy is in right now;
+        `current` field is the stage the deploy is in right now
+        (empty once the deployment is live, failed or cancelled);
         `history` lists the closed rows in transition order
         (oldest → newest), each carrying server-measured
         `duration_ms` so the CLI / dashboard don't have to trust
@@ -29658,41 +29755,11 @@ paths:
             no account-existence leak).
       responses:
         '200':
-          description: "The raw `deployments.stage_state` jsonb. Shape: {current, current_started_at, history: [{name, started_at, ended_at, duration_ms, status, reason}]}."
+          description: The deployment's stored `stage_state` document, served verbatim.
           content:
             application/json:
               schema:
-                type: object
-                description: The raw `deployments.stage_state` jsonb. Closed-vocabulary enforcement lives at the database layer (`deployments_stage_state_current_check`).
-                properties:
-                  current:
-                    type: string
-                    enum: [source_download, dependency_restore, image_build, security_scan, snapshot_prepare, readiness]
-                  current_started_at:
-                    type: [string, "null"]
-                    format: date-time
-                  history:
-                    type: array
-                    items:
-                      type: object
-                      properties:
-                        name:
-                          type: string
-                          enum: [source_download, dependency_restore, image_build, security_scan, snapshot_prepare, readiness]
-                        started_at:
-                          type: [string, "null"]
-                          format: date-time
-                        ended_at:
-                          type: [string, "null"]
-                          format: date-time
-                        duration_ms:
-                          type: integer
-                          format: int64
-                        status:
-                          type: string
-                          enum: [completed, failed]
-                        reason:
-                          type: string
+                $ref: '#/components/schemas/DeploymentStageState'
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404':
           description: Deployment row missing or cross-account probe (IDOR-safe; never 403).
@@ -78266,7 +78333,7 @@ components:
         label: { type: string }
         description: { type: string }
         category: { type: string }
-        kind: { type: string, enum: [boolean, integer, duration, string, enum, secret_reference] }
+        kind: { type: string, enum: [boolean, integer, duration, string, enum, secret_reference, platform_flag, platform_flag_groups] }
         default_value: {}
         desired_value: {}
         effective_value: {}
@@ -78331,6 +78398,137 @@ components:
         version: { type: integer, format: int64, minimum: 1 }
         reason: { type: string, minLength: 3, maxLength: 500 }
         expected_version: { type: integer, format: int64, minimum: 0 }
+
+    # ─── Platform flags (ADR-1700) ───────────────────────────────────────
+
+    PlatformFlagRule:
+      description: "One targeting rule of a platform flag. Accounts, group, plans and rollout combine with AND; the first matching rule decides."
+      type: object
+      required: [id, value]
+      properties:
+        id: { type: string, pattern: '^[a-z][a-z0-9_-]{0,63}$' }
+        accounts:
+          type: array
+          maxItems: 1000
+          items: { type: string, format: uuid }
+        group: { type: string, pattern: '^[a-z][a-z0-9_-]{0,63}$' }
+        plans:
+          type: array
+          items: { type: string, enum: [free, hobby, pro, scale] }
+        rollout: { type: integer, minimum: 0, maximum: 10000, description: "Basis points of the accounts the other constraints admit." }
+        value: { type: boolean }
+
+    PlatformFlagDefinition:
+      description: "Stored value of a platform flag. Enabled is the kill switch; default applies to accounts no rule matches."
+      type: object
+      required: [enabled, default]
+      properties:
+        enabled: { type: boolean }
+        default: { type: boolean }
+        rules:
+          type: array
+          maxItems: 32
+          items: { $ref: '#/components/schemas/PlatformFlagRule' }
+
+    OperatorRuntimeConfigApplyReceipt:
+      description: "What one daemon instance reported applying for a runtime-configuration key."
+      type: object
+      required: [config_key, daemon, instance, version, status, reported_at]
+      properties:
+        config_key: { type: string }
+        daemon: { type: string }
+        instance: { type: string }
+        version: { type: integer, format: int64 }
+        status: { type: string, enum: [applied, failed] }
+        error: { type: string }
+        reported_at: { type: string, format: date-time }
+
+    OperatorPlatformFlagConvergence:
+      description: "Consumers of a platform flag grouped by whether every instance applied its current version."
+      type: object
+      required: [converged, pending, failed]
+      properties:
+        converged: { type: array, items: { type: string } }
+        pending: { type: array, items: { type: string } }
+        failed: { type: array, items: { type: string } }
+
+    OperatorPlatformFlag:
+      description: "One catalogued platform flag with its live definition, apply receipts and convergence."
+      type: object
+      required: [key, config_key, label, description, adr, consumers, legacy_env, definition,
+                 source, version, status, receipts, convergence]
+      properties:
+        key: { type: string }
+        config_key: { type: string, description: "Runtime-configuration key that stores the flag; write it with PATCH /v1/admin/config/{key}." }
+        label: { type: string }
+        description: { type: string }
+        capability: { type: string }
+        adr: { type: string }
+        consumers: { type: array, items: { type: string } }
+        legacy_env: { type: array, items: { type: string } }
+        retire_by: { type: string, format: date }
+        definition: { $ref: '#/components/schemas/PlatformFlagDefinition' }
+        source: { type: string, enum: [default_or_environment, operator] }
+        version: { type: integer, format: int64 }
+        status: { type: string, enum: [pending, applied, failed, blocked] }
+        last_error: { type: string }
+        updated_at: { type: string, format: date-time }
+        receipts:
+          type: array
+          items: { $ref: '#/components/schemas/OperatorRuntimeConfigApplyReceipt' }
+        convergence: { $ref: '#/components/schemas/OperatorPlatformFlagConvergence' }
+
+    OperatorPlatformFlagGroups:
+      description: "Shared named account sets referenced by platform-flag rules."
+      type: object
+      required: [config_key, groups, references, version]
+      properties:
+        config_key: { type: string }
+        groups:
+          type: object
+          additionalProperties: { type: array, items: { type: string, format: uuid } }
+        references:
+          type: object
+          additionalProperties: { type: array, items: { type: string } }
+        version: { type: integer, format: int64 }
+
+    OperatorPlatformFlagList:
+      description: "Every platform flag and the shared account groups."
+      type: object
+      required: [items, groups, generated_at]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/OperatorPlatformFlag' }
+        groups: { $ref: '#/components/schemas/OperatorPlatformFlagGroups' }
+        generated_at: { type: string, format: date-time }
+
+    OperatorPlatformFlagDecision:
+      description: "One platform flag decided for one account. Available is the decision and the plan entitlement of the released capability."
+      type: object
+      required: [flag, account_id, plan, enabled, reason, version, available]
+      properties:
+        flag: { type: string }
+        account_id: { type: string, format: uuid }
+        plan: { type: string }
+        enabled: { type: boolean }
+        reason: { type: string, enum: [unknown_flag, flag_disabled, account_missing, rule_match, default] }
+        rule_id: { type: string }
+        bucket: { type: integer, minimum: 0, maximum: 9999 }
+        version: { type: integer, format: int64 }
+        entitled: { type: boolean }
+        available: { type: boolean }
+
+    OperatorAccountPlatformFlags:
+      description: "Every platform flag decided for one account."
+      type: object
+      required: [account_id, plan, items]
+      properties:
+        account_id: { type: string, format: uuid }
+        plan: { type: string }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/OperatorPlatformFlagDecision' }
 
     # ─── Dashboard auth (issue #165 PR #2, ADR-032) ──────────────────────
 
@@ -81020,6 +81218,11 @@ components:
         id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
         slug: { type: string, pattern: '^[a-z0-9]([a-z0-9-]{1,38})[a-z0-9]$', example: "hello-world" }
         type: { type: string, enum: [app, function] , example: "app"}
+        project_id:
+          type: string
+          format: uuid
+          description: "Parent project (ADR-050) as a canonical hyphenated UUID. Omitted when the app is standalone. Read-only: app create and update requests do not accept it."
+          example: "3f2b8c1e-6a4d-4e5f-9b7a-1c2d3e4f5a6b"
         visibility: { type: string, enum: [public, internal], default: public, description: "Public exposes the app through the edge; internal keeps it available only to authenticated service-to-service routing. Available on every plan." }
         workload_class:
           type: string
@@ -86500,6 +86703,135 @@ components:
         source: { type: string, enum: [registry, object_storage] }
         sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
 
+    # Wire shape of `deployments.stage_state` (state.StageState, ADR-117).
+    # Served verbatim by GET /v1/deployments/{id}/stages and embedded as
+    # DeploymentResponse.stage_state. TestSpecComplianceDeploymentStageState
+    # pins property names, required fields and enums to the Go structs.
+    DeploymentStageState:
+      type: object
+      description: >-
+        Customer-visible deployment stage progress (ADR-117). `current` is the
+        open stage, or an empty string once the deployment is live, failed or
+        cancelled and that stage has moved into `history`.
+      required: [current, history]
+      properties:
+        current:
+          type: string
+          enum: ['', source_download, dependency_restore, image_build, security_scan, snapshot_prepare, readiness]
+        current_started_at:
+          type: [string, "null"]
+          format: date-time
+          description: Start of the open stage. Null or absent when no stage is open, and on legacy rows created before stage timing.
+        history:
+          type: array
+          description: Closed stages, oldest first. Writers keep the most recent 64 (MaxStageHistory).
+          items: { $ref: '#/components/schemas/DeploymentStageHistoryEntry' }
+        retry_requested_stage:
+          type: string
+          enum: [source_download, dependency_restore, image_build, security_scan, snapshot_prepare, readiness]
+          description: Stage a retry asked to resume from (ADR-162). Present only on retry deployments, which always restart at source_download.
+        retry_restart_reason:
+          type: string
+          description: Why a retry restarted from source_download rather than retry_requested_stage.
+        dependency_gate: { $ref: '#/components/schemas/DeploymentDependencyGate' }
+        build_dependency_gate: { $ref: '#/components/schemas/DeploymentBuildDependencyGate' }
+        hosting_verification: { $ref: '#/components/schemas/DeploymentHostingVerification' }
+    DeploymentStageHistoryEntry:
+      type: object
+      description: One closed stage with server-measured duration.
+      required: [name, started_at, ended_at, duration_ms, status]
+      properties:
+        name:
+          type: string
+          enum: [source_download, dependency_restore, image_build, security_scan, snapshot_prepare, readiness]
+        started_at: { type: [string, "null"], format: date-time }
+        ended_at: { type: [string, "null"], format: date-time }
+        duration_ms: { type: integer, format: int64, minimum: 0 }
+        status: { type: string, enum: [completed, failed, cancelled] }
+        reason: { type: string, description: Failure or cancellation detail; absent or empty for completed stages. }
+    DeploymentDependencyGate:
+      type: object
+      description: >-
+        Compose dependency readiness gate pinned at admission (ADR-685). The
+        deadline starts when the candidate first presents its own readiness proof.
+      required: [dependencies, status]
+      properties:
+        dependencies:
+          type: array
+          items: { $ref: '#/components/schemas/DeploymentDependencyPin' }
+        started_at: { type: string, format: date-time }
+        deadline_at: { type: string, format: date-time }
+        status: { type: string, enum: [waiting, ready, failed] }
+        blocker: { type: string, description: The dependency or deadline currently blocking release. }
+    DeploymentBuildDependencyGate:
+      type: object
+      description: >-
+        Build-time wait on the API deployments a guided service migration
+        selected (ADR-1666). It is checked before cache lookup and slot
+        allocation and never holds a build slot while waiting.
+      required: [dependencies, status, deadline_at, check_after]
+      properties:
+        dependencies:
+          type: array
+          items: { $ref: '#/components/schemas/DeploymentDependencyPin' }
+        status: { type: string, enum: [waiting, ready, failed] }
+        code: { type: string, description: "Machine-readable reason while waiting or failed, for example build_dependency_not_ready or build_dependency_timeout. Absent once ready." }
+        blocker: { type: string, description: The dependency or deadline currently blocking the build. }
+        deadline_at: { type: string, format: date-time }
+        check_after: { type: string, format: date-time, description: "Earliest time the gate is re-checked. Zero time (0001-01-01T00:00:00Z) when no re-check is scheduled." }
+    DeploymentDependencyPin:
+      type: object
+      description: A dependency deployment captured at admission; it never follows a later deployment.
+      required: [service, app_id, deployment_id]
+      properties:
+        service: { type: string }
+        app_id: { type: string }
+        deployment_id: { type: string }
+    DeploymentHostingVerification:
+      type: object
+      description: >-
+        Candidate hosting verification recovery progress (ADR-481, ADR-482).
+        last_error_code distinguishes publication, gateway, transport and
+        candidate-evidence failures; a transport failure does not attribute blame
+        to the app or platform. retry_not_before is an eligibility floor, not a
+        promised delivery time; completed_at means the attempt finished, while
+        the hosting receipt records its verdict.
+      required: [started_at, deadline_at, attempts]
+      properties:
+        started_at: { type: string, format: date-time }
+        deadline_at: { type: string, format: date-time }
+        attempts: { type: integer, minimum: 0 }
+        last_error_code: { type: string }
+        last_route_checks: { $ref: '#/components/schemas/HostingRouteCheckSet' }
+        retry_not_before: { type: string, format: date-time }
+        completed_at: { type: string, format: date-time }
+    HostingRouteCheckSet:
+      type: object
+      description: API route checks from the app's imported OpenAPI document. document_sha256 binds them to that exact document.
+      required: [source, status, checks]
+      properties:
+        source: { type: string, enum: [app_openapi] }
+        document_sha256: { type: string }
+        status: { type: string, enum: [verified, failed, unavailable] }
+        checks:
+          type: array
+          maxItems: 10
+          items: { $ref: '#/components/schemas/HostingRouteCheckResult' }
+    HostingRouteCheckResult:
+      type: object
+      description: Bounded, non-secret evidence from one authenticated candidate GET. Request and response bodies are omitted.
+      required: [method, path, status, verified_at]
+      properties:
+        method: { type: string }
+        path: { type: string }
+        status: { type: string, enum: [verified, failed, skipped] }
+        status_code: { type: integer }
+        latency_ms: { type: integer, format: int64 }
+        verified_at: { type: string, format: date-time, description: Zero time (0001-01-01T00:00:00Z) when the check did not run. }
+        request_id: { type: string }
+        error_code: { type: string }
+        error: { type: string }
+
     DeploymentResponse:
       description: "One deployment: id, app, source ref, build status, commit SHA, and lifecycle timestamps. The optional `has_overrides` and `override_*` fields are the persisted echo of the create-time overrides object (issue #460 / ADR-053); they round-trip via `GET /v1/apps/{slug}/deployments/{id}` so a customer can audit what their last deploy pinned. Env values are NEVER echoed — only the keys (`override_env_keys`); env_secrets refs ARE echoed because the ref shape is non-secret by design."
       type: object
@@ -86516,18 +86848,13 @@ components:
         durable_entity_validator:
           $ref: '#/components/schemas/DurableEntityValidatorDeploymentInfo'
         stage_state:
-          type: object
+          $ref: '#/components/schemas/DeploymentStageState'
           description: >-
-            Actual stage progress, including retry_requested_stage and
-            retry_restart_reason when prerequisites must be rebuilt. Optional
-            hosting_verification records started_at, deadline_at, attempts,
-            last_error_code, retry_not_before and completed_at during unavailable
-            candidate verification recovery (ADR-481, ADR-482). last_error_code
-            distinguishes publication, gateway, transport and candidate-evidence
-            failures; a transport failure does not attribute blame to the app or
-            platform. retry_not_before is an
-            eligibility floor, not a promised delivery time; completed_at means
-            the attempt finished, while the hosting receipt records its verdict.
+            Actual stage progress; the same document GET
+            /v1/deployments/{id}/stages serves. retry_requested_stage and
+            retry_restart_reason appear when prerequisites must be rebuilt;
+            hosting_verification appears during unavailable candidate
+            verification recovery (ADR-481, ADR-482).
         dev_patch:
           $ref: '#/components/schemas/DevPatchPreview'
         id: { type: string, pattern: '^[a-f0-9]{32}$', example: "0123456789abcdef0123456789abcdef" }
@@ -100473,6 +100800,7 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleGeoAction' }
             - { $ref: '#/components/schemas/EdgeRuleThrottleAction' }
             - { $ref: '#/components/schemas/EdgeRuleBudgetAction' }
+            - { $ref: '#/components/schemas/EdgeRuleCacheAction' }
             - { $ref: '#/components/schemas/EdgeRuleRespondAction' }
             - { $ref: '#/components/schemas/EdgeRuleRetryAction' }
             - { $ref: '#/components/schemas/EdgeRuleCircuitBreakerAction' }
@@ -100545,6 +100873,7 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleGeoAction' }
             - { $ref: '#/components/schemas/EdgeRuleThrottleAction' }
             - { $ref: '#/components/schemas/EdgeRuleBudgetAction' }
+            - { $ref: '#/components/schemas/EdgeRuleCacheAction' }
             - { $ref: '#/components/schemas/EdgeRuleRespondAction' }
             - { $ref: '#/components/schemas/EdgeRuleRetryAction' }
             - { $ref: '#/components/schemas/EdgeRuleCircuitBreakerAction' }
@@ -100594,6 +100923,7 @@ components:
             - { $ref: '#/components/schemas/EdgeRuleGeoAction' }
             - { $ref: '#/components/schemas/EdgeRuleThrottleAction' }
             - { $ref: '#/components/schemas/EdgeRuleBudgetAction' }
+            - { $ref: '#/components/schemas/EdgeRuleCacheAction' }
             - { $ref: '#/components/schemas/EdgeRuleRespondAction' }
             - { $ref: '#/components/schemas/EdgeRuleRetryAction' }
             - { $ref: '#/components/schemas/EdgeRuleCircuitBreakerAction' }
@@ -101490,7 +101820,9 @@ components:
             gateway request refreshes the key in the background. Default
             0 (disabled); absolute cap 300.
           * `stale_if_error_seconds` — required. Stale-on-error window
-            in seconds. Default 300; absolute cap 300
+            in seconds; 0 disables it (apid does not replace 0 with a
+            default, so send 300 explicitly for the recommended
+            window). Absolute cap 300
             (`api.ResponseCacheStaleIfErrorMaxSeconds`). During an
             upstream error the gateway returns the cached body within
             this window instead of 502/504.
@@ -101515,8 +101847,8 @@ components:
           default: 60
           description: |
             Fresh window in seconds. 0 = inherit the apid-side default
-            (60s). Positive values are clamped to the platform cap
-            (3600s = 1 hour).
+            (60s). Values above the platform cap
+            (3600s = 1 hour) are rejected with 422.
         stale_while_revalidate_seconds:
           type: integer
           minimum: 0
@@ -101533,8 +101865,8 @@ components:
           default: 300
           description: |
             Stale-on-error window in seconds. 0 = no stale-on-error
-            (errors return 502/504 directly). Positive values are
-            clamped to the platform cap (300s = 5 minutes).
+            (errors return 502/504 directly). Values above the
+            platform cap (300s = 5 minutes) are rejected with 422.
         vary_on:
           type: array
           description: |
@@ -108745,6 +109077,7 @@ components:
         slug: { type: string }
         type: { type: string, enum: [app, function] }
         runtime: { type: string, description: Runtime identifier for functions when configured. }
+        project_id: { type: string, format: uuid, description: Parent project as a canonical hyphenated UUID. Omitted when the app is standalone. }
         status: { type: string }
         created_at: { type: string, format: date-time }
 
